@@ -2,7 +2,7 @@
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
   "snapshot_date": "2026-10-15",
-  "snapshot_note": "Wave 4: 8-node 3D solid elements (with Taylor-Beresford-Wilson incompatible modes), 3D elastic catenary cables and member T/C limits, nonlinear direct-integration time history (Gap/Hook/Damper) with initial-case state continuation, schema-driven native SDB stream writer, AISC Angle/DblAngle V3 shear, H3 closed-section torsion, EC3 V3 shapes, and concrete minor-axis V3/M2 design. See wave notes and validation.json for exact scope; product parity remains incomplete.",
+  "snapshot_note": "Post-review correctness repairs: constitutive reaction recovery, explicit unsupported-input guards, checked native export and verified design formula corrections. Full product/vendor parity remains unestablished.",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
     "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
@@ -65,7 +65,7 @@
     {
       "id": "frame-geometric-nonlinearity",
       "area": "solver",
-      "feature": "Nonlinear static, P-Delta, catenary cable equilibrium, and initial-case state continuation.",
+      "feature": "Bounded nonlinear static/P-Delta with explicit convergence controls and unsupported-combination validation.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -85,9 +85,13 @@
         {
           "file": "docs/reconstruction/solver-wave4.md",
           "note": "Catenary cable nonlinear static equilibrium, frame T/C limits, and initial_case continuation."
+        },
+        {
+          "file": "docs/reconstruction/solver-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "General frame/shell large displacements, stateful hysteretic frame plasticity, and combined P-Delta/contact are unsupported. Catenary cables, frame T/C limits, and Gap/Hook contact with initial_case continuation are verified against Examples 6-003, 6-004, 7-001, and 7-002."
+      "limits": "No general large-displacement corotational frame/shell behavior. Capped frames with geometric nonlinearity and unsupported loading/offset combinations reject."
     },
     {
       "id": "frame-modal-buckling-spectrum",
@@ -121,7 +125,7 @@
     {
       "id": "time-history",
       "area": "solver",
-      "feature": "Linear and nonlinear direct-integration time-history cases using Newmark average/linear acceleration, Hilber-Hughes-Taylor (HHT-alpha), or Wilson-theta integration, with initial-case continuation.",
+      "feature": "Selected linear and nonlinear direct-integration histories; nonlinear reactions use the same constitutive state and damping as integration.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -137,9 +141,13 @@
         {
           "file": "docs/reconstruction/solver-wave4.md",
           "note": "Verified against Example 6-003 (Gap static/dynamic continuation) and Example 6-005 (Maxwell damper harmonic excitation)."
+        },
+        {
+          "file": "docs/reconstruction/solver-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Nonlinear direct-integration history supports Gap, Hook, and Maxwell Damper links plus initial_case continuation. Bouc-Wen/hysteretic plasticity in dynamics, Fast Nonlinear Analysis (FNA), and history patterns with element/self-weight loads remain unsupported."
+      "limits": "History-origin continuation rejects because full terminal state is not stored. Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending."
     },
     {
       "id": "other-case-types",
@@ -197,8 +205,8 @@
     {
       "id": "solid-elements",
       "area": "solver",
-      "feature": "8-node 3D isoparametric solid elements with optional Taylor-Beresford-Wilson incompatible bending modes, degenerate wedges/tetrahedra, self-weight, Face 1..6 surface pressure, uniform temperature loads, and stress recovery.",
-      "status": "implemented-tested",
+      "feature": "Eight-node solid stiffness/stress recovery with zero mass/weight modifiers honored and invalid modifiers rejected.",
+      "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/solid.rs",
@@ -213,14 +221,18 @@
         {
           "file": "docs/reconstruction/solver-wave4.md",
           "note": "Formulation and benchmark verification notes."
+        },
+        {
+          "file": "docs/reconstruction/solver-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Higher-order 20-node solids and nonlinear material plasticity in solids are not implemented."
+      "limits": "Mesh/constitutive coverage is partial; solid surface/temperature history loading is rejected. No comprehensive vendor physics acceptance."
     },
     {
       "id": "links",
       "area": "solver",
-      "feature": "Oriented effective linear/viscous links plus nonlinear static and direct-integration dynamic Gap, Hook, and Maxwell Damper constitutive response.",
+      "feature": "Effective linear/viscous links and bounded nonlinear Gap/Hook/Maxwell response, with constitutive history reaction recovery.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -234,15 +246,19 @@
         {
           "file": "docs/reconstruction/solver-wave4.md",
           "note": "Nonlinear direct-integration history for Gap, Hook, and Maxwell Damper links (Examples 6-003, 6-004, 6-005) and native m_param import."
+        },
+        {
+          "file": "docs/reconstruction/solver-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "PlasticWen/friction-isolator/multilinear-plastic dynamic hysteresis, coupled contact/P-Delta, and exact fixed-DOF constraint equations remain incomplete."
+      "limits": "Other nonlinear laws and unvalidated geometric coupling remain unsupported. Wilson-theta Maxwell internal-state integration rejects. General massless damping and exact fixed link constraints remain limited."
     },
     {
       "id": "cables-and-member-limits",
       "area": "solver",
-      "feature": "3D elastic catenary cable elements (Peyrot & Goulois, 1979) and frame tension/compression limits (tc_limits).",
-      "status": "implemented-tested",
+      "feature": "Cable-only nonlinear static for supported full-span uniform loading; bounded small-displacement frame axial limits.",
+      "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/cable.rs",
@@ -257,9 +273,13 @@
         {
           "file": "docs/reconstruction/solver-wave4.md",
           "note": "Catenary and member T/C limit formulation notes."
+        },
+        {
+          "file": "docs/reconstruction/solver-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Dynamic large-displacement cable whip and coupled frame P-Delta + T/C limit interaction remain outside the verified subset."
+      "limits": "Mixed cable/frame/link/area/solid models, cable springs/constraints, target end tension, partial/nonuniform/point cable loads, and capped members with axial span loads or unsupported releases/offsets reject. Native cable examples containing target-tension initialization now explicitly reject."
     },
     {
       "id": "constraints",
@@ -305,7 +325,7 @@
     {
       "id": "steel-design",
       "area": "design",
-      "feature": "AISC 360-10 LRFD/ASD and Eurocode 3 frame capacities and interactions, including AISC Angle/DblAngle V3 shear, closed-section H3 torsion interaction, and EC3 local-3 shear across standard shapes.",
+      "feature": "Selected AISC/EC3 checks, corrected distinct Box/Pipe H3 interactions and unequal-wall torsion dimensions, and independently defined EC3 local-3 shear areas.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -321,14 +341,18 @@
         {
           "file": "docs/reconstruction/design-wave4.md",
           "note": "Wave 4 steel and concrete design expansion notes."
+        },
+        {
+          "file": "docs/reconstruction/design-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Aluminum and ColdFormed materials remain rejected in the steel workflow. Under EC3, local-3 shear with concurrent axial/major-bending/major-shear/torsion or closed-section torsion remains explicitly rejected. Nominal Box/Pipe dimensions are treated as design thickness."
+      "limits": "EC3 local-3 is bounded to Rectangular, Pipe and equal-wall Box; other shapes and incompatible concurrent demands reject. ERW/SAW design-thickness inputs, comprehensive buckling and full design-code validation remain incomplete."
     },
     {
       "id": "concrete-design",
       "area": "design",
-      "feature": "ACI 318-14 and Eurocode 2 beam biaxial flexure (M3/M2) and biaxial shear (V2/V3) sizing plus rectangular/circular column biaxial PMM and V2/V3 shear.",
+      "feature": "Selected ACI/EC2 beam and column checks with supported major-axis flexure and shear outputs.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -339,9 +363,13 @@
         {
           "file": "docs/reconstruction/design-wave4.md",
           "note": "Concrete minor-axis V3 shear and M2 flexure verification."
+        },
+        {
+          "file": "docs/reconstruction/design-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Nonzero concrete torsion (|T| > 1e-9) remains explicitly rejected. ACI/EC2 coverage is selected member checks, not full seismic detailing."
+      "limits": "Concrete beam M2 rejects: the result schema cannot express side-face reinforcement separately. Existing column PMM remains partial; no full biaxial reinforcement-detailing or torsion acceptance."
     },
     {
       "id": "s2k-interoperability",
@@ -405,7 +433,7 @@
     {
       "id": "sdb-export",
       "area": "format",
-      "feature": "Export a SapModel to a schema-compliant SAP2000 v19 native cBinaryStream SDB file (pack_model_to_native_sdb / save_native_sdb_file), alongside the private S2K snapshot container.",
+      "feature": "Experimental native serialization with referential-integrity/completeness guards, observed class-version tags and semantic roundtrip verification before writing.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -421,14 +449,18 @@
         {
           "file": "docs/reconstruction/formats-wave4.md",
           "note": "Native SDB stream writer specification and round-trip verification."
+        },
+        {
+          "file": "docs/reconstruction/format-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Generated native SDB files pass schema inspection to EOF and round-trip through extract_sdb_to_model, but opening generated files inside a licensed Windows SAP2000 v19 executable remains untested."
+      "limits": "Opaque S2K preservation, unimplemented represented assignments and non-roundtrippable data reject instead of disappearing. Default concrete metadata is among the rejected states; callers must deliberately select a supported model subset. Internal schema success is not licensed vendor-runtime acceptance."
     },
     {
       "id": "oapi",
       "area": "api",
-      "feature": "Rust facade with selected cSapModel, cFile (including save_native_sdb), point/frame/cable/area/solid/link, properties, load/case/combo, analysis/results, and design methods.",
+      "feature": "Selected Rust object facades, atomic solid geometry/temperature validation, zero-state nonlinear history definitions and native-export diagnostics.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -439,14 +471,18 @@
         {
           "file": "docs/reconstruction/application-wave4.md",
           "note": "Wave 4 OAPI and CLI additions."
+        },
+        {
+          "file": "docs/reconstruction/application-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "This is a Rust method facade, not a Windows COM server. Tendon objects, broad database table interfaces, and full CSI OAPI method coverage remain incomplete."
+      "limits": "Not a COM server or complete OAPI contract. Editor continuation/geometric dynamics remain unsupported; actual supported signatures are documented explicitly."
     },
     {
       "id": "gui",
       "area": "application",
-      "feature": "egui desktop model editor/viewer with templates, section browser, load assignment, analysis, selected diagrams, ratios, and tables.",
+      "feature": "Native egui workbench including validated zero-state nonlinear-history definitions and existing model/result workflows.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -461,9 +497,13 @@
         {
           "file": "docs/reconstruction/application-wave3.md",
           "note": "Case/function definition editor, run selection, durable export warnings and headless input tests."
+        },
+        {
+          "file": "docs/reconstruction/application-fixes.md",
+          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "GUI is a selected 2D/3D workbench, not SAP2000 UI parity. Tables and edit flows cover limited object/result types."
+      "limits": "Headless rendering/input tests cover selected paths only. Full tutorial, native desktop and Windows/macOS runtime acceptance remain unverified."
     },
     {
       "id": "templates",

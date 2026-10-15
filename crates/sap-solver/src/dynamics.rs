@@ -74,8 +74,14 @@ pub(crate) struct LinearStepper {
 
 impl LinearStepper {
     #[cfg(test)]
-    pub fn new(k: &[f64], mass: &[f64], fixed: &[bool], case: &LoadCase,
-        force: &[f64], force_slope: &[f64]) -> Result<Self, SolverError> {
+    pub fn new(
+        k: &[f64],
+        mass: &[f64],
+        fixed: &[bool],
+        case: &LoadCase,
+        force: &[f64],
+        force_slope: &[f64],
+    ) -> Result<Self, SolverError> {
         Self::with_element_damping(k, mass, fixed, case, force, force_slope, &vec![0.; k.len()])
     }
 
@@ -90,7 +96,12 @@ impl LinearStepper {
     ) -> Result<Self, SolverError> {
         validate_parameters(case)?;
         let n = mass.len();
-        if k.len() != n * n || element_damping.len() != n*n || fixed.len() != n || force.len() != n || force_slope.len() != n {
+        if k.len() != n * n
+            || element_damping.len() != n * n
+            || fixed.len() != n
+            || force.len() != n
+            || force_slope.len() != n
+        {
             return Err(SolverError::InvalidInput(
                 "dynamic system dimensions differ".into(),
             ));
@@ -110,7 +121,10 @@ impl LinearStepper {
         // A general singular first-order/algebraic block requires a separate DAE
         // reduction. Reject it instead of silently projecting away dashpot forces.
         for i in 0..n {
-            if !fixed[i] && mass[i] == 0.0 && (0..n).any(|j| !fixed[j] && element_damping[i*n+j] != 0.) {
+            if !fixed[i]
+                && mass[i] == 0.0
+                && (0..n).any(|j| !fixed[j] && element_damping[i * n + j] != 0.)
+            {
                 return Err(SolverError::UnsupportedInput("link damping on a free massless coordinate requires general DAE initialization".into()));
             }
         }
@@ -141,7 +155,11 @@ impl LinearStepper {
         let a4 = gamma / beta - 1.0;
         let a5 = h * (gamma / (2.0 * beta) - 1.0);
         let (alpha_m, beta_k) = case.rayleigh_damping;
-        let mut c: Vec<f64> = k.iter().zip(element_damping).map(|(kij, cij)| beta_k * kij + cij).collect();
+        let mut c: Vec<f64> = k
+            .iter()
+            .zip(element_damping)
+            .map(|(kij, cij)| beta_k * kij + cij)
+            .collect();
         for i in 0..n {
             c[i * n + i] += alpha_m * mass[i];
         }
@@ -578,7 +596,7 @@ impl NonlinearStepper {
 
         // Compute initial acceleration at massive DOFs when starting from rest at u0
         let mut a_init = vec![0.0; n];
-        if u_init.is_none() {
+        {
             let mut r_nl0 = vec![0.0; n];
             for sp in &springs {
                 sp.add_force(&mut r_nl0, sp.f_prev);
@@ -648,9 +666,9 @@ impl NonlinearStepper {
                         + self.a2 * self.state.v[i]
                         + self.a3 * self.state.a[i]);
             for j in 0..self.n {
-                rhs_linear[i] +=
-                    self.c[i * self.n + j] * (weight * q_vec[j] + self.alpha * self.state.v[j])
-                        + self.alpha * self.k[i * self.n + j] * self.state.u[j];
+                rhs_linear[i] += self.c[i * self.n + j]
+                    * (weight * q_vec[j] + self.alpha * self.state.v[j])
+                    + self.alpha * self.k[i * self.n + j] * self.state.u[j];
             }
         }
         for sp in &self.springs {
@@ -741,19 +759,27 @@ impl NonlinearStepper {
                 stage_u[i] = 0.0;
             }
         }
-        let max_iters = case.max_iterations.max(20);
-        let tol = case.convergence_tol.clamp(1e-12, 1e-4);
+        let max_iters = case.max_iterations;
+        let tol = case.convergence_tol;
 
         for iter in 0..=max_iters {
             let (residual, tangent) = eval_res_tan(&stage_u);
             let scale = (0..self.n)
                 .filter(|&i| !self.fixed[i])
                 .map(|i| rhs_linear[i].abs().max((residual[i] + rhs_linear[i]).abs()))
-                .fold(1e-12, f64::max);
+                .fold(0.0, f64::max);
             let norm = (0..self.n)
                 .filter(|&i| !self.fixed[i])
                 .map(|i| residual[i].abs())
                 .fold(0.0, f64::max);
+            if residual.iter().chain(&stage_u).any(|x| !x.is_finite()) || !scale.is_finite() {
+                return Err(SolverError::NonConvergence {
+                    case: case.name.clone(),
+                    iterations: iter,
+                    residual: norm,
+                    reason: "nonfinite nonlinear dynamic residual or state".into(),
+                });
+            }
             if norm <= tol * scale {
                 break;
             }
@@ -786,18 +812,37 @@ impl NonlinearStepper {
                 }
                 slope = residual.iter().zip(&direction).map(|(r, p)| r * p).sum();
                 if !slope.is_finite() || slope >= 0.0 {
-                    break;
+                    return Err(SolverError::NonConvergence {
+                        case: case.name.clone(),
+                        iterations: iter,
+                        residual: norm,
+                        reason: "no nonlinear dynamic descent direction".into(),
+                    });
                 }
             }
             let mut hi = 1.0;
-            for _ in 0..40 {
-                if eval_dir_deriv(&stage_u, &direction, hi) >= 0.0 {
+            let mut bracketed = false;
+            for _ in 0..80 {
+                let derivative = eval_dir_deriv(&stage_u, &direction, hi);
+                if !derivative.is_finite() {
+                    break;
+                }
+                if derivative >= 0.0 {
+                    bracketed = true;
                     break;
                 }
                 hi *= 2.0;
             }
+            if !bracketed {
+                return Err(SolverError::NonConvergence {
+                    case: case.name.clone(),
+                    iterations: iter,
+                    residual: norm,
+                    reason: "nonlinear dynamic line search failed to bracket equilibrium".into(),
+                });
+            }
             let mut lo = 0.0;
-            for _ in 0..40 {
+            for _ in 0..80 {
                 let mid = 0.5 * (lo + hi);
                 if eval_dir_deriv(&stage_u, &direction, mid) < 0.0 {
                     lo = mid;

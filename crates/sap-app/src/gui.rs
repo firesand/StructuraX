@@ -2396,8 +2396,11 @@ impl SapGuiApp {
                             match save_native_sdb_file(&self.model, &self.file_path_input) {
                                 Err(error) => self.status_msg = format!("Export SDB error: {error}"),
                                 Ok(()) => {
+                                    self.export_warnings.push(
+                                        "Experimental native SDB export: vendor application acceptance is unverified; retain the original source.".into(),
+                                    );
                                     self.status_msg = format!(
-                                        "Exported binary stream .SDB to {}",
+                                        "Exported experimental binary stream .SDB to {} — vendor application acceptance is unverified",
                                         self.file_path_input
                                     );
                                     close_file = true;

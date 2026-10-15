@@ -11,6 +11,7 @@ pub mod linalg;
 mod link;
 mod nonlinear;
 pub mod solid;
+mod supported_subset;
 
 use indexmap::IndexMap;
 use sap_model::{
@@ -53,7 +54,12 @@ pub enum SolverError {
     #[error("Unsupported analysis input: {0}")]
     UnsupportedInput(String),
     #[error("Nonlinear case '{case}' did not converge after {iterations} iterations (residual {residual:e}): {reason}")]
-    NonConvergence { case: String, iterations: usize, residual: f64, reason: String },
+    NonConvergence {
+        case: String,
+        iterations: usize,
+        residual: f64,
+        reason: String,
+    },
     #[error("Invalid analysis input: {0}")]
     InvalidInput(String),
 }
@@ -68,8 +74,8 @@ pub fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
     model.concrete_design_results.clear();
     // Analyze a working copy so coordinate normalization never rewrites assignments.
     let mut working = model.clone();
-    let result = coordinates::normalize_loads(&mut working)
-        .and_then(|()| analyze_model_inner(&mut working));
+    let result =
+        coordinates::normalize_loads(&mut working).and_then(|()| analyze_model_inner(&mut working));
     if result.is_ok() {
         model.case_results = working.case_results;
         model.is_locked = working.is_locked;
@@ -116,14 +122,8 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     )?;
 
     // Build K_base = K_struct + grounded springs + multipoint constraints
-    let k_base = add_springs_and_constraints(
-        model,
-        &work_points,
-        &pt_index,
-        &joint_rot,
-        &k_struct,
-        ndof,
-    );
+    let k_base =
+        add_springs_and_constraints(model, &work_points, &pt_index, &joint_rot, &k_struct, ndof);
 
     for case_name in ordered_cases {
         let lc = model.load_cases.get(&case_name).unwrap().clone();
@@ -142,79 +142,72 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
                     ndof,
                 )?
             }
-            LoadCaseType::NonlinearStatic => {
-                run_nonlinear_static_case(
-                    model,
-                    &lc,
-                    &work_points,
-                    &work_areas,
-                    &orig_area_map,
-                    &pt_index,
-                    &joint_rot,
-                    &k_struct,
-                    &k_base,
-                    ndof,
-                )?
-            }
-            LoadCaseType::Modal => {
-                run_modal_case(
-                    model,
-                    &lc,
-                    &work_points,
-                    &pt_index,
-                    &joint_rot,
-                    &k_base,
-                    &diag_mass,
-                    ndof,
-                )?
-            }
-            LoadCaseType::Buckling => {
-                run_buckling_case(
-                    model,
-                    &lc,
-                    &work_points,
-                    &pt_index,
-                    &joint_rot,
-                    &k_base,
-                    ndof,
-                )?
-            }
-            LoadCaseType::ResponseSpectrum => {
-                run_response_spectrum_case(
-                    model,
-                    &lc,
-                    &work_points,
-                    &work_areas,
-                    &orig_area_map,
-                    &pt_index,
-                    &joint_rot,
-                    &k_struct,
-                    &k_base,
-                    &diag_mass,
-                    ndof,
-                )?
-            }
+            LoadCaseType::NonlinearStatic => run_nonlinear_static_case(
+                model,
+                &lc,
+                &work_points,
+                &work_areas,
+                &orig_area_map,
+                &pt_index,
+                &joint_rot,
+                &k_struct,
+                &k_base,
+                ndof,
+            )?,
+            LoadCaseType::Modal => run_modal_case(
+                model,
+                &lc,
+                &work_points,
+                &pt_index,
+                &joint_rot,
+                &k_base,
+                &diag_mass,
+                ndof,
+            )?,
+            LoadCaseType::Buckling => run_buckling_case(
+                model,
+                &lc,
+                &work_points,
+                &pt_index,
+                &joint_rot,
+                &k_base,
+                ndof,
+            )?,
+            LoadCaseType::ResponseSpectrum => run_response_spectrum_case(
+                model,
+                &lc,
+                &work_points,
+                &work_areas,
+                &orig_area_map,
+                &pt_index,
+                &joint_rot,
+                &k_struct,
+                &k_base,
+                &diag_mass,
+                ndof,
+            )?,
             LoadCaseType::LinearHistory
             | LoadCaseType::NonlinearHistory
             | LoadCaseType::LinearDynamic
-            | LoadCaseType::NonlinearDynamic => {
-                run_time_history_case(
-                    model,
-                    &lc,
-                    &work_points,
-                    &work_areas,
-                    &orig_area_map,
-                    &pt_index,
-                    &joint_rot,
-                    &k_struct,
-                    &k_base,
-                    &diag_mass,
-                    ndof,
-                )?
+            | LoadCaseType::NonlinearDynamic => run_time_history_case(
+                model,
+                &lc,
+                &work_points,
+                &work_areas,
+                &orig_area_map,
+                &pt_index,
+                &joint_rot,
+                &k_struct,
+                &k_base,
+                &diag_mass,
+                ndof,
+            )?,
+            _ => {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "case '{}' has type {:?}",
+                    case_name, lc.case_type
+                )))
             }
-            _ => return Err(SolverError::UnsupportedInput(format!(
-                "case '{}' has type {:?}", case_name, lc.case_type
-            ))),
         };
         model.case_results.insert(case_name, res);
     }
@@ -271,7 +264,8 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
     for area in model.areas.values() {
         if !(3..=4).contains(&area.points.len()) {
             return Err(SolverError::UnsupportedInput(format!(
-                "area '{}' requires 3 or 4 nodes", area.name
+                "area '{}' requires 3 or 4 nodes",
+                area.name
             )));
         }
         // Validate before auto-meshing, whose working-mesh expansion needs all corners.
@@ -285,9 +279,15 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
     let has_cables = model.frames.values().any(|f| f.cable_params.is_some());
     for frame in model.frames.values() {
         if let Some(cp) = &frame.cable_params {
-            if cp.undeformed_length.is_some_and(|l| !l.is_finite() || l <= 0.0)
-                || cp.target_tension_i.is_some_and(|t| !t.is_finite() || t <= 0.0)
-                || cp.horizontal_tension.is_some_and(|h| !h.is_finite() || h <= 0.0)
+            if cp
+                .undeformed_length
+                .is_some_and(|l| !l.is_finite() || l <= 0.0)
+                || cp
+                    .target_tension_i
+                    .is_some_and(|t| !t.is_finite() || t <= 0.0)
+                || cp
+                    .horizontal_tension
+                    .is_some_and(|h| !h.is_finite() || h <= 0.0)
             {
                 return Err(SolverError::InvalidInput(format!(
                     "cable '{}' has nonpositive or nonfinite cable parameter",
@@ -303,18 +303,27 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 )));
             }
         }
-        let pi = model.points.get(&frame.point_i)
+        let pi = model
+            .points
+            .get(&frame.point_i)
             .ok_or_else(|| SolverError::PointNotFound(frame.point_i.clone()))?;
-        let pj = model.points.get(&frame.point_j)
+        let pj = model
+            .points
+            .get(&frame.point_j)
             .ok_or_else(|| SolverError::PointNotFound(frame.point_j.clone()))?;
         let length = ((pj.x - pi.x).powi(2) + (pj.y - pi.y).powi(2) + (pj.z - pi.z).powi(2)).sqrt();
         if !length.is_finite() || length <= 0.0 {
-            return Err(SolverError::InvalidInput(format!("frame '{}' has invalid length", frame.name)));
+            return Err(SolverError::InvalidInput(format!(
+                "frame '{}' has invalid length",
+                frame.name
+            )));
         }
     }
     for (name, lc) in model.load_cases.iter().filter(|(_, lc)| lc.run_flag) {
         if lc.loads.iter().any(|load| !load.scale_factor.is_finite()) {
-            return Err(SolverError::InvalidInput(format!("case '{name}' has nonfinite load scale")));
+            return Err(SolverError::InvalidInput(format!(
+                "case '{name}' has nonfinite load scale"
+            )));
         }
 
         if !matches!(
@@ -329,7 +338,10 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 | LoadCaseType::LinearDynamic
                 | LoadCaseType::NonlinearDynamic
         ) {
-            return Err(SolverError::UnsupportedInput(format!("case '{name}' has type {:?}", lc.case_type)));
+            return Err(SolverError::UnsupportedInput(format!(
+                "case '{name}' has type {:?}",
+                lc.case_type
+            )));
         }
         if matches!(
             lc.case_type,
@@ -337,13 +349,17 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 | LoadCaseType::NonlinearHistory
                 | LoadCaseType::NonlinearDynamic
         ) {
-            if lc.max_iterations == 0 || !lc.convergence_tol.is_finite() || lc.convergence_tol <= 0. {
+            if lc.max_iterations == 0 || !lc.convergence_tol.is_finite() || lc.convergence_tol <= 0.
+            {
                 return Err(SolverError::InvalidInput(format!("case '{name}' needs positive nonlinear iteration count and finite positive tolerance")));
             }
             for object in model.links.values() {
                 let prop = &model.link_props[&object.prop];
                 if !prop.nonlinear_data_complete {
-                    return Err(SolverError::UnsupportedInput(format!("link '{}' has incomplete imported nonlinear constitutive data", object.name)));
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "link '{}' has incomplete imported nonlinear constitutive data",
+                        object.name
+                    )));
                 }
                 if !matches!(
                     prop.link_type,
@@ -352,7 +368,10 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                         | sap_model::LinkPropType::Hook
                         | sap_model::LinkPropType::Damper
                 ) {
-                    return Err(SolverError::UnsupportedInput(format!("nonlinear link constitutive iteration for '{}' is not implemented", object.name)));
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "nonlinear link constitutive iteration for '{}' is not implemented",
+                        object.name
+                    )));
                 }
                 for d in 0..6 {
                     if prop.dof_nonlinear[d] && prop.dof_active[d] && !prop.dof_fixed[d] {
@@ -362,7 +381,10 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                                 | sap_model::LinkPropType::Hook
                                 | sap_model::LinkPropType::Damper
                         ) {
-                            return Err(SolverError::InvalidInput(format!("link '{}' nonlinear flags require a supported nonlinear property", object.name)));
+                            return Err(SolverError::InvalidInput(format!(
+                                "link '{}' nonlinear flags require a supported nonlinear property",
+                                object.name
+                            )));
                         }
                         if matches!(
                             prop.link_type,
@@ -387,8 +409,12 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                                 object.name
                             )));
                         }
-                        if lc.case_type == LoadCaseType::NonlinearStatic && lc.nl_geom != NLGeomType::None {
-                            return Err(SolverError::UnsupportedInput(format!("case '{name}' combines geometric nonlinearity and nonlinear links")));
+                        if lc.case_type == LoadCaseType::NonlinearStatic
+                            && lc.nl_geom != NLGeomType::None
+                        {
+                            return Err(SolverError::UnsupportedInput(format!(
+                                "case '{name}' combines geometric nonlinearity and nonlinear links"
+                            )));
                         }
                     }
                 }
@@ -412,12 +438,18 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
             return Err(SolverError::UnsupportedInput(format!("case '{name}' requires continuation from a nonlinear link tangent, which is not stored")));
         }
         if lc.nl_geom == NLGeomType::LargeDisplacements && !has_cables {
-            return Err(SolverError::UnsupportedInput(format!("case '{name}' requests large displacements")));
+            return Err(SolverError::UnsupportedInput(format!(
+                "case '{name}' requests large displacements"
+            )));
         }
-        if matches!(lc.case_type, LoadCaseType::LinearHistory | LoadCaseType::LinearDynamic)
-            && lc.initial_case.is_some()
+        if matches!(
+            lc.case_type,
+            LoadCaseType::LinearHistory | LoadCaseType::LinearDynamic
+        ) && lc.initial_case.is_some()
         {
-            return Err(SolverError::UnsupportedInput(format!("initial state for case '{name}' is not implemented")));
+            return Err(SolverError::UnsupportedInput(format!(
+                "initial state for case '{name}' is not implemented"
+            )));
         }
         if matches!(
             lc.case_type,
@@ -429,65 +461,111 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
             dynamics::validate_parameters(lc)?;
             for (_, pattern, scale) in &lc.history_loads {
                 if !scale.is_finite() {
-                    return Err(SolverError::InvalidInput(format!("case '{name}' has a nonfinite history load scale")));
+                    return Err(SolverError::InvalidInput(format!(
+                        "case '{name}' has a nonfinite history load scale"
+                    )));
                 }
-                if matches!(pattern.trim().to_ascii_uppercase().as_str(), "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z") {
+                if matches!(
+                    pattern.trim().to_ascii_uppercase().as_str(),
+                    "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
+                ) {
                     continue;
                 }
-                let pat = model.load_patterns.get(pattern).ok_or_else(|| SolverError::InvalidInput(
-                    format!("case '{name}' references missing history load pattern '{pattern}'")))?;
-                let unsupported_member_loads = model.frames.values().any(|f|
+                let pat = model.load_patterns.get(pattern).ok_or_else(|| {
+                    SolverError::InvalidInput(format!(
+                        "case '{name}' references missing history load pattern '{pattern}'"
+                    ))
+                })?;
+                let unsupported_member_loads = model.frames.values().any(|f| {
                     f.loads_temp.iter().any(|l| &l.load_pat == pattern)
-                    || f.loads_gravity.contains_key(pattern))
-                    || model.areas.values().any(|a|
-                        a.loads_uniform.iter().any(|l| &l.load_pat == pattern)
+                        || f.loads_gravity.contains_key(pattern)
+                }) || model.areas.values().any(|a| {
+                    a.loads_uniform.iter().any(|l| &l.load_pat == pattern)
                         || a.loads_pressure.iter().any(|l| &l.load_pat == pattern)
-                        || a.loads_temp.iter().any(|l| &l.load_pat == pattern));
-                let motion_loads = model.points.values().any(|p| p.loads_displ.iter().any(|l| &l.load_pat == pattern));
+                        || a.loads_temp.iter().any(|l| &l.load_pat == pattern)
+                });
+                let motion_loads = model
+                    .points
+                    .values()
+                    .any(|p| p.loads_displ.iter().any(|l| &l.load_pat == pattern));
                 if pat.self_wt_multiplier != 0.0 || unsupported_member_loads || motion_loads {
                     return Err(SolverError::UnsupportedInput(format!("history pattern '{pattern}' contains self-weight, element loads, or support motion; only joint forces are implemented")));
                 }
             }
         }
-        let functions = lc.history_loads.iter().map(|(f, _, _)| f)
+        let functions = lc
+            .history_loads
+            .iter()
+            .map(|(f, _, _)| f)
             .chain(lc.spectrum_loads.iter().map(|(f, _, _)| f));
         for function in functions {
-            let f = model.functions.get(function).ok_or_else(|| SolverError::InvalidInput(
-                format!("case '{name}' references missing function '{function}'")))?;
-            if f.points.is_empty() || f.points.iter().any(|(x, y)| !x.is_finite() || !y.is_finite())
+            let f = model.functions.get(function).ok_or_else(|| {
+                SolverError::InvalidInput(format!(
+                    "case '{name}' references missing function '{function}'"
+                ))
+            })?;
+            if f.points.is_empty()
+                || f.points
+                    .iter()
+                    .any(|(x, y)| !x.is_finite() || !y.is_finite())
                 || f.points.windows(2).any(|p| p[0].0 >= p[1].0)
             {
-                return Err(SolverError::InvalidInput(format!("function '{function}' needs finite, strictly increasing samples")));
+                return Err(SolverError::InvalidInput(format!(
+                    "function '{function}' needs finite, strictly increasing samples"
+                )));
             }
         }
     }
+    supported_subset::validate(model)?;
     Ok(())
 }
 
 fn validate_active_loads(model: &SapModel) -> Result<(), SolverError> {
-    let used_patterns: std::collections::BTreeSet<&str> = model.load_cases.values()
+    let used_patterns: std::collections::BTreeSet<&str> = model
+        .load_cases
+        .values()
         .filter(|case| case.run_flag)
-        .flat_map(|case| case.loads.iter().filter(|load| load.scale_factor != 0.0)
-            .map(|load| load.load_name.as_str())
-            .chain(case.history_loads.iter().filter(|(_, _, scale)| *scale != 0.0)
-                .map(|(_, pattern, _)| pattern.as_str())))
+        .flat_map(|case| {
+            case.loads
+                .iter()
+                .filter(|load| load.scale_factor != 0.0)
+                .map(|load| load.load_name.as_str())
+                .chain(
+                    case.history_loads
+                        .iter()
+                        .filter(|(_, _, scale)| *scale != 0.0)
+                        .map(|(_, pattern, _)| pattern.as_str()),
+                )
+        })
         .collect();
-    for (name,point) in &model.points {
-        if point.loads_force.iter().any(|load| used_patterns.contains(load.load_pat.as_str()) && load.force.iter().any(|x|!x.is_finite()))
-            || point.loads_displ.iter().any(|load| used_patterns.contains(load.load_pat.as_str()) && load.displ.iter().any(|x|!x.is_finite())) {
-            return Err(SolverError::InvalidInput(format!("joint '{name}' has nonfinite applied force or displacement")));
+    for (name, point) in &model.points {
+        if point.loads_force.iter().any(|load| {
+            used_patterns.contains(load.load_pat.as_str())
+                && load.force.iter().any(|x| !x.is_finite())
+        }) || point.loads_displ.iter().any(|load| {
+            used_patterns.contains(load.load_pat.as_str())
+                && load.displ.iter().any(|x| !x.is_finite())
+        }) {
+            return Err(SolverError::InvalidInput(format!(
+                "joint '{name}' has nonfinite applied force or displacement"
+            )));
         }
     }
     for (name, area) in &model.areas {
         for load in &area.loads_pressure {
-            if used_patterns.contains(load.load_pat.as_str()) && load.val != 0.
-                && (!matches!(load.face, -1 | -2) || load.pattern_name.as_ref().is_some_and(|p| !p.is_empty())) {
+            if used_patterns.contains(load.load_pat.as_str())
+                && load.val != 0.
+                && (!matches!(load.face, -1 | -2)
+                    || load.pattern_name.as_ref().is_some_and(|p| !p.is_empty()))
+            {
                 return Err(SolverError::UnsupportedInput(format!("area '{name}' has edge or patterned pressure; only uniform top/bottom pressure is implemented")));
             }
         }
         for load in &area.loads_uniform {
-            if used_patterns.contains(load.load_pat.as_str()) && load.val != 0.
-                && ((7..=9).contains(&load.dir) || load.dir == 11) {
+            if used_patterns.contains(load.load_pat.as_str())
+                && load.val != 0.
+                && ((7..=9).contains(&load.dir) || load.dir == 11)
+            {
                 return Err(SolverError::UnsupportedInput(format!("area '{name}' has projected uniform loading; surface projection is not implemented")));
             }
         }
@@ -496,15 +574,21 @@ fn validate_active_loads(model: &SapModel) -> Result<(), SolverError> {
 }
 
 fn validate_area_geometry(model: &SapModel, area: &AreaObj) -> Result<(), SolverError> {
-    let invalid = || SolverError::InvalidInput(format!(
+    let invalid = || {
+        SolverError::InvalidInput(format!(
         "area '{}' has degenerate, nonfinite, or folded geometry; use distinct corners forming a valid triangle or convex quadrilateral",
         area.name
-    ));
+    ))
+    };
     let origin = &model.points[&area.points[0]];
-    let mut coords: Vec<[f64; 3]> = area.points.iter().map(|name| {
-        let point = &model.points[name];
-        [point.x - origin.x, point.y - origin.y, point.z - origin.z]
-    }).collect();
+    let mut coords: Vec<[f64; 3]> = area
+        .points
+        .iter()
+        .map(|name| {
+            let point = &model.points[name];
+            [point.x - origin.x, point.y - origin.y, point.z - origin.z]
+        })
+        .collect();
     if coords.iter().flatten().any(|v| !v.is_finite()) {
         return Err(invalid());
     }
@@ -545,8 +629,12 @@ fn validate_area_geometry(model: &SapModel, area: &AreaObj) -> Result<(), Solver
 fn analysis_case_order(model: &SapModel) -> Result<Vec<String>, SolverError> {
     // Preserve the default static/modal/dynamic preference while honoring explicit
     // dependencies even when the input file lists the dependent case first.
-    let mut pending: Vec<String> = model.load_cases.iter().filter(|(_, lc)| lc.run_flag)
-        .map(|(name, _)| name.clone()).collect();
+    let mut pending: Vec<String> = model
+        .load_cases
+        .iter()
+        .filter(|(_, lc)| lc.run_flag)
+        .map(|(name, _)| name.clone())
+        .collect();
     pending.sort_by_key(|name| match model.load_cases[name].case_type {
         LoadCaseType::LinearStatic | LoadCaseType::NonlinearStatic => 0,
         LoadCaseType::Modal => 1,
@@ -555,21 +643,32 @@ fn analysis_case_order(model: &SapModel) -> Result<Vec<String>, SolverError> {
     for name in &pending {
         if let Some(dep) = &model.load_cases[name].initial_case {
             if !model.load_cases.get(dep).is_some_and(|lc| lc.run_flag) {
-                return Err(SolverError::InvalidInput(format!("case '{name}' requires missing or disabled initial case '{dep}'")));
+                return Err(SolverError::InvalidInput(format!(
+                    "case '{name}' requires missing or disabled initial case '{dep}'"
+                )));
             }
             if model.load_cases[name].case_type == LoadCaseType::ResponseSpectrum
                 && model.load_cases[dep].case_type != LoadCaseType::Modal
             {
-                return Err(SolverError::InvalidInput(format!("spectrum case '{name}' requires a modal initial case")));
+                return Err(SolverError::InvalidInput(format!(
+                    "spectrum case '{name}' requires a modal initial case"
+                )));
             }
         }
     }
     let mut ordered = Vec::with_capacity(pending.len());
     while !pending.is_empty() {
-        let ready = pending.iter().position(|name| model.load_cases[name].initial_case
-            .as_ref().is_none_or(|dep| ordered.contains(dep)));
+        let ready = pending.iter().position(|name| {
+            model.load_cases[name]
+                .initial_case
+                .as_ref()
+                .is_none_or(|dep| ordered.contains(dep))
+        });
         let Some(index) = ready else {
-            return Err(SolverError::InvalidInput(format!("cyclic initial-case dependencies: {}", pending.join(", "))));
+            return Err(SolverError::InvalidInput(format!(
+                "cyclic initial-case dependencies: {}",
+                pending.join(", ")
+            )));
         };
         ordered.push(pending.remove(index));
     }
@@ -724,8 +823,11 @@ fn assemble_elastic_stiffness_and_mass(
             .get(&sec.material)
             .ok_or_else(|| SolverError::MaterialNotFound(sec.material.clone()))?;
 
-        let (length, e_axes) =
-            frame_local_axes([pt_i.x, pt_i.y, pt_i.z], [pt_j.x, pt_j.y, pt_j.z], frame.angle_deg);
+        let (length, e_axes) = frame_local_axes(
+            [pt_i.x, pt_i.y, pt_i.z],
+            [pt_j.x, pt_j.y, pt_j.z],
+            frame.angle_deg,
+        );
         let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
         let di = rz * frame.end_offset_i;
         let dj = rz * frame.end_offset_j;
@@ -814,7 +916,9 @@ fn assemble_elastic_stiffness_and_mass(
         let op = link::operator(link, prop, work_points, pt_index, joint_rot);
         link::assemble(&mut k_struct, ndof, &op, link::stiffness(prop));
         for name in std::iter::once(&link.point_i).chain(link.point_j.iter()) {
-            for d in 0..3 { diag_mass[6 * pt_index[name] + d] += 0.5 * prop.mass; }
+            for d in 0..3 {
+                diag_mass[6 * pt_index[name] + d] += 0.5 * prop.mass;
+            }
         }
     }
 
@@ -1044,8 +1148,7 @@ fn add_springs_and_constraints(
                             for b in 0..3 {
                                 let gi = 6 * idx + offset + a;
                                 let gj = 6 * idx + offset + b;
-                                k[gi * ndof + gj] +=
-                                    pt.spring[d] * r_p[g_axis][a] * r_p[g_axis][b];
+                                k[gi * ndof + gj] += pt.spring[d] * r_p[g_axis][a] * r_p[g_axis][b];
                             }
                         }
                     }
@@ -1101,11 +1204,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
-                                &[
-                                    (6 * slave, 1.0),
-                                    (6 * master, -1.0),
-                                    (6 * master + 5, dy),
-                                ],
+                                &[(6 * slave, 1.0), (6 * master, -1.0), (6 * master + 5, dy)],
                                 penalty,
                             );
                             // u_yS - u_yM - dx * r_zM = 0
@@ -1165,11 +1264,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
-                                &[
-                                    (6 * slave, 1.0),
-                                    (6 * master, -1.0),
-                                    (6 * master + 4, -dz),
-                                ],
+                                &[(6 * slave, 1.0), (6 * master, -1.0), (6 * master + 4, -dz)],
                                 penalty,
                             );
                             // u_zS - u_zM + dx * r_yM = 0
@@ -1353,15 +1448,17 @@ fn assemble_global_geometric_stiffness(
             .get(&sec.material)
             .ok_or_else(|| SolverError::MaterialNotFound(sec.material.clone()))?;
 
-        let (length, e_axes) =
-            frame_local_axes([pt_i.x, pt_i.y, pt_i.z], [pt_j.x, pt_j.y, pt_j.z], frame.angle_deg);
+        let (length, e_axes) = frame_local_axes(
+            [pt_i.x, pt_i.y, pt_i.z],
+            [pt_j.x, pt_j.y, pt_j.z],
+            frame.angle_deg,
+        );
         let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
         let di = rz * frame.end_offset_i;
         let dj = rz * frame.end_offset_j;
         let lf = (length - di - dj).max(1e-6 * length);
 
-        let has_release =
-            frame.release_i.iter().any(|&r| r) || frame.release_j.iter().any(|&r| r);
+        let has_release = frame.release_i.iter().any(|&r| r) || frame.release_j.iter().any(|&r| r);
         let mut kg_eff = if has_release {
             let ke_raw = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
             let mut k_base_loc = ke_raw;
@@ -1430,8 +1527,7 @@ fn run_linear_static_case(
         if let Some(init_res) = model.case_results.get(init_name) {
             for (fname, stations) in &init_res.frame_forces {
                 if !stations.is_empty() {
-                    let p_avg =
-                        0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
+                    let p_avg = 0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
                     initial_axial.insert(fname.clone(), p_avg);
                 }
             }
@@ -1566,6 +1662,7 @@ fn run_cable_nonlinear_static_case(
     let mut restraints = vec![[false; 3]; num_pts];
     let mut nodal_loads = vec![[0.0; 3]; num_pts];
     let mut u_init = vec![[0.0; 3]; num_pts];
+    let mut prescribed = vec![[false; 3]; num_pts];
 
     if let Some(init_name) = &lc.initial_case {
         if let Some(init_res) = model.case_results.get(init_name) {
@@ -1622,6 +1719,7 @@ fn run_cable_nonlinear_static_case(
                 for d in 0..3 {
                     if u_glob[d].abs() > 1e-18 {
                         restraints[idx][d] = true;
+                        prescribed[idx][d] = true;
                         u_init[idx][d] += u_glob[d] * sf;
                     }
                 }
@@ -1714,8 +1812,8 @@ fn run_cable_nonlinear_static_case(
         &restraints,
         &nodal_loads,
         Some(&u_init),
-        lc.max_iterations.max(80),
-        lc.convergence_tol.min(1e-9),
+        lc.max_iterations,
+        lc.convergence_tol,
     )?;
 
     let mut joint_displacements = IndexMap::new();
@@ -1758,7 +1856,7 @@ fn run_cable_nonlinear_static_case(
                 0.0,
                 0.0,
             ];
-            if pt.restraint.iter().any(|&r| r) {
+            if pt.restraint.iter().any(|&r| r) || prescribed[idx].iter().any(|r| *r) {
                 joint_reactions.insert(pname.clone(), reac);
                 for g in 0..3 {
                     base_reactions[g] += rg[g];
@@ -1909,7 +2007,9 @@ fn run_nonlinear_static_case(
         ndof,
     )?;
 
-    if lc.nl_geom == NLGeomType::None { return Ok(last_res); }
+    if lc.nl_geom == NLGeomType::None {
+        return Ok(last_res);
+    }
     // A solve counts as one iteration. Honor the requested budget and tolerance;
     // never publish the last iterate as converged merely because it was last.
     for iteration in 1..=lc.max_iterations {
@@ -1924,34 +2024,75 @@ fn run_nonlinear_static_case(
                 current_axial.insert(fname.clone(), p_new);
             }
         }
-        if max_diff <= lc.convergence_tol * force_scale { return Ok(last_res); }
-        if iteration == lc.max_iterations {
-            return Err(SolverError::NonConvergence {case:lc.name.clone(),iterations:iteration,
-                residual:max_diff,reason:"P-Delta axial-force iteration limit reached".into()});
+        if max_diff <= lc.convergence_tol * force_scale {
+            return Ok(last_res);
         }
-        let kg = assemble_global_geometric_stiffness(model,work_points,pt_index,joint_rot,&current_axial,true,ndof)?;
+        if iteration == lc.max_iterations {
+            return Err(SolverError::NonConvergence {
+                case: lc.name.clone(),
+                iterations: iteration,
+                residual: max_diff,
+                reason: "P-Delta axial-force iteration limit reached".into(),
+            });
+        }
+        let kg = assemble_global_geometric_stiffness(
+            model,
+            work_points,
+            pt_index,
+            joint_rot,
+            &current_axial,
+            true,
+            ndof,
+        )?;
         let mut k_iter = k_base.to_vec();
         let mut k_struct_iter = k_struct.to_vec();
-        for i in 0..(ndof * ndof) { k_iter[i] += kg[i]; k_struct_iter[i] += kg[i]; }
-        last_res = solve_static_with_stiffness(model,&lc.name,&case_loads,work_points,work_areas,
-            orig_area_map,pt_index,joint_rot,&k_struct_iter,&k_iter,&current_axial,None,ndof)?;
+        for i in 0..(ndof * ndof) {
+            k_iter[i] += kg[i];
+            k_struct_iter[i] += kg[i];
+        }
+        last_res = solve_static_with_stiffness(
+            model,
+            &lc.name,
+            &case_loads,
+            work_points,
+            work_areas,
+            orig_area_map,
+            pt_index,
+            joint_rot,
+            &k_struct_iter,
+            &k_iter,
+            &current_axial,
+            None,
+            ndof,
+        )?;
     }
     unreachable!()
-
 }
 
 /// Merge support forces and their global resultant about the model origin.
-fn add_reaction_contributions(contributions:IndexMap<String,[f64;6]>,points:&IndexMap<String,PointObj>,
-    indices:&IndexMap<String,usize>,rotations:&[[[f64;3];3]],reactions:&mut IndexMap<String,[f64;6]>,base:&mut [f64;6]) {
-    for (name,delta) in contributions {
-        let point=&points[&name];let r=rotations[indices[&name]];
-        let reaction=reactions.entry(name).or_insert([0.;6]);
-        for d in 0..6 {reaction[d] += delta[d];}
-        let global:[f64;6]=std::array::from_fn(|i|(0..3).map(|j|r[i%3][j]*delta[3*(i/3)+j]).sum());
-        for d in 0..6 {base[d] += global[d];}
-        base[3] += point.y*global[2]-point.z*global[1];
-        base[4] += point.z*global[0]-point.x*global[2];
-        base[5] += point.x*global[1]-point.y*global[0];
+fn add_reaction_contributions(
+    contributions: IndexMap<String, [f64; 6]>,
+    points: &IndexMap<String, PointObj>,
+    indices: &IndexMap<String, usize>,
+    rotations: &[[[f64; 3]; 3]],
+    reactions: &mut IndexMap<String, [f64; 6]>,
+    base: &mut [f64; 6],
+) {
+    for (name, delta) in contributions {
+        let point = &points[&name];
+        let r = rotations[indices[&name]];
+        let reaction = reactions.entry(name).or_insert([0.; 6]);
+        for d in 0..6 {
+            reaction[d] += delta[d];
+        }
+        let global: [f64; 6] =
+            std::array::from_fn(|i| (0..3).map(|j| r[i % 3][j] * delta[3 * (i / 3) + j]).sum());
+        for d in 0..6 {
+            base[d] += global[d];
+        }
+        base[3] += point.y * global[2] - point.z * global[1];
+        base[4] += point.z * global[0] - point.x * global[2];
+        base[5] += point.x * global[1] - point.y * global[0];
     }
 }
 
@@ -2065,11 +2206,20 @@ fn solve_static_with_stiffness(
     // Link mass/weight is halved between ends, including the grounded end.
     for link in model.links.values() {
         let prop = &model.link_props[&link.prop];
-        let weight: f64 = case_loads.iter().map(|(pat,sf)|
-            model.load_patterns.get(pat).map_or(0., |p| p.self_wt_multiplier * sf * prop.weight)).sum();
+        let weight: f64 = case_loads
+            .iter()
+            .map(|(pat, sf)| {
+                model
+                    .load_patterns
+                    .get(pat)
+                    .map_or(0., |p| p.self_wt_multiplier * sf * prop.weight)
+            })
+            .sum();
         for name in std::iter::once(&link.point_i).chain(link.point_j.iter()) {
             let idx = pt_index[name];
-            for d in 0..3 { f_ext_joint[6*idx+d] -= 0.5 * weight * joint_rot[idx][2][d]; }
+            for d in 0..3 {
+                f_ext_joint[6 * idx + d] -= 0.5 * weight * joint_rot[idx][2][d];
+            }
         }
     }
 
@@ -2085,8 +2235,11 @@ fn solve_static_with_stiffness(
         let sec = &model.frame_sections[&frame.section];
         let mat = &model.materials[&sec.material];
 
-        let (length, e_axes) =
-            frame_local_axes([pt_i.x, pt_i.y, pt_i.z], [pt_j.x, pt_j.y, pt_j.z], frame.angle_deg);
+        let (length, e_axes) = frame_local_axes(
+            [pt_i.x, pt_i.y, pt_i.z],
+            [pt_j.x, pt_j.y, pt_j.z],
+            frame.angle_deg,
+        );
         let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
         let di = rz * frame.end_offset_i;
         let dj = rz * frame.end_offset_j;
@@ -2174,8 +2327,7 @@ fn solve_static_with_stiffness(
             node_indices.push(idx);
             coords.push([pt.x, pt.y, pt.z]);
         }
-        let (e_axes, _, local_xy) =
-            area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
+        let (e_axes, _, local_xy) = area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
 
         for (pat_name, sf) in case_loads {
             let self_wt_mult = model
@@ -2328,7 +2480,7 @@ fn solve_static_with_stiffness(
         let has_support = pt.restraint.iter().any(|&r| r)
             || pt.spring.iter().any(|&s| s > 0.0)
             || pt.spring_coupled.is_some()
-            || (0..6).any(|d| prescribed_u[6*idx+d].is_some());
+            || (0..6).any(|d| prescribed_u[6 * idx + d].is_some());
         if has_support && model.points.contains_key(pname) {
             let mut reac = [0.0f64; 6];
             for d in 0..6 {
@@ -2364,8 +2516,21 @@ fn solve_static_with_stiffness(
     }
 
     add_reaction_contributions(
-        link::grounded_reactions(model,work_points,pt_index,joint_rot,&u_joint,None,nonlinear_case.is_some()),
-        work_points,pt_index,joint_rot,&mut joint_reactions,&mut base_reactions);
+        link::grounded_reactions(
+            model,
+            work_points,
+            pt_index,
+            joint_rot,
+            &u_joint,
+            None,
+            nonlinear_case.is_some(),
+        ),
+        work_points,
+        pt_index,
+        joint_rot,
+        &mut joint_reactions,
+        &mut base_reactions,
+    );
 
     // 7. Recover Frame Internal Station Forces & Deflections
     let mut frame_forces = IndexMap::new();
@@ -2413,15 +2578,7 @@ fn solve_static_with_stiffness(
         }
 
         let stations = recover_frame_stations(
-            model,
-            frame,
-            sec,
-            mat,
-            e_axes,
-            *length,
-            &u_loc,
-            &f_end_loc,
-            case_loads,
+            model, frame, sec, mat, e_axes, *length, &u_loc, &f_end_loc, case_loads,
         );
         frame_forces.insert(fname.clone(), stations);
     }
@@ -2443,8 +2600,7 @@ fn solve_static_with_stiffness(
             node_indices.push(idx);
             coords.push([pt.x, pt.y, pt.z]);
         }
-        let (e_axes, _, local_xy) =
-            area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
+        let (e_axes, _, local_xy) = area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
 
         let mut u_loc = vec![0.0f64; 6 * n_nodes];
         for (a, &pt_idx) in node_indices.iter().enumerate() {
@@ -2524,7 +2680,10 @@ fn solve_static_with_stiffness(
     for (lname, link) in &model.links {
         let prop = &model.link_props[&link.prop];
         let op = link::operator(link, prop, work_points, pt_index, joint_rot);
-        link_forces.insert(lname.clone(), link::forces_for_case(prop, &op, &u_joint, nonlinear_case.is_some()));
+        link_forces.insert(
+            lname.clone(),
+            link::forces_for_case(prop, &op, &u_joint, nonlinear_case.is_some()),
+        );
     }
 
     Ok(CaseResults {
@@ -2564,8 +2723,7 @@ fn run_modal_case(
             let mut init_axial = IndexMap::new();
             for (fname, stations) in &init_res.frame_forces {
                 if !stations.is_empty() {
-                    let p_avg =
-                        0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
+                    let p_avg = 0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
                     init_axial.insert(fname.clone(), p_avg);
                 }
             }
@@ -2635,11 +2793,7 @@ fn run_modal_case(
     for (m_idx, (omega_sq, phi)) in raw_modes.into_iter().enumerate() {
         let omega = omega_sq.max(0.0).sqrt();
         let freq_hz = omega / (2.0 * PI);
-        let period_sec = if freq_hz > 1e-12 {
-            1.0 / freq_hz
-        } else {
-            0.0
-        };
+        let period_sec = if freq_hz > 1e-12 { 1.0 / freq_hz } else { 0.0 };
 
         let mut pf = [0.0f64; 6];
         for i in 0..ndof {
@@ -2705,8 +2859,7 @@ fn run_buckling_case(
         if let Some(rc_res) = model.case_results.get(&rc_name) {
             for (fname, stations) in &rc_res.frame_forces {
                 if !stations.is_empty() {
-                    let p_avg =
-                        0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
+                    let p_avg = 0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
                     ref_axial.insert(fname.clone(), p_avg);
                 }
             }
@@ -3052,8 +3205,11 @@ fn assemble_static_pattern_rhs(
         let pt_j = &work_points[idx_j];
         let sec = &model.frame_sections[&frame.section];
         let mat = &model.materials[&sec.material];
-        let (length, e_axes) =
-            frame_local_axes([pt_i.x, pt_i.y, pt_i.z], [pt_j.x, pt_j.y, pt_j.z], frame.angle_deg);
+        let (length, e_axes) = frame_local_axes(
+            [pt_i.x, pt_i.y, pt_i.z],
+            [pt_j.x, pt_j.y, pt_j.z],
+            frame.angle_deg,
+        );
         let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
         let di = rz * frame.end_offset_i;
         let dj = rz * frame.end_offset_j;
@@ -3137,7 +3293,10 @@ fn run_time_history_case(
     for (func_name, pat_or_acc, sf) in &lc.history_loads {
         let mut f_vec = vec![0.0f64; ndof];
         let upper = pat_or_acc.trim().to_ascii_uppercase();
-        if matches!(upper.as_str(), "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z") {
+        if matches!(
+            upper.as_str(),
+            "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
+        ) {
             let dir_idx = match upper.as_str() {
                 "U1" | "UX" | "X" => 0,
                 "U2" | "UY" | "Y" => 1,
@@ -3221,6 +3380,8 @@ fn run_time_history_case(
     let mut t_peak = 0.0;
     let mut peak_norm = 0.0f64;
     let mut nl_link_peak: IndexMap<(String, usize), f64> = IndexMap::new();
+    let mut reaction_base = k_base.to_vec();
+    let mut reaction_struct = k_struct.to_vec();
 
     let mut time_steps = Vec::with_capacity(n_steps + 1);
     let mut time_history_disp: IndexMap<String, Vec<[f64; 6]>> = IndexMap::new();
@@ -3253,6 +3414,8 @@ fn run_time_history_case(
             &linear_struct,
             ndof,
         );
+        reaction_base.clone_from(&linear_base);
+        reaction_struct.clone_from(&linear_struct);
         let u_init = initial_displacement_vector(model, lc, work_points, ndof);
         let mut integrator = dynamics::NonlinearStepper::new(
             model,
@@ -3332,13 +3495,25 @@ fn run_time_history_case(
         orig_area_map,
         pt_index,
         joint_rot,
-        k_struct,
+        &reaction_struct,
         &u_peak,
         ndof,
     );
     // Recover the simultaneous physical reaction, not just its elastic part.
     // Applied loads at fixed DOFs are retained in load_at even though the stepper
     // suppresses their displacement. Rayleigh and link damping both contribute.
+    let mut nonlinear_nodal = vec![0.; ndof];
+    for object in model.links.values() {
+        let prop = &model.link_props[&object.prop];
+        let op = link::operator(object, prop, work_points, pt_index, joint_rot);
+        for d in 0..6 {
+            if let Some(force) = nl_link_peak.get(&(object.name.clone(), d)) {
+                for (i, b) in op.dofs.iter().zip(&op.b[d]) {
+                    nonlinear_nodal[*i] += force * b;
+                }
+            }
+        }
+    }
     let applied_peak = load_at(t_peak, false);
     let (alpha_mass, beta_stiffness) = lc.rayleigh_damping;
     for (name, reaction) in &mut res.joint_reactions {
@@ -3346,52 +3521,65 @@ fn run_time_history_case(
         let point = &work_points[name];
         let mut delta = [0.; 6];
         for d in 0..6 {
-            let i = 6*idx+d;
+            let i = 6 * idx + d;
             if point.restraint[d] {
-                let internal: f64 = (0..ndof).map(|j|
-                    k_base[i*ndof+j]*u_peak[j]
-                    + (element_damping[i*ndof+j]+beta_stiffness*k_base[i*ndof+j])*v_peak[j]).sum();
-                let physical = internal + alpha_mass*diag_mass[i]*v_peak[i]
-                    + diag_mass[i]*a_peak[i] - applied_peak[i];
+                let internal: f64 = (0..ndof)
+                    .map(|j| {
+                        reaction_base[i * ndof + j] * u_peak[j]
+                            + (element_damping[i * ndof + j]
+                                + beta_stiffness * reaction_base[i * ndof + j])
+                                * v_peak[j]
+                    })
+                    .sum();
+                let physical = internal
+                    + nonlinear_nodal[i]
+                    + alpha_mass * diag_mass[i] * v_peak[i]
+                    + diag_mass[i] * a_peak[i]
+                    - applied_peak[i];
                 delta[d] = physical - reaction[d];
             } else if point.spring[d] > 0. {
-                delta[d] = -beta_stiffness*point.spring[d]*v_peak[i];
+                delta[d] = -beta_stiffness * point.spring[d] * v_peak[i];
             }
             reaction[d] += delta[d];
         }
         let r = joint_rot[idx];
-        let global: [f64;6] = std::array::from_fn(|i|
-            (0..3).map(|j| r[i%3][j]*delta[3*(i/3)+j]).sum());
-        for d in 0..6 { res.base_reactions[d] += global[d]; }
-        res.base_reactions[3] += point.y*global[2]-point.z*global[1];
-        res.base_reactions[4] += point.z*global[0]-point.x*global[2];
-        res.base_reactions[5] += point.x*global[1]-point.y*global[0];
+        let global: [f64; 6] =
+            std::array::from_fn(|i| (0..3).map(|j| r[i % 3][j] * delta[3 * (i / 3) + j]).sum());
+        for d in 0..6 {
+            res.base_reactions[d] += global[d];
+        }
+        res.base_reactions[3] += point.y * global[2] - point.z * global[1];
+        res.base_reactions[4] += point.z * global[0] - point.x * global[2];
+        res.base_reactions[5] += point.x * global[1] - point.y * global[0];
     }
-    add_reaction_contributions(
-        link::grounded_reactions(model,work_points,pt_index,joint_rot,&u_peak,Some((&v_peak,beta_stiffness)),is_nonlinear_history),
-        work_points,pt_index,joint_rot,&mut res.joint_reactions,&mut res.base_reactions);
     res.case_name = lc.name.clone();
     res.time_steps = time_steps;
     res.time_history_disp = time_history_disp;
-    for (name, link) in &model.links {
-        let prop = &model.link_props[&link.prop];
-        let op = link::operator(link, prop, work_points, pt_index, joint_rot);
-        let mut lf = link::forces(prop, &op, &u_peak, Some(&v_peak));
-        if is_nonlinear_history {
-            let mut replaced = false;
-            for d in 0..6 {
-                if let Some(&f_nl) = nl_link_peak.get(&(name.clone(), d)) {
-                    lf[d] = f_nl;
-                    replaced = true;
-                }
-            }
-            if replaced {
-                lf[4] -= prop.dj3 * lf[2];
-                lf[5] -= prop.dj2 * lf[1];
+    let mut grounded = IndexMap::<String, [f64; 6]>::new();
+    for (name, object) in &model.links {
+        let prop = &model.link_props[&object.prop];
+        let op = link::operator(object, prop, work_points, pt_index, joint_rot);
+        let snapshot = std::array::from_fn(|d| nl_link_peak.get(&(name.clone(), d)).copied());
+        let raw = link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &snapshot, 0.);
+        res.link_forces
+            .insert(name.clone(), link::section_at_j(prop, raw));
+        if object.point_j.is_none() {
+            let support_raw =
+                link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &snapshot, beta_stiffness);
+            let force = grounded.entry(object.point_i.clone()).or_insert([0.; 6]);
+            for (c, value) in force.iter_mut().enumerate() {
+                *value -= (0..6).map(|d| op.b[d][c] * support_raw[d]).sum::<f64>();
             }
         }
-        res.link_forces.insert(name.clone(), lf);
     }
+    add_reaction_contributions(
+        grounded,
+        work_points,
+        pt_index,
+        joint_rot,
+        &mut res.joint_reactions,
+        &mut res.base_reactions,
+    );
     Ok(res)
 }
 
@@ -3456,8 +3644,11 @@ fn recover_results_from_displacement_vector(
         let sec = &model.frame_sections[&frame.section];
         let mat = &model.materials[&sec.material];
 
-        let (length, e_axes) =
-            frame_local_axes([pt_i.x, pt_i.y, pt_i.z], [pt_j.x, pt_j.y, pt_j.z], frame.angle_deg);
+        let (length, e_axes) = frame_local_axes(
+            [pt_i.x, pt_i.y, pt_i.z],
+            [pt_j.x, pt_j.y, pt_j.z],
+            frame.angle_deg,
+        );
         let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
         let di = rz * frame.end_offset_i;
         let dj = rz * frame.end_offset_j;
@@ -3517,11 +3708,15 @@ fn recover_results_from_displacement_vector(
 /// Right derivative of the piecewise-linear load function. The function is
 /// constant outside its samples, matching eval_dynamic_function's convention.
 fn eval_dynamic_function_slope(model: &SapModel, func_name: &str, x: f64) -> f64 {
-    let Some(func) = model.functions.get(func_name) else { return 0.0; };
+    let Some(func) = model.functions.get(func_name) else {
+        return 0.0;
+    };
     for window in func.points.windows(2) {
         let (x0, y0) = window[0];
         let (x1, y1) = window[1];
-        if x >= x0 && x < x1 { return (y1 - y0) / (x1 - x0); }
+        if x >= x0 && x < x1 {
+            return (y1 - y0) / (x1 - x0);
+        }
     }
     0.0
 }
@@ -3638,8 +3833,12 @@ fn evaluate_load_combos(model: &mut SapModel) {
             }
 
             for k in 0..6 {
-                comb_res.base_reactions[k] =
-                    combine_op(comb_res.base_reactions[k], src.base_reactions[k], *sf, is_first);
+                comb_res.base_reactions[k] = combine_op(
+                    comb_res.base_reactions[k],
+                    src.base_reactions[k],
+                    *sf,
+                    is_first,
+                );
             }
 
             for (fname, stations) in &src.frame_forces {
@@ -3716,7 +3915,10 @@ fn evaluate_load_combos(model: &mut SapModel) {
             }
 
             for (lname, lf) in &src.link_forces {
-                let entry = comb_res.link_forces.entry(lname.clone()).or_insert([0.0; 6]);
+                let entry = comb_res
+                    .link_forces
+                    .entry(lname.clone())
+                    .or_insert([0.0; 6]);
                 for k in 0..6 {
                     entry[k] = combine_op(entry[k], lf[k], *sf, is_first);
                 }
@@ -3804,11 +4006,16 @@ mod tests {
         model.add_point("1", 0.0, 0.0, 0.0);
         model.points.get_mut("1").unwrap().restraint = [true, true, true, true, false, true];
         model.add_point("2", 120.0, 0.0, 0.0);
-        model.points.get_mut("2").unwrap().loads_force.push(PointLoadForce {
-            load_pat: "DEAD".into(),
-            csys: "GLOBAL".into(),
-            force: [0.0, 0.0, -10.0, 0.0, 0.0, 0.0],
-        });
+        model
+            .points
+            .get_mut("2")
+            .unwrap()
+            .loads_force
+            .push(PointLoadForce {
+                load_pat: "DEAD".into(),
+                csys: "GLOBAL".into(),
+                force: [0.0, 0.0, -10.0, 0.0, 0.0, 0.0],
+            });
         model.add_frame("1", "1", "2", "FSEC1");
 
         let res = analyze_model(&mut model);
@@ -3872,11 +4079,16 @@ mod tests {
         model.add_point("1", 0.0, 0.0, 0.0);
         model.points.get_mut("1").unwrap().restraint = [true; 6];
         model.add_point("2", 0.0, 0.0, 120.0);
-        model.points.get_mut("2").unwrap().loads_force.push(PointLoadForce {
-            load_pat: "DEAD".into(),
-            csys: "GLOBAL".into(),
-            force: [5.0, 0.0, -50.0, 0.0, 0.0, 0.0],
-        });
+        model
+            .points
+            .get_mut("2")
+            .unwrap()
+            .loads_force
+            .push(PointLoadForce {
+                load_pat: "DEAD".into(),
+                csys: "GLOBAL".into(),
+                force: [5.0, 0.0, -50.0, 0.0, 0.0, 0.0],
+            });
         model.add_frame("1", "1", "2", "FSEC1");
         model.frames.get_mut("1").unwrap().release_j[5] = true;
 
@@ -3909,15 +4121,30 @@ mod tests {
         model.points.get_mut("2").unwrap().restraint = [true; 6];
         model.add_point("3", 0.0, 0.0, 100.0);
         model.points.get_mut("3").unwrap().mass = [0.05, 0.05, 0.05, 0.0, 0.0, 0.0];
-        model.points.get_mut("3").unwrap().constraints.push("DIAPH1".into());
+        model
+            .points
+            .get_mut("3")
+            .unwrap()
+            .constraints
+            .push("DIAPH1".into());
         model.add_point("4", 100.0, 0.0, 100.0);
         model.points.get_mut("4").unwrap().mass = [0.05, 0.05, 0.05, 0.0, 0.0, 0.0];
-        model.points.get_mut("4").unwrap().constraints.push("DIAPH1".into());
-        model.points.get_mut("4").unwrap().loads_force.push(PointLoadForce {
-            load_pat: "DEAD".into(),
-            csys: "GLOBAL".into(),
-            force: [0.0, 0.0, -20.0, 0.0, 0.0, 0.0],
-        });
+        model
+            .points
+            .get_mut("4")
+            .unwrap()
+            .constraints
+            .push("DIAPH1".into());
+        model
+            .points
+            .get_mut("4")
+            .unwrap()
+            .loads_force
+            .push(PointLoadForce {
+                load_pat: "DEAD".into(),
+                csys: "GLOBAL".into(),
+                force: [0.0, 0.0, -20.0, 0.0, 0.0, 0.0],
+            });
 
         model.add_frame("C1", "1", "3", "FSEC1");
         model.add_frame("C2", "2", "4", "FSEC1");

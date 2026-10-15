@@ -1,5 +1,5 @@
-//! Open Application Programming Interface (`sap-api`), cleanly implementing the
-//! `SAP2000v19` (`sap2000v19.dll`) `cOAPI` and `cSapModel` automation hierarchy in Rust.
+//! Selected typed Rust facades following the SAP2000 v19 object hierarchy.
+//! This crate is not a COM server or a complete implementation of the vendor API.
 //!
 //! All mutating and query methods follow the CSI OAPI convention of returning `0` (`OAPI_OK`)
 //! on success and non-zero on error.
@@ -8,8 +8,11 @@
 
 mod definitions;
 mod links;
-pub use links::{cLinkObj,cPropLink,set_link_object,set_link_property};
-pub use definitions::{cFunctions, set_case_definition, set_function_definition, validate_case_definition, DefinitionError};
+pub use definitions::{
+    cFunctions, set_case_definition, set_function_definition, validate_case_definition,
+    DefinitionError,
+};
+pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 
 use sap_design::{try_run_concrete_design, try_run_steel_design, ConcreteCode, SteelCode};
 use sap_format::{
@@ -200,8 +203,12 @@ impl cSapModel {
         cSolidObj { api: self }
     }
 
-    pub fn prop_link(&mut self) -> cPropLink<'_> { cPropLink { api: self } }
-    pub fn link_obj(&mut self) -> cLinkObj<'_> { cLinkObj { api: self } }
+    pub fn prop_link(&mut self) -> cPropLink<'_> {
+        cPropLink { api: self }
+    }
+    pub fn link_obj(&mut self) -> cLinkObj<'_> {
+        cLinkObj { api: self }
+    }
 
     pub fn prop_material(&mut self) -> cPropMaterial<'_> {
         cPropMaterial { api: self }
@@ -227,7 +234,9 @@ impl cSapModel {
         cLoadCases { api: self }
     }
 
-    pub fn functions(&mut self) -> cFunctions<'_> { cFunctions { api: self } }
+    pub fn functions(&mut self) -> cFunctions<'_> {
+        cFunctions { api: self }
+    }
 
     pub fn resp_combo(&mut self) -> cRespCombo<'_> {
         cRespCombo { api: self }
@@ -298,7 +307,10 @@ impl cFile<'_> {
                 self.api.last_file_path = Some(path.to_path_buf());
                 OAPI_OK
             }
-            Err(error) => { self.api.last_file_error=Some(error.to_string()); OAPI_ERR },
+            Err(error) => {
+                self.api.last_file_error = Some(error.to_string());
+                OAPI_ERR
+            }
         }
     }
 
@@ -324,16 +336,20 @@ impl cFile<'_> {
         };
         match res {
             Ok(warnings) => {
-                self.api.export_warnings=warnings;
-                self.api.last_file_error=None;
+                self.api.export_warnings = warnings;
+                self.api.last_file_error = None;
                 self.api.last_file_path = Some(path);
                 OAPI_OK
             }
-            Err(error) => { self.api.last_file_error=Some(error.to_string()); OAPI_ERR },
+            Err(error) => {
+                self.api.last_file_error = Some(error.to_string());
+                OAPI_ERR
+            }
         }
     }
 
-    /// Exports the active model as a native SAP2000 v19 `cBinaryStream` `.sdb` file.
+    /// Exports the supported model subset as an experimental native `cBinaryStream` file.
+    /// Unsupported/lossy state rejects before writing; vendor runtime acceptance is unverified.
     pub fn save_native_sdb(&mut self, file_name: &str) -> i32 {
         if file_name.trim().is_empty() {
             self.api.last_file_error = Some("Empty native SDB destination path".to_string());
@@ -343,6 +359,9 @@ impl cFile<'_> {
         self.api.export_warnings.clear();
         match save_native_sdb_file(&self.api.inner, &path) {
             Ok(()) => {
+                self.api.export_warnings.push(
+                    "Experimental native SDB export: vendor application acceptance is unverified; retain the original source.".into(),
+                );
                 self.api.last_file_error = None;
                 self.api.last_file_path = Some(path);
                 OAPI_OK
@@ -964,7 +983,9 @@ impl cSolidObj<'_> {
         };
         if self.api.inner.is_locked
             || !self.api.inner.solid_sections.contains_key(sec)
-            || points.iter().any(|p| !self.api.inner.points.contains_key(p))
+            || points
+                .iter()
+                .any(|p| !self.api.inner.points.contains_key(p))
             || (!user_name.trim().is_empty() && self.api.inner.solids.contains_key(user_name))
         {
             return (OAPI_ERR, String::new());
@@ -974,6 +995,16 @@ impl cSolidObj<'_> {
         } else {
             user_name.to_owned()
         };
+        // Use the solver's geometric contract before inserting or invalidating results.
+        // Collapsed wedge/tetrahedral mappings remain allowed only when their
+        // center and integration-point Jacobians satisfy that same contract.
+        let coords = points.each_ref().map(|id| {
+            let p = &self.api.inner.points[id];
+            [p.x, p.y, p.z]
+        });
+        if sap_solver::solid::validate_solid_geometry(&coords).is_err() {
+            return (OAPI_ERR, String::new());
+        }
         self.api.inner.solids.insert(
             name.clone(),
             SolidObj {
@@ -1005,7 +1036,12 @@ impl cSolidObj<'_> {
         {
             return OAPI_ERR;
         }
-        let solid = self.api.inner.solids.get_mut(name).expect("validated solid");
+        let solid = self
+            .api
+            .inner
+            .solids
+            .get_mut(name)
+            .expect("validated solid");
         if replace {
             solid
                 .loads_surface
@@ -1034,12 +1070,21 @@ impl cSolidObj<'_> {
         {
             return OAPI_ERR;
         }
-        let solid = self.api.inner.solids.get_mut(name).expect("validated solid");
-        if replace {
-            solid.loads_temp.insert(load_pat.to_owned(), val);
+        let solid = self
+            .api
+            .inner
+            .solids
+            .get_mut(name)
+            .expect("validated solid");
+        let prospective = if replace {
+            val
         } else {
-            *solid.loads_temp.entry(load_pat.to_owned()).or_default() += val;
+            solid.loads_temp.get(load_pat).copied().unwrap_or(0.0) + val
+        };
+        if !prospective.is_finite() {
+            return OAPI_ERR;
         }
+        solid.loads_temp.insert(load_pat.to_owned(), prospective);
         self.api.inner.invalidate_results();
         OAPI_OK
     }
@@ -1565,25 +1610,43 @@ pub struct cLoadCases<'a> {
 
 impl cLoadCases<'_> {
     pub fn set_linear_static(&mut self, name: &str, loads: Vec<(String, f64)>) -> i32 {
-        let mut case=LoadCase::linear_static(name,"",1.0);
-        case.loads=loads.into_iter().map(|(load_name,scale_factor)|LoadCaseAssignment {load_name,scale_factor}).collect();
+        let mut case = LoadCase::linear_static(name, "", 1.0);
+        case.loads = loads
+            .into_iter()
+            .map(|(load_name, scale_factor)| LoadCaseAssignment {
+                load_name,
+                scale_factor,
+            })
+            .collect();
         self.set_definition(case)
     }
     pub fn set_modal_eigen(&mut self, name: &str, max_modes: usize) -> i32 {
-        self.set_definition(LoadCase::modal_eigen(name,max_modes))
+        self.set_definition(LoadCase::modal_eigen(name, max_modes))
     }
     pub fn set_pdelta(&mut self, name: &str, loads: Vec<(String, f64)>) -> i32 {
-        let mut case=LoadCase::linear_static(name,"",1.0);
-        case.case_type=LoadCaseType::NonlinearStatic;
-        case.nl_geom=NLGeomType::PDelta;
-        case.loads=loads.into_iter().map(|(load_name,scale_factor)|LoadCaseAssignment {load_name,scale_factor}).collect();
+        let mut case = LoadCase::linear_static(name, "", 1.0);
+        case.case_type = LoadCaseType::NonlinearStatic;
+        case.nl_geom = NLGeomType::PDelta;
+        case.loads = loads
+            .into_iter()
+            .map(|(load_name, scale_factor)| LoadCaseAssignment {
+                load_name,
+                scale_factor,
+            })
+            .collect();
         self.set_definition(case)
     }
     pub fn set_buckling(&mut self, name: &str, loads: Vec<(String, f64)>, num_modes: usize) -> i32 {
-        let mut case=LoadCase::linear_static(name,"",1.0);
-        case.case_type=LoadCaseType::Buckling;
-        case.num_buckling_modes=num_modes;
-        case.loads=loads.into_iter().map(|(load_name,scale_factor)|LoadCaseAssignment {load_name,scale_factor}).collect();
+        let mut case = LoadCase::linear_static(name, "", 1.0);
+        case.case_type = LoadCaseType::Buckling;
+        case.num_buckling_modes = num_modes;
+        case.loads = loads
+            .into_iter()
+            .map(|(load_name, scale_factor)| LoadCaseAssignment {
+                load_name,
+                scale_factor,
+            })
+            .collect();
         self.set_definition(case)
     }
 }
@@ -2040,6 +2103,9 @@ mod tests {
     #[test]
     fn test_oapi_solid_cable_and_native_sdb_export() {
         let mut api = cSapModel::new(Units::KipInF);
+        // Explicitly choose the native writer's lossless steel-only subset.
+        api.inner.materials.shift_remove("4000Psi");
+        api.inner.area_sections.clear();
         assert_eq!(
             api.prop_solid()
                 .set_prop("BRICK1", "A992Fy50", 0.0, 0.0, 0.0, true),
@@ -2087,7 +2153,9 @@ mod tests {
         assert!(solid_res[0].1.center_stress.s33 < 0.0);
 
         let out = std::env::temp_dir().join(format!("sap-api-native-{}.sdb", std::process::id()));
-        assert_eq!(api.file().save_native_sdb(out.to_str().unwrap()), OAPI_OK);
+        assert_eq!(api.file().save_native_sdb(out.to_str().unwrap()), OAPI_OK,
+            "{:?}", api.last_file_error);
+        assert!(api.export_warnings.iter().any(|w| w.contains("Experimental")));
         let doc = sap_format::inspect_native_sdb_file(&out).unwrap();
         assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
         std::fs::remove_file(out).unwrap();

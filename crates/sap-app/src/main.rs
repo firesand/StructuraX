@@ -9,8 +9,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sap_design::{try_run_concrete_design, try_run_steel_design};
 use sap_format::{
-    inspect_native_sdb_file, load_model_with_report, save_native_sdb_file,
-    save_s2k_file_with_report, save_sdb_file_with_report,
+    inspect_native_sdb, inspect_native_sdb_file, load_model_with_report, pack_model_to_native_sdb,
+    save_s2k_file_with_report, save_sdb_file_with_report, write_sdb_bytes,
 };
 use sap_section::ProDatabase;
 use sap_solver::{analyze_model, benchmarks::run_verification_suite};
@@ -70,7 +70,7 @@ enum Commands {
     ExportNativeSdb {
         /// Input .s2k, .$2k, or .sdb model file
         input: PathBuf,
-        /// Destination binary .sdb file path
+        /// New destination binary .sdb file path; must not already exist
         output: PathBuf,
     },
 }
@@ -196,9 +196,13 @@ fn run_cli_analyze(
             std::fs::write(out_path, json)?;
         } else if ext == "sdb" {
             eprintln!("Output warning: .sdb output is a private StructuraX container; use export-native-sdb for binary stream export or .s2k for text interoperability.");
-            for warning in save_sdb_file_with_report(&model, out_path)? { eprintln!("Output warning: {warning}"); }
+            for warning in save_sdb_file_with_report(&model, out_path)? {
+                eprintln!("Output warning: {warning}");
+            }
         } else {
-            for warning in save_s2k_file_with_report(&model, out_path)? { eprintln!("Output warning: {warning}"); }
+            for warning in save_s2k_file_with_report(&model, out_path)? {
+                eprintln!("Output warning: {warning}");
+            }
         }
         println!("Saved output to {}", out_path.display());
     }
@@ -284,8 +288,8 @@ fn run_cli_export_native_sdb(input: &std::path::Path, output: &std::path::Path) 
     for warning in &report.warnings {
         eprintln!("Import warning: {warning}");
     }
-    save_native_sdb_file(&report.model, output)?;
-    let doc = inspect_native_sdb_file(output)?;
+    let sdb = pack_model_to_native_sdb(&report.model)?;
+    let doc = inspect_native_sdb(&sdb)?;
     let inv = doc.inventory();
     anyhow::ensure!(
         inv.parsed_bytes == inv.stream_bytes,
@@ -293,8 +297,25 @@ fn run_cli_export_native_sdb(input: &std::path::Path, output: &std::path::Path) 
         inv.parsed_bytes,
         inv.stream_bytes
     );
+    let bytes = write_sdb_bytes(&sdb)?;
+    use std::io::Write;
+    let mut destination = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(output)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Cannot create {} without overwriting: {error}",
+                output.display()
+            )
+        })?;
+    if let Err(error) = destination.write_all(&bytes) {
+        drop(destination);
+        let _ = std::fs::remove_file(output);
+        return Err(error.into());
+    }
     println!(
-        "Exported binary stream SDB to {} ({} stream bytes, 100% schema verified).",
+        "Exported experimental SDB stream to {} ({} bytes consumed by the internal schema parser; vendor application acceptance is unverified).",
         output.display(),
         inv.stream_bytes
     );
@@ -304,6 +325,7 @@ fn run_cli_export_native_sdb(input: &std::path::Path, output: &std::path::Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sap_format::save_native_sdb_file;
 
     #[test]
     fn native_sdb_cli_copy_is_exact_and_never_overwrites() {
@@ -317,7 +339,11 @@ mod tests {
         );
         let output = std::env::temp_dir().join(format!("{unique}.sdb"));
         let input = std::env::temp_dir().join(format!("{unique}-input.sdb"));
-        let model = sap_model::SapModel::new(sap_units::Units::KipInF);
+        let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
+        // This test exercises the explicitly supported steel-only native subset.
+        // Default concrete metadata is tested as a rejection by the format crate.
+        model.materials.shift_remove("4000Psi");
+        model.area_sections.clear();
         save_native_sdb_file(&model, &input).unwrap();
         let original = std::fs::read(&input).expect("native SDB fixture must be available");
 
@@ -343,12 +369,20 @@ mod tests {
         );
         let output = std::env::temp_dir().join(format!("{unique}.sdb"));
         let input = std::env::temp_dir().join(format!("{unique}-input.sdb"));
-        let model = sap_model::SapModel::new(sap_units::Units::KipInF);
+        let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
+        // This test exercises the explicitly supported steel-only native subset.
+        // Default concrete metadata is tested as a rejection by the format crate.
+        model.materials.shift_remove("4000Psi");
+        model.area_sections.clear();
         save_native_sdb_file(&model, &input).unwrap();
 
         run_cli_export_native_sdb(&input, &output).unwrap();
         let doc = inspect_native_sdb_file(&output).unwrap();
         assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+        let original = std::fs::read(&output).unwrap();
+        let error = run_cli_export_native_sdb(&input, &output).unwrap_err();
+        assert!(error.to_string().contains("without overwriting"));
+        assert_eq!(std::fs::read(&output).unwrap(), original);
         std::fs::remove_file(output).unwrap();
         std::fs::remove_file(input).unwrap();
     }

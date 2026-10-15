@@ -1,0 +1,60 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "Bounded post-review correctness repairs",
+  "baseline_commit": "39089be716985de035906458f9f3133ab044ab2b",
+  "production_ready": false,
+  "full_reconstruction_complete": false,
+  "tests": {
+    "all_features": {
+      "command": "cargo test --locked --workspace --all-features",
+      "passed": 214,
+      "failed": 0,
+      "local_vendor_fixtures_present": true
+    },
+    "portable_source_copy": {
+      "command": "cargo test --locked --workspace",
+      "passed": 207,
+      "failed": 0,
+      "vendor_inputs_present": false,
+      "note": "Only Cargo files and crates copied. All eight local crates rebuilt from the copy after clearing their shared-target artifacts; external dependency cache reused. Seven feature-gated solver fixture tests excluded. Legacy optional fixture tests return early."
+    }
+  },
+  "strict_clippy": {
+    "command": "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+    "passed": true
+  },
+  "native_build": {
+    "command": "cargo build --locked --workspace",
+    "passed": true
+  },
+  "selected_references": {
+    "command": "target/debug/structurax verify",
+    "passed": 59,
+    "total": 59,
+    "note": "History-origin continuation reference removed because it is unsupported; not counted as passing. Not a full vendor differential suite."
+  },
+  "optional_format_corpus": {
+    "inventory_and_exact_copy": 336,
+    "observed_emitted_class_versions": 48,
+    "strict_s2k_roundtrips": 334,
+    "strict_native_roundtrips": 329,
+    "incomplete_law_export_refusals": 5,
+    "unsupported_imports": 2
+  },
+  "new_test_functions": 27,
+  "vendor_runtime_acceptance": "not tested",
+  "desktop_human_workflows": "not tested in this repair",
+  "windows_macos_runtime": "not tested",
+  "remaining_scope": "See REVIEW.md and per-component fix notes; unsupported combinations reject instead of yielding misleading results.",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "source_manifest": "docs/review/structurax-fixes/source-manifest.json",
+  "source_manifest_sha256": "99146265cf6cdb0a7fb5c5acaf8d254aafec612a2a37f5f741e94f490a283a88",
+  "debug_binary_sha256": "1608e88eed73991dee79dc8f34321a4f4408b68e13196925f2a9e76f58f996a5",
+  "log_sha256": {
+    "target/review/structurax-fixes/workspace-tests.log": "b69470b5696cfd536371bd467087f2335af184eee4d50257d486a4f513c8d00e",
+    "target/review/structurax-fixes/clean-copy-tests.log": "37dfb5abb269911e52b1d6dd723dedc560c6a761ca8b55b9a2f89e86c002191c",
+    "target/review/structurax-fixes/clippy.log": "46308cf0abcda06912de41eb4076448063ed6d0ae796881927be754cbce578f3",
+    "target/review/structurax-fixes/build.log": "6b231d188d14cf8c45956e1c095c7f7ed64b271d7f1d039ff1f52050e40f9ac0",
+    "target/review/structurax-fixes/verify.log": "3fd999ebc8eb9d0b03495888bbe2584e3dab4bfef7ceb5fa7991658af69589f2"
+  }
+}

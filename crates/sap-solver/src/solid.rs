@@ -196,16 +196,8 @@ pub fn solid_material_rotation_matrix(mat_angle_deg: [f64; 3]) -> [[f64; 3]; 3] 
 
     // R = R_z(a) * R_y(b) * R_x(c)
     [
-        [
-            ca * cb,
-            ca * sb * sc - sa * cc,
-            ca * sb * cc + sa * sc,
-        ],
-        [
-            sa * cb,
-            sa * sb * sc + ca * cc,
-            sa * sb * cc - ca * sc,
-        ],
+        [ca * cb, ca * sb * sc - sa * cc, ca * sb * cc + sa * sc],
+        [sa * cb, sa * sb * sc + ca * cc, sa * sb * cc - ca * sc],
         [-sb, cb * sc, cb * cc],
     ]
 }
@@ -259,6 +251,7 @@ pub fn solid_local_constitutive_matrix(
     mat: &Material,
     sec: &SolidSection,
 ) -> Result<([[f64; 6]; 6], [f64; 6]), SolverError> {
+    validate_modifiers(sec)?;
     let [e1, e2, e3] = mat.e_ortho.unwrap_or([mat.e, mat.e, mat.e]);
     if e1 <= 0.0 || e2 <= 0.0 || e3 <= 0.0 {
         return Err(SolverError::InvalidInput(format!(
@@ -331,7 +324,7 @@ pub fn solid_local_constitutive_matrix(
     let mut mods = [1.0; 6];
     for i in 0..6 {
         let m = sec.modifiers[i];
-        mods[i] = if m > 0.0 { m } else { 1.0 };
+        mods[i] = m;
     }
     for i in 0..3 {
         for j in 0..3 {
@@ -438,12 +431,7 @@ fn build_bu_matrix(d_n: &[[f64; 3]; 8], inv_j: &[[f64; 3]; 3]) -> [[f64; 24]; 6]
 /// $\mathbf{B}_\alpha(\boldsymbol{\xi})$ using the center-Jacobian patch-test modification:
 /// $$\nabla_{\mathbf{x}} P_m(\boldsymbol{\xi}) = \frac{\det \mathbf{J}_0}{\det \mathbf{J}(\boldsymbol{\xi})} \mathbf{J}_0^{-T} \nabla_{\boldsymbol{\xi}} P_m(\boldsymbol{\xi})$$
 /// where $P_m(\boldsymbol{\xi}) = 1 - \xi_m^2$ has $\frac{\partial P_m}{\partial \xi_k} = -2 \xi_m \delta_{mk}$.
-fn build_ba_matrix(
-    xi: [f64; 3],
-    det_j: f64,
-    det_j0: f64,
-    inv_j0: &[[f64; 3]; 3],
-) -> [[f64; 9]; 6] {
+fn build_ba_matrix(xi: [f64; 3], det_j: f64, det_j0: f64, inv_j0: &[[f64; 3]; 3]) -> [[f64; 9]; 6] {
     let mut b_a = [[0.0; 9]; 6];
     let ratio = det_j0 / det_j;
     for m in 0..3 {
@@ -640,11 +628,7 @@ pub fn compute_solid_stiffness_and_mass(
 
     // Equal-weight lumped nodal mass at each of the 8 nodes (CSI Chapter XIII:
     // total element mass = volume * unit_mass * mass_modifier, distributed 1/8 per node)
-    let mass_mod = if sec.modifiers[6] > 0.0 {
-        sec.modifiers[6]
-    } else {
-        1.0
-    };
+    let mass_mod = sec.modifiers[6];
     let node_mass = 0.125 * volume * mat.unit_mass * mass_mod;
     let m_diag = [node_mass; 24];
 
@@ -693,16 +677,13 @@ pub fn compute_solid_nodal_loads(
     self_weight_mult: f64,
     gravity_dir: [f64; 3],
 ) -> Result<[f64; 24], SolverError> {
+    validate_modifiers(sec)?;
     let volume = validate_solid_geometry(coords)?;
     let mut f_elem = [0.0; 24];
 
     // 1. Self-weight body forces
     if self_weight_mult.abs() > 0.0 && mat.unit_weight.abs() > 0.0 {
-        let weight_mod = if sec.modifiers[7] > 0.0 {
-            sec.modifiers[7]
-        } else {
-            1.0
-        };
+        let weight_mod = sec.modifiers[7];
         let node_weight = 0.125 * volume * mat.unit_weight * weight_mod * self_weight_mult;
         for a in 0..8 {
             f_elem[3 * a] += node_weight * gravity_dir[0];
@@ -968,6 +949,18 @@ pub fn recover_solid_result(
         nodal_stresses,
         nodal_forces,
     })
+}
+
+fn validate_modifiers(sec: &SolidSection) -> Result<(), SolverError> {
+    if sec
+        .modifiers
+        .iter()
+        .enumerate()
+        .any(|(i, m)| !m.is_finite() || *m < 0. || (i < 6 && *m == 0.))
+    {
+        return Err(SolverError::InvalidInput(format!("solid section '{}' requires finite positive stiffness modifiers and finite nonnegative mass/weight modifiers", sec.name)));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

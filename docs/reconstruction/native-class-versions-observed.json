@@ -1,0 +1,200 @@
+{
+  "scope": "ClassVersion tag observations from supplied SAP2000 v19 fixture corpus; not vendor runtime acceptance",
+  "files_inspected": 336,
+  "classes": {
+    "ANALYSISCASEARRAY": {
+      "version": 3,
+      "observations": 767
+    },
+    "AUTOARRAY": {
+      "version": 1,
+      "observations": 227
+    },
+    "CABLEPROPERTYARRAY": {
+      "version": 1,
+      "observations": 280
+    },
+    "CLARRAY": {
+      "version": 1,
+      "observations": 147
+    },
+    "COMBOARRAY": {
+      "version": 1,
+      "observations": 121
+    },
+    "CONSTRAINTARRAY": {
+      "version": 2,
+      "observations": 65
+    },
+    "COORDSYSTEMARRAY": {
+      "version": 1,
+      "observations": 336
+    },
+    "DDARRAY": {
+      "version": 1,
+      "observations": 767
+    },
+    "FUNCSHUNARRAY": {
+      "version": 4,
+      "observations": 802
+    },
+    "LAARRAY": {
+      "version": 1,
+      "observations": 727
+    },
+    "LOADPATTERNARRAY": {
+      "version": 3,
+      "observations": 636
+    },
+    "NLLINKPROPARRAY": {
+      "version": 3,
+      "observations": 298
+    },
+    "NONLINEARITYARRAY": {
+      "version": 1,
+      "observations": 767
+    },
+    "PATTERNARRAY": {
+      "version": 1,
+      "observations": 341
+    },
+    "RUNARRAY": {
+      "version": 2,
+      "observations": 336
+    },
+    "SECTIONARRAY": {
+      "version": 1,
+      "observations": 44501
+    },
+    "SHELLSECTIONARRAY": {
+      "version": 1,
+      "observations": 285
+    },
+    "SOLIDPROPERTYARRAY": {
+      "version": 1,
+      "observations": 278
+    },
+    "SOLUTIONCONTROLARRAY": {
+      "version": 3,
+      "observations": 767
+    },
+    "S_AREAOBJECTS": {
+      "version": 1,
+      "observations": 27721
+    },
+    "S_CableData": {
+      "version": 1,
+      "observations": 1039
+    },
+    "S_LINEOBJECTS": {
+      "version": 1,
+      "observations": 1039
+    },
+    "S_MT": {
+      "version": 1,
+      "observations": 1702
+    },
+    "S_Material": {
+      "version": 1,
+      "observations": 1702
+    },
+    "S_MaterialPropertiesConcrete": {
+      "version": 5,
+      "observations": 1702
+    },
+    "S_MaterialPropertiesSteel": {
+      "version": 2,
+      "observations": 1702
+    },
+    "S_NLLINKOBJECTS": {
+      "version": 2,
+      "observations": 82
+    },
+    "S_POINTOBJECTS": {
+      "version": 1,
+      "observations": 89503
+    },
+    "S_ProjectStartUp": {
+      "version": 1,
+      "observations": 336
+    },
+    "S_SOLIDOBJECTS": {
+      "version": 1,
+      "observations": 36138
+    },
+    "TVARRAY": {
+      "version": 1,
+      "observations": 6309
+    },
+    "TYCJoint": {
+      "version": 1,
+      "observations": 540
+    },
+    "TYFCLoad": {
+      "version": 1,
+      "observations": 28
+    },
+    "TYFDLoad": {
+      "version": 1,
+      "observations": 418
+    },
+    "TYFFixity": {
+      "version": 1,
+      "observations": 1
+    },
+    "TYFModifier": {
+      "version": 1,
+      "observations": 2
+    },
+    "TYGLoad": {
+      "version": 1,
+      "observations": 331
+    },
+    "TYJFLoad": {
+      "version": 1,
+      "observations": 1008
+    },
+    "TYJGDLoad": {
+      "version": 1,
+      "observations": 40
+    },
+    "TYMass": {
+      "version": 1,
+      "observations": 117
+    },
+    "TYPDFORCE": {
+      "version": 1,
+      "observations": 6
+    },
+    "TYPJoint": {
+      "version": 1,
+      "observations": 1723
+    },
+    "TYRestraint": {
+      "version": 1,
+      "observations": 8799
+    },
+    "TYSPLoad": {
+      "version": 1,
+      "observations": 6552
+    },
+    "TYShULoad": {
+      "version": 1,
+      "observations": 3812
+    },
+    "TYSpring": {
+      "version": 1,
+      "observations": 10
+    },
+    "TYTLoad": {
+      "version": 1,
+      "observations": 2208
+    },
+    "VSARRAY": {
+      "version": 1,
+      "observations": 8
+    }
+  },
+  "unobserved_emitted_classes": [],
+  "ambiguous_classes": {}
+}

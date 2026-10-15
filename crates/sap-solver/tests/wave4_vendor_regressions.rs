@@ -261,7 +261,14 @@ fn vendor_sdb_example_6_003_gap_link_static_and_direct_history() {
         nldhist3.initial_case = Some("NLSTAT1".to_string());
         model.load_cases.insert("NLDHIST3".to_string(), nldhist3);
 
-        analyze_model(&mut model).expect("solve Example 6-003");
+        // These two source cases require terminal velocity/internal-state
+        // continuation, which is deliberately rejected rather than reset.
+        let err = analyze_model(&mut model).unwrap_err();
+        assert!(err.to_string().contains("history continuation"), "{err}");
+        assert!(model.case_results.is_empty());
+        model.load_cases.shift_remove("NLSTAT3");
+        model.load_cases.shift_remove("NLDHIST2");
+        analyze_model(&mut model).expect("solve supported Example 6-003 cases");
 
         let f_nlstat1 = model.case_results["NLSTAT1"].link_forces["1"][0];
         assert!(
@@ -274,14 +281,16 @@ fn vendor_sdb_example_6_003_gap_link_static_and_direct_history() {
             "NLDHIST1 gap force = {f_nldhist1}"
         );
 
-        for cname in ["NLSTAT2", "NLSTAT3"] {
+        {
+            let cname = "NLSTAT2";
             let uz = model.case_results[cname].joint_displacements["2"][2];
             assert!(
                 (uz - 3.9169).abs() < 0.01,
                 "{cname} Joint 2 uplift Uz = {uz}"
             );
         }
-        for cname in ["NLDHIST2", "NLDHIST3"] {
+        {
+            let cname = "NLDHIST3";
             let uz_end = model.case_results[cname].time_history_disp["2"]
                 .last()
                 .unwrap()[2];
@@ -348,52 +357,26 @@ fn vendor_sdb_example_6_005_maxwell_damper_harmonic_history() {
 }
 
 #[test]
-fn vendor_sdb_example_7_001_and_7_002_catenary_cables() {
+fn vendor_sdb_cables_reject_unmapped_target_tension_instead_of_ignoring_it() {
     let dir = vendor_dir();
     // Example 7-001: 6 catenary cables C1..C6 (Peyrot & Goulois 1979)
     // In example_7_001.sdb, C1..C6 correspond to cases DEADTEMP, DISP1, DISP2, DISP3, DISP4, DISP5
     // at Lower Support Joint 2!
     let p_701 = dir.join("example_7_001.sdb");
     let mut m_701 = load_sdb_file(&p_701).expect("load example_7_001.sdb");
-    analyze_model(&mut m_701).expect("solve example_7_001.sdb");
-
-    for (case_name, ref_fx2, ref_fz2, tol) in [
-        ("DEADTEMP", 4_258_491.0, -2_555_045.0, 10.0),
-        ("DISP1", 504.1, -328.9, 0.2),
-        ("DISP2", 22.15, 15.73, 0.05),
-        ("DISP3", 9.17, 19.24, 0.05),
-        ("DISP4", 3.06, 19.93, 0.05),
-        ("DISP5", 0.00, 20.02, 0.05),
-    ] {
-        let r2 = m_701.case_results[case_name].joint_reactions["2"];
-        assert!(
-            (r2[0] - ref_fx2).abs() < tol,
-            "Ex 7-001 {case_name} Fx2 = {}, expected {ref_fx2}",
-            r2[0]
-        );
-        assert!(
-            (r2[2] - ref_fz2).abs() < tol,
-            "Ex 7-001 {case_name} Fz2 = {}, expected {ref_fz2}",
-            r2[2]
-        );
-    }
+    // Native metadata requests target-end-tension initialization, whose mapping
+    // was previously ignored. Keep the full import and require an explicit error;
+    // catenary equations remain checked independently by cable module benchmarks.
+    let error = analyze_model(&mut m_701).unwrap_err();
+    assert!(error.to_string().contains("target end tension"), "{error}");
+    assert!(m_701.case_results.is_empty());
 
     // Example 7-002: Two-segment cable under DEAD + PTLOAD + COMB1 (Tibert 1999)
     let p_702 = dir.join("example_7_002.sdb");
     let mut m_702 = load_sdb_file(&p_702).expect("load example_7_002.sdb");
-    analyze_model(&mut m_702).expect("solve example_7_002.sdb");
-
-    let disp_comb1 = m_702.case_results["COMB1"].joint_displacements["2"];
-    assert!(
-        (disp_comb1[0] - (-2.819)).abs() < 0.01,
-        "Ex 7-002 COMB1 Ux(2) = {}",
-        disp_comb1[0]
-    );
-    assert!(
-        (disp_comb1[2] - (-18.457)).abs() < 0.02,
-        "Ex 7-002 COMB1 Uz(2) = {}",
-        disp_comb1[2]
-    );
+    let error = analyze_model(&mut m_702).unwrap_err();
+    assert!(error.to_string().contains("target end tension"), "{error}");
+    assert!(m_702.case_results.is_empty());
 }
 
 #[test]

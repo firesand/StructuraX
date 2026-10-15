@@ -148,19 +148,45 @@ fn spring_forces(
     })
 }
 
-fn section_at_j(prop: &LinkProp, mut forces: [f64; 6]) -> [f64; 6] {
+pub(crate) fn section_at_j(prop: &LinkProp, mut forces: [f64; 6]) -> [f64; 6] {
     forces[4] -= prop.dj3 * forces[2];
     forces[5] -= prop.dj2 * forces[1];
     forces
 }
 
-pub(crate) fn forces(
+/// Constitutive snapshot forces before conversion to J-end section moments.
+/// Nonlinear DOFs replace ke exactly; ce acts through the same viscous matrix
+/// used by the stepper. Rayleigh stiffness damping uses only the linear base.
+pub(crate) fn dynamic_spring_forces(
     prop: &LinkProp,
     op: &LinkOperator,
     u: &[f64],
-    velocity: Option<&[f64]>,
+    velocity: &[f64],
+    nonlinear: &[Option<f64>; 6],
+    beta: f64,
 ) -> [f64; 6] {
-    section_at_j(prop, spring_forces(prop, op, u, velocity, false))
+    let k = stiffness(prop);
+    std::array::from_fn(|d| {
+        let displacement: f64 = op.dofs.iter().zip(&op.b[d]).map(|(i, b)| u[*i] * b).sum();
+        let speed: f64 = op
+            .dofs
+            .iter()
+            .zip(&op.b[d])
+            .map(|(i, b)| velocity[*i] * b)
+            .sum();
+        let viscous = if prop.dof_active[d] && !prop.dof_fixed[d] {
+            prop.ce[d] * speed
+        } else {
+            0.
+        };
+        nonlinear[d].unwrap_or(k[d] * displacement)
+            + viscous
+            + if nonlinear[d].is_none() {
+                beta * k[d] * speed
+            } else {
+                0.
+            }
+    })
 }
 
 pub(crate) fn forces_for_case(

@@ -550,7 +550,40 @@ pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> 
                 .is_some_and(|material| material.mat_type == MatType::Concrete)
         },
     )?;
+    reject_unreportable_beam_m2(model, &combo_forces)?;
     run_concrete_design_validated(model, code, combo_forces);
+    Ok(())
+}
+
+/// The current result schema reports only top/bottom longitudinal steel. It cannot
+/// distinguish reinforcement required on the two side faces by beam-axis M2.
+/// Reject M2 on beams rather than folding those areas into the top/bottom outputs.
+fn reject_unreportable_beam_m2(
+    model: &SapModel,
+    combo_forces: &[(String, Vec<(String, Vec<sap_model::FrameStationResult>)>)],
+) -> Result<(), DesignError> {
+    for (frame_name, frame) in &model.frames {
+        let Some(section) = model.frame_sections.get(&frame.section) else {
+            continue;
+        };
+        let is_concrete = model
+            .materials
+            .get(&section.material)
+            .is_some_and(|material| material.mat_type == MatType::Concrete);
+        if !is_concrete || is_concrete_column(model, frame, section) {
+            continue;
+        }
+        for (_, frames) in combo_forces {
+            for (_, stations) in frames.iter().filter(|(name, _)| name == frame_name) {
+                if let Some(station) = stations.iter().find(|station| station.m2.abs() > 1e-9) {
+                    return Err(DesignError::UnsupportedBeamMinorAxisFlexure {
+                        frame: frame_name.clone(),
+                        m2: station.m2.to_string(),
+                    });
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -637,11 +670,7 @@ fn run_concrete_design_validated(
         let d_bot = (h - cover_bot).max(0.5 * h);
         let d_top = (h - cover_top).max(0.5 * h);
         let is_circle = sec.prop_type == FramePropType::Circle;
-        let (bw2, d2_shear) = if is_circle {
-            (h, 0.8 * h)
-        } else {
-            (b, d_bot)
-        };
+        let (bw2, d2_shear) = if is_circle { (h, 0.8 * h) } else { (b, d_bot) };
         let d3_minor = (b - cover_bot).max(0.5 * b);
         let cover_minor = cover_bot.min(0.4 * b);
         let (bw3, d3_shear) = if is_circle {
@@ -822,7 +851,7 @@ fn run_concrete_design_validated(
                     let vu2 = st.v2.abs();
                     let vu3 = st.v3.abs();
 
-                    let (mut as_bot, as_min_b, mut over_b, av_s_2, over_v2) = match code {
+                    let (as_bot, as_min_b, over_b, av_s_2, over_v2) = match code {
                         ConcreteCode::Aci318 => {
                             let (ab, amin, ob) = design_aci_beam_flexure(
                                 m_pos, b, d_bot, cover_top, fc, fy, es, units,
@@ -839,7 +868,7 @@ fn run_concrete_design_validated(
                         }
                     };
 
-                    let (mut as_top, as_min_t, mut over_t) = match code {
+                    let (as_top, as_min_t, over_t) = match code {
                         ConcreteCode::Aci318 => {
                             design_aci_beam_flexure(m_neg, b, d_top, cover_bot, fc, fy, es, units)
                         }
@@ -850,35 +879,6 @@ fn run_concrete_design_validated(
                             (at, amin, ov)
                         }
                     };
-
-                    if st.m2.abs() > 1e-9 {
-                        let m2_pos = st.m2.max(0.0);
-                        let m2_neg = (-st.m2).max(0.0);
-                        let (as_b2, ob2, as_t2, ot2) = match code {
-                            ConcreteCode::Aci318 => {
-                                let (ab2, _, ob2) = design_aci_beam_flexure(
-                                    m2_pos, h, d3_minor, cover_minor, fc, fy, es, units,
-                                );
-                                let (at2, _, ot2) = design_aci_beam_flexure(
-                                    m2_neg, h, d3_minor, cover_minor, fc, fy, es, units,
-                                );
-                                (ab2, ob2, at2, ot2)
-                            }
-                            ConcreteCode::Eurocode2 => {
-                                let (ab2, _, _, ob2) = design_ec2_beam(
-                                    m2_pos, 0.0, h, d3_minor, cover_minor, fc, fy, fyt, units,
-                                );
-                                let (at2, _, _, ot2) = design_ec2_beam(
-                                    m2_neg, 0.0, h, d3_minor, cover_minor, fc, fy, fyt, units,
-                                );
-                                (ab2, ob2, at2, ot2)
-                            }
-                        };
-                        as_bot = as_bot.max(as_b2);
-                        as_top = as_top.max(as_t2);
-                        over_b = over_b || ob2;
-                        over_t = over_t || ot2;
-                    }
 
                     let (av_s_3, over_v3) = if vu3 > 1e-9 {
                         match code {

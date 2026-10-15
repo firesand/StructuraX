@@ -70,6 +70,8 @@ fn new_case(kind: LoadCaseType, name: &str) -> LoadCase {
             | LoadCaseType::ResponseSpectrum
             | LoadCaseType::LinearHistory
             | LoadCaseType::LinearDynamic
+            | LoadCaseType::NonlinearHistory
+            | LoadCaseType::NonlinearDynamic
     ) {
         case.loads.clear();
     }
@@ -190,6 +192,7 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                 LoadCaseType::Buckling,
                 LoadCaseType::ResponseSpectrum,
                 LoadCaseType::LinearHistory,
+                LoadCaseType::NonlinearHistory,
             ] {
                 ui.selectable_value(&mut kind, value, format!("{value:?}"));
             }
@@ -280,7 +283,26 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                 "Function ordinates × scale are spectral acceleration in current model units.",
             );
         }
-        LoadCaseType::LinearHistory | LoadCaseType::LinearDynamic => {
+        LoadCaseType::LinearHistory
+        | LoadCaseType::LinearDynamic
+        | LoadCaseType::NonlinearHistory
+        | LoadCaseType::NonlinearDynamic => {
+            if matches!(
+                case.case_type,
+                LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
+            ) {
+                ui.label("Nonlinear link history from rest; continuation and geometric nonlinearity are unavailable.");
+                ui.horizontal(|ui| {
+                    ui.label("Maximum iterations per step:");
+                    ui.add(egui::DragValue::new(&mut case.max_iterations).range(1..=10000));
+                    ui.label("Convergence tolerance:");
+                    ui.add(
+                        egui::DragValue::new(&mut case.convergence_tol)
+                            .speed(1e-7)
+                            .max_decimals(12),
+                    );
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Steps:");
                 ui.add(egui::DragValue::new(&mut case.num_time_steps).range(1..=1_000_000));
@@ -427,6 +449,8 @@ mod tests {
             LoadCaseType::Buckling,
             LoadCaseType::ResponseSpectrum,
             LoadCaseType::LinearHistory,
+            LoadCaseType::NonlinearHistory,
+            LoadCaseType::NonlinearDynamic,
         ] {
             app.analysis_editor.case = new_case(kind, "TEST");
             time += 1.;

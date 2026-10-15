@@ -78,7 +78,17 @@ impl CableElement {
         w_vec: [f64; 3],
         delta_t: f64,
     ) -> Result<Self, SolverError> {
-        if area <= 0.0 || e <= 0.0 || l0 <= 0.0 {
+        if area <= 0.0
+            || e <= 0.0
+            || l0 <= 0.0
+            || [area, e, alpha, l0, delta_t]
+                .iter()
+                .chain(x_i_init.iter())
+                .chain(x_j_init.iter())
+                .chain(w_vec.iter())
+                .any(|x| !x.is_finite())
+            || 1. + alpha * delta_t <= 0.
+        {
             return Err(SolverError::InvalidInput(format!(
                 "invalid cable parameters: area={area}, E={e}, L0={l0}"
             )));
@@ -108,7 +118,16 @@ impl CableElement {
         w_vec: [f64; 3],
         delta_t: f64,
     ) -> Result<Self, SolverError> {
-        if area <= 0.0 || e <= 0.0 || h_target <= 0.0 {
+        if area <= 0.0
+            || e <= 0.0
+            || h_target <= 0.0
+            || [area, e, alpha, h_target, delta_t]
+                .iter()
+                .chain(x_i_init.iter())
+                .chain(x_j_init.iter())
+                .chain(w_vec.iter())
+                .any(|x| !x.is_finite())
+        {
             return Err(SolverError::InvalidInput(format!(
                 "invalid cable horizontal-tension parameters: area={area}, E={e}, H={h_target}"
             )));
@@ -163,6 +182,16 @@ impl CableElement {
                 damp *= 0.5;
             }
             l0 += damp * step;
+        }
+        let (_, f_j, _, _) = solve_catenary_2d(lx, lz, l0, ea, w, 1.0)?;
+        let residual = (f_j[0] - h_target).abs();
+        if !residual.is_finite() || residual > 1e-12 * h_target {
+            return Err(SolverError::NonConvergence {
+                case: "CableShape".into(),
+                iterations: 60,
+                residual,
+                reason: "horizontal-tension initialization did not converge".into(),
+            });
         }
         Self::from_undeformed_length(x_i_init, x_j_init, area, e, alpha, l0, w_vec, delta_t)
     }
@@ -274,6 +303,21 @@ fn solve_catenary_2d(
         (h_init, f4_init)
     };
 
+    // Avoid subtracting nearly equal tensions/inverse-hyperbolic sines for
+    // highly prestressed cables. These are algebraically identical differences.
+    let asinh_sum = |h: f64, f4: f64| {
+        let f2 = total_w - f4;
+        let ti = h.hypot(f2);
+        let tj = h.hypot(f4);
+        let dt = (f4 - f2) * total_w / (tj + ti);
+        if f4 <= 0. {
+            ((total_w - dt) / (-f4 + tj)).ln_1p()
+        } else if f2 <= 0. {
+            ((total_w + dt) / (-f2 + ti)).ln_1p()
+        } else {
+            (f4 / h).asinh() + (f2 / h).asinh()
+        }
+    };
     let tol = 1e-13 * l0.max(chord);
     let mut converged = false;
 
@@ -281,11 +325,10 @@ fn solve_catenary_2d(
         let f2 = total_w - f4;
         let t_i = h.hypot(f2);
         let t_j = h.hypot(f4);
-        let asinh_4 = (f4 / h).asinh();
-        let asinh_2 = (f2 / h).asinh();
+        let asinh_total = asinh_sum(h, f4);
 
-        let gx = h * (l0 / ea + (c_th / w) * (asinh_4 + asinh_2)) - lx;
-        let gz = (f4 * f4 - f2 * f2) / (2.0 * ea * w) + (c_th / w) * (t_j - t_i) - lz;
+        let gx = h * (l0 / ea + (c_th / w) * asinh_total) - lx;
+        let gz = (f4 - f2) * l0 / (2. * ea) + c_th * (f4 - f2) * l0 / (t_j + t_i) - lz;
         let res = gx.hypot(gz);
         if res <= tol {
             converged = true;
@@ -293,8 +336,8 @@ fn solve_catenary_2d(
         }
 
         // Exact 2x2 symmetric positive definite flexibility matrix F_flex = d(lx, lz)/d(H, F4)
-        let f_xx = l0 / ea + (c_th / w) * (asinh_4 + asinh_2 - f4 / t_j - f2 / t_i);
-        let f_xz = (c_th * h / w) * (1.0 / t_j - 1.0 / t_i);
+        let f_xx = l0 / ea + (c_th / w) * (asinh_total - f4 / t_j - f2 / t_i);
+        let f_xz = -c_th * h * (f4 - f2) * l0 / ((t_j + t_i) * t_j * t_i);
         let f_zz = l0 / ea + (c_th / w) * (f4 / t_j + f2 / t_i);
         let det = f_xx * f_zz - f_xz * f_xz;
         if !det.is_finite() || det <= 1e-36 {
@@ -315,11 +358,9 @@ fn solve_catenary_2d(
             let f2_try = total_w - f4_try;
             let ti_try = h_try.hypot(f2_try);
             let tj_try = h_try.hypot(f4_try);
-            let gx_try =
-                h_try * (l0 / ea + (c_th / w) * ((f4_try / h_try).asinh() + (f2_try / h_try).asinh()))
-                    - lx;
-            let gz_try = (f4_try * f4_try - f2_try * f2_try) / (2.0 * ea * w)
-                + (c_th / w) * (tj_try - ti_try)
+            let gx_try = h_try * (l0 / ea + (c_th / w) * asinh_sum(h_try, f4_try)) - lx;
+            let gz_try = (f4_try - f2_try) * l0 / (2. * ea)
+                + c_th * (f4_try - f2_try) * l0 / (tj_try + ti_try)
                 - lz;
             if gx_try.hypot(gz_try) < res || step <= 1e-4 {
                 h = h_try;
@@ -334,9 +375,9 @@ fn solve_catenary_2d(
         let f2 = total_w - f4;
         let t_i = h.hypot(f2);
         let t_j = h.hypot(f4);
-        let gx = h * (l0 / ea + (c_th / w) * ((f4 / h).asinh() + (f2 / h).asinh())) - lx;
-        let gz = (f4 * f4 - f2 * f2) / (2.0 * ea * w) + (c_th / w) * (t_j - t_i) - lz;
-        if gx.hypot(gz) > 1e-7 * l0.max(chord) {
+        let gx = h * (l0 / ea + (c_th / w) * asinh_sum(h, f4)) - lx;
+        let gz = (f4 - f2) * l0 / (2. * ea) + c_th * (f4 - f2) * l0 / (t_j + t_i) - lz;
+        if !gx.hypot(gz).is_finite() || gx.hypot(gz) > tol {
             return Err(SolverError::NonConvergence {
                 case: "CableElement2D".to_string(),
                 iterations: 120,
@@ -349,20 +390,23 @@ fn solve_catenary_2d(
     let f2 = total_w - f4;
     let t_i = h.hypot(f2);
     let t_j = h.hypot(f4);
-    let asinh_4 = (f4 / h).asinh();
-    let asinh_2 = (f2 / h).asinh();
+    let asinh_total = asinh_sum(h, f4);
 
-    let f_xx = l0 / ea + (c_th / w) * (asinh_4 + asinh_2 - f4 / t_j - f2 / t_i);
-    let f_xz = (c_th * h / w) * (1.0 / t_j - 1.0 / t_i);
+    let f_xx = l0 / ea + (c_th / w) * (asinh_total - f4 / t_j - f2 / t_i);
+    let f_xz = -c_th * h * (f4 - f2) * l0 / ((t_j + t_i) * t_j * t_i);
     let f_zz = l0 / ea + (c_th / w) * (f4 / t_j + f2 / t_i);
-    let det = (f_xx * f_zz - f_xz * f_xz).max(1e-30);
+    let det = f_xx * f_zz - f_xz * f_xz;
+    if !det.is_finite() || det <= 0. {
+        return Err(SolverError::InvalidInput(
+            "singular catenary flexibility".into(),
+        ));
+    }
 
     let k_xx = f_zz / det;
     let k_xz = -f_xz / det;
     let k_zz = f_xx / det;
 
-    let l_def =
-        c_th * l0 + (f2 * t_i + f4 * t_j + h * h * (asinh_2 + asinh_4)) / (2.0 * ea * w);
+    let l_def = c_th * l0 + (f2 * t_i + f4 * t_j + h * h * asinh_total) / (2.0 * ea * w);
 
     Ok(([-h, f2], [h, f4], [[k_xx, k_xz], [k_xz, k_zz]], l_def))
 }
@@ -375,7 +419,19 @@ pub fn evaluate_cable_element(
     u_i: [f64; 3],
     u_j: [f64; 3],
 ) -> Result<CableState, SolverError> {
-    if elem.area <= 0.0 || elem.e <= 0.0 || elem.l0 <= 0.0 {
+    if elem.area <= 0.0
+        || elem.e <= 0.0
+        || elem.l0 <= 0.0
+        || [elem.area, elem.e, elem.alpha, elem.l0, elem.delta_t]
+            .iter()
+            .chain(elem.x_i_init.iter())
+            .chain(elem.x_j_init.iter())
+            .chain(elem.w_vec.iter())
+            .chain(u_i.iter())
+            .chain(u_j.iter())
+            .any(|x| !x.is_finite())
+        || 1. + elem.alpha * elem.delta_t <= 0.
+    {
         return Err(SolverError::InvalidInput(
             "cable element requires positive area, E, and L0".to_string(),
         ));
@@ -427,15 +483,19 @@ pub fn evaluate_cable_element(
             dx[2] / chord_length,
         ];
         let tension = k_elastic * (chord_length - l_th);
-        let f_i = [-tension * e_dir[0], -tension * e_dir[1], -tension * e_dir[2]];
+        let f_i = [
+            -tension * e_dir[0],
+            -tension * e_dir[1],
+            -tension * e_dir[2],
+        ];
         let f_j = [tension * e_dir[0], tension * e_dir[1], tension * e_dir[2]];
         let t_over_l = tension / chord_length;
         let mut k_3d = [[0.0; 3]; 3];
         for r in 0..3 {
             for c in 0..3 {
                 let delta = if r == c { 1.0 } else { 0.0 };
-                k_3d[r][c] = k_elastic * e_dir[r] * e_dir[c]
-                    + t_over_l * (delta - e_dir[r] * e_dir[c]);
+                k_3d[r][c] =
+                    k_elastic * e_dir[r] * e_dir[c] + t_over_l * (delta - e_dir[r] * e_dir[c]);
             }
         }
         let k_tangent = assemble_two_node_tangent(&k_3d);
@@ -574,6 +634,20 @@ pub fn solve_cable_network(
     max_iter: usize,
     tol: f64,
 ) -> Result<(Vec<[f64; 3]>, Vec<CableState>), SolverError> {
+    if max_iter == 0
+        || !tol.is_finite()
+        || tol <= 0.
+        || restraints.len() != n_nodes
+        || nodal_loads.len() != n_nodes
+        || u_init.is_some_and(|u| u.len() != n_nodes)
+        || nodal_loads
+            .iter()
+            .flatten()
+            .chain(u_init.into_iter().flatten().flatten())
+            .any(|x| !x.is_finite())
+    {
+        return Err(SolverError::InvalidInput("cable network needs finite loads/state, matching node counts and positive iteration controls".into()));
+    }
     let mut u = match u_init {
         Some(init) => init.to_vec(),
         None => vec![[0.0; 3]; n_nodes],
@@ -591,56 +665,83 @@ pub fn solve_cable_network(
     }
     let nf = free_dofs.len();
 
-    let eval_network = |u_cur: &[[f64; 3]]| -> Result<(Vec<f64>, Vec<f64>, Vec<CableState>), SolverError> {
-        let mut r_free = vec![0.0; nf];
-        let mut k_free = vec![0.0; nf * nf];
-        let mut states = Vec::with_capacity(elements.len());
+    let eval_network =
+        |u_cur: &[[f64; 3]]| -> Result<(Vec<f64>, Vec<f64>, Vec<CableState>), SolverError> {
+            let mut r_free = vec![0.0; nf];
+            let mut k_free = vec![0.0; nf * nf];
+            let mut states = Vec::with_capacity(elements.len());
 
-        for (i, d) in &free_dofs {
-            let idx = dof_map[*i][*d].unwrap();
-            r_free[idx] = -nodal_loads[*i][*d];
-        }
+            for (i, d) in &free_dofs {
+                let idx = dof_map[*i][*d].unwrap();
+                r_free[idx] = -nodal_loads[*i][*d];
+            }
 
-        for &(ni, nj, ref elem) in elements {
-            let st = evaluate_cable_element(elem, u_cur[ni], u_cur[nj])?;
-            let node_pair = [ni, nj];
-            let f_pair = [st.f_i, st.f_j];
-            for a in 0..2 {
-                for d in 0..3 {
-                    if let Some(gi) = dof_map[node_pair[a]][d] {
-                        r_free[gi] += f_pair[a][d];
+            for &(ni, nj, ref elem) in elements {
+                let st = evaluate_cable_element(elem, u_cur[ni], u_cur[nj])?;
+                let node_pair = [ni, nj];
+                let f_pair = [st.f_i, st.f_j];
+                for a in 0..2 {
+                    for d in 0..3 {
+                        if let Some(gi) = dof_map[node_pair[a]][d] {
+                            r_free[gi] += f_pair[a][d];
+                        }
                     }
                 }
-            }
-            for a in 0..2 {
-                for da in 0..3 {
-                    if let Some(gi) = dof_map[node_pair[a]][da] {
-                        let row_local = 3 * a + da;
-                        for b in 0..2 {
-                            for db in 0..3 {
-                                if let Some(gj) = dof_map[node_pair[b]][db] {
-                                    let col_local = 3 * b + db;
-                                    k_free[gi * nf + gj] += st.k_tangent[row_local][col_local];
+                for a in 0..2 {
+                    for da in 0..3 {
+                        if let Some(gi) = dof_map[node_pair[a]][da] {
+                            let row_local = 3 * a + da;
+                            for b in 0..2 {
+                                for db in 0..3 {
+                                    if let Some(gj) = dof_map[node_pair[b]][db] {
+                                        let col_local = 3 * b + db;
+                                        k_free[gi * nf + gj] += st.k_tangent[row_local][col_local];
+                                    }
                                 }
                             }
                         }
                     }
                 }
+                states.push(st);
             }
-            states.push(st);
-        }
-        Ok((r_free, k_free, states))
-    };
+            Ok((r_free, k_free, states))
+        };
 
     if nf == 0 {
         let (_, _, states) = eval_network(&u)?;
         return Ok((u, states));
     }
 
-    for _it in 0..max_iter {
+    // Scale by the forces being balanced, before cancellation between cable
+    // ends. Self-weight is inside element forces, not in nodal_loads.
+    let force_scale = |states: &[CableState]| {
+        let mut nodal = nodal_loads
+            .iter()
+            .map(|f| f.map(f64::abs))
+            .collect::<Vec<_>>();
+        for ((i, j, _), state) in elements.iter().zip(states) {
+            for d in 0..3 {
+                nodal[*i][d] += state.f_i[d].abs();
+                nodal[*j][d] += state.f_j[d].abs();
+            }
+        }
+        free_dofs
+            .iter()
+            .map(|&(i, d)| nodal[i][d])
+            .fold(0., f64::max)
+    };
+    for iteration in 0..max_iter {
         let (r_free, k_free, states) = eval_network(&u)?;
         let res_norm = r_free.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if res_norm <= tol {
+        if !res_norm.is_finite() {
+            return Err(SolverError::NonConvergence {
+                case: "CableNetwork".into(),
+                iterations: iteration,
+                residual: res_norm,
+                reason: "nonfinite cable network residual".into(),
+            });
+        }
+        if res_norm <= tol * force_scale(&states) {
             return Ok((u, states));
         }
 
@@ -650,24 +751,34 @@ pub fn solve_cable_network(
         // Backtracking line search on residual norm
         let mut alpha = 1.0;
         let mut u_next = u.clone();
-        for _ls in 0..16 {
+        let mut accepted = false;
+        for _ls in 0..40 {
             for (k, &(ni, d)) in free_dofs.iter().enumerate() {
                 u_next[ni][d] = u[ni][d] + alpha * du[k];
             }
             if let Ok((r_try, _, _)) = eval_network(&u_next) {
                 let res_try = r_try.iter().map(|v| v * v).sum::<f64>().sqrt();
-                if res_try < res_norm || alpha <= 1e-3 {
+                if res_try.is_finite() && res_try < res_norm {
+                    accepted = true;
                     break;
                 }
             }
             alpha *= 0.5;
+        }
+        if !accepted {
+            return Err(SolverError::NonConvergence {
+                case: "CableNetwork".into(),
+                iterations: iteration,
+                residual: res_norm,
+                reason: "cable network line search did not decrease residual".into(),
+            });
         }
         u = u_next;
     }
 
     let (r_free, _, states) = eval_network(&u)?;
     let res_norm = r_free.iter().map(|v| v * v).sum::<f64>().sqrt();
-    if res_norm <= 1e3 * tol {
+    if res_norm.is_finite() && res_norm <= tol * force_scale(&states) {
         return Ok((u, states));
     }
     Err(SolverError::NonConvergence {
@@ -872,16 +983,9 @@ mod tests {
 
         // Step 2: Self-weight + 8 kips downward load at Joint 2, continuing from self-weight state
         let loads_pt = [[0.0; 3], [0.0, 0.0, -8.0], [0.0; 3]];
-        let (u_pt, _) = solve_cable_network(
-            3,
-            &elements,
-            &restraints,
-            &loads_pt,
-            Some(&u_sw),
-            60,
-            1e-10,
-        )
-        .unwrap();
+        let (u_pt, _) =
+            solve_cable_network(3, &elements, &restraints, &loads_pt, Some(&u_sw), 60, 1e-10)
+                .unwrap();
 
         let disp_ux = u_pt[1][0] - u_sw[1][0];
         let disp_uz = u_pt[1][2] - u_sw[1][2];

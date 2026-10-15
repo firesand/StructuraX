@@ -29,80 +29,32 @@ pub fn compute_ec3_rectangular_minor_shear(
 }
 
 /// EC3 6.2.6(3) local-3 plastic shear resistance $V_{\text{pl},3,\text{Rd}} = A_{v3} (f_y / \sqrt{3}) / \gamma_{M0}$
-/// for `Rectangular`, `I`, `Channel`, `DbChannel`, `T`, `Box`, `Pipe`, and `Circle` sections.
+/// for solid `Rectangular`, circular hollow `Pipe`, and uniform-wall `Box` sections.
+/// The model's `as3` is an analysis shear-deformation area; it is never used as the
+/// Eurocode shear area here. Other local-3 shape/orientation formulas fail closed.
 pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64, DesignError> {
-    if !sec.as3.is_finite() || sec.as3 < 0.0 {
-        return Err(DesignError::InvalidShearProperty {
-            section: sec.name.clone(),
-            property: "As3",
-            value: sec.as3.to_string(),
-        });
-    }
     let fy = positive(sec, "Fy", mat.fy)?;
     let av3 = match sec.prop_type {
         FramePropType::Rectangular => positive(sec, "area", sec.area)?,
-        FramePropType::I => {
-            if sec.as3 > 0.0 {
-                sec.as3
-            } else {
-                let b_top = positive(sec, "flange width", sec.t2)?;
-                let tf_top = positive(sec, "flange thickness", sec.tf)?;
-                let b_bot = positive(
-                    sec,
-                    "bottom flange width",
-                    if sec.t2b > 0.0 { sec.t2b } else { sec.t2 },
-                )?;
-                let tf_bot = positive(
-                    sec,
-                    "bottom flange thickness",
-                    if sec.tfb > 0.0 { sec.tfb } else { sec.tf },
-                )?;
-                b_top * tf_top + b_bot * tf_bot
-            }
-        }
-        FramePropType::Channel => {
-            if sec.as3 > 0.0 {
-                sec.as3
-            } else {
-                let b = positive(sec, "flange width", sec.t2)?;
-                let tf = positive(sec, "flange thickness", sec.tf)?;
-                2.0 * b * tf
-            }
-        }
-        FramePropType::DbChannel => {
-            if sec.as3 > 0.0 {
-                sec.as3
-            } else {
-                let b = positive(sec, "flange width", sec.t2)?;
-                let tf = positive(sec, "flange thickness", sec.tf)?;
-                4.0 * b * tf
-            }
-        }
-        FramePropType::T => {
-            if sec.as3 > 0.0 {
-                sec.as3
-            } else {
-                let b = positive(sec, "flange width", sec.t2)?;
-                let tf = positive(sec, "flange thickness", sec.tf)?;
-                b * tf
-            }
-        }
         FramePropType::Box => {
-            if sec.as3 > 0.0 {
-                sec.as3
-            } else {
-                let b = positive(sec, "flange width", sec.t2)?;
-                let tf = positive(sec, "flange thickness", sec.tf)?;
-                2.0 * b * tf
+            let b = positive(sec, "section width", sec.t2)?;
+            let h = positive(sec, "section depth", sec.t3)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            let tw = positive(sec, "web thickness", sec.tw)?;
+            let tolerance = 1e-9 * tf.max(tw);
+            if (tf - tw).abs() > tolerance {
+                return Err(DesignError::UnsupportedEc3MinorShearSection {
+                    section: sec.name.clone(),
+                    kind: format!("{:?} with unequal wall thicknesses", sec.prop_type),
+                });
             }
+            // EN 1993-1-1 6.2.6(3)(f), rolled RHS loaded parallel to width.
+            let area = positive(sec, "area", sec.area)?;
+            area * b / (b + h)
         }
-        FramePropType::Pipe | FramePropType::Circle => {
-            if sec.as3 > 0.0 {
-                sec.as3
-            } else {
-                let area = positive(sec, "area", sec.area)?;
-                (2.0 / std::f64::consts::PI) * area
-            }
+        FramePropType::Pipe => {
+            let area = positive(sec, "area", sec.area)?;
+            (2.0 / std::f64::consts::PI) * area
         }
         _ => {
             return Err(DesignError::UnsupportedEc3MinorShearSection {
@@ -111,11 +63,7 @@ pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64
             });
         }
     };
-    positive(
-        sec,
-        "EC3 minor shear resistance",
-        av3 * fy / 3.0_f64.sqrt(),
-    )
+    positive(sec, "EC3 minor shear resistance", av3 * fy / 3.0_f64.sqrt())
 }
 
 fn positive(sec: &FrameSection, name: &'static str, value: f64) -> Result<f64, DesignError> {
