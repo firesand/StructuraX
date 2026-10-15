@@ -1,0 +1,99 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "reconstruction-wave-4",
+  "full_reconstruction_complete": false,
+  "previous_checkpoint": "docs/reconstruction/validation-wave3.json",
+  "workspace_test_count": 187,
+  "workspace_tests": "passed",
+  "workspace_test_suites": 27,
+  "strict_workspace_clippy": "passed",
+  "native_build": "passed",
+  "workspace_format_check": {
+    "status": "not-repeated",
+    "note": "Historical mixed formatting remains; no workspace-wide cosmetic rewrite was applied. New and edited standalone modules were formatted."
+  },
+  "selected_synthetic_reference_checks": {
+    "passed": 60,
+    "total": 60,
+    "full_vendor_suite": false
+  },
+  "native_sdb_corpus": {
+    "fixtures_present": 336,
+    "inventory_preservation_and_supported_roundtrip_tests": "passed in workspace suite",
+    "supported_model_roundtrips": 334,
+    "explicit_unsupported_history_rejections": 2,
+    "native_sdb_export_schema_verified": true,
+    "numerical_vendor_parity": false
+  },
+  "vendor_fixture_runtime": {
+    "input": "extracted/files/example_1_001.sdb",
+    "analyzed_cases": 7,
+    "output": "target/reconstruction/wave4/vendor-static-results.json",
+    "native_export_output": "target/reconstruction/wave4/example_1_001_native_export.sdb",
+    "vendor_executable_run": false,
+    "import_subset_warning_visible": true
+  },
+  "gui": {
+    "application_tests": 13,
+    "headless_case_controls_rendered": true,
+    "pointer_click_created_dynamic_function": true,
+    "new_native_OS_interaction_pass": false,
+    "previous_native_smoke": "docs/reconstruction/validation-wave1.json",
+    "full_tutorial_accepted": false,
+    "notes": "docs/reconstruction/application-wave4.md"
+  },
+  "solver": {
+    "tests": 80,
+    "notes": "docs/reconstruction/solver-wave4.md"
+  },
+  "design": {
+    "tests": 23,
+    "notes": "docs/reconstruction/design-wave4.md"
+  },
+  "format_and_model": {
+    "tests": 43,
+    "preservation_tests": 11,
+    "notes": "docs/reconstruction/formats-wave4.md"
+  },
+  "api": {
+    "tests": 23,
+    "notes": "docs/reconstruction/application-wave4.md"
+  },
+  "rea": {
+    "connection_evidence_checkpoint": "wave-2",
+    "version_at_that_checkpoint": "6.5.0",
+    "evidence": "docs/reconstruction/rea-connection-wave2.json",
+    "target_code_executed": false,
+    "setup_repeated_this_wave": false
+  },
+  "commands": [
+    "cargo test --offline --workspace",
+    "cargo clippy --offline --workspace --all-targets -- -D warnings",
+    "cargo build --offline --workspace",
+    "target/debug/sap2000-rs verify",
+    "target/debug/sap2000-rs analyze extracted/files/example_1_001.sdb --output target/reconstruction/wave4/vendor-static-results.json",
+    "target/debug/sap2000-rs export-native-sdb extracted/files/example_1_001.sdb --output target/reconstruction/wave4/example_1_001_native_export.sdb",
+    "target/debug/sap2000-rs inspect-sdb target/reconstruction/wave4/example_1_001_native_export.sdb"
+  ],
+  "logs": {
+    "workspace-tests.log": "target/reconstruction/wave4/workspace-tests.log",
+    "clippy.log": "target/reconstruction/wave4/clippy.log",
+    "build.log": "target/reconstruction/wave4/build.log",
+    "verify.log": "target/reconstruction/wave4/verify.log",
+    "vendor-static.log": "target/reconstruction/wave4/vendor-static.log"
+  },
+  "source_manifest": "target/reconstruction/wave4/source-manifest.json",
+  "source_manifest_sha256": "8595811c4737c52ac5c9959b33cd480542c194dc8eb4230902168324c1c02ed1",
+  "binary": {
+    "path": "target/debug/sap2000-rs",
+    "sha256": "2e16597c95b56010e35f567bcdb587f140d5884cd2c41654a77d78a36306364f"
+  },
+  "limits": [
+    "No vendor executable or full differential suite run",
+    "Nonlinear link laws beyond Gap/Hook/Damper (PlasticWen, Isolator1, Isolator2), large-displacement corotational kinematics, and MovingLoad/SteadyState/Psd/Hyperstatic cases incomplete",
+    "General massless damping outside Maxwell dampers, exact link constraints, end-offset recovery and full dynamic step histories incomplete",
+    "Native SDB export writes default values for unprojected SDB sections and has not been opened in a licensed Windows SAP2000 v19 runtime",
+    "Design codes (EC3 full multi-axis concurrent demands, concrete torsion, ERW/SAW thickness overwrites), auto-select sections, generated combinations and broader GUI/API coverage partial",
+    "No full tutorial desktop, Windows or hardware-renderer acceptance"
+  ]
+}

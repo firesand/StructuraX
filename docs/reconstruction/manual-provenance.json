@@ -1,0 +1,25 @@
+[
+  {
+    "path": "/mnt/Extern2/Torrents/CSI SAP2000 Version 19.0.0/CSiRefer.pdf",
+    "exists": true,
+    "bytes": 7966519,
+    "sha256": "80fb7fbd68da6bdfb3454e4199e5338b829ab216b9ea065157b992ffce1f4617",
+    "extracted_copy": "extracted/files/csirefer.pdf",
+    "matches_extracted_copy": true,
+    "pdfinfo": "Title:           SapRefer3.vp\nAuthor:          Computers and Structures, Inc.\nCreator:         Corel Ventura 10.0\nProducer:        Corel PDF Engine Version 10.397\nCreationDate:    Sun Aug 14 19:12:04 2016 WIB\nModDate:         Thu Oct 27 23:00:14 2016 WIB\nCustom Metadata: no\nMetadata Stream: yes\nTagged:          no\nUserProperties:  no\nSuspects:        no\nForm:            AcroForm\nJavaScript:      no\nPages:           556\nEncrypted:       no\nPage size:       612 x 792 pts (letter)\nPage rot:        0\nFile size:       7966519 bytes\nOptimized:       no\nPDF version:     1.6\n",
+    "printed_edition": "July2016 ISO GEN062708M1 Rev15; CSI Analysis Reference Manual",
+    "role": "analysis assumptions and algorithms; not an OAPI contract reference"
+  },
+  {
+    "path": "/mnt/Extern2/Torrents/CSI SAP2000 Version 19.0.0/SapTutor.pdf",
+    "exists": true,
+    "bytes": 3133889,
+    "sha256": "bc8c91932748599e0f5a812f8b1b992719eb27119d66e91bd2e6ce213c7ede1d",
+    "extracted_copy": "extracted/files/saptutor.pdf",
+    "matches_extracted_copy": false,
+    "pdfinfo": "Title:           SAP2000 Manual - Tutorial\nSubject:         Introductory Tutorial\nAuthor:          Computers and Structures, Inc.\nCreator:         Acrobat PDFMaker 11 for Word\nProducer:        Adobe PDF Library 11.0\nCreationDate:    Mon Oct 24 03:20:18 2016 WIB\nModDate:         Fri Aug 25 02:11:04 2023 WIB\nCustom Metadata: no\nMetadata Stream: yes\nTagged:          no\nUserProperties:  no\nSuspects:        no\nForm:            AcroForm\nJavaScript:      no\nPages:           63\nEncrypted:       no\nPage size:       612 x 792 pts (letter)\nPage rot:        0\nFile size:       3133889 bytes\nOptimized:       yes\nPDF version:     1.7\n",
+    "printed_edition": "January2022 ISO SAP010122M2 Rev0; introduction mentions SAP2000 Version16",
+    "text_diff_lines_vs_extracted": 277,
+    "role": "tutorial workflow reference; exact v19 edition not established"
+  }
+]

@@ -1,0 +1,72 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "reconstruction-wave-1",
+  "full_reconstruction_complete": false,
+  "workspace_test_count": 79,
+  "workspace_tests": "passed",
+  "strict_workspace_clippy": "passed",
+  "native_build": "passed",
+  "selected_synthetic_reference_checks": {
+    "passed": 38,
+    "total": 38,
+    "full_vendor_suite": false
+  },
+  "native_sdb_corpus": {
+    "fixtures_present": 336,
+    "full_inventory_and_exact_copy_passed": 336,
+    "supported_model_import_roundtrips": 334,
+    "explicit_unsupported_dynamic_case_rejections": 2,
+    "native_case_mapping_corrected": 436,
+    "live_cases_audited": 767,
+    "affected_files": 202,
+    "numerical_vendor_parity": false
+  },
+  "native_cli": {
+    "input": "/home/edo/REA/extracted/files/example_1_001.sdb",
+    "inventory_complete": true,
+    "stream_bytes": 70245,
+    "records": 592,
+    "source_sha256": "482b27b60330a49938fcaafad4d5c443a5323d68266928cfd88e55f5a6203e28",
+    "exact_copy": true,
+    "existing_output_refused": true,
+    "copy_stdout": "Copied native SAP2000 SDB to /home/edo/REA/target/reconstruction/native-cli-2lrr9_tb/copy.sdb (9377 bytes; verified exact original bytes).\n",
+    "refusal_stderr": "Error: Cannot create /home/edo/REA/target/reconstruction/native-cli-2lrr9_tb/copy.sdb without overwriting: File exists (os error 17)\n"
+  },
+  "gui": {
+    "native_gui_started": true,
+    "steel_design_button_clicked": true,
+    "rendering": "Xvfb software OpenGL",
+    "screenshots": [
+      "gui-startup.png",
+      "gui-steel-design.png"
+    ],
+    "human_desktop_validation": false,
+    "screenshot_review": {
+      "design_status": "Design calculations completed for 26 members.",
+      "ratio_view_visible": true,
+      "stale_V3_error_absent": true
+    }
+  },
+  "vendor_static_runtime": {
+    "fixture": "extracted/files/example_1_001.sdb",
+    "analyzed_cases": 7,
+    "output": "target/reconstruction/vendor-static-results.json",
+    "vendor_execution_compared": false
+  },
+  "manual_provenance": "docs/reconstruction/manual-provenance.json",
+  "logs": {
+    "workspace-tests.log": "target/reconstruction/workspace-tests.log",
+    "build.log": "target/reconstruction/build.log",
+    "clippy.log": "target/reconstruction/clippy.log",
+    "verify.log": "target/reconstruction/verify.log",
+    "vendor-static.log": "target/reconstruction/vendor-static.log",
+    "gui-runtime.log": "target/reconstruction/gui-runtime.log"
+  },
+  "limits": [
+    "No original SAP2000 executable run",
+    "No full vendor-result differential suite",
+    "Native arbitrary-model exporter incomplete",
+    "Nonlinear elements, several case types, code design and GUI/API coverage remain partial",
+    "Linux software-rendered GUI smoke test; no Windows or hardware-GPU acceptance"
+  ]
+}

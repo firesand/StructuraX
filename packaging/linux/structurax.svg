@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#1e293b"/>
+    </linearGradient>
+    <linearGradient id="beam" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#22c55e"/>
+    </linearGradient>
+  </defs>
+  <rect width="256" height="256" rx="44" fill="url(#bg)"/>
+  <!-- 3D Structural Space Frame / Truss Wireframe -->
+  <g stroke="url(#beam)" stroke-width="8" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <polygon points="128,36 212,84 212,172 128,220 44,172 44,84"/>
+    <line x1="128" y1="36" x2="128" y2="128"/>
+    <line x1="212" y1="84" x2="128" y2="128"/>
+    <line x1="44" y1="84" x2="128" y2="128"/>
+    <line x1="128" y1="128" x2="128" y2="220"/>
+    <line x1="44" y1="172" x2="128" y2="128"/>
+    <line x1="212" y1="172" x2="128" y2="128"/>
+    <line x1="44" y1="84" x2="212" y2="84" stroke-opacity="0.55" stroke-width="5"/>
+  </g>
+  <!-- Nodal Joints -->
+  <g fill="#f8fafc" stroke="#0ea5e9" stroke-width="4">
+    <circle cx="128" cy="36" r="9"/>
+    <circle cx="212" cy="84" r="9"/>
+    <circle cx="212" cy="172" r="9"/>
+    <circle cx="128" cy="220" r="9"/>
+    <circle cx="44" cy="172" r="9"/>
+    <circle cx="44" cy="84" r="9"/>
+    <circle cx="128" cy="128" r="11" fill="#38bdf8"/>
+  </g>
+</svg>
+

@@ -1,0 +1,37 @@
+{
+  "checked_on": "2026-10-15",
+  "playlist_url": "https://www.youtube.com/playlist?list=PLF8qIet2NX2F23FtLNF7clwGJKvkCb0by",
+  "title": "SAP2000 Full Course – Structural Modeling from Beginner to Pro",
+  "owner": "SAP2000 Tutorial Series 結構工程教學系列",
+  "channel_url": "https://www.youtube.com/@sap2000tutorials",
+  "initial_data_sha256": "3d1f2a82338bdd8fcf23eba691398943c39d9ea4c20bd6548f5118e65e5ea0ea",
+  "visible_video_count": 3,
+  "official_csi_catalog_overlap": [],
+  "authority": "Supplementary tutorial channel; CSI affiliation not established. Prefer v19 vendor manuals and fixtures for expected behavior.",
+  "entries": [
+    {
+      "video_id": "ZZCFGD_1SM8",
+      "title": "SAP2000 Tutorials Lesson 1 | Simply Supported Beam (Beginner Guide) #sap2000",
+      "url": "https://www.youtube.com/watch?v=ZZCFGD_1SM8",
+      "duration_display": "13.13",
+      "version": "unverified",
+      "evidence_level": "playlist metadata only; not watched or transcribed"
+    },
+    {
+      "video_id": "HlEwet5BFXY",
+      "title": "SAP2000 Tutorials Lesson 2-Cantilever Beam #SAP2000 #CivilEngineering #EngineeringStudents #FEExam",
+      "url": "https://www.youtube.com/watch?v=HlEwet5BFXY",
+      "duration_display": "24.32",
+      "version": "unverified",
+      "evidence_level": "playlist metadata only; not watched or transcribed"
+    },
+    {
+      "video_id": "9O48Bm2-ZEw",
+      "title": "Sap2000 Tutorials Lesson 3-Continuous Beam #sap2000 #civilengineering #structuralengineering",
+      "url": "https://www.youtube.com/watch?v=9O48Bm2-ZEw",
+      "duration_display": "11.04",
+      "version": "unverified",
+      "evidence_level": "playlist metadata only; not watched or transcribed"
+    }
+  ]
+}

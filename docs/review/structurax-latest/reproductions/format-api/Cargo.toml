@@ -1,0 +1,19 @@
+[package]
+name="structurax-format-api-repro"
+version="0.1.0"
+edition="2021"
+[dependencies]
+sap-model={path="../../../../../crates/sap-model"}
+sap-format={path="../../../../../crates/sap-format"}
+sap-api={path="../../../../../crates/sap-api"}
+sap-units={path="../../../../../crates/sap-units"}
+
+[workspace]
+
+[[bin]]
+name = "structurax-format-api-repro"
+path = "main.rs"
+
+[[bin]]
+name = "class_versions"
+path = "bin/class_versions.rs"

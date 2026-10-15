@@ -1,0 +1,21 @@
+# Maintainer: StructuraX Engineering Team
+pkgname=structurax
+pkgver=1.0.0
+pkgrel=1
+pkgdesc="3D Finite Element Structural Analysis & Code-Based Member Design Suite"
+arch=('x86_64')
+url="https://github.com/firesand/StructuraX"
+license=('MIT')
+depends=('glibc' 'gcc-libs' 'libx11' 'libglvnd')
+source=("structurax-${pkgver}-linux-x86_64.tar.gz")
+sha256sums=('SKIP')
+
+package() {
+  cd "${srcdir}/structurax-${pkgver}-linux-x86_64"
+  install -Dm755 "bin/structurax" "${pkgdir}/usr/bin/structurax"
+  install -Dm644 "share/applications/structurax.desktop" "${pkgdir}/usr/share/applications/structurax.desktop"
+  install -Dm644 "share/icons/hicolor/scalable/apps/structurax.svg" "${pkgdir}/usr/share/icons/hicolor/scalable/apps/structurax.svg"
+  install -dm755 "${pkgdir}/usr/share/structurax/sections"
+  cp -a share/structurax/sections/*.pro "${pkgdir}/usr/share/structurax/sections/" 2>/dev/null || true
+}
+

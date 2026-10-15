@@ -1,0 +1,30 @@
+name: Validate StructuraX
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Install desktop build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgl1-mesa-dev
+      - name: Workspace tests (vendor fixtures absent)
+        run: cargo test --locked --workspace
+      - name: Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Reference checks
+        run: cargo run --locked --bin structurax -- verify
+      - name: Packaging script syntax
+        run: |
+          python3 -m py_compile scripts/*.py
+          bash -n scripts/package-macos-arm64.sh

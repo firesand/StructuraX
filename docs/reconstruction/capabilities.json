@@ -1,0 +1,564 @@
+{
+  "project": "sap2000-rs",
+  "target": "SAP2000 v19 reconstruction",
+  "snapshot_date": "2026-10-15",
+  "snapshot_note": "Wave 4: 8-node 3D solid elements (with Taylor-Beresford-Wilson incompatible modes), 3D elastic catenary cables and member T/C limits, nonlinear direct-integration time history (Gap/Hook/Damper) with initial-case state continuation, schema-driven native SDB stream writer, AISC Angle/DblAngle V3 shear, H3 closed-section torsion, EC3 V3 shapes, and concrete minor-axis V3/M2 design. See wave notes and validation.json for exact scope; product parity remains incomplete.",
+  "status_legend": {
+    "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
+    "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
+    "unsupported": "Explicitly rejected, absent from dispatch, or represented only as data without a corresponding implementation.",
+    "unknown": "Source evidence is insufficient to claim behavior; needs comparison with SAP2000 v19 or an authoritative manual/example."
+  },
+  "capabilities": [
+    {
+      "id": "model-core-objects",
+      "area": "model",
+      "feature": "Points, frame objects, area objects, solids, links, materials, sections, loads, cases, combinations, constraints, functions, and results are represented in SapModel.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-model/src/lib.rs",
+          "lines": "20-207",
+          "note": "Enums declare material, section, area, link, load-case, constraint, and frame-template families."
+        },
+        {
+          "file": "crates/sap-model/src/lib.rs",
+          "lines": "1144-1168",
+          "note": "SapModel stores object collections and design/result maps."
+        }
+      ],
+      "limits": "Data representation does not imply full solver, API, or file-format support for every enum value. 8-node solids, 3D catenary cables, member T/C limits, and Gap/Hook/Damper nonlinear links are now assembled; several specialized case and section enum values remain unimplemented."
+    },
+    {
+      "id": "frame-linear-static",
+      "area": "solver",
+      "feature": "3D frame linear static analysis with joint loads, frame loads, supports, releases, offsets, springs, and recovered force stations.",
+      "status": "implemented-tested",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "51-107",
+          "note": "Analysis setup and global stiffness assembly."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "111-125",
+          "note": "LinearStatic and LinearStaticMultiStep dispatch to static analysis."
+        },
+        {
+          "file": "crates/sap-solver/src/benchmarks.rs",
+          "lines": "69-318",
+          "note": "Synthetic Example 1-001 covers seven static load cases."
+        },
+        {
+          "file": "crates/sap-solver/src/frame.rs",
+          "lines": "248-350",
+          "note": "Frame local stiffness implementation."
+        },
+        {
+          "file": "docs/reconstruction/beam-workflows.md",
+          "note": "Independent simply supported, cantilever and two-span analytical tests expose and verify station recovery correction."
+        }
+      ],
+      "limits": "Frame theory and loads still require broader vendor fixture comparisons; the selected synthetic benchmark suite is not full v19 validation."
+    },
+    {
+      "id": "frame-geometric-nonlinearity",
+      "area": "solver",
+      "feature": "Nonlinear static, P-Delta, catenary cable equilibrium, and initial-case state continuation.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "126-148",
+          "note": "NonlinearStatic case dispatch covering P-Delta, catenary cables, member T/C limits, and Gap/Hook contact."
+        },
+        {
+          "file": "crates/sap-solver/src/nonlinear.rs",
+          "lines": "150-350",
+          "note": "Iterative nonlinear static equilibrium with initial-case continuation."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave3.md",
+          "note": "Nonlinear equilibrium and explicit convergence settings/errors with analytical regressions."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave4.md",
+          "note": "Catenary cable nonlinear static equilibrium, frame T/C limits, and initial_case continuation."
+        }
+      ],
+      "limits": "General frame/shell large displacements, stateful hysteretic frame plasticity, and combined P-Delta/contact are unsupported. Catenary cables, frame T/C limits, and Gap/Hook contact with initial_case continuation are verified against Examples 6-003, 6-004, 7-001, and 7-002."
+    },
+    {
+      "id": "frame-modal-buckling-spectrum",
+      "area": "solver",
+      "feature": "Eigen/Ritz modal, linear buckling, and response-spectrum case types.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "140-177",
+          "note": "Modal, buckling, and response-spectrum dispatch."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "1887-2027",
+          "note": "Modal and eigenvector solution path."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "2028-2110",
+          "note": "Buckling solution path."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "2111-2345",
+          "note": "Response spectrum path."
+        }
+      ],
+      "limits": "Not all vendor modal options or response-spectrum functions/combination rules are exposed. Validate modes, participation, buckling factors, damping, directionality, and result combinations against reference outputs."
+    },
+    {
+      "id": "time-history",
+      "area": "solver",
+      "feature": "Linear and nonlinear direct-integration time-history cases using Newmark average/linear acceleration, Hilber-Hughes-Taylor (HHT-alpha), or Wilson-theta integration, with initial-case continuation.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "178-210",
+          "note": "Linear and nonlinear history/dynamic case dispatch."
+        },
+        {
+          "file": "crates/sap-solver/src/dynamics.rs",
+          "lines": "490-865",
+          "note": "NonlinearStepper implements direct-integration equilibrium for Gap, Hook, and Maxwell Damper links with initial-state continuation."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave4.md",
+          "note": "Verified against Example 6-003 (Gap static/dynamic continuation) and Example 6-005 (Maxwell damper harmonic excitation)."
+        }
+      ],
+      "limits": "Nonlinear direct-integration history supports Gap, Hook, and Maxwell Damper links plus initial_case continuation. Bouc-Wen/hysteretic plasticity in dynamics, Fast Nonlinear Analysis (FNA), and history patterns with element/self-weight loads remain unsupported."
+    },
+    {
+      "id": "other-case-types",
+      "area": "solver",
+      "feature": "Moving load, steady state, PSD, and hyperstatic case families are represented in the model/API or importer.",
+      "status": "unsupported",
+      "evidence": [
+        {
+          "file": "crates/sap-model/src/lib.rs",
+          "lines": "144-163",
+          "note": "LoadCaseType declares these types."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "196-215",
+          "note": "Unmatched dispatch cases return UnsupportedInput."
+        }
+      ],
+      "limits": "Enum presence and import mapping must not be presented as execution support."
+    },
+    {
+      "id": "area-shell-plane",
+      "area": "solver",
+      "feature": "Three- and four-node area elements with membrane, plate, shell, and selected plane/axisymmetric constitutive modes, auto-meshing, and recovered resultants.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "71-73",
+          "note": "Auto-meshed areas are expanded before assembly."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "217-229",
+          "note": "Area preflight requires 3 or 4 nodes and valid geometry."
+        },
+        {
+          "file": "crates/sap-solver/src/area.rs",
+          "lines": "110-123",
+          "note": "Triangles and quads dispatch to the area stiffness implementation."
+        },
+        {
+          "file": "crates/sap-solver/src/area.rs",
+          "lines": "150-157",
+          "note": "Shell, plane, and ASolid flags select membrane/bending behavior."
+        },
+        {
+          "file": "crates/sap-solver/src/benchmarks.rs",
+          "lines": "860-917",
+          "note": "Selected Example 1-008 verification implementation."
+        }
+      ],
+      "limits": "The model documentation allows higher-order plane/ASolid connectivity, but solver preflight rejects more than four nodes. Layered shell enum is not evidence of nonlinear layered material behavior."
+    },
+    {
+      "id": "solid-elements",
+      "area": "solver",
+      "feature": "8-node 3D isoparametric solid elements with optional Taylor-Beresford-Wilson incompatible bending modes, degenerate wedges/tetrahedra, self-weight, Face 1..6 surface pressure, uniform temperature loads, and stress recovery.",
+      "status": "implemented-tested",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/solid.rs",
+          "lines": "1-1010",
+          "note": "8-node brick stiffness, 9 incompatible modes, surface pressure, thermal loads, and stress recovery."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",
+          "lines": "18-80",
+          "note": "Verified against vendor SDB fixtures Example 5-001 (compatible & incompatible Patch Test), Example 5-002, and Example 5-005."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave4.md",
+          "note": "Formulation and benchmark verification notes."
+        }
+      ],
+      "limits": "Higher-order 20-node solids and nonlinear material plasticity in solids are not implemented."
+    },
+    {
+      "id": "links",
+      "area": "solver",
+      "feature": "Oriented effective linear/viscous links plus nonlinear static and direct-integration dynamic Gap, Hook, and Maxwell Damper constitutive response.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "docs/reconstruction/solver-wave2.md",
+          "note": "CSI B operator and direct integration implementation with analytical regressions."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave3.md",
+          "note": "Exact small-displacement Gap/Hook per-DOF laws, nonlinear equilibrium, actuator/grounded reactions and convergence regressions."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave4.md",
+          "note": "Nonlinear direct-integration history for Gap, Hook, and Maxwell Damper links (Examples 6-003, 6-004, 6-005) and native m_param import."
+        }
+      ],
+      "limits": "PlasticWen/friction-isolator/multilinear-plastic dynamic hysteresis, coupled contact/P-Delta, and exact fixed-DOF constraint equations remain incomplete."
+    },
+    {
+      "id": "cables-and-member-limits",
+      "area": "solver",
+      "feature": "3D elastic catenary cable elements (Peyrot & Goulois, 1979) and frame tension/compression limits (tc_limits).",
+      "status": "implemented-tested",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/cable.rs",
+          "lines": "1-752",
+          "note": "Exact 3D thermal-elastic catenary element, network solver, and frame T/C limit constitutive engine."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",
+          "lines": "312-358",
+          "note": "Verified against vendor SDB fixtures Example 7-001 (C1..C6) and Example 7-002 (2-segment cable under point load)."
+        },
+        {
+          "file": "docs/reconstruction/solver-wave4.md",
+          "note": "Catenary and member T/C limit formulation notes."
+        }
+      ],
+      "limits": "Dynamic large-displacement cable whip and coupled frame P-Delta + T/C limit interaction remain outside the verified subset."
+    },
+    {
+      "id": "constraints",
+      "area": "solver",
+      "feature": "Multipoint constraints include Equal, Local, Diaphragm, Body/Weld, and Plate paths.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "880-920",
+          "note": "Penalty constraint assembly and equal/local/diaphragm behavior."
+        },
+        {
+          "file": "crates/sap-solver/src/lib.rs",
+          "lines": "1019-1111",
+          "note": "Body, Weld, Plate behavior and generic fallback."
+        },
+        {
+          "file": "crates/sap-model/src/lib.rs",
+          "lines": "165-179",
+          "note": "Nine constraint types declared."
+        }
+      ],
+      "limits": "Rod, Beam, and Line hit the generic equal-DOF fallback rather than their named geometric constraint models. Penalty enforcement also needs comparison against exact vendor behavior."
+    },
+    {
+      "id": "coordinates-and-load-systems",
+      "area": "solver",
+      "feature": "Joint/frame/link axes, global/local and named Cartesian load systems; projected frame load handling.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/coordinates.rs",
+          "note": "Analysis-only coordinate normalization preserves input assignments."
+        },
+        {
+          "file": "crates/sap-solver/tests/coordinate_link_regressions.rs",
+          "note": "Named force/moment/support motion, projection, area loads and joint-axis checks."
+        }
+      ],
+      "limits": "Named coordinates use the explicit intrinsic right-handed Rz*Ry*Rx model convention; imported three-angle ordering needs vendor differential validation. Projected area loading remains unsupported."
+    },
+    {
+      "id": "steel-design",
+      "area": "design",
+      "feature": "AISC 360-10 LRFD/ASD and Eurocode 3 frame capacities and interactions, including AISC Angle/DblAngle V3 shear, closed-section H3 torsion interaction, and EC3 local-3 shear across standard shapes.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-design/src/steel.rs",
+          "lines": "500-705,1076-1166",
+          "note": "AISC axial, bending, V2 shear, and H3.1/H3.2 closed-section torsional capacities and Eq. H3-6 interaction."
+        },
+        {
+          "file": "crates/sap-design/src/shear.rs",
+          "lines": "31-222",
+          "note": "AISC V3 shear (including Angle and DblAngle per G4) and EC3 6.2.6(3) local-3 shear across Rectangular, I, Channel, DbChannel, T, Box, Pipe, and Circle."
+        },
+        {
+          "file": "docs/reconstruction/design-wave4.md",
+          "note": "Wave 4 steel and concrete design expansion notes."
+        }
+      ],
+      "limits": "Aluminum and ColdFormed materials remain rejected in the steel workflow. Under EC3, local-3 shear with concurrent axial/major-bending/major-shear/torsion or closed-section torsion remains explicitly rejected. Nominal Box/Pipe dimensions are treated as design thickness."
+    },
+    {
+      "id": "concrete-design",
+      "area": "design",
+      "feature": "ACI 318-14 and Eurocode 2 beam biaxial flexure (M3/M2) and biaxial shear (V2/V3) sizing plus rectangular/circular column biaxial PMM and V2/V3 shear.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-design/src/concrete.rs",
+          "lines": "40-265,530-810",
+          "note": "ACI and EC2 beam/column flexure and V2/V3 shear design."
+        },
+        {
+          "file": "docs/reconstruction/design-wave4.md",
+          "note": "Concrete minor-axis V3 shear and M2 flexure verification."
+        }
+      ],
+      "limits": "Nonzero concrete torsion (|T| > 1e-9) remains explicitly rejected. ACI/EC2 coverage is selected member checks, not full seismic detailing."
+    },
+    {
+      "id": "s2k-interoperability",
+      "area": "format",
+      "feature": "Selected semantic import/export with preserved original text, opaque tables and uninterpreted columns, checked edit reconciliation and warnings.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-format/src/s2k.rs",
+          "lines": "515-532",
+          "note": "Diagnostic parse entry point and unsupported-table collection."
+        },
+        {
+          "file": "docs/reconstruction/formats-wave3.md",
+          "note": "Original bytes, opaque tables and columns retained with checked edited-owner reconciliation and explicit conflicts."
+        },
+        {
+          "file": "docs/reconstruction/formats-wave4.md",
+          "note": "Roundtrip support for nonlinear link param1/param2 and cable parameters."
+        }
+      ],
+      "limits": "Unknown data is preserved but not interpreted. Ambiguous owner mapping and unit changes with opaque dimensions reject export. Full vendor export acceptance is untested."
+    },
+    {
+      "id": "sdb-import",
+      "area": "format",
+      "feature": "SAP2000 v19 binary SDB container parsing, schema-driven native-record inventory, exact source-byte preservation, and model projection including solids, links (m_param, m_SingleJoint), cables, and functions.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-format/src/sdb.rs",
+          "lines": "815-2100",
+          "note": "Native cBinaryStream record to SapModel extraction path."
+        },
+        {
+          "file": "docs/reconstruction/formats-wave4.md",
+          "note": "Wave 4 extraction of NLLINKPROPARRAY.m_param, single-joint grounded links, parametric Sine functions, and CABLEPROPERTYARRAY / S_CableData."
+        }
+      ],
+      "limits": "Native inventory and source-preserving serialization cover all schema-known records in the checked 336-file local corpus, but only recognized schema paths become SapModel fields."
+    },
+    {
+      "id": "native-sdb-preservation",
+      "area": "format/application",
+      "feature": "Inventory schema-known native SDB records and copy an existing vendor file byte-for-byte without converting it into a SapModel.",
+      "status": "implemented-tested",
+      "evidence": [
+        {
+          "file": "crates/sap-format/src/sdb/native.rs",
+          "lines": "44-100,417-444",
+          "note": "Native document inventory traverses the stream and preserves original bytes; local fixture regression checks at least 336 files."
+        },
+        {
+          "file": "crates/sap-app/src/main.rs",
+          "lines": "54-65,221-296",
+          "note": "inspect-sdb emits JSON inventory; copy-native-sdb refuses overwrite and verifies copied bytes."
+        }
+      ],
+      "limits": "The operation inventories and preserves source bytes; it does not project all record semantics or validate engineering results."
+    },
+    {
+      "id": "sdb-export",
+      "area": "format",
+      "feature": "Export a SapModel to a schema-compliant SAP2000 v19 native cBinaryStream SDB file (pack_model_to_native_sdb / save_native_sdb_file), alongside the private S2K snapshot container.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-format/src/sdb/native.rs",
+          "lines": "600-1450",
+          "note": "Schema-driven BinarySdbWriter serializes all top-level v19 SDB records in traverse() order and passes inspect_native_sdb 100% to EOF."
+        },
+        {
+          "file": "crates/sap-app/src/main.rs",
+          "lines": "66-75,298-330",
+          "note": "CLI export-native-sdb subcommand."
+        },
+        {
+          "file": "docs/reconstruction/formats-wave4.md",
+          "note": "Native SDB stream writer specification and round-trip verification."
+        }
+      ],
+      "limits": "Generated native SDB files pass schema inspection to EOF and round-trip through extract_sdb_to_model, but opening generated files inside a licensed Windows SAP2000 v19 executable remains untested."
+    },
+    {
+      "id": "oapi",
+      "area": "api",
+      "feature": "Rust facade with selected cSapModel, cFile (including save_native_sdb), point/frame/cable/area/solid/link, properties, load/case/combo, analysis/results, and design methods.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-api/src/lib.rs",
+          "lines": "160-240,850-1120",
+          "note": "cSapModel accessor surface including cPropSolid, cSolidObj, cFrameObj cable/TC limits, cAnalysisResults::solid_stress, and cFile::save_native_sdb."
+        },
+        {
+          "file": "docs/reconstruction/application-wave4.md",
+          "note": "Wave 4 OAPI and CLI additions."
+        }
+      ],
+      "limits": "This is a Rust method facade, not a Windows COM server. Tendon objects, broad database table interfaces, and full CSI OAPI method coverage remain incomplete."
+    },
+    {
+      "id": "gui",
+      "area": "application",
+      "feature": "egui desktop model editor/viewer with templates, section browser, load assignment, analysis, selected diagrams, ratios, and tables.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-app/src/gui.rs",
+          "lines": "326-710",
+          "note": "Menus, toolbar, display modes, and action dispatch."
+        },
+        {
+          "file": "docs/reconstruction/gui-wave2.md",
+          "note": "Six-tab native editing workflows and headless render/pointer interaction tests."
+        },
+        {
+          "file": "docs/reconstruction/application-wave3.md",
+          "note": "Case/function definition editor, run selection, durable export warnings and headless input tests."
+        }
+      ],
+      "limits": "GUI is a selected 2D/3D workbench, not SAP2000 UI parity. Tables and edit flows cover limited object/result types."
+    },
+    {
+      "id": "templates",
+      "area": "application",
+      "feature": "Beam, 2D frame, 2D truss, 3D frame, wall, and spherical dome generators; selectable 2D/3D frame subtypes.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-model/src/templates.rs",
+          "lines": "6-723",
+          "note": "Beam, 2D frame/truss, 3D frame, wall, and dome generators."
+        }
+      ],
+      "limits": "Six generators are present; generated default properties need reference comparisons."
+    },
+    {
+      "id": "verification-suite",
+      "area": "validation",
+      "feature": "60 live reference checks across 13 benchmark families plus vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/benchmarks.rs",
+          "lines": "55-75",
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003, 6-005, 7-001, and 7-002 (60 checks)."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",
+          "lines": "1-380",
+          "note": "Vendor SDB integration regressions for Examples 5-001, 5-002, 5-005, 6-003, 6-004, 6-005, 7-001, and 7-002."
+        }
+      ],
+      "limits": "The live suite is a selected benchmark subset, not the full 336-file vendor verification collection."
+    }
+  ],
+  "vendor_validation_assets": [
+    {
+      "path": "extracted/files/sap2000_verification.xls",
+      "use": "Primary local workbook for selected solver verification examples."
+    },
+    {
+      "path": "extracted/files/sap2000_verification.sbf",
+      "use": "Companion binary verification data."
+    },
+    {
+      "path": "extracted/files/problem_1_001.pdf",
+      "use": "Geometry, loads, expected outputs for Example 1-001."
+    },
+    {
+      "path": "extracted/files/example_1_001.sdb",
+      "use": "Native v19 model fixture for parser/solver comparison."
+    },
+    {
+      "path": "extracted/files/aisc_360_10_example_001.pdf",
+      "use": "AISC steel design example reference."
+    },
+    {
+      "path": "extracted/files/en_3_2005_example_001.pdf",
+      "use": "EC3 design example reference."
+    },
+    {
+      "path": "extracted/files/en_2_2004_ex001.pdf",
+      "use": "EC2 design example reference."
+    },
+    {
+      "path": "extracted/files/csirefer.pdf",
+      "use": "SAP2000 v19 analysis manual for solver methods and conventions; not an OAPI method contract."
+    },
+    {
+      "path": "extracted/files/saptutor.pdf",
+      "use": "October 2016 Rev 0 Introductory Tutorial that explicitly introduces SAP2000 Version 19; primary workflow reference for the 13-step GUI acceptance map."
+    },
+    {
+      "path": "extracted/files/sapstart.pdf",
+      "use": "Vendor getting-started manual for UI/model workflow guidance."
+    },
+    {
+      "path": "extracted/files/aisc14.pro",
+      "use": "AISC section database fixture."
+    },
+    {
+      "path": "target/reconstruction/tutorial-text-diff.txt",
+      "use": "Local comparison showing the separately supplied January 2022 SapTutor has a Version 16 introduction; use only as a cross-check, not the v19 workflow baseline."
+    }
+  ],
+  "acceptance_checklist": [
+    "Freeze a fixture manifest with hashes, SAP2000 v19 provenance, units, expected tables, expected outputs, and explicit tolerances; distinguish vendor references from synthetic hand-built checks.",
+    "For each imported SDB/S2K fixture, compare imported object counts and critical assignments to vendor tables; fail or report omitted tables/columns before solving.",
+    "Round-trip supported S2K tables and compare normalized tables; test the native SDB reader separately. Do not treat private SDB writer output as native-vendor interchange.",
+    "Validate solver cases in order: single frame loads/releases/offsets; multi-axis local/global loads; shell membrane/plate/shell; link linear behavior; modal, buckling, response spectrum, Newmark history; then P-Delta. Unsupported case types and unimplemented loads must return explicit errors.",
+    "Add negative fixtures proving solids, unsupported nonlinear link families/combinations, cables/tension-only members, unsupported coordinate-system forms, higher-order areas, and unsupported dynamic cases reject rather than produce plausible results.",
+    "Validate constraint definitions separately for every enum type; implement exact Rod, Beam, and Line behavior or reject instead of using generic equal DOFs.",
+    "For steel design, validate AISC LRFD/ASD and EC3 hand examples by section family; cover local V2/V3 shear, torsion, axial plus biaxial bending, slender elements, buckling, unbraced lengths, and invalid section/material/code combinations.",
+    "For concrete design, validate ACI/EC2 beam and column examples including both shear axes, biaxial bending, reinforcement layout, column slenderness, and status handling against vendor outputs.",
+    "Audit the API one method at a time against version-matched CSI OAPI type-library metadata/object browser/API help, with contract tests for names, defaults, return codes, mutation invalidation, units, error propagation, and unsupported methods.",
+    "Exercise each GUI workflow end to end: create/open/save, edit model, assign loads, solve, inspect diagrams/results/tables, design, and show clear import/analysis/design errors."
+  ]
+}

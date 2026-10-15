@@ -1,0 +1,36 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "StructuraX private repository readiness review",
+  "production_ready": false,
+  "full_reconstruction_complete": false,
+  "original_workspace_tests": 187,
+  "fixture_enabled_workspace_tests": 187,
+  "fixture_enabled_command": "cargo test --locked --workspace --features sap-solver/vendor-fixtures",
+  "clean_copy_without_vendor_inputs": {
+    "tests": 180,
+    "passed": true,
+    "command": "cargo test --locked --workspace",
+    "note": "Seven explicitly gated solver vendor tests omitted; legacy optional fixture checks return early when absent."
+  },
+  "strict_all_features_clippy": "passed",
+  "native_build": "passed",
+  "selected_reference_checks": {
+    "passed": 60,
+    "total": 60,
+    "vendor_differential_suite": false
+  },
+  "packaging": {
+    "python_syntax": "passed",
+    "bash_syntax": "passed",
+    "smoke": "unchanged ELF payload and license verified; local vendor sentinel excluded",
+    "current_host_release_glibc": "2.43; rejected by 2.35 baseline guard without mutation",
+    "windows_runtime": "not tested",
+    "macos_runtime": "not tested"
+  },
+  "known_correctness_defects_remain": true,
+  "review": "docs/review/structurax-latest/REVIEW.md",
+  "source_manifest": "docs/review/structurax-latest/source-manifest.json",
+  "source_manifest_sha256": "e0b60d10454ea67ff5010610bb80035ff02e494ce3baaf95a6912ce288e686d2",
+  "logs_directory": "target/review/structurax-latest",
+  "source_history_note": "Initial Git baseline; no historical Git authorship evidence for prior workspace edits."
+}

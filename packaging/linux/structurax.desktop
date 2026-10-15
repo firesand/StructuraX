@@ -1,0 +1,14 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=StructuraX
+GenericName=3D Structural Analysis & Design Suite
+Comment=3D Finite Element Structural Analysis & Code-Based Member Design Suite
+Exec=structurax %F
+Icon=structurax
+Terminal=false
+Categories=Science;Engineering;Construction;Education;
+MimeType=application/x-structurax-s2k;application/x-structurax-sdb;
+Keywords=FEM;FEA;Structural;Engineering;Frame;Shell;Solid;Cable;Steel;Concrete;
+StartupWMClass=StructuraX
+

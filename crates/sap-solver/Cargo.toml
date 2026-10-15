@@ -1,0 +1,25 @@
+[package]
+name = "sap-solver"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+# Explicit opt-in; requires user-supplied vendor examples.
+vendor-fixtures = []
+
+[dependencies]
+sap-units.workspace = true
+sap-model.workspace = true
+sap-section.workspace = true
+serde.workspace = true
+rayon.workspace = true
+indexmap.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+sap-format = { path = "../sap-format" }

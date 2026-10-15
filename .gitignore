@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+/target_*/
+**/*.rs.bk
+
+# Vendor extracted files & local reverse-engineering toolchains
+/extracted/
+/tools/
+
+# OS & editor files
+.DS_Store
+*.swp
+*~
+
+
+# Generated packages and local analysis dumps
+/dist/
+/docs/re/raw_solver/
+__pycache__/
+*.pyc
+.env
+.env.*
+*.pem
+*.key
+
+# Standalone diagnostic harness build outputs
+**/target/
+/docs/review/structurax-latest/reproductions/*/Cargo.lock

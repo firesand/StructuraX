@@ -1,0 +1,87 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "reconstruction-wave-2",
+  "full_reconstruction_complete": false,
+  "previous_checkpoint": "docs/reconstruction/validation-wave1.json",
+  "workspace_test_count": 127,
+  "workspace_tests": "passed",
+  "strict_workspace_clippy": "passed",
+  "native_build": "passed",
+  "workspace_format_check": {
+    "status": "not-clean",
+    "note": "Existing mixed formatting remains; no workspace-wide cosmetic rewrite was applied.",
+    "log": "target/reconstruction/wave2/format-check.log"
+  },
+  "selected_synthetic_reference_checks": {
+    "passed": 38,
+    "total": 38,
+    "full_vendor_suite": false
+  },
+  "native_sdb_corpus": {
+    "fixtures_present": 336,
+    "inventory_preservation_and_supported_roundtrip_tests": "passed in workspace suite",
+    "numerical_vendor_parity": false
+  },
+  "vendor_fixture_runtime": {
+    "input": "extracted/files/example_1_001.sdb",
+    "analyzed_cases": 7,
+    "output": "target/reconstruction/wave2/vendor-static-results.json",
+    "vendor_executable_run": false,
+    "import_subset_warning_visible": true
+  },
+  "gui": {
+    "tests": 10,
+    "headless_egui_tabs_rendered": 6,
+    "pointer_click_created_pattern_and_case": true,
+    "material_SI_defaults_and_type_change": "passed",
+    "S2K_assignment_roundtrip": "passed",
+    "new_native_OS_interaction_pass": false,
+    "previous_native_smoke": "docs/reconstruction/validation-wave1.json",
+    "full_tutorial_accepted": false
+  },
+  "solver": {
+    "tests": 52,
+    "notes": "docs/reconstruction/solver-wave2.md"
+  },
+  "model_and_api": {
+    "tests": 27,
+    "notes": "docs/reconstruction/editing-wave2.md"
+  },
+  "rea": {
+    "live_mcp_verified": true,
+    "version": "6.5.0",
+    "tools": 207,
+    "prompts": 6,
+    "managed_v19_metadata_inspected": true,
+    "target_code_executed": false,
+    "evidence": "docs/reconstruction/rea-connection-wave2.json"
+  },
+  "commands": [
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo build --workspace",
+    "target/debug/sap2000-rs verify",
+    "target/debug/sap2000-rs analyze extracted/files/example_1_001.sdb --output target/reconstruction/wave2/vendor-static-results.json"
+  ],
+  "logs": {
+    "workspace-tests.log": "target/reconstruction/wave2/workspace-tests.log",
+    "clippy.log": "target/reconstruction/wave2/clippy.log",
+    "build.log": "target/reconstruction/wave2/build.log",
+    "verify.log": "target/reconstruction/wave2/verify.log",
+    "vendor-static.log": "target/reconstruction/wave2/vendor-static.log"
+  },
+  "source_manifest": "target/reconstruction/wave2/source-manifest.json",
+  "source_manifest_sha256": "aac1c7c26b4c4165735ea68f54f9665a9522b5ef6ccfd154a1e3d3559d3deb1b",
+  "binary": {
+    "path": "target/debug/sap2000-rs",
+    "sha256": "5b418e267834a8d9f79952ae6b4b08b6f2d6fb5721b1f226eb3aa626b6824dab"
+  },
+  "limits": [
+    "No vendor executable or full differential suite run",
+    "Full nonlinear elements/cases, solids and cable behavior incomplete",
+    "General massless damping, exact link constraints, end-offset recovery and full dynamic histories incomplete",
+    "Arbitrary-model native SDB export and complete S2K preservation incomplete",
+    "Design codes, auto-select sections, generated combinations and broader GUI/API coverage partial",
+    "No full tutorial desktop, Windows or hardware-renderer acceptance"
+  ]
+}

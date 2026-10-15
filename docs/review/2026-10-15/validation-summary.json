@@ -1,0 +1,56 @@
+{
+  "date": "2026-10-15",
+  "baseline_tests_passed": 23,
+  "final_tests_passed": 56,
+  "checks": [
+    {
+      "check": "workspace-tests",
+      "exit_code": 0
+    },
+    {
+      "check": "clippy",
+      "exit_code": 0
+    },
+    {
+      "check": "build",
+      "exit_code": 0
+    },
+    {
+      "check": "help",
+      "exit_code": 0
+    },
+    {
+      "check": "verify",
+      "exit_code": 0
+    },
+    {
+      "check": "analyze-vendor",
+      "exit_code": 0
+    },
+    {
+      "check": "save-s2k",
+      "exit_code": 0
+    },
+    {
+      "check": "reload-s2k",
+      "exit_code": 0
+    },
+    {
+      "check": "section",
+      "exit_code": 0
+    },
+    {
+      "check": "invalid-units-rejected",
+      "exit_code": 1,
+      "expected_nonzero": true
+    }
+  ],
+  "reference_comparisons": 38,
+  "reference_families": 8,
+  "native_sdb_import_fixtures": 336,
+  "standard_pro_libraries": 28,
+  "s2k_roundtrip_case_results_equal": true,
+  "roundtrip_cases": 7,
+  "gui": "Native Xvfb/software OpenGL startup and Verify Suite click passed; both screenshots visually inspected. Full interaction and hardware GPU unverified.",
+  "original_vendor_execution": false
+}

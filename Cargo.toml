@@ -1,0 +1,55 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sap-units",
+    "crates/sap-model",
+    "crates/sap-section",
+    "crates/sap-format",
+    "crates/sap-solver",
+    "crates/sap-design",
+    "crates/sap-api",
+    "crates/sap-app",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["StructuraX Engineering Team"]
+description = "StructuraX — 3D Finite Element Structural Analysis & Code-Based Member Design Suite"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+anyhow = "1.0.98"
+flate2 = "1.1.1"
+rayon = "1.10.0"
+indexmap = { version = "2.9.0", features = ["serde"] }
+clap = { version = "4.5.38", features = ["derive"] }
+eframe = { version = "0.29.1", default-features = false, features = ["glow", "default_fonts", "x11"] }
+egui = { version = "0.29.1", default-features = false, features = ["default_fonts"] }
+
+sap-units = { path = "crates/sap-units" }
+sap-model = { path = "crates/sap-model" }
+sap-section = { path = "crates/sap-section" }
+sap-format = { path = "crates/sap-format" }
+sap-solver = { path = "crates/sap-solver" }
+sap-design = { path = "crates/sap-design" }
+sap-api = { path = "crates/sap-api" }
+
+[workspace.lints.clippy]
+needless_range_loop = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+field_reassign_with_default = "allow"
+manual_memcpy = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+

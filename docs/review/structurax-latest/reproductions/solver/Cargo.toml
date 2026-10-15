@@ -1,0 +1,14 @@
+[package]
+name="structurax-solver-repro"
+version="0.1.0"
+edition="2021"
+[dependencies]
+sap-solver={path="../../../../../crates/sap-solver"}
+sap-model={path="../../../../../crates/sap-model"}
+sap-units={path="../../../../../crates/sap-units"}
+
+[workspace]
+
+[[bin]]
+name = "structurax-solver-repro"
+path = "main.rs"

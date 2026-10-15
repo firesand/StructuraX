@@ -1,0 +1,379 @@
+{
+  "checked_on": "2026-10-15",
+  "source_page": "https://www.csiamerica.com/products/sap2000/videos",
+  "catalog_endpoint": "https://www.csiamerica.com/csi/extensions/VintenCloud/CSIProductDetailPage/24.2.1/services/DynamicContent.Service.ss?action=watch-and-learn",
+  "source_sha256": "7aeb5c215659aed5ef67ae475fb7bca242ec397dc2330a7203f4a63f4c725d5c",
+  "product_item_id": "4617",
+  "count": 46,
+  "evidence_level": "Public catalog metadata read. No video playback, transcript, or numerical validation performed.",
+  "entries": [
+    {
+      "id": "140",
+      "title": "SAP2000 v25.0.0 Enhancements",
+      "category": "CSI Spotlight",
+      "duration": "10m8s",
+      "url": "https://youtu.be/wQrxc2FQm8M",
+      "version_scope": "post-v19; exclude from v19 baseline"
+    },
+    {
+      "id": "120",
+      "title": "SAP2000 v23.0.0 Enhancements",
+      "category": "CSI Spotlight",
+      "duration": "9m43s",
+      "url": "https://youtu.be/uhEXAxTcCvw",
+      "version_scope": "post-v19; exclude from v19 baseline"
+    },
+    {
+      "id": "129",
+      "title": "Initialization of New Models",
+      "category": "CSI Spotlight",
+      "duration": "3m55s",
+      "url": "https://youtu.be/3Vcd5gXyyUA",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "143",
+      "title": "SAP2000 Extrusion Features",
+      "category": "CSI Spotlight",
+      "duration": "2m54s",
+      "url": "https://youtu.be/KK9XiDG3pA4",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "128",
+      "title": "How to use the Copy/Paste Assigns Tool",
+      "category": "CSI Spotlight",
+      "duration": "2m54s",
+      "url": "https://youtu.be/-qP7KGrMVkM",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "29",
+      "title": "Introductory Tutorial",
+      "category": "Introduction",
+      "duration": "30m17s",
+      "url": "https://youtu.be/2povDdw2pTQ",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "42",
+      "title": "Select Commands",
+      "category": "Modeling",
+      "duration": "6m49s",
+      "url": "https://youtu.be/Ck1-a4asRhA",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "41",
+      "title": "Draw Commands",
+      "category": "Modeling",
+      "duration": "9m29s",
+      "url": "https://youtu.be/aLCMg0P6pmw",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "43",
+      "title": "Nonprismatic Sections",
+      "category": "Modeling",
+      "duration": "6m22s",
+      "url": "https://youtu.be/ihltIW9AaSU",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "38",
+      "title": "Area Edge Constraints",
+      "category": "Modeling",
+      "duration": "3m13s",
+      "url": "https://youtu.be/nbotSbo1odU",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "39",
+      "title": "Tension-only Bracing",
+      "category": "Modeling",
+      "duration": "4m21s",
+      "url": "https://youtu.be/JkhYzTtwsKE",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "45",
+      "title": "Section Designer",
+      "category": "Modeling",
+      "duration": "13m23s",
+      "url": "https://youtu.be/1a-0Vbuejcs",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "46",
+      "title": "Cardinal Points",
+      "category": "Modeling",
+      "duration": "9m51s",
+      "url": "https://youtu.be/EHkm8TRywn0",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "49",
+      "title": "Cable Objects",
+      "category": "Modeling",
+      "duration": "18m40s",
+      "url": "https://youtu.be/xXZ77VoCZO8",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "50",
+      "title": "Tendons",
+      "category": "Modeling",
+      "duration": "10m33s",
+      "url": "https://youtu.be/0vHvYa4qPWQ",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "51",
+      "title": "Gap Elements",
+      "category": "Modeling",
+      "duration": "17m46s",
+      "url": "https://youtu.be/2xh4gRX9_A0",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "58",
+      "title": "Varying Mass in Seismic Analyses",
+      "category": "Modeling",
+      "duration": "17m13s",
+      "url": "https://youtu.be/z2LSPh0_I0k",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "172",
+      "title": "Foundation Properties and Assemblies",
+      "category": "Modeling",
+      "duration": "4m9s",
+      "url": "https://youtu.be/HZs44MY2-Mw",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "179",
+      "title": "TECH TIPS: Auto vs. Manual Meshing- SAP2000",
+      "category": "Modeling",
+      "duration": "3m45s",
+      "url": "https://youtu.be/MYEcqV96T_8",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "54",
+      "title": "Wave Loading",
+      "category": "Loading",
+      "duration": "5m24s",
+      "url": "https://youtu.be/GCDj25WeCOI",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "31",
+      "title": "Automated Wind Loads",
+      "category": "Loading",
+      "duration": "18m43s",
+      "url": "https://youtu.be/Sn_VokPsKw4",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "144",
+      "title": "Define and Assign Joint Patterns in SAP2000",
+      "category": "Loading",
+      "duration": "4m45s",
+      "url": "https://youtu.be/7maeesL8POU",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "32",
+      "title": "Mass and Modal Analysis",
+      "category": "Analysis",
+      "duration": "5m46s",
+      "url": "https://youtu.be/3ZbKg-oVC5I",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "36",
+      "title": "P-Delta Analysis",
+      "category": "Analysis",
+      "duration": "10m17s",
+      "url": "https://youtu.be/YzWocAtK03I",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "40",
+      "title": "Response Spectrum Analysis",
+      "category": "Analysis",
+      "duration": "5m31s",
+      "url": "https://youtu.be/mryI8Jij7F0",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "33",
+      "title": "Modal Time History Analysis",
+      "category": "Analysis",
+      "duration": "14m4s",
+      "url": "https://youtu.be/VjkqA4_hlMk",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "52",
+      "title": "Nonlinear Staged Construction",
+      "category": "Analysis",
+      "duration": "7m48s",
+      "url": "https://youtu.be/L-HT3KTUa4w",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "37",
+      "title": "Nonlinear Shear Walls",
+      "category": "Analysis",
+      "duration": "29m49s",
+      "url": "https://youtu.be/Y7z6IYxF-eQ",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "30",
+      "title": "Static Pushover Analysis",
+      "category": "Analysis",
+      "duration": "10m40s",
+      "url": "https://youtu.be/CzqZVDse-eI",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "53",
+      "title": "Power Spectral Density",
+      "category": "Analysis",
+      "duration": "12m50s",
+      "url": "https://youtu.be/MmdPgA-RLdE",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "55",
+      "title": "Model Alive",
+      "category": "Analysis",
+      "duration": "4m52s",
+      "url": "https://youtu.be/QyJCmZ0cziU",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "35",
+      "title": "Buckling Factors and Modes",
+      "category": "Analysis",
+      "duration": "7m22s",
+      "url": "https://youtu.be/gmNOmGOSIK0",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "34",
+      "title": "Fast Nonlinear Analysis",
+      "category": "Analysis",
+      "duration": "17m58s",
+      "url": "https://youtu.be/ufbFG9e4yjU",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "60",
+      "title": "Steady-State Vibration",
+      "category": "Analysis",
+      "duration": "17m36s",
+      "url": "https://youtu.be/vNGcyZgQqkk",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "61",
+      "title": "Modeling Beam-Column Joint Flexibility",
+      "category": "Analysis",
+      "duration": "12m5s",
+      "url": "https://youtu.be/39Qc-CmZFGQ",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "169",
+      "title": "Merge Analysis Results",
+      "category": "Analysis",
+      "duration": "4m6s",
+      "url": "https://youtu.be/eO-j5K33Xn4",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "57",
+      "title": "CSiLoadOptimizer",
+      "category": "Design",
+      "duration": "10m36s",
+      "url": "https://youtu.be/2iGsJMY_-84",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "62",
+      "title": "Concrete Shell Reinforcement Design",
+      "category": "Design",
+      "duration": "16m56s",
+      "url": "https://youtu.be/arcy8tDbh3Q",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "170",
+      "title": "TECH TIPS: Create Multi-Step Animation Video- SAP2000",
+      "category": "Output and Display",
+      "duration": "4m6s",
+      "url": "https://youtu.be/GFCi0TfkasM",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "48",
+      "title": "Creating Reports",
+      "category": "Reporting",
+      "duration": "11m17s",
+      "url": "https://youtu.be/SFNS22hUObk",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "56",
+      "title": "Open Application Programming Interface",
+      "category": "Tools",
+      "duration": "13m54s",
+      "url": "https://youtu.be/QRdXGi0g0BE",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "59",
+      "title": "Web Activated Licensing",
+      "category": "Tools",
+      "duration": "13m59s",
+      "url": "https://youtu.be/frfHM1yNKck",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "44",
+      "title": "Interactive Database Editing",
+      "category": "Database Tables",
+      "duration": "7m59s",
+      "url": "https://youtu.be/YIrv_W0xlT0",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "47",
+      "title": "Displaying Tabular Data",
+      "category": "Database Tables",
+      "duration": "9m14s",
+      "url": "https://youtu.be/nda5Mov-82k",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "180",
+      "title": "TECH TIPS: Interactive Database Editing- SAP2000",
+      "category": "Database Tables",
+      "duration": "4m57s",
+      "url": "https://youtu.be/F9FHp-QZDOU",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    },
+    {
+      "id": "142",
+      "title": "Import of DXF Models",
+      "category": "Import and Export",
+      "duration": "3m13s",
+      "url": "https://youtu.be/rZE_KoeUI24",
+      "version_scope": "unverified; check video and v19 references before implementation"
+    }
+  ]
+}

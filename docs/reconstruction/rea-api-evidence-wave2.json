@@ -1,0 +1,322 @@
+{
+  "checkpoint": "2026-10-15-wave2",
+  "evidence_id": "ev_df0b96fd587ac80c13943569dd6d7019246cc1cdbe43b044a610b7d0b42341d8",
+  "artifact": {
+    "path": "/home/edo/REA/extracted/files/sap2000v19.dll",
+    "sha256": "f01b1f380c12566bb3046a586cce022a495d7114b8157c4b5a2215ac818b4b63",
+    "byte_length": 368560,
+    "format": "pe"
+  },
+  "module": {
+    "name": "SAP2000v19.dll",
+    "generation": 0,
+    "mvid": "920afd3b-edef-4c12-ae75-fcbf9d84780e",
+    "enc_id": null,
+    "enc_base_id": null,
+    "token": "0x00000001",
+    "row_offset": 51252
+  },
+  "selection": {
+    "type_names": [
+      "SAP2000v19.cPropMaterial",
+      "SAP2000v19.cEditGeneral",
+      "SAP2000v19.cEditFrame"
+    ],
+    "unmatched_type_names": []
+  },
+  "coverage": {
+    "state": "complete",
+    "issues": []
+  },
+  "methods": [
+    {
+      "declaring_type": "SAP2000v19.cPropMaterial",
+      "name": "SetOConcrete",
+      "token": "0x060008e0",
+      "signature": {
+        "raw_length": 14,
+        "raw_sha256": "ee68eb20f224a6eb68cc4f2d5e2f00e18d8167ec00cc5f762c808b15481e7f58",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 11,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "r8",
+          "bool",
+          "r8",
+          "i4",
+          "i4",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "r8"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cPropMaterial",
+      "name": "SetOConcrete_1",
+      "token": "0x060008e1",
+      "signature": {
+        "raw_length": 15,
+        "raw_sha256": "48d16a8a000b77e235f6aa89b31f76f0f6b207d34ea3d47b3e7aad9df732f6e4",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 12,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "r8",
+          "bool",
+          "r8",
+          "i4",
+          "i4",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "r8"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cPropMaterial",
+      "name": "SetOSteel",
+      "token": "0x060008e5",
+      "signature": {
+        "raw_length": 14,
+        "raw_sha256": "664b513350baa9ba495896a1e7a161bd003a0797423f3a53edfcbcbc6fb71e3a",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 11,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "i4",
+          "i4",
+          "r8",
+          "r8",
+          "r8",
+          "r8"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cPropMaterial",
+      "name": "SetOSteel_1",
+      "token": "0x060008e6",
+      "signature": {
+        "raw_length": 15,
+        "raw_sha256": "2a4371221c38838e72cf5a233cea37e747ba12caf9dd811205dbbd7937c5fc03",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 12,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "i4",
+          "i4",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "r8"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cPropMaterial",
+      "name": "SetOConcrete_2",
+      "token": "0x060008f3",
+      "signature": {
+        "raw_length": 16,
+        "raw_sha256": "f99ff53f4aacd7e672f995331dd8b655f3689a345744cf51980751b03368cbe5",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 13,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "r8",
+          "r8",
+          "bool",
+          "r8",
+          "i4",
+          "i4",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "r8",
+          "r8"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cEditFrame",
+      "name": "DivideAtDistance",
+      "token": "0x06000bb8",
+      "signature": {
+        "raw_length": 9,
+        "raw_sha256": "414ec7a36e71b187b81b33a80da06c8ad3bf99d7a562051fb2cef4f74ae3989e",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 4,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "r8",
+          "bool",
+          "string[]&"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cEditFrame",
+      "name": "DivideAtIntersections",
+      "token": "0x06000bb9",
+      "signature": {
+        "raw_length": 9,
+        "raw_sha256": "4035f554ac50109b6611f0e74130678c8b565ee3954e12a20dd79f203f40cbbf",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 3,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "i4&",
+          "string[]&"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cEditFrame",
+      "name": "DivideByRatio",
+      "token": "0x06000bba",
+      "signature": {
+        "raw_length": 9,
+        "raw_sha256": "ebb4f6ce1c81ada8f40fd8ef9185af95c21683c629d423ae6c539e70ab38b89c",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 4,
+        "return_type": "i4",
+        "parameter_types": [
+          "string",
+          "i4",
+          "r8",
+          "string[]&"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cEditGeneral",
+      "name": "Move",
+      "token": "0x06000bc6",
+      "signature": {
+        "raw_length": 6,
+        "raw_sha256": "83d7299cc2982d9536ecb6dfcbcf2e19dd7f85075ded898cb1ac95be5ebf923b",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 3,
+        "return_type": "i4",
+        "parameter_types": [
+          "r8",
+          "r8",
+          "r8"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    },
+    {
+      "declaring_type": "SAP2000v19.cEditGeneral",
+      "name": "ReplicateLinear",
+      "token": "0x06000bce",
+      "signature": {
+        "raw_length": 16,
+        "raw_sha256": "fdea6f3f0882591b36e502d8d092457d4c7db02b65ae59dcb076b9336ddeafd1",
+        "kind": "method",
+        "parse_status": "decoded",
+        "calling_convention": "default has-this",
+        "generic_parameter_count": null,
+        "parameter_count": 8,
+        "return_type": "i4",
+        "parameter_types": [
+          "r8",
+          "r8",
+          "r8",
+          "i4",
+          "i4&",
+          "string[]&",
+          "i4[]&",
+          "bool"
+        ],
+        "field_type": null,
+        "issue": null
+      },
+      "body_status": "absent"
+    }
+  ],
+  "limitations": [
+    "Metadata tokens are build-local coordinates and are only meaningful with the reported artifact SHA-256 and MVID.",
+    "CIL instruction anchors are decoded from file-backed method bodies only; no target assembly is loaded or executed.",
+    "Exported types are reported from ExportedType rows as declared; forwarded types are not resolved in their implementing assemblies.",
+    "User strings are the #US literals loaded by ldstr in the inspected method bodies, with their own coverage; instruction anchors and normalized CIL digests keep their build-local tokens.",
+    "Member signatures decode ECMA-335 primitive, class, valuetype, generic instantiation, generic variable, pointer, byref, single-dimension and general array, function pointer, custom modifier, and typed reference forms; class and valuetype operands keep their encoded TypeDefOrRefOrSpec values, and unsupported forms such as vararg sentinels retain raw signature hashes.",
+    "Types, fields, methods, call edges, field accesses, and user strings cover only the selected declaring types; coverage describes that selection. Edge targets outside it keep their names but are not described."
+  ]
+}

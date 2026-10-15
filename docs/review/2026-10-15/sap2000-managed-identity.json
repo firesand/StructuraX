@@ -1,0 +1,79 @@
+{
+  "evidence_id": "ev_7a4c25dbfbba16b340883c4ef5aa0736d0c1239bcbf3f53b90d4fa12b148fdce",
+  "subject": {
+    "name": "sap2000.exe",
+    "digest": {
+      "sha256": "e32030006c5f7ad9cd66feceb9ce8579a6b91dd399d00b5cd2744b2826ab55c5"
+    },
+    "local_path": "/home/edo/REA/extracted/files/sap2000.exe",
+    "format": "pe",
+    "architecture": "x86_64"
+  },
+  "provider": {
+    "id": "rea-dotnet-static",
+    "name": "REA managed static analysis provider",
+    "version": "1"
+  },
+  "operation": "inspect_managed_artifact",
+  "limitations": [
+    "Static inspection did not load the assembly, resolve dependencies through a CLR, decompile C#, or execute target code."
+  ],
+  "classification": {
+    "status": "managed",
+    "container": "pe",
+    "runtime_family": "dotnet-framework",
+    "implementation": "cil",
+    "managed_architecture": "x86_64",
+    "evidence": [
+      {
+        "code": "cli-header-observed",
+        "detail": "A file-backed PE CLI header and metadata root were admitted.",
+        "file_offset": 528
+      },
+      {
+        "code": "target-framework-observed",
+        "detail": "An assembly-level TargetFrameworkAttribute names .NET Framework.",
+        "file_offset": 33903894
+      },
+      {
+        "code": "managed-architecture-derived",
+        "detail": "Managed architecture x86_64 is derived from PE machine and CLI flags.",
+        "file_offset": 544
+      }
+    ]
+  },
+  "metadata_counts": {
+    "Module": 1,
+    "TypeRef": 2796,
+    "TypeDef": 2721,
+    "Field": 43132,
+    "MethodDef": 71198,
+    "Param": 106570,
+    "InterfaceImpl": 268,
+    "MemberRef": 31425,
+    "Constant": 9257,
+    "CustomAttribute": 54445,
+    "FieldMarshal": 146,
+    "DeclSecurity": 3,
+    "ClassLayout": 18,
+    "StandAloneSig": 8950,
+    "EventMap": 3,
+    "Event": 32,
+    "PropertyMap": 36,
+    "Property": 2183,
+    "MethodSemantics": 3181,
+    "MethodImpl": 3922,
+    "ModuleRef": 27,
+    "TypeSpec": 777,
+    "ImplMap": 200,
+    "FieldRVA": 22,
+    "Assembly": 1,
+    "AssemblyRef": 33,
+    "ManifestResource": 456,
+    "NestedClass": 1638,
+    "GenericParam": 7,
+    "MethodSpec": 1286,
+    "GenericParamConstraint": 2
+  },
+  "complete_evidence_path": "/home/edo/REA/target/review/2026-10-15/sap2000-managed-identity.json"
+}

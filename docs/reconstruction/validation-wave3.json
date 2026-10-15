@@ -1,0 +1,98 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "reconstruction-wave-3",
+  "full_reconstruction_complete": false,
+  "previous_checkpoint": "docs/reconstruction/validation-wave2.json",
+  "workspace_test_count": 167,
+  "workspace_tests": "passed",
+  "workspace_test_suites": 26,
+  "strict_workspace_clippy": "passed",
+  "native_build": "passed",
+  "workspace_format_check": {
+    "status": "not-repeated",
+    "note": "Historical mixed formatting remains; no workspace-wide cosmetic rewrite was applied. New and edited standalone modules were formatted."
+  },
+  "selected_synthetic_reference_checks": {
+    "passed": 38,
+    "total": 38,
+    "full_vendor_suite": false
+  },
+  "native_sdb_corpus": {
+    "fixtures_present": 336,
+    "inventory_preservation_and_supported_roundtrip_tests": "passed in workspace suite",
+    "supported_model_roundtrips": 334,
+    "explicit_unsupported_history_rejections": 2,
+    "numerical_vendor_parity": false
+  },
+  "vendor_fixture_runtime": {
+    "input": "extracted/files/example_1_001.sdb",
+    "analyzed_cases": 7,
+    "output": "target/reconstruction/wave3/vendor-static-results.json",
+    "vendor_executable_run": false,
+    "import_subset_warning_visible": true
+  },
+  "gui": {
+    "application_tests": 12,
+    "headless_case_controls_rendered": true,
+    "pointer_click_created_dynamic_function": true,
+    "new_native_OS_interaction_pass": false,
+    "previous_native_smoke": "docs/reconstruction/validation-wave1.json",
+    "full_tutorial_accepted": false,
+    "notes": "docs/reconstruction/application-wave3.md"
+  },
+  "solver": {
+    "tests": 67,
+    "notes": "docs/reconstruction/solver-wave3.md"
+  },
+  "design": {
+    "tests": 20,
+    "notes": "docs/reconstruction/design-wave3.md"
+  },
+  "format_and_model": {
+    "tests": 41,
+    "preservation_tests": 11,
+    "notes": "docs/reconstruction/formats-wave3.md"
+  },
+  "api": {
+    "tests": 22,
+    "notes": "docs/reconstruction/application-wave3.md"
+  },
+  "rea": {
+    "connection_evidence_checkpoint": "wave-2",
+    "version_at_that_checkpoint": "6.5.0",
+    "evidence": "docs/reconstruction/rea-connection-wave2.json",
+    "target_code_executed": false,
+    "setup_repeated_this_wave": false
+  },
+  "commands": [
+    "cargo test --workspace",
+    "cargo clippy --workspace --all-targets -- -D warnings",
+    "cargo build --workspace",
+    "target/debug/sap2000-rs verify",
+    "target/debug/sap2000-rs analyze extracted/files/example_1_001.sdb --output target/reconstruction/wave3/vendor-static-results.json",
+    "cargo test -p sap-format test_sdb_roundtrip_and_vendor_combos -- --nocapture"
+  ],
+  "logs": {
+    "workspace-tests.log": "target/reconstruction/wave3/workspace-tests.log",
+    "clippy.log": "target/reconstruction/wave3/clippy.log",
+    "build.log": "target/reconstruction/wave3/build.log",
+    "verify.log": "target/reconstruction/wave3/verify.log",
+    "vendor-static.log": "target/reconstruction/wave3/vendor-static.log",
+    "native-corpus-counts.log": "target/reconstruction/wave3/native-corpus-counts.log"
+  },
+  "source_manifest": "target/reconstruction/wave3/source-manifest.json",
+  "source_manifest_sha256": "cf4561be0830dfa0d96cd5603aadf9b8ceb80f2034050bf43788331b5fea4e32",
+  "binary": {
+    "path": "target/debug/sap2000-rs",
+    "sha256": "a533653aa3616cc5729874e64ca7dfbbb082c777d6eb96995d4ad1c1f1344cc8"
+  },
+  "limits": [
+    "No vendor executable or full differential suite run",
+    "Nonlinear laws beyond small-displacement Gap/Hook, combined contact/P-Delta, solids, cables and nonlinear dynamics incomplete",
+    "General massless damping, exact link constraints, end-offset recovery and full dynamic histories incomplete",
+    "Arbitrary-model native SDB export absent; S2K opaque preservation does not implement unknown semantics and ambiguous edits reject",
+    "Design codes, auto-select sections, generated combinations and broader GUI/API coverage partial",
+    "No full tutorial desktop, Windows or hardware-renderer acceptance"
+  ]
+}
+
