@@ -562,6 +562,12 @@ fn reject_unreportable_beam_m2(
     model: &SapModel,
     combo_forces: &[(String, Vec<(String, Vec<sap_model::FrameStationResult>)>)],
 ) -> Result<(), DesignError> {
+    // M2 and M3 have identical dimensions. Use a dimensionless comparison so
+    // roundoff-sized local-2 moments on an otherwise major-axis beam do not
+    // depend on the model's current force/length units. If M2 is the only
+    // flexural demand, it sets the scale and is therefore still rejected.
+    const RELATIVE_ZERO_TOLERANCE: f64 = 1.0e-9;
+
     for (frame_name, frame) in &model.frames {
         let Some(section) = model.frame_sections.get(&frame.section) else {
             continue;
@@ -573,9 +579,21 @@ fn reject_unreportable_beam_m2(
         if !is_concrete || is_concrete_column(model, frame, section) {
             continue;
         }
+
+        let moment_scale = combo_forces
+            .iter()
+            .flat_map(|(_, frames)| frames.iter())
+            .filter(|(name, _)| name == frame_name)
+            .flat_map(|(_, stations)| stations.iter())
+            .map(|station| station.m2.abs().max(station.m3.abs()))
+            .fold(0.0_f64, f64::max);
+
         for (_, frames) in combo_forces {
             for (_, stations) in frames.iter().filter(|(name, _)| name == frame_name) {
-                if let Some(station) = stations.iter().find(|station| station.m2.abs() > 1e-9) {
+                if let Some(station) = stations
+                    .iter()
+                    .find(|station| station.m2.abs() > RELATIVE_ZERO_TOLERANCE * moment_scale)
+                {
                     return Err(DesignError::UnsupportedBeamMinorAxisFlexure {
                         frame: frame_name.clone(),
                         m2: station.m2.to_string(),

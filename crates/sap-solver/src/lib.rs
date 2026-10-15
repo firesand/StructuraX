@@ -349,9 +349,12 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 | LoadCaseType::NonlinearHistory
                 | LoadCaseType::NonlinearDynamic
         ) {
-            if lc.max_iterations == 0 || !lc.convergence_tol.is_finite() || lc.convergence_tol <= 0.
+            if lc.max_iterations == 0
+                || !lc.convergence_tol.is_finite()
+                || lc.convergence_tol <= 0.
+                || lc.convergence_tol >= 1.
             {
-                return Err(SolverError::InvalidInput(format!("case '{name}' needs positive nonlinear iteration count and finite positive tolerance")));
+                return Err(SolverError::InvalidInput(format!("case '{name}' needs positive nonlinear iteration count and finite relative tolerance in (0,1)")));
             }
             for object in model.links.values() {
                 let prop = &model.link_props[&object.prop];
@@ -3380,8 +3383,10 @@ fn run_time_history_case(
     let mut t_peak = 0.0;
     let mut peak_norm = 0.0f64;
     let mut nl_link_peak: IndexMap<(String, usize), f64> = IndexMap::new();
-    let mut reaction_base = k_base.to_vec();
-    let mut reaction_struct = k_struct.to_vec();
+    // Linear history borrows the assembled matrices. Only nonlinear history
+    // owns a separately assembled constitutive base for reaction recovery.
+    let mut reaction_base = std::borrow::Cow::Borrowed(k_base);
+    let mut reaction_struct = std::borrow::Cow::Borrowed(k_struct);
 
     let mut time_steps = Vec::with_capacity(n_steps + 1);
     let mut time_history_disp: IndexMap<String, Vec<[f64; 6]>> = IndexMap::new();
@@ -3414,15 +3419,15 @@ fn run_time_history_case(
             &linear_struct,
             ndof,
         );
-        reaction_base.clone_from(&linear_base);
-        reaction_struct.clone_from(&linear_struct);
+        reaction_base = std::borrow::Cow::Owned(linear_base);
+        reaction_struct = std::borrow::Cow::Owned(linear_struct);
         let u_init = initial_displacement_vector(model, lc, work_points, ndof);
         let mut integrator = dynamics::NonlinearStepper::new(
             model,
             work_points,
             pt_index,
             joint_rot,
-            &linear_base,
+            &reaction_base,
             diag_mass,
             &is_fixed,
             lc,

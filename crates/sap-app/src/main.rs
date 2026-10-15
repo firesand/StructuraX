@@ -9,8 +9,8 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sap_design::{try_run_concrete_design, try_run_steel_design};
 use sap_format::{
-    inspect_native_sdb, inspect_native_sdb_file, load_model_with_report, pack_model_to_native_sdb,
-    save_s2k_file_with_report, save_sdb_file_with_report, write_sdb_bytes,
+    inspect_native_sdb_file, load_model_with_report, save_native_sdb_file,
+    save_s2k_file_with_report, save_sdb_file_with_report,
 };
 use sap_section::ProDatabase;
 use sap_solver::{analyze_model, benchmarks::run_verification_suite};
@@ -288,8 +288,8 @@ fn run_cli_export_native_sdb(input: &std::path::Path, output: &std::path::Path) 
     for warning in &report.warnings {
         eprintln!("Import warning: {warning}");
     }
-    let sdb = pack_model_to_native_sdb(&report.model)?;
-    let doc = inspect_native_sdb(&sdb)?;
+    save_native_sdb_file(&report.model, output)?;
+    let doc = inspect_native_sdb_file(output)?;
     let inv = doc.inventory();
     anyhow::ensure!(
         inv.parsed_bytes == inv.stream_bytes,
@@ -297,23 +297,6 @@ fn run_cli_export_native_sdb(input: &std::path::Path, output: &std::path::Path) 
         inv.parsed_bytes,
         inv.stream_bytes
     );
-    let bytes = write_sdb_bytes(&sdb)?;
-    use std::io::Write;
-    let mut destination = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output)
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "Cannot create {} without overwriting: {error}",
-                output.display()
-            )
-        })?;
-    if let Err(error) = destination.write_all(&bytes) {
-        drop(destination);
-        let _ = std::fs::remove_file(output);
-        return Err(error.into());
-    }
     println!(
         "Exported experimental SDB stream to {} ({} bytes consumed by the internal schema parser; vendor application acceptance is unverified).",
         output.display(),
@@ -325,7 +308,6 @@ fn run_cli_export_native_sdb(input: &std::path::Path, output: &std::path::Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sap_format::save_native_sdb_file;
 
     #[test]
     fn native_sdb_cli_copy_is_exact_and_never_overwrites() {
@@ -341,7 +323,7 @@ mod tests {
         let input = std::env::temp_dir().join(format!("{unique}-input.sdb"));
         let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
         // This test exercises the explicitly supported steel-only native subset.
-        // Default concrete metadata is tested as a rejection by the format crate.
+        // The separate handwritten-S2K test also covers the default concrete metadata.
         model.materials.shift_remove("4000Psi");
         model.area_sections.clear();
         save_native_sdb_file(&model, &input).unwrap();
@@ -371,7 +353,7 @@ mod tests {
         let input = std::env::temp_dir().join(format!("{unique}-input.sdb"));
         let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
         // This test exercises the explicitly supported steel-only native subset.
-        // Default concrete metadata is tested as a rejection by the format crate.
+        // The separate handwritten-S2K test also covers the default concrete metadata.
         model.materials.shift_remove("4000Psi");
         model.area_sections.clear();
         save_native_sdb_file(&model, &input).unwrap();
@@ -384,6 +366,44 @@ mod tests {
         assert!(error.to_string().contains("without overwriting"));
         assert_eq!(std::fs::read(&output).unwrap(), original);
         std::fs::remove_file(output).unwrap();
+        std::fs::remove_file(input).unwrap();
+    }
+
+    #[test]
+    fn native_sdb_cli_exports_handwritten_s2k_without_discarding_opaque_fields() {
+        let unique = format!(
+            "structurax-handwritten-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let input = std::env::temp_dir().join(format!("{unique}.s2k"));
+        let output = std::env::temp_dir().join(format!("{unique}.sdb"));
+        let source = "TABLE: \"JOINT COORDINATES\"\n Joint=A XorR=0 Y=0 Z=0\n Joint=B XorR=120 Y=0 Z=0\nTABLE: \"CONNECTIVITY - FRAME\"\n Frame=F JointI=A JointJ=B\nEND TABLE DATA\n";
+        std::fs::write(&input, source).unwrap();
+        run_cli_export_native_sdb(&input, &output).unwrap();
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), source);
+        let reopened = sap_format::load_sdb_file(&output).unwrap();
+        assert_eq!(reopened.points["B"].x, 120.);
+        assert_eq!(reopened.frames["F"].point_i, "A");
+        assert_eq!(reopened.frames["F"].point_j, "B");
+        let bytes = std::fs::read(&output).unwrap();
+        assert!(run_cli_export_native_sdb(&input, &output)
+            .unwrap_err()
+            .to_string()
+            .contains("without overwriting"));
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        std::fs::remove_file(&output).unwrap();
+        std::fs::write(
+            &input,
+            source.replace("Joint=A XorR=0", "Joint=A VendorTag=retain XorR=0"),
+        )
+        .unwrap();
+        let error = run_cli_export_native_sdb(&input, &output).unwrap_err();
+        assert!(error.to_string().contains("VENDORTAG"), "{error}");
+        assert!(!output.exists());
         std::fs::remove_file(input).unwrap();
     }
 }

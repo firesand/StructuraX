@@ -14,7 +14,7 @@ H3-6 now has the manual's separate equations (`aisc36010.txt:5583-5607`, printed
 
 ## Concrete beam M2 boundary
 
-Beam local-2 flexure is now explicitly rejected for both ACI 318-14 and EC2. `ConcreteDesignResult` contains only `as_top` and `as_bot`; using their max to report local-2 side-face reinforcement conflates two different faces and cannot produce a reliable detailing requirement. No shared model/API schema was changed. ACI and EC2 tests assert that nonzero beam M2 returns `UnsupportedBeamMinorAxisFlexure` and clears results instead of presenting a plausible-looking top/bottom design. Concrete columns continue to use their existing biaxial PMM interaction result. `docs/reconstruction/design-wave4.md` was corrected to describe this support boundary.
+Beam local-2 flexure is explicitly rejected for both ACI 318-14 and EC2. `ConcreteDesignResult` contains only `as_top` and `as_bot`; using their max to report local-2 side-face reinforcement conflates two different faces and cannot produce a reliable detailing requirement. No shared model/API schema was changed. ACI and EC2 tests assert that meaningful beam M2 returns `UnsupportedBeamMinorAxisFlexure` and clears results instead of presenting a plausible-looking top/bottom design. The zero test is dimensionless: `|M2|` is compared with `1e-9` times the largest absolute M2/M3 demand for that beam over its stations and combinations. Thus conversion between force/length units preserves the decision, while M2-only flexure remains rejected regardless of magnitude. Concrete columns continue to use their existing biaxial PMM interaction result. `docs/reconstruction/design-wave4.md` was corrected to describe this support boundary.
 
 ## Validation
 

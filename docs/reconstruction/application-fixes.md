@@ -28,7 +28,16 @@ atomic rejection of invalid definitions and solid changes.
 
 Native-export APIs continue using the format crate's checked preflight. Errors
 remain available in `last_file_error`; successful saves also retain an experimental
-export warning. The GUI retains the same warning. CLI export completes semantic and parser checks in memory and uses exclusive file creation, refusing to overwrite an existing destination. Its regression checks that the existing bytes survive a repeated export. API/GUI saves retain their existing overwrite behavior after successful preflight; this is not an atomic-I/O guarantee. The CLI describes internal parser coverage and explicitly states that vendor application acceptance is unverified.
+export warning. The GUI retains the same warning. All native-export entry points
+now share exclusive destination creation: existing files (including symlinks)
+are refused. The writer synchronizes the file, reads it back, compares exact
+serialized bytes and inspects the actual stream before success; an I/O or
+verification failure removes the new incomplete output. The CLI also reopens
+and inspects the destination for its report. No existing file is truncated.
+Tests inject truncated/corrupt writes and I/O failures, check repeat saves through
+the API and CLI, and verify handwritten S2K conversion with unknown-column refusal.
+This policy applies to native exports; ordinary S2K/private saves are unchanged.
+Vendor application acceptance remains unverified.
 
 The Rust facade is not a COM implementation. Existing actual solid/cable methods
 are `cPropSolid::set_prop(name, material, a, b, c, incompatible)`, property `count`,

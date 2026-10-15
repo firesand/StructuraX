@@ -458,3 +458,28 @@ fn cable_prescribed_free_joint_includes_actuator_reaction() {
     close(r.joint_reactions["I"][0], -10.);
     close(r.base_reactions[0], 0.);
 }
+
+#[test]
+fn nonlinear_case_relative_tolerance_must_be_between_zero_and_one() {
+    for case_type in [
+        LoadCaseType::NonlinearStatic,
+        LoadCaseType::NonlinearHistory,
+    ] {
+        for tolerance in [0., 1., 2., f64::NAN, f64::INFINITY] {
+            let mut m = base();
+            m.points["J"].spring[0] = 100.;
+            m.points["J"].mass[0] = 1.;
+            force(&mut m, [1., 0., 0., 0., 0., 0.]);
+            history(&mut m, "H", 1);
+            m.load_cases["H"].case_type = case_type;
+            m.load_cases["H"].convergence_tol = tolerance;
+            let error = analyze_model(&mut m).unwrap_err();
+            assert!(matches!(error, SolverError::InvalidInput(_)), "{error}");
+            assert!(
+                error.to_string().contains("relative tolerance in (0,1)"),
+                "{error}"
+            );
+            assert!(m.case_results.is_empty());
+        }
+    }
+}

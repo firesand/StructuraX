@@ -350,6 +350,7 @@ impl cFile<'_> {
 
     /// Exports the supported model subset as an experimental native `cBinaryStream` file.
     /// Unsupported/lossy state rejects before writing; vendor runtime acceptance is unverified.
+    /// The destination must be new; written bytes are read back and verified before success.
     pub fn save_native_sdb(&mut self, file_name: &str) -> i32 {
         if file_name.trim().is_empty() {
             self.api.last_file_error = Some("Empty native SDB destination path".to_string());

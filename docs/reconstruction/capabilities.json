@@ -455,7 +455,7 @@
           "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Opaque S2K preservation, unimplemented represented assignments and non-roundtrippable data reject instead of disappearing. Default concrete metadata is among the rejected states; callers must deliberately select a supported model subset. Internal schema success is not licensed vendor-runtime acceptance."
+      "limits": "Recognized S2K source formatting is accepted; opaque tables/columns and unrepresented assignments reject. Native import defaults independent shear-rebar Fys to Fy as a reconstruction fallback; unequal Fys cannot be exported. All native export entry points require a new destination and verify disk readback. Internal schema success is not licensed vendor-runtime acceptance."
     },
     {
       "id": "oapi",

@@ -26,6 +26,38 @@ use crate::FormatError;
 pub mod native;
 pub use native::{pack_model_to_native_sdb, save_native_sdb_file};
 
+// Native materials store Windows COLORREF integers. Keep the common canonical
+// names and preserve every other integer exactly rather than guessing a name.
+fn native_material_color(value: i32) -> String {
+    match value {
+        0x000000 => "Black".into(),
+        0x0000ff => "Red".into(),
+        0x00ff00 => "Green".into(),
+        0xff0000 => "Blue".into(),
+        0x00ffff => "Yellow".into(),
+        0xff00ff => "Magenta".into(),
+        0xffff00 => "Cyan".into(),
+        0xffffff => "White".into(),
+        0x808080 => "Gray".into(),
+        _ => format!("ColorRef:{value}"),
+    }
+}
+
+fn material_colorref(value: &str) -> Option<i32> {
+    match value {
+        "Black" => Some(0x000000),
+        "Red" => Some(0x0000ff),
+        "Green" => Some(0x00ff00),
+        "Blue" => Some(0xff0000),
+        "Yellow" => Some(0x00ffff),
+        "Magenta" => Some(0xff00ff),
+        "Cyan" => Some(0xffff00),
+        "White" => Some(0xffffff),
+        "Gray" => Some(0x808080),
+        _ => value.strip_prefix("ColorRef:")?.parse().ok(),
+    }
+}
+
 const SDB_SCHEMAS_TXT: &str = include_str!("sdb_schemas.txt");
 
 /// Maximum allowed decompressed `.sdb` stream size (128 MiB) to prevent decompression bombs.
@@ -1168,6 +1200,9 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             mat_type,
             ..Material::default_steel_kip_in()
         };
+        if let Some(color) = m.get("m_color").and_then(SdbVal::as_i32) {
+            mat.color = native_material_color(color);
+        }
         if let Some(mts) = m.get("m_Mt").and_then(|v| v.as_arr_obj()) {
             if let Some(mt0) = mts.first() {
                 if let Some(w) = mt0.get("m_w").and_then(|v| v.as_f64()) {
@@ -1211,6 +1246,10 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 }
             }
         }
+        // SapModel's independent shear-rebar Fys has no observed native scalar.
+        // Use the material yield as a reconstruction fallback; native synthesis
+        // rejects an independent Fys which this projection cannot preserve.
+        mat.fys = mat.fy;
         model.materials.insert(name, mat);
     }
 

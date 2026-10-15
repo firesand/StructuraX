@@ -960,7 +960,7 @@ mod tests {
 
         let mut box_sec = make_box_tube("BOX_EC3", "A992Fy50", 10.0, 6.0, 0.5, 0.5);
         box_sec.as3 = 1000.0; // Deliberately unlike the section's EC3 local-3 shear area.
-        // EN 1993-1-1 6.2.6(3)(f), V3 parallel to width: Av=A*b/(b+h).
+                              // EN 1993-1-1 6.2.6(3)(f), V3 parallel to width: Av=A*b/(b+h).
         let expected_ec3_box = box_sec.area * 6.0 / (6.0 + 10.0) * 50.0 / 3.0_f64.sqrt();
         assert!((compute_ec3_minor_shear(&box_sec, mat).unwrap() - expected_ec3_box).abs() < 1e-10);
         let mut unequal_box = box_sec.clone();
@@ -1032,8 +1032,8 @@ mod tests {
         // in the inelastic branch between 2.45*sqrt(E/Fy) and 3.07*sqrt(E/Fy).
         let slender_unequal_box = make_box_tube("HSS20X10X1X0.1", "A992Fy50", 10.0, 20.0, 1.0, 0.1);
         let t = 0.1_f64;
-        let c = 2.0 * (20.0 - 0.1) * (10.0 - 1.0) * t
-            - 4.5 * (4.0 - std::f64::consts::PI) * t.powi(3);
+        let c =
+            2.0 * (20.0 - 0.1) * (10.0 - 1.0) * t - 4.5 * (4.0 - std::f64::consts::PI) * t.powi(3);
         let h_over_t = 70.0;
         let fcr = 0.60 * 50.0 * (2.45 * (29000.0_f64 / 50.0).sqrt()) / h_over_t;
         let expected_slender_tc = 0.90 * fcr * c;
@@ -1268,6 +1268,83 @@ mod tests {
                 .get_mut("BM_3D")
                 .unwrap()[0]
                 .m2 = 0.0;
+        }
+
+        // Ignore only roundoff-scale M2 relative to the same-frame flexural
+        // demand. The dimensionless boundary must be invariant under unit
+        // conversion, and a small M2 with no M3 reference demand remains real.
+        for (design_code, units) in [
+            ("ACI 318-14", Units::KipInF),
+            ("Eurocode 2-2004", Units::KnMmC),
+        ] {
+            let mut relative_model = model.clone();
+            relative_model.concrete_design_code = design_code.into();
+            let mut converted_results = relative_model.case_results.clone();
+            relative_model.convert_units_in_place(units);
+            let force_factor = Units::KipInF.force_factor_to(units);
+            let moment_factor = Units::KipInF.moment_factor_to(units);
+            let length_factor = Units::KipInF.length_factor_to(units);
+            for case in converted_results.values_mut() {
+                for stations in case.frame_forces.values_mut() {
+                    for station in stations {
+                        station.p *= force_factor;
+                        station.v2 *= force_factor;
+                        station.v3 *= force_factor;
+                        station.t *= moment_factor;
+                        station.m2 *= moment_factor;
+                        station.m3 *= moment_factor;
+                        station.station *= length_factor;
+                        station
+                            .local_disp
+                            .iter_mut()
+                            .for_each(|v| *v *= length_factor);
+                    }
+                }
+            }
+            relative_model.case_results = converted_results;
+            let station = &mut relative_model
+                .case_results
+                .get_mut("ULT")
+                .unwrap()
+                .frame_forces
+                .get_mut("BM_3D")
+                .unwrap()[0];
+            station.m2 = station.m3 * 0.5e-9;
+            try_run_concrete_design(&mut relative_model).unwrap();
+            assert!(relative_model.concrete_design_results.contains_key("BM_3D"));
+
+            let station = &mut relative_model
+                .case_results
+                .get_mut("ULT")
+                .unwrap()
+                .frame_forces
+                .get_mut("BM_3D")
+                .unwrap()[0];
+            station.m2 = station.m3 * 2.0e-9;
+            relative_model.concrete_design_results.insert(
+                "STALE".into(),
+                relative_model.concrete_design_results["BM_3D"].clone(),
+            );
+            assert!(matches!(
+                try_run_concrete_design(&mut relative_model),
+                Err(DesignError::UnsupportedBeamMinorAxisFlexure { ref frame, .. }) if frame == "BM_3D"
+            ));
+            assert!(relative_model.concrete_design_results.is_empty());
+
+            let station = &mut relative_model
+                .case_results
+                .get_mut("ULT")
+                .unwrap()
+                .frame_forces
+                .get_mut("BM_3D")
+                .unwrap()[0];
+            station.m3 = 0.0;
+            station.m2 = 1.0e-6;
+            assert!(matches!(
+                try_run_concrete_design(&mut relative_model),
+                Err(DesignError::UnsupportedBeamMinorAxisFlexure { ref frame, .. }) if frame == "BM_3D"
+            ));
+            assert!(relative_model.concrete_design_results.is_empty());
         }
 
         // Verify biaxial shear overstress when V3 exceeds phi * Vn3,max under ACI 318-14:

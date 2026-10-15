@@ -596,17 +596,15 @@ impl NonlinearStepper {
 
         // Compute initial acceleration at massive DOFs when starting from rest at u0
         let mut a_init = vec![0.0; n];
-        {
-            let mut r_nl0 = vec![0.0; n];
-            for sp in &springs {
-                sp.add_force(&mut r_nl0, sp.f_prev);
-            }
-            for i in 0..n {
-                if !fixed[i] && mass[i] > 0.0 {
-                    let resistance: f64 =
-                        (0..n).map(|j| k_linear[i * n + j] * u0[j]).sum::<f64>() + r_nl0[i];
-                    a_init[i] = (force0[i] - resistance) / mass[i];
-                }
+        let mut r_nl0 = vec![0.0; n];
+        for sp in &springs {
+            sp.add_force(&mut r_nl0, sp.f_prev);
+        }
+        for i in 0..n {
+            if !fixed[i] && mass[i] > 0.0 {
+                let resistance: f64 =
+                    (0..n).map(|j| k_linear[i * n + j] * u0[j]).sum::<f64>() + r_nl0[i];
+                a_init[i] = (force0[i] - resistance) / mass[i];
             }
         }
 

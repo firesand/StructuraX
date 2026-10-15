@@ -16,7 +16,7 @@ AISC closed-section torsion uses distinct Box/Pipe interaction equations and the
 
 ## Interchange
 
-S2K semantic support remains table-selected with source/opaque preservation and conservative edit reconciliation. Native source-byte copy and inventory are distinct from synthesized model export. Native export now validates references, nonlinear completeness, source-preservation boundaries and represented-data roundtrips before writing. This catches unimplemented assignments and even unsupported default concrete metadata. Class-version tags come from the local corpus; internal parsing and self-roundtrips do not establish SAP2000 runtime acceptance. See [format-fixes.md](format-fixes.md).
+S2K semantic support remains table-selected with source/opaque preservation and conservative edit reconciliation. Native source-byte copy and inventory are distinct from synthesized model export. Native export now validates references, nonlinear completeness, source-preservation boundaries and represented-data roundtrips before writing. Recognized handwritten S2K formatting does not block export; unknown tables/columns and unrepresented assignments still do. Default material colors now roundtrip, while independent Fys values differing from Fy remain unsupported by native synthesis. All native saves use exclusive creation and verified disk readback. Class-version tags come from the local corpus; internal parsing and self-roundtrips do not establish SAP2000 runtime acceptance. See [format-fixes.md](format-fixes.md).
 
 ## Application and API
 

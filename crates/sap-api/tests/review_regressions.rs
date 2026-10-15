@@ -218,3 +218,32 @@ fn native_file_api_reports_preservation_conflict_without_overwriting_destination
     assert!(api.last_file_path.is_none());
     std::fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn native_file_api_uses_the_same_no_overwrite_contract_as_cli_and_gui() {
+    let mut api = cSapModel::new(Units::KipInF);
+    api.inner.materials.shift_remove("4000Psi");
+    api.inner.area_sections.clear();
+    let path = std::env::temp_dir().join(format!(
+        "structurax-api-native-existing-{}-{}.sdb",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let before = api.inner.clone();
+    assert_eq!(api.file().save_native_sdb(path.to_str().unwrap()), OAPI_OK);
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(api.inner, before);
+    assert_eq!(api.file().save_native_sdb(path.to_str().unwrap()), OAPI_ERR);
+    assert!(api
+        .last_file_error
+        .as_ref()
+        .unwrap()
+        .contains("without overwriting"));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(api.inner, before);
+    assert_eq!(api.last_file_path.as_ref(), Some(&path));
+    std::fs::remove_file(path).unwrap();
+}

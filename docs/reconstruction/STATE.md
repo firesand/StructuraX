@@ -2,7 +2,7 @@
 
 Updated 2026-10-15.
 
-**Latest checkpoint:** [post-review repairs](../review/structurax-fixes/REVIEW.md) correct supported-subset numerical/design defects and reject combinations previously processed incorrectly. [The baseline review](../review/structurax-latest/REVIEW.md) and wave notes remain historical evidence. Native runtime acceptance is still unverified.
+**Latest checkpoint:** [PR review follow-up](../review/structurax-followup/REVIEW.md) correct supported-subset numerical/design defects and reject combinations previously processed incorrectly. [The baseline review](../review/structurax-latest/REVIEW.md) and wave notes remain historical evidence. Native runtime acceptance is still unverified.
  The requested destination is a fully implemented, reliable reconstruction of the supplied SAP2000 v19 product. **That destination has not been reached.** The source is an experimental native Rust application with selected working analysis, design, and interchange paths. Enum coverage, a successful build, and synthetic benchmark agreement do not establish product parity.
 
 ## Reference and environment
@@ -76,6 +76,10 @@ Parallel owners: Solver Solid & Cable Engine (3D solid brick + Wilson-Taylor inc
 - Native synthesis validates references, incomplete nonlinear data, source preservation and semantic roundtrip loss before writing. Class versions derive from the observed corpus. `format-fixes.md` distinguishes 329 accepted native projections, 5 incomplete-law export refusals and 2 unsupported imports in the 336-file corpus.
 - Solid API invalid geometry and temperature overflow reject atomically. Typed/editor nonlinear history from rest, export warnings and CLI no-overwrite are covered in `application-fixes.md`.
 - Integrated commands, counts and fingerprints are in `../review/structurax-fixes/validation.json`. Historical wave-4 counts include a continuation benchmark now removed because it exercised an unsupported path.
+
+## PR review follow-up
+
+Handwritten supported S2K can export without clearing preservation; actual opaque source data still reject. Native material colors roundtrip; independent Fys defaults to Fy on native import and unequal values reject synthesis. All native save entry points now refuse overwrites and verify synchronized disk readback. Cable horizontal-tension initialization is checked against compatibility-solver precision, with a documented stiff/taut sweep. Concrete beam M2 rejection is relative to moment demand and unit-independent. Explicit iteration budgets remain in force; additional continuation and slack-network tests distinguish rejection from missing coverage. Exact tests/source evidence are in `../review/structurax-followup/validation.json`.
 
 ## Remaining high-priority limits
 

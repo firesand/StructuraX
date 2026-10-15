@@ -36,8 +36,11 @@ fn acceleration(name: &str) -> bool {
 }
 
 pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
-    if model.s2k_preservation.is_some() {
-        return Err(unsupported("s2k_preservation", "native synthesis cannot carry original opaque S2K text; retain the source and explicitly clear preservation only when requesting a supported-only projection, or save a private snapshot"));
+    if let Some(saved) = &model.s2k_preservation {
+        let issues = crate::s2k::preservation::native_projection_issues(saved)?;
+        if !issues.is_empty() {
+            return Err(unsupported("s2k_preservation", format!("native synthesis cannot carry unrepresented S2K source data: {}; retain the source or save a private snapshot", issues.join("; "))));
+        }
     }
     // The native index maps are built from record names, while references use map
     // keys. Inconsistent names must not become duplicate or substituted indices.
@@ -384,6 +387,12 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         }
     }
     for (name, m) in &model.materials {
+        if m.fys != m.fy {
+            return Err(unsupported(
+                format!("materials.{name}.fys"),
+                "independent shear-rebar yield has no verified native representation; this importer uses the material Fy as a reconstruction fallback",
+            ));
+        }
         if m.e_ortho.is_some() || m.u_ortho.is_some() || m.g_ortho.is_some() || m.a_ortho.is_some()
         {
             return Err(unsupported(
@@ -407,6 +416,9 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
 fn semantic_model(model: &SapModel) -> SapModel {
     let mut copy = model.clone();
     copy.is_locked = false;
+    // validate() permits this only after proving the saved source has no opaque
+    // tables, columns or omitted records. The input retains its original text.
+    copy.s2k_preservation = None;
     copy.case_results.clear();
     copy.steel_design_results.clear();
     copy.concrete_design_results.clear();

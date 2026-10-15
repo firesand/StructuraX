@@ -1,4 +1,4 @@
-mod preservation;
+pub(crate) mod preservation;
 
 use std::collections::BTreeMap;
 

@@ -1,5 +1,7 @@
 # StructuraX post-review repairs
 
+**Historical first repair checkpoint.** The [PR follow-up](../structurax-followup/REVIEW.md) supersedes the S2K guard, cable initialization precision and native-file I/O contracts below.
+
 Checkpoint: 2026-10-15. Baseline commit: `39089be716985de035906458f9f3133ab044ab2b`.
 This follow-up addresses the confirmed findings in the [baseline review](../structurax-latest/REVIEW.md). It distinguishes repaired supported behavior from features disabled until they can be implemented correctly. StructuraX remains experimental; full reconstruction and engineering/vendor acceptance are not established.
 

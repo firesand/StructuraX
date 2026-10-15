@@ -5,6 +5,7 @@
 
 mod export_guard;
 mod class_versions;
+mod verified_file;
 
 use super::*;
 use serde::Serialize;
@@ -950,6 +951,8 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
         raw_materials.push(HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(mat.name.clone())),
+            ("m_color".into(), SdbVal::I32(material_colorref(&mat.color).ok_or_else(||
+                export_guard::unsupported(format!("materials.{}.color", mat.name), "color has no supported exact COLORREF encoding"))?)),
             ("m_mtype".into(), SdbVal::I32(mtype)),
             ("m_NumberMTs".into(), SdbVal::I32(1)),
             ("m_Mt".into(), SdbVal::ArrObj(vec![mt0])),
@@ -2083,12 +2086,15 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     Ok(sdb)
 }
 
-/// Save an experimental checked native projection. Validation, packing and
-/// semantic comparison all finish before an existing destination is touched.
+/// Save an experimental checked native projection to a new destination.
+/// Validation and packing finish before creation; existing files are never
+/// overwritten. Written bytes are synchronized, read back and inspected before
+/// success. Failed writes/checks remove the newly created incomplete output.
 /// No vendor runtime compatibility or arbitrary-model serialization is claimed.
 pub fn save_native_sdb_file(model: &SapModel, path: impl AsRef<Path>) -> Result<(), FormatError> {
     let sdb = pack_model_to_native_sdb(model)?;
-    write_sdb_file(path, &sdb)
+    let bytes = write_sdb_bytes(&sdb)?;
+    verified_file::write_new(path.as_ref(), &bytes)
 }
 
 #[cfg(test)]
@@ -2209,10 +2215,6 @@ mod tests {
         model.points.insert("2".into(), p2);
         model.points.insert("3".into(), p3);
 
-        for mat in model.materials.values_mut() {
-            mat.fys = 50.0;
-            mat.color = "Blue".into();
-        }
         let mut cab_sec = FrameSection::default();
         cab_sec.name = "CAB1".into();
         cab_sec.material = "A992Fy50".into();

@@ -263,9 +263,14 @@ fn vendor_sdb_example_6_003_gap_link_static_and_direct_history() {
 
         // These two source cases require terminal velocity/internal-state
         // continuation, which is deliberately rejected rather than reset.
-        let err = analyze_model(&mut model).unwrap_err();
-        assert!(err.to_string().contains("history continuation"), "{err}");
-        assert!(model.case_results.is_empty());
+        for (rejected_case, other_case) in [("NLSTAT3", "NLDHIST2"), ("NLDHIST2", "NLSTAT3")] {
+            let mut candidate = model.clone();
+            candidate.load_cases.shift_remove(other_case);
+            let err = analyze_model(&mut candidate).unwrap_err();
+            assert!(err.to_string().contains("history continuation"), "{err}");
+            assert!(err.to_string().contains(rejected_case), "{err}");
+            assert!(candidate.case_results.is_empty());
+        }
         model.load_cases.shift_remove("NLSTAT3");
         model.load_cases.shift_remove("NLDHIST2");
         analyze_model(&mut model).expect("solve supported Example 6-003 cases");

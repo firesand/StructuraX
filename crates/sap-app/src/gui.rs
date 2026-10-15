@@ -2391,7 +2391,7 @@ impl SapGuiApp {
                                 }
                             }
                         }
-                        if ui.button("💾 Export Binary .SDB").clicked() {
+                        if ui.button("💾 Export Binary .SDB (new file)").clicked() {
                             self.export_warnings.clear();
                             match save_native_sdb_file(&self.model, &self.file_path_input) {
                                 Err(error) => self.status_msg = format!("Export SDB error: {error}"),

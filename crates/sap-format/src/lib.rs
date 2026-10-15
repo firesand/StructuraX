@@ -115,6 +115,7 @@ pub fn load_model_with_report(path: impl AsRef<Path>) -> Result<ImportReport, Fo
         }
         let model = extract_sdb_to_model(&sdb)?;
         let mut warnings = vec!["Native SDB import reads a supported subset. Grid definitions, project metadata, generated/external dynamic-function sources, nonlinear/coupled link parameters, patterned solid loads, and many advanced assignments are omitted; saving cannot preserve the full vendor model.".into()];
+        warnings.push("Independent shear-rebar Fys is not mapped from native data; imported Fys uses Fy as a reconstruction fallback.".into());
         for prop in model
             .link_props
             .values()

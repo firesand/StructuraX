@@ -4,7 +4,7 @@ The priority is reliable, explicitly scoped behavior before additional feature c
 
 1. Extend the bounded [review repairs](docs/review/structurax-fixes/REVIEW.md): implement
    currently rejected cable/member-load combinations with independent regressions.
-2. Complete native representation of guarded assignments and default concrete metadata,
+2. Complete native representation of guarded assignments and independent shear-rebar yield data,
    preserving strict data-loss and referential-integrity checks.
 3. Validate native export against a compatible licensed SAP2000 runtime, including
    unsupported-field diagnostics and critical assignment comparisons.

@@ -20,6 +20,9 @@
 use crate::linalg::solve_lu;
 use crate::SolverError;
 
+// Shared by the compatibility solve and the conditioning-aware shape check.
+const COMPATIBILITY_REL_TOL: f64 = 1e-13;
+
 /// Definition of a 2-node 3D elastic catenary cable element between end `I` and end `J`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CableElement {
@@ -183,9 +186,17 @@ impl CableElement {
             }
             l0 += damp * step;
         }
-        let (_, f_j, _, _) = solve_catenary_2d(lx, lz, l0, ea, w, 1.0)?;
+        let (_, f_j, tangent, _) = solve_catenary_2d(lx, lz, l0, ea, w, 1.0)?;
         let residual = (f_j[0] - h_target).abs();
-        if !residual.is_finite() || residual > 1e-12 * h_target {
+        // The inner solve controls a LENGTH residual, while this inverse shape
+        // solve controls force. dH = Kxx*dx + Kxz*dz, so its controlled length
+        // accuracy implies this force uncertainty (Euclidean operator norm).
+        // A fixed relative-H threshold alone is unattainable for stiff, taut
+        // cables: EA/H amplifies roundoff in the recovered unstressed length.
+        let length_accuracy = COMPATIBILITY_REL_TOL * l0.max(chord);
+        let force_accuracy = tangent[0][0].hypot(tangent[0][1]) * length_accuracy;
+        let tolerance = 1e-12 * h_target + force_accuracy;
+        if !residual.is_finite() || !tolerance.is_finite() || residual > tolerance {
             return Err(SolverError::NonConvergence {
                 case: "CableShape".into(),
                 iterations: 60,
@@ -318,7 +329,7 @@ fn solve_catenary_2d(
             (f4 / h).asinh() + (f2 / h).asinh()
         }
     };
-    let tol = 1e-13 * l0.max(chord);
+    let tol = COMPATIBILITY_REL_TOL * l0.max(chord);
     let mut converged = false;
 
     for _iter in 0..120 {
@@ -637,6 +648,7 @@ pub fn solve_cable_network(
     if max_iter == 0
         || !tol.is_finite()
         || tol <= 0.
+        || tol >= 1.
         || restraints.len() != n_nodes
         || nodal_loads.len() != n_nodes
         || u_init.is_some_and(|u| u.len() != n_nodes)
@@ -646,7 +658,7 @@ pub fn solve_cable_network(
             .chain(u_init.into_iter().flatten().flatten())
             .any(|x| !x.is_finite())
     {
-        return Err(SolverError::InvalidInput("cable network needs finite loads/state, matching node counts and positive iteration controls".into()));
+        return Err(SolverError::InvalidInput("cable network needs finite loads/state, matching node counts, positive iteration count and relative tolerance in (0,1)".into()));
     }
     let mut u = match u_init {
         Some(init) => init.to_vec(),
