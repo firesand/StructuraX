@@ -261,6 +261,18 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
     }
     validate_active_loads(model)?;
     link::validate(model)?;
+    for (pname, pt) in &model.points {
+        if pt.spring.iter().any(|x| !x.is_finite())
+            || pt
+                .spring_coupled
+                .as_ref()
+                .is_some_and(|c| c.iter().any(|x| !x.is_finite()))
+        {
+            return Err(SolverError::InvalidInput(format!(
+                "joint '{pname}' has nonfinite spring stiffness"
+            )));
+        }
+    }
     for area in model.areas.values() {
         if !(3..=4).contains(&area.points.len()) {
             return Err(SolverError::UnsupportedInput(format!(
@@ -429,10 +441,14 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 | LoadCaseType::NonlinearHistory
                 | LoadCaseType::NonlinearDynamic
         ) && lc.initial_case.as_ref().is_some_and(|initial| {
-            model
-                .load_cases
-                .get(initial)
-                .is_some_and(|c| c.case_type == LoadCaseType::NonlinearStatic)
+            model.load_cases.get(initial).is_some_and(|c| {
+                matches!(
+                    c.case_type,
+                    LoadCaseType::NonlinearStatic
+                        | LoadCaseType::NonlinearHistory
+                        | LoadCaseType::NonlinearDynamic
+                )
+            })
         }) && model
             .link_props
             .values()
@@ -445,14 +461,26 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 "case '{name}' requests large displacements"
             )));
         }
-        if matches!(
-            lc.case_type,
-            LoadCaseType::LinearHistory | LoadCaseType::LinearDynamic
-        ) && lc.initial_case.is_some()
-        {
+        if lc.case_type == LoadCaseType::LinearHistory && lc.initial_case.is_some() {
             return Err(SolverError::UnsupportedInput(format!(
-                "initial state for case '{name}' is not implemented"
+                "initial state for modal history case '{name}' is not implemented"
             )));
+        }
+        if lc.case_type == LoadCaseType::LinearDynamic {
+            if let Some(init_name) = &lc.initial_case {
+                if model.load_cases.get(init_name).is_some_and(|c| {
+                    !matches!(
+                        c.case_type,
+                        LoadCaseType::LinearDynamic
+                            | LoadCaseType::NonlinearHistory
+                            | LoadCaseType::NonlinearDynamic
+                    )
+                }) {
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "initial state for case '{name}' from non-transient case '{init_name}' is not implemented"
+                    )));
+                }
+            }
         }
         if matches!(
             lc.case_type,
@@ -1106,6 +1134,71 @@ fn assemble_area_into_global(
     }
 }
 
+/// Returns the 6x6 grounded spring stiffness matrix of `pt` expressed in the joint-local
+/// DOF basis `[U1, U2, U3, R1, R2, R3]` (`v_global = R_p * v_local`).
+///
+/// - `pt.spring_coupled` (`[f64; 21]`) is unpacked in column-major upper-triangular order:
+///   `[U1U1, U1U2, U2U2, U1U3, U2U3, U3U3, ...]`, matching SAP2000 `.s2k`/`.sdb`.
+/// - When `!pt.spring_is_local`, `K_global` is transformed into joint-local DOFs via
+///   `K_local = R_6^T * K_global * R_6` where `R_6 = diag(R_p, R_p)`.
+fn joint_spring_matrix_local(pt: &PointObj, r_p: &[[f64; 3]; 3]) -> Option<[[f64; 6]; 6]> {
+    let ks = if let Some(coupled) = &pt.spring_coupled {
+        let mut ks6 = [[0.0f64; 6]; 6];
+        let mut pos = 0;
+        for c in 0..6 {
+            for r in 0..=c {
+                ks6[r][c] = coupled[pos];
+                ks6[c][r] = coupled[pos];
+                pos += 1;
+            }
+        }
+        ks6
+    } else if pt.spring.iter().any(|&s| s > 0.0) {
+        let mut ks6 = [[0.0f64; 6]; 6];
+        for d in 0..6 {
+            if pt.spring[d] > 0.0 {
+                ks6[d][d] = pt.spring[d];
+            }
+        }
+        ks6
+    } else {
+        return None;
+    };
+
+    if pt.spring_is_local {
+        return Some(ks);
+    }
+
+    let mut r6 = [[0.0f64; 6]; 6];
+    for a in 0..3 {
+        for b in 0..3 {
+            r6[a][b] = r_p[a][b];
+            r6[a + 3][b + 3] = r_p[a][b];
+        }
+    }
+    let mut tmp = [[0.0f64; 6]; 6];
+    for m in 0..6 {
+        for j in 0..6 {
+            let mut s = 0.0;
+            for n in 0..6 {
+                s += ks[m][n] * r6[n][j];
+            }
+            tmp[m][j] = s;
+        }
+    }
+    let mut k_loc = [[0.0f64; 6]; 6];
+    for i in 0..6 {
+        for j in 0..6 {
+            let mut s = 0.0;
+            for m in 0..6 {
+                s += r6[m][i] * tmp[m][j];
+            }
+            k_loc[i][j] = s;
+        }
+    }
+    Some(k_loc)
+}
+
 /// Adds grounded joint springs (`pt.spring`, `pt.spring_coupled`) and multipoint constraints (`model.constraints`)
 /// to `k_struct`.
 fn add_springs_and_constraints(
@@ -1120,41 +1213,10 @@ fn add_springs_and_constraints(
 
     // 1. Grounded joint springs
     for (idx, pt) in work_points.values().enumerate() {
-        if let Some(coupled) = &pt.spring_coupled {
-            // Unpack 21-term upper-triangular 6x6 spring matrix
-            let mut ks6 = [[0.0f64; 6]; 6];
-            let mut pos = 0;
-            for r in 0..6 {
-                for c in r..6 {
-                    ks6[r][c] = coupled[pos];
-                    ks6[c][r] = coupled[pos];
-                    pos += 1;
-                }
-            }
+        if let Some(ks_loc) = joint_spring_matrix_local(pt, &joint_rot[idx]) {
             for r in 0..6 {
                 for c in 0..6 {
-                    k[(6 * idx + r) * ndof + (6 * idx + c)] += ks6[r][c];
-                }
-            }
-        } else {
-            for d in 0..6 {
-                if pt.spring[d] > 0.0 {
-                    if pt.spring_is_local {
-                        let gi = 6 * idx + d;
-                        k[gi * ndof + gi] += pt.spring[d];
-                    } else {
-                        // Transform global spring along axis d into joint-local coordinates
-                        let r_p = &joint_rot[idx];
-                        let offset = if d < 3 { 0 } else { 3 };
-                        let g_axis = d % 3;
-                        for a in 0..3 {
-                            for b in 0..3 {
-                                let gi = 6 * idx + offset + a;
-                                let gj = 6 * idx + offset + b;
-                                k[gi * ndof + gj] += pt.spring[d] * r_p[g_axis][a] * r_p[g_axis][b];
-                            }
-                        }
-                    }
+                    k[(6 * idx + r) * ndof + (6 * idx + c)] += ks_loc[r][c];
                 }
             }
         }
@@ -1595,6 +1657,7 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
                     LoadCaseType::NonlinearStatic
                         | LoadCaseType::NonlinearHistory
                         | LoadCaseType::NonlinearDynamic
+                        | LoadCaseType::LinearDynamic
                 )
             });
     }
@@ -1603,7 +1666,9 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
     for c in chain {
         if matches!(
             c.case_type,
-            LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
+            LoadCaseType::NonlinearHistory
+                | LoadCaseType::NonlinearDynamic
+                | LoadCaseType::LinearDynamic
         ) {
             let t_end = (c.num_time_steps as f64) * c.time_step_dt;
             for (func_name, pat_or_acc, scale_factor) in &c.history_loads {
@@ -1636,6 +1701,33 @@ fn initial_displacement_vector(
 ) -> Option<Vec<f64>> {
     let init_name = lc.initial_case.as_ref()?;
     let init_res = model.case_results.get(init_name)?;
+    if let Some(ts) = &init_res.transient_state {
+        if ts.u.len() == ndof
+            && ts.point_order.len() == work_points.len()
+            && ts
+                .point_order
+                .iter()
+                .zip(work_points.keys())
+                .all(|(a, b)| a == b)
+        {
+            return Some(ts.u.clone());
+        }
+        let mut u = vec![0.0; ndof];
+        let ts_idx: IndexMap<&str, usize> = ts
+            .point_order
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.as_str(), i))
+            .collect();
+        for (idx, pname) in work_points.keys().enumerate() {
+            if let Some(&src_i) = ts_idx.get(pname.as_str()) {
+                if 6 * src_i + 6 <= ts.u.len() {
+                    u[6 * idx..6 * idx + 6].copy_from_slice(&ts.u[6 * src_i..6 * src_i + 6]);
+                }
+            }
+        }
+        return Some(u);
+    }
     let mut u = vec![0.0; ndof];
     for (idx, pname) in work_points.keys().enumerate() {
         let d_opt = init_res
@@ -1790,6 +1882,17 @@ fn run_cable_nonlinear_static_case(
             if let Some(l0) = cp.undeformed_length {
                 cable::CableElement::from_undeformed_length(
                     x_i, x_j, area, e, alpha, l0, w_vec, delta_t,
+                )?
+            } else if let Some(target_ti) = cp.target_tension_i {
+                let chord = [x_j[0] - x_i[0], x_j[1] - x_i[1], x_j[2] - x_i[2]];
+                let shaped = cable::CableElement::from_target_tension_i(
+                    chord,
+                    e * area,
+                    target_ti,
+                    weight_per_len,
+                )?;
+                cable::CableElement::from_undeformed_length(
+                    x_i, x_j, area, e, alpha, shaped.l0, w_vec, delta_t,
                 )?
             } else if let Some(h_target) = cp.horizontal_tension {
                 cable::CableElement::from_horizontal_tension(
@@ -2186,13 +2289,17 @@ fn solve_static_with_stiffness(
                     uj
                 };
 
+                let ks_loc_opt = joint_spring_matrix_local(pt, &joint_rot[idx]);
                 for d in 0..6 {
                     if u_j[d].abs() > 1e-18 {
                         let gdof = 6 * idx + d;
+                        let has_spring_dof = ks_loc_opt
+                            .as_ref()
+                            .is_some_and(|ks| ks[d].iter().any(|&v| v.abs() > 0.0));
                         if pt.restraint[d] {
                             let prev = prescribed_u[gdof].unwrap_or(0.0);
                             prescribed_u[gdof] = Some(prev + u_j[d]);
-                        } else if pt.spring[d] > 0.0 {
+                        } else if has_spring_dof {
                             // Grounded spring settlement/rotation (`Example 1-005` Models B & D)
                             spring_ground_u[gdof] += u_j[d];
                         } else {
@@ -2410,10 +2517,18 @@ fn solve_static_with_stiffness(
     // 4. Form right-hand side F_rhs = f_ext - f_fef + K_spring * u_ground
     let mut rhs = vec![0.0f64; ndof];
     for i in 0..ndof {
-        let pt_idx = i / 6;
-        let d = i % 6;
-        let k_sp = work_points[pt_idx].spring[d];
-        rhs[i] = f_ext_joint[i] - f_fef_joint[i] + k_sp * spring_ground_u[i];
+        rhs[i] = f_ext_joint[i] - f_fef_joint[i];
+    }
+    for (idx, pt) in work_points.values().enumerate() {
+        if let Some(ks_loc) = joint_spring_matrix_local(pt, &joint_rot[idx]) {
+            for r in 0..6 {
+                let mut f_sp = 0.0;
+                for c in 0..6 {
+                    f_sp += ks_loc[r][c] * spring_ground_u[6 * idx + c];
+                }
+                rhs[6 * idx + r] += f_sp;
+            }
+        }
     }
 
     // 5. Apply restraints, inactive global DOFs (`model.active_dofs`), and prescribed displacements
@@ -2480,9 +2595,9 @@ fn solve_static_with_stiffness(
         let disp: [f64; 6] = std::array::from_fn(|d| u_joint[6 * idx + d]);
         joint_displacements.insert(pname.clone(), disp);
 
+        let ks_loc_opt = joint_spring_matrix_local(pt, &joint_rot[idx]);
         let has_support = pt.restraint.iter().any(|&r| r)
-            || pt.spring.iter().any(|&s| s > 0.0)
-            || pt.spring_coupled.is_some()
+            || ks_loc_opt.is_some()
             || (0..6).any(|d| prescribed_u[6 * idx + d].is_some());
         if has_support && model.points.contains_key(pname) {
             let mut reac = [0.0f64; 6];
@@ -2495,9 +2610,13 @@ fn solve_static_with_stiffness(
                         f_int += k_struct[gdof * ndof + j] * u_joint[j];
                     }
                     reac[d] = f_int - f_ext_joint[gdof];
-                } else if pt.spring[d] > 0.0 {
-                    // Grounded spring reaction on structure: R = -k_spring * (u - u_ground)
-                    reac[d] = -pt.spring[d] * (u_joint[gdof] - spring_ground_u[gdof]);
+                } else if let Some(ks_loc) = &ks_loc_opt {
+                    // Grounded spring reaction on structure: R = -K_spring * (u - u_ground)
+                    let mut f_sp = 0.0;
+                    for c in 0..6 {
+                        f_sp += ks_loc[d][c] * (u_joint[6 * idx + c] - spring_ground_u[6 * idx + c]);
+                    }
+                    reac[d] = -f_sp;
                 }
             }
             joint_reactions.insert(pname.clone(), reac);
@@ -2702,6 +2821,7 @@ fn solve_static_with_stiffness(
         time_steps: Vec::new(),
         time_history_disp: IndexMap::new(),
         base_reactions,
+        transient_state: None,
     })
 }
 
@@ -3332,6 +3452,7 @@ fn run_time_history_case(
                 LoadCaseType::NonlinearStatic
                     | LoadCaseType::NonlinearHistory
                     | LoadCaseType::NonlinearDynamic
+                    | LoadCaseType::LinearDynamic
             ) {
                 let init_loads = accumulated_nonlinear_static_loads(model, init_lc);
                 assemble_static_pattern_rhs(
@@ -3376,6 +3497,47 @@ fn run_time_history_case(
         lc.case_type,
         LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
     );
+    let is_direct_history = matches!(
+        lc.case_type,
+        LoadCaseType::LinearDynamic
+            | LoadCaseType::NonlinearHistory
+            | LoadCaseType::NonlinearDynamic
+    );
+
+    let seed_ts = if let Some(init_name) = &lc.initial_case {
+        let init_res = model.case_results.get(init_name);
+        if let Some(ts) = init_res.and_then(|r| r.transient_state.as_ref()) {
+            let order_matches = ts.point_order.len() == work_points.len()
+                && ts
+                    .point_order
+                    .iter()
+                    .zip(work_points.keys())
+                    .all(|(a, b)| a == b);
+            if !order_matches {
+                return Err(SolverError::InvalidInput(format!(
+                    "case '{}' initial_case '{}' has incompatible transient point order",
+                    lc.name, init_name
+                )));
+            }
+            Some(ts)
+        } else if model.load_cases.get(init_name).is_some_and(|c| {
+            matches!(
+                c.case_type,
+                LoadCaseType::LinearDynamic
+                    | LoadCaseType::NonlinearHistory
+                    | LoadCaseType::NonlinearDynamic
+            )
+        }) {
+            return Err(SolverError::InvalidInput(format!(
+                "case '{}' initial_case '{}' is missing persisted transient state",
+                lc.name, init_name
+            )));
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let mut u_peak = vec![0.0f64; ndof];
     let mut v_peak = vec![0.0f64; ndof];
@@ -3383,6 +3545,7 @@ fn run_time_history_case(
     let mut t_peak = 0.0;
     let mut peak_norm = 0.0f64;
     let mut nl_link_peak: IndexMap<(String, usize), f64> = IndexMap::new();
+    let mut terminal_state: Option<sap_model::TransientTerminalState> = None;
     // Linear history borrows the assembled matrices. Only nonlinear history
     // owns a separately assembled constitutive base for reaction recovery.
     let mut reaction_base = std::borrow::Cow::Borrowed(k_base);
@@ -3422,6 +3585,7 @@ fn run_time_history_case(
         reaction_base = std::borrow::Cow::Owned(linear_base);
         reaction_struct = std::borrow::Cow::Owned(linear_struct);
         let u_init = initial_displacement_vector(model, lc, work_points, ndof);
+        let f0 = load_at(0.0, false);
         let mut integrator = dynamics::NonlinearStepper::new(
             model,
             work_points,
@@ -3431,10 +3595,13 @@ fn run_time_history_case(
             diag_mass,
             &is_fixed,
             lc,
-            &load_at(0.0, false),
+            &f0,
             &element_damping,
             u_init.as_deref(),
         )?;
+        if let Some(ts) = seed_ts {
+            integrator.seed_transient_state(ts, &f0)?;
+        }
         for step in 0..=n_steps {
             let t = (step as f64) * dt;
             time_steps.push(t);
@@ -3457,16 +3624,32 @@ fn run_time_history_case(
                 trace.push(disp);
             }
         }
+        if is_direct_history {
+            let previous_force = integrator.previous_force().to_vec();
+            let nonlinear_link_forces = integrator.terminal_link_force_states();
+            terminal_state = Some(sap_model::TransientTerminalState {
+                point_order: work_points.keys().cloned().collect(),
+                u: integrator.state.u,
+                v: integrator.state.v,
+                a: integrator.state.a,
+                previous_force,
+                nonlinear_link_forces,
+            });
+        }
     } else {
+        let f0 = load_at(0.0, false);
         let mut integrator = dynamics::LinearStepper::with_element_damping(
             k_base,
             diag_mass,
             &is_fixed,
             lc,
-            &load_at(0.0, false),
+            &f0,
             &load_at(0.0, true),
             &element_damping,
         )?;
+        if let Some(ts) = seed_ts {
+            integrator.seed_transient_state(ts, &f0)?;
+        }
         for step in 0..=n_steps {
             let t = (step as f64) * dt;
             time_steps.push(t);
@@ -3490,6 +3673,17 @@ fn run_time_history_case(
                 let disp: [f64; 6] = std::array::from_fn(|d| u[6 * idx + d]);
                 trace.push(disp);
             }
+        }
+        if is_direct_history {
+            let previous_force = integrator.previous_force().to_vec();
+            terminal_state = Some(sap_model::TransientTerminalState {
+                point_order: work_points.keys().cloned().collect(),
+                u: integrator.state.u,
+                v: integrator.state.v,
+                a: integrator.state.a,
+                previous_force,
+                nonlinear_link_forces: Vec::new(),
+            });
         }
     }
 
@@ -3524,6 +3718,7 @@ fn run_time_history_case(
     for (name, reaction) in &mut res.joint_reactions {
         let idx = pt_index[name];
         let point = &work_points[name];
+        let ks_loc_opt = joint_spring_matrix_local(point, &joint_rot[idx]);
         let mut delta = [0.; 6];
         for d in 0..6 {
             let i = 6 * idx + d;
@@ -3542,8 +3737,12 @@ fn run_time_history_case(
                     + diag_mass[i] * a_peak[i]
                     - applied_peak[i];
                 delta[d] = physical - reaction[d];
-            } else if point.spring[d] > 0. {
-                delta[d] = -beta_stiffness * point.spring[d] * v_peak[i];
+            } else if let Some(ks_loc) = &ks_loc_opt {
+                let mut f_damp = 0.0;
+                for c in 0..6 {
+                    f_damp += ks_loc[d][c] * v_peak[6 * idx + c];
+                }
+                delta[d] = -beta_stiffness * f_damp;
             }
             reaction[d] += delta[d];
         }
@@ -3560,6 +3759,7 @@ fn run_time_history_case(
     res.case_name = lc.name.clone();
     res.time_steps = time_steps;
     res.time_history_disp = time_history_disp;
+    res.transient_state = terminal_state;
     let mut grounded = IndexMap::<String, [f64; 6]>::new();
     for (name, object) in &model.links {
         let prop = &model.link_props[&object.prop];
@@ -3608,7 +3808,8 @@ fn recover_results_from_displacement_vector(
         let disp: [f64; 6] = std::array::from_fn(|d| u_joint[6 * idx + d]);
         joint_displacements.insert(pname.clone(), disp);
 
-        let has_support = pt.restraint.iter().any(|&r| r) || pt.spring.iter().any(|&s| s > 0.0);
+        let ks_loc_opt = joint_spring_matrix_local(pt, &joint_rot[idx]);
+        let has_support = pt.restraint.iter().any(|&r| r) || ks_loc_opt.is_some();
         if has_support && model.points.contains_key(pname) {
             let mut reac = [0.0f64; 6];
             for d in 0..6 {
@@ -3619,8 +3820,12 @@ fn recover_results_from_displacement_vector(
                         f_int += k_struct[gdof * ndof + j] * u_joint[j];
                     }
                     reac[d] = f_int;
-                } else if pt.spring[d] > 0.0 {
-                    reac[d] = -pt.spring[d] * u_joint[gdof];
+                } else if let Some(ks_loc) = &ks_loc_opt {
+                    let mut f_sp = 0.0;
+                    for c in 0..6 {
+                        f_sp += ks_loc[d][c] * u_joint[6 * idx + c];
+                    }
+                    reac[d] = -f_sp;
                 }
             }
             joint_reactions.insert(pname.clone(), reac);
@@ -3754,10 +3959,57 @@ fn eval_dynamic_function(model: &SapModel, func_name: &str, x: f64) -> f64 {
     pts[pts.len() - 1].1
 }
 
-/// Evaluates all `LoadCombo`s in `model.load_combos` and stores combined `CaseResults` in `model.case_results`.
+/// Evaluates all `LoadCombo`s in `model.load_combos` in topological order and stores
+/// combined `CaseResults` in `model.case_results` (safely skipping cyclic or empty combos).
 fn evaluate_load_combos(model: &mut SapModel) {
-    let combos: Vec<sap_model::LoadCombo> = model.load_combos.values().cloned().collect();
-    for combo in combos {
+    let n_combos = model.load_combos.len();
+    if n_combos == 0 {
+        return;
+    }
+    let combo_idx_map: IndexMap<String, usize> = model
+        .load_combos
+        .keys()
+        .enumerate()
+        .map(|(idx, name)| (name.clone(), idx))
+        .collect();
+    let mut in_degree = vec![0usize; n_combos];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n_combos];
+    for (idx, combo) in model.load_combos.values().enumerate() {
+        let mut seen_deps = std::collections::BTreeSet::new();
+        for (src_name, _) in &combo.cases {
+            if model.case_results.contains_key(src_name) {
+                continue;
+            }
+            if let Some(&dep_idx) = combo_idx_map.get(src_name) {
+                if seen_deps.insert(dep_idx) {
+                    in_degree[idx] += 1;
+                    if dep_idx != idx {
+                        dependents[dep_idx].push(idx);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut ready = std::collections::BinaryHeap::new();
+    for (idx, &deg) in in_degree.iter().enumerate() {
+        if deg == 0 {
+            ready.push(std::cmp::Reverse(idx));
+        }
+    }
+    let mut topo_order = Vec::with_capacity(n_combos);
+    while let Some(std::cmp::Reverse(idx)) = ready.pop() {
+        topo_order.push(idx);
+        for &next in &dependents[idx] {
+            in_degree[next] -= 1;
+            if in_degree[next] == 0 {
+                ready.push(std::cmp::Reverse(next));
+            }
+        }
+    }
+
+    for combo_idx in topo_order {
+        let combo = model.load_combos[combo_idx].clone();
         let mut comb_res = CaseResults {
             case_name: combo.name.clone(),
             ..Default::default()
@@ -3811,29 +4063,33 @@ fn evaluate_load_combos(model: &mut SapModel) {
             dst.von_mises = finalize_op(dst.von_mises);
         };
 
-        for (c_idx, (src_name, sf)) in combo.cases.iter().enumerate() {
-            let is_first = c_idx == 0;
+        let mut contributed = 0usize;
+        for (src_name, sf) in &combo.cases {
             let Some(src) = model.case_results.get(src_name).cloned() else {
                 continue;
             };
+            let is_first = contributed == 0;
+            contributed += 1;
 
             for (pname, d) in &src.joint_displacements {
+                let key_first = is_first || !comb_res.joint_displacements.contains_key(pname);
                 let entry = comb_res
                     .joint_displacements
                     .entry(pname.clone())
                     .or_insert([0.0; 6]);
                 for k in 0..6 {
-                    entry[k] = combine_op(entry[k], d[k], *sf, is_first);
+                    entry[k] = combine_op(entry[k], d[k], *sf, key_first);
                 }
             }
 
             for (pname, r) in &src.joint_reactions {
+                let key_first = is_first || !comb_res.joint_reactions.contains_key(pname);
                 let entry = comb_res
                     .joint_reactions
                     .entry(pname.clone())
                     .or_insert([0.0; 6]);
                 for k in 0..6 {
-                    entry[k] = combine_op(entry[k], r[k], *sf, is_first);
+                    entry[k] = combine_op(entry[k], r[k], *sf, key_first);
                 }
             }
 
@@ -3847,6 +4103,7 @@ fn evaluate_load_combos(model: &mut SapModel) {
             }
 
             for (fname, stations) in &src.frame_forces {
+                let key_first = is_first || !comb_res.frame_forces.contains_key(fname);
                 let entry = comb_res
                     .frame_forces
                     .entry(fname.clone())
@@ -3861,50 +4118,52 @@ fn evaluate_load_combos(model: &mut SapModel) {
                             .collect()
                     });
                 for (dst_s, src_s) in entry.iter_mut().zip(stations.iter()) {
-                    dst_s.p = combine_op(dst_s.p, src_s.p, *sf, is_first);
-                    dst_s.v2 = combine_op(dst_s.v2, src_s.v2, *sf, is_first);
-                    dst_s.v3 = combine_op(dst_s.v3, src_s.v3, *sf, is_first);
-                    dst_s.t = combine_op(dst_s.t, src_s.t, *sf, is_first);
-                    dst_s.m2 = combine_op(dst_s.m2, src_s.m2, *sf, is_first);
-                    dst_s.m3 = combine_op(dst_s.m3, src_s.m3, *sf, is_first);
+                    dst_s.p = combine_op(dst_s.p, src_s.p, *sf, key_first);
+                    dst_s.v2 = combine_op(dst_s.v2, src_s.v2, *sf, key_first);
+                    dst_s.v3 = combine_op(dst_s.v3, src_s.v3, *sf, key_first);
+                    dst_s.t = combine_op(dst_s.t, src_s.t, *sf, key_first);
+                    dst_s.m2 = combine_op(dst_s.m2, src_s.m2, *sf, key_first);
+                    dst_s.m3 = combine_op(dst_s.m3, src_s.m3, *sf, key_first);
                     for k in 0..3 {
                         dst_s.local_disp[k] =
-                            combine_op(dst_s.local_disp[k], src_s.local_disp[k], *sf, is_first);
+                            combine_op(dst_s.local_disp[k], src_s.local_disp[k], *sf, key_first);
                     }
                 }
             }
 
             for (aname, ar) in &src.area_results {
+                let key_first = is_first || !comb_res.area_results.contains_key(aname);
                 let entry = comb_res.area_results.entry(aname.clone()).or_default();
-                entry.f11 = combine_op(entry.f11, ar.f11, *sf, is_first);
-                entry.f22 = combine_op(entry.f22, ar.f22, *sf, is_first);
-                entry.f12 = combine_op(entry.f12, ar.f12, *sf, is_first);
-                entry.m11 = combine_op(entry.m11, ar.m11, *sf, is_first);
-                entry.m22 = combine_op(entry.m22, ar.m22, *sf, is_first);
-                entry.m12 = combine_op(entry.m12, ar.m12, *sf, is_first);
-                entry.v13 = combine_op(entry.v13, ar.v13, *sf, is_first);
-                entry.v23 = combine_op(entry.v23, ar.v23, *sf, is_first);
-                entry.s11_top = combine_op(entry.s11_top, ar.s11_top, *sf, is_first);
-                entry.s22_top = combine_op(entry.s22_top, ar.s22_top, *sf, is_first);
-                entry.s12_top = combine_op(entry.s12_top, ar.s12_top, *sf, is_first);
-                entry.svm_top = combine_op(entry.svm_top, ar.svm_top, *sf, is_first);
+                entry.f11 = combine_op(entry.f11, ar.f11, *sf, key_first);
+                entry.f22 = combine_op(entry.f22, ar.f22, *sf, key_first);
+                entry.f12 = combine_op(entry.f12, ar.f12, *sf, key_first);
+                entry.m11 = combine_op(entry.m11, ar.m11, *sf, key_first);
+                entry.m22 = combine_op(entry.m22, ar.m22, *sf, key_first);
+                entry.m12 = combine_op(entry.m12, ar.m12, *sf, key_first);
+                entry.v13 = combine_op(entry.v13, ar.v13, *sf, key_first);
+                entry.v23 = combine_op(entry.v23, ar.v23, *sf, key_first);
+                entry.s11_top = combine_op(entry.s11_top, ar.s11_top, *sf, key_first);
+                entry.s22_top = combine_op(entry.s22_top, ar.s22_top, *sf, key_first);
+                entry.s12_top = combine_op(entry.s12_top, ar.s12_top, *sf, key_first);
+                entry.svm_top = combine_op(entry.svm_top, ar.svm_top, *sf, key_first);
             }
 
             for (sname, sr) in &src.solid_results {
+                let key_first = is_first || !comb_res.solid_results.contains_key(sname);
                 let entry = comb_res.solid_results.entry(sname.clone()).or_default();
-                combine_stress(&mut entry.center_stress, &sr.center_stress, *sf, is_first);
+                combine_stress(&mut entry.center_stress, &sr.center_stress, *sf, key_first);
                 for g in 0..8 {
                     combine_stress(
                         &mut entry.gauss_stresses[g],
                         &sr.gauss_stresses[g],
                         *sf,
-                        is_first,
+                        key_first,
                     );
                     combine_stress(
                         &mut entry.nodal_stresses[g],
                         &sr.nodal_stresses[g],
                         *sf,
-                        is_first,
+                        key_first,
                     );
                 }
                 for k in 0..8 {
@@ -3913,21 +4172,26 @@ fn evaluate_load_combos(model: &mut SapModel) {
                             entry.nodal_forces[k][d],
                             sr.nodal_forces[k][d],
                             *sf,
-                            is_first,
+                            key_first,
                         );
                     }
                 }
             }
 
             for (lname, lf) in &src.link_forces {
+                let key_first = is_first || !comb_res.link_forces.contains_key(lname);
                 let entry = comb_res
                     .link_forces
                     .entry(lname.clone())
                     .or_insert([0.0; 6]);
                 for k in 0..6 {
-                    entry[k] = combine_op(entry[k], lf[k], *sf, is_first);
+                    entry[k] = combine_op(entry[k], lf[k], *sf, key_first);
                 }
             }
+        }
+
+        if contributed == 0 {
+            continue;
         }
 
         if combo.combo_type == ComboType::Srss {

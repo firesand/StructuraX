@@ -67,6 +67,7 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_example_6_005());
     rows.extend(verify_example_7_001());
     rows.extend(verify_example_7_002());
+    rows.extend(verify_example_7_003());
     rows
 }
 
@@ -1381,12 +1382,26 @@ pub fn verify_example_6_003() -> Vec<BenchmarkVerificationRow> {
         .load_cases
         .insert("NLDHIST1".to_string(), nldhist1.clone());
 
-    // History-origin continuation is not a supported verification row: the
-    // persisted result model does not store terminal velocities/internal states.
+    let mut nlstat3 = LoadCase::linear_static("NLSTAT3", "V", 1.0);
+    nlstat3.case_type = LoadCaseType::NonlinearStatic;
+    nlstat3.initial_case = Some("NLDHIST1".to_string());
+    model.load_cases.insert("NLSTAT3".to_string(), nlstat3);
+
+    let mut nldhist2 = nldhist1.clone();
+    nldhist2.name = "NLDHIST2".to_string();
+    nldhist2.initial_case = Some("NLDHIST1".to_string());
+    nldhist2.history_loads = vec![("RAMP40".to_string(), "V".to_string(), 1.0)];
+    nldhist2.num_time_steps = 800;
+    model.load_cases.insert("NLDHIST2".to_string(), nldhist2);
+
     analyze_model(&mut model).expect("Ex 6-003 analysis failed");
     let f_nlstat1 = model.case_results["NLSTAT1"].link_forces["1"][0];
     let f_nldhist1 = model.case_results["NLDHIST1"].link_forces["1"][0];
     let uz_nlstat2 = model.case_results["NLSTAT2"].joint_displacements["2"][2];
+    let uz_nlstat3 = model.case_results["NLSTAT3"].joint_displacements["2"][2];
+    let uz_nldhist2 = model.case_results["NLDHIST2"].time_history_disp["2"]
+        .last()
+        .expect("NLDHIST2 terminal step")[2];
     vec![
         BenchmarkVerificationRow::new(
             "Ex 6-003 (Gap Static)",
@@ -1410,6 +1425,22 @@ pub fn verify_example_6_003() -> Vec<BenchmarkVerificationRow> {
             "Uz (Jt 2) [in]",
             3.9169,
             uz_nlstat2,
+            0.2,
+        ),
+        BenchmarkVerificationRow::new(
+            "Ex 6-003 (Hist->Static)",
+            "NLSTAT3",
+            "Uz (Jt 2) [in]",
+            3.9169,
+            uz_nlstat3,
+            0.2,
+        ),
+        BenchmarkVerificationRow::new(
+            "Ex 6-003 (Hist->Hist)",
+            "NLDHIST2",
+            "Uz (Jt 2) [in]",
+            3.9169,
+            uz_nldhist2,
             0.2,
         ),
     ]
@@ -1649,6 +1680,146 @@ pub fn verify_example_7_002() -> Vec<BenchmarkVerificationRow> {
             -18.457,
             disp_uz,
             0.1,
+        ),
+    ]
+}
+
+/// Example 7-003: 3D Prestressed 3x3 Cable Net Initialized via Target I-End Tension (Tibert 1999).
+pub fn verify_example_7_003() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::CableParams;
+    let mut net = SapModel::new(Units::KipFtF);
+    net.load_patterns.clear();
+    net.load_cases.clear();
+    net.load_patterns.insert(
+        "SELF".into(),
+        LoadPattern {
+            name: "SELF".into(),
+            pat_type: LoadPatternType::Dead,
+            self_wt_multiplier: 1.0,
+        },
+    );
+    net.load_patterns.insert(
+        "POINT".into(),
+        LoadPattern {
+            name: "POINT".into(),
+            pat_type: LoadPatternType::Other,
+            self_wt_multiplier: 0.0,
+        },
+    );
+    let mut mat = Material::default_steel_kip_in();
+    mat.name = "CABLE_MAT".into();
+    mat.e = 12_000.0 * 144.0;
+    mat.a = 0.0;
+    let area_ft2 = 0.227 / 144.0;
+    mat.unit_weight = 0.0001 / area_ft2;
+    mat.unit_mass = 0.0;
+    net.materials.insert("CABLE_MAT".into(), mat);
+    net.frame_sections.insert(
+        "CAB_SEC".into(),
+        FrameSection {
+            name: "CAB_SEC".into(),
+            material: "CABLE_MAT".into(),
+            area: area_ft2,
+            ..FrameSection::default()
+        },
+    );
+
+    net.add_point("1", 100.0, 100.0, 10.0);
+    net.add_point("2", 200.0, 100.0, 10.0);
+    net.add_point("3", 100.0, 200.0, 10.0);
+    net.add_point("4", 200.0, 200.0, 10.0);
+    for (sname, x, y) in [
+        ("5", 100.0, 0.0),
+        ("6", 200.0, 0.0),
+        ("7", 0.0, 100.0),
+        ("8", 300.0, 100.0),
+        ("9", 0.0, 200.0),
+        ("10", 300.0, 200.0),
+        ("11", 100.0, 300.0),
+        ("12", 200.0, 300.0),
+    ] {
+        net.add_point(sname, x, y, 40.0);
+        net.points.get_mut(sname).unwrap().restraint = [true; 6];
+    }
+    for j in ["1", "2", "3", "4"] {
+        net.points.get_mut(j).unwrap().loads_force.push(PointLoadForce {
+            load_pat: "POINT".into(),
+            csys: "GLOBAL".into(),
+            force: [0.0, 0.0, -8.0, 0.0, 0.0, 0.0],
+        });
+    }
+    for (cname, pi, pj) in [
+        ("1", "7", "1"),
+        ("4", "9", "3"),
+        ("9", "5", "1"),
+        ("12", "6", "2"),
+        ("3", "8", "2"),
+        ("6", "10", "4"),
+        ("10", "4", "12"),
+        ("7", "3", "11"),
+    ] {
+        net.add_frame(cname, pi, pj, "CAB_SEC");
+        let f = net.frames.get_mut(cname).unwrap();
+        f.tc_limits = Some((true, 0.0, false, 0.0));
+        f.cable_params = Some(CableParams {
+            undeformed_length: None,
+            target_tension_i: Some(5.325),
+            horizontal_tension: None,
+            num_segments: 1,
+        });
+    }
+    for (cname, pi, pj) in [
+        ("2", "1", "2"),
+        ("5", "3", "4"),
+        ("11", "2", "4"),
+        ("8", "3", "1"),
+    ] {
+        net.add_frame(cname, pi, pj, "CAB_SEC");
+        let f = net.frames.get_mut(cname).unwrap();
+        f.tc_limits = Some((true, 0.0, false, 0.0));
+        f.cable_params = Some(CableParams {
+            undeformed_length: None,
+            target_tension_i: Some(5.459),
+            horizontal_tension: None,
+            num_segments: 1,
+        });
+    }
+
+    let mut lc_self = LoadCase::linear_static("SELF", "SELF", 1.0);
+    lc_self.case_type = LoadCaseType::NonlinearStatic;
+    net.load_cases.insert("SELF".into(), lc_self);
+
+    let mut lc_pt = LoadCase::linear_static("POINT", "POINT", 1.0);
+    lc_pt.case_type = LoadCaseType::NonlinearStatic;
+    lc_pt.initial_case = Some("SELF".into());
+    net.load_cases.insert("POINT".into(), lc_pt);
+
+    analyze_model(&mut net).expect("Ex 7-003 analysis failed");
+    let u1 = net.case_results["POINT"].joint_displacements["1"];
+    vec![
+        BenchmarkVerificationRow::new(
+            "Ex 7-003 (3D Cable Net)",
+            "POINT",
+            "Ux (Jt 1) [ft]",
+            -0.1328,
+            u1[0],
+            0.2,
+        ),
+        BenchmarkVerificationRow::new(
+            "Ex 7-003 (3D Cable Net)",
+            "POINT",
+            "Uy (Jt 1) [ft]",
+            -0.1328,
+            u1[1],
+            0.2,
+        ),
+        BenchmarkVerificationRow::new(
+            "Ex 7-003 (3D Cable Net)",
+            "POINT",
+            "Uz (Jt 1) [ft]",
+            -1.4745,
+            u1[2],
+            0.2,
         ),
     ]
 }

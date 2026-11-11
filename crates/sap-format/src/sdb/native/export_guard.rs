@@ -192,18 +192,25 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                     "requires 1..=i32::MAX",
                 ));
             }
-            if [
+            let specs = [
                 c.undeformed_length,
                 c.target_tension_i,
                 c.horizontal_tension,
-            ]
-            .into_iter()
-            .flatten()
-            .any(|x| !x.is_finite() || x <= 0.)
+            ];
+            if specs
+                .into_iter()
+                .flatten()
+                .any(|x| !x.is_finite() || x <= 0.)
             {
                 return Err(unsupported(
                     format!("frames.{name}.cable_params"),
                     "specified cable targets must be finite and positive",
+                ));
+            }
+            if specs.into_iter().flatten().count() > 1 {
+                return Err(unsupported(
+                    format!("frames.{name}.cable_params"),
+                    "native S_CableData selects at most one governing specification (undeformed_length, target_tension_i, or horizontal_tension)",
                 ));
             }
         }
@@ -367,22 +374,29 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         ));
     }
     for (name, p) in &model.points {
-        if p.spring_coupled.is_some() {
-            return Err(unsupported(
-                format!("points.{name}.spring_coupled"),
-                "coupled joint spring serialization is not implemented",
-            ));
+        if let Some(coupled) = &p.spring_coupled {
+            if p.spring.iter().any(|&v| v != 0.0) {
+                return Err(unsupported(
+                    format!("points.{name}.spring_coupled"),
+                    "native TYSpring stores a single 21-term stiffness matrix; combine uncoupled and coupled springs before export",
+                ));
+            }
+            if coupled.iter().all(|v| v.is_finite())
+                && coupled
+                    .iter()
+                    .enumerate()
+                    .all(|(idx, &val)| crate::sdb::SPRING_DIAG_INDICES.contains(&idx) || val == 0.0)
+            {
+                return Err(unsupported(
+                    format!("points.{name}.spring_coupled"),
+                    "coupled spring matrix with zero off-diagonals canonicalizes to uncoupled spring on native reimport; store diagonal terms in points.spring",
+                ));
+            }
         }
         if p.local_axes_matrix.is_some() {
             return Err(unsupported(
                 format!("points.{name}.local_axes_matrix"),
                 "explicit joint axis-matrix serialization is not implemented",
-            ));
-        }
-        if p.spring_is_local {
-            return Err(unsupported(
-                format!("points.{name}.spring_is_local"),
-                "local spring-coordinate serialization is not verified",
             ));
         }
     }
@@ -395,10 +409,26 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         }
         if m.e_ortho.is_some() || m.u_ortho.is_some() || m.g_ortho.is_some() || m.a_ortho.is_some()
         {
-            return Err(unsupported(
-                format!("materials.{name}.orthotropic"),
-                "orthotropic material serialization and native projection are not implemented",
-            ));
+            let (Some(eo), Some(uo), Some(go), Some(ao)) =
+                (m.e_ortho, m.u_ortho, m.g_ortho, m.a_ortho)
+            else {
+                return Err(unsupported(
+                    format!("materials.{name}.orthotropic"),
+                    "native orthotropic material requires complete [e_ortho, u_ortho, g_ortho, a_ortho] arrays",
+                ));
+            };
+            if [eo, uo, go, ao]
+                .into_iter()
+                .flatten()
+                .all(|v| v.is_finite())
+                && [m.e, m.u, m.g, m.a].into_iter().all(|v| v.is_finite())
+                && (m.e != eo[0] || m.u != uo[0] || m.g != go[0] || m.a != ao[0])
+            {
+                return Err(unsupported(
+                    format!("materials.{name}.orthotropic"),
+                    "primary scalar properties (e, u, g, a) must equal index [0] of their orthotropic arrays",
+                ));
+            }
         }
     }
     for (name, c) in &model.coord_systems {

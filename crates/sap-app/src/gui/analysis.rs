@@ -61,6 +61,54 @@ fn save_function(model: &mut SapModel, state: &AnalysisEditor) -> Result<String,
     sap_api::set_function_definition(model, function).map_err(|e| e.to_string())?;
     Ok(format!("Saved function {}.", state.function.name))
 }
+fn delete_case(model: &mut SapModel, name: &str) -> Result<String, String> {
+    if model.is_locked {
+        return Err("Unlock the model before deleting cases.".into());
+    }
+    if !model.load_cases.contains_key(name) {
+        return Err(format!("Case '{name}' does not exist."));
+    }
+    if model
+        .load_cases
+        .values()
+        .any(|c| c.name != name && c.initial_case.as_deref() == Some(name))
+    {
+        return Err(format!(
+            "Case '{name}' is referenced as initial/modal source by another case."
+        ));
+    }
+    if model
+        .load_combos
+        .values()
+        .any(|combo| combo.cases.iter().any(|(c, _)| c == name))
+    {
+        return Err(format!(
+            "Case '{name}' is referenced by a load combination; update or delete the combination first."
+        ));
+    }
+    model.load_cases.shift_remove(name);
+    model.invalidate_results();
+    Ok(format!("Deleted case {name}."))
+}
+fn delete_function(model: &mut SapModel, name: &str) -> Result<String, String> {
+    if model.is_locked {
+        return Err("Unlock the model before deleting functions.".into());
+    }
+    if !model.functions.contains_key(name) {
+        return Err(format!("Function '{name}' does not exist."));
+    }
+    if model.load_cases.values().any(|c| {
+        c.spectrum_loads.iter().any(|(f, _, _)| f == name)
+            || c.history_loads.iter().any(|(f, _, _)| f == name)
+    }) {
+        return Err(format!(
+            "Function '{name}' is referenced by an analysis case."
+        ));
+    }
+    model.functions.shift_remove(name);
+    model.invalidate_results();
+    Ok(format!("Deleted function {name}."))
+}
 fn new_case(kind: LoadCaseType, name: &str) -> LoadCase {
     let mut case = LoadCase::linear_static(name, "DEAD", 1.0);
     case.case_type = kind;
@@ -192,7 +240,9 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                 LoadCaseType::Buckling,
                 LoadCaseType::ResponseSpectrum,
                 LoadCaseType::LinearHistory,
+                LoadCaseType::LinearDynamic,
                 LoadCaseType::NonlinearHistory,
+                LoadCaseType::NonlinearDynamic,
             ] {
                 ui.selectable_value(&mut kind, value, format!("{value:?}"));
             }
@@ -373,7 +423,18 @@ impl SapGuiApp {
                         for (name,case) in &self.model.load_cases {if ui.button(name).clicked() {state.case=case.clone();ui.close_menu();}}
                     });
                     case_controls(ui,&self.model,&mut state.case);
-                    if ui.button("Save Analysis Case").clicked() {outcome=Some(sap_api::set_case_definition(&mut self.model,state.case.clone()).map(|_|format!("Saved case {}.",state.case.name)).map_err(|e|e.to_string()));}
+                    ui.horizontal(|ui| {
+                        if ui.button("Save Analysis Case").clicked() {
+                            outcome = Some(
+                                sap_api::set_case_definition(&mut self.model, state.case.clone())
+                                    .map(|_| format!("Saved case {}.", state.case.name))
+                                    .map_err(|e| e.to_string()),
+                            );
+                        }
+                        if ui.button("Delete Case").clicked() {
+                            outcome = Some(delete_case(&mut self.model, &state.case.name));
+                        }
+                    });
                     ui.separator();
                     ui.label("Cases selected to run:");
                     let mut toggle=None;
@@ -391,9 +452,16 @@ impl SapGuiApp {
                     if !state.function.is_time_history {ui.horizontal(|ui| {ui.label("Reference damping ratio:");ui.add(egui::DragValue::new(&mut state.function.damping_ratio).speed(0.005));});}
                     ui.label("One pair per line: time/value or period/spectral acceleration. Spaces or commas; # starts a comment.");
                     ui.add(egui::TextEdit::multiline(&mut state.samples).code_editor().desired_rows(9).desired_width(f32::INFINITY));
-                    if ui.button("Save Dynamic Function").clicked() {outcome=Some(save_function(&mut self.model,&state));}
+                    ui.horizontal(|ui| {
+                        if ui.button("Save Dynamic Function").clicked() {
+                            outcome = Some(save_function(&mut self.model, &state));
+                        }
+                        if ui.button("Delete Function").clicked() {
+                            outcome = Some(delete_function(&mut self.model, &state.function.name));
+                        }
+                    });
                 }
-                if let Some(result)=outcome {self.status_msg=match result {Ok(message)=>{self.inspected_frame=None;message},Err(error)=>format!("Definition error: {error}")};}
+                if let Some(result)=outcome {self.status_msg=match result {Ok(message)=>{self.inspected_frame=None;self.sync_active_case();message},Err(error)=>format!("Definition error: {error}")};}
                 ui.separator();ui.label(&self.status_msg);
             });
         }

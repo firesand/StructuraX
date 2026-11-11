@@ -936,15 +936,40 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ),
             ("m_fc".into(), SdbVal::F64(mat.fc)),
         ]);
+        let is_ortho = mat.e_ortho.is_some()
+            || mat.u_ortho.is_some()
+            || mat.g_ortho.is_some()
+            || mat.a_ortho.is_some();
+        let sym_type = if is_ortho {
+            1
+        } else if matches!(mat.mat_type, MatType::Rebar | MatType::Tendon) {
+            3
+        } else {
+            0
+        };
+        let e_arr = mat.e_ortho.map_or_else(|| vec![mat.e; 3], |v| v.to_vec());
+        let g_arr = mat.g_ortho.map_or_else(|| vec![mat.g; 3], |v| v.to_vec());
+        let mut u_arr = vec![0.0; 15];
+        if let Some(uo) = mat.u_ortho {
+            u_arr[..3].copy_from_slice(&uo);
+        } else {
+            u_arr[..3].fill(mat.u);
+        }
+        let mut a_arr = vec![0.0; 6];
+        if let Some(ao) = mat.a_ortho {
+            a_arr[..3].copy_from_slice(&ao);
+        } else {
+            a_arr[..3].fill(mat.a);
+        }
         let mt0 = HashMap::from([
             ("__class_id".into(), SdbVal::Str("S_MT".into())),
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_w".into(), SdbVal::F64(mat.unit_weight)),
             ("m_m".into(), SdbVal::F64(mat.unit_mass)),
-            ("m_e".into(), SdbVal::ArrF64(vec![mat.e; 3])),
-            ("m_g".into(), SdbVal::ArrF64(vec![mat.g; 3])),
-            ("m_u".into(), SdbVal::ArrF64(vec![mat.u; 3])),
-            ("m_a".into(), SdbVal::ArrF64(vec![mat.a; 3])),
+            ("m_e".into(), SdbVal::ArrF64(e_arr)),
+            ("m_g".into(), SdbVal::ArrF64(g_arr)),
+            ("m_u".into(), SdbVal::ArrF64(u_arr)),
+            ("m_a".into(), SdbVal::ArrF64(a_arr)),
             ("m_SteelProps".into(), SdbVal::Obj(steel_props)),
             ("m_ConcreteProps".into(), SdbVal::Obj(conc_props)),
         ]);
@@ -954,6 +979,7 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_color".into(), SdbVal::I32(material_colorref(&mat.color).ok_or_else(||
                 export_guard::unsupported(format!("materials.{}.color", mat.name), "color has no supported exact COLORREF encoding"))?)),
             ("m_mtype".into(), SdbVal::I32(mtype)),
+            ("m_SymType".into(), SdbVal::I32(sym_type)),
             ("m_NumberMTs".into(), SdbVal::I32(1)),
             ("m_Mt".into(), SdbVal::ArrObj(vec![mt0])),
         ]));
@@ -1262,9 +1288,19 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             l_map.insert("m_LimitTension".into(), SdbVal::F64(lim_t));
         }
         if let Some(ref cp) = fr.cable_params {
+            let cable_type = if cp.undeformed_length.is_some() {
+                8
+            } else if cp.target_tension_i.is_some() {
+                3
+            } else if cp.horizontal_tension.is_some() {
+                5
+            } else {
+                8
+            };
             let cd_map = HashMap::from([
                 ("__class_id".into(), SdbVal::Str("S_CableData".into())),
                 ("m_ModelUsingFrames".into(), SdbVal::Bool(false)),
+                ("m_CableType".into(), SdbVal::I32(cable_type)),
                 ("m_NumSegs".into(), SdbVal::I32(cp.num_segments as i32)),
                 (
                     "m_UndeformedLength".into(),
@@ -1452,11 +1488,23 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 ]));
             }
         }
-        if pt.spring.iter().any(|&k| k != 0.0) {
+        if pt.spring.iter().any(|&k| k != 0.0) || pt.spring_coupled.is_some() || pt.spring_is_local
+        {
+            let xjps = if let Some(coupled) = pt.spring_coupled {
+                coupled.to_vec()
+            } else {
+                let mut arr = vec![0.0; 21];
+                for (d, &idx) in SPRING_DIAG_INDICES.iter().enumerate() {
+                    arr[idx] = pt.spring[d];
+                }
+                arr
+            };
+            let csys = if pt.spring_is_local { -1 } else { 1 };
             raw_springs.push(HashMap::from([
                 ("m_alive".into(), SdbVal::Bool(true)),
                 ("m_jn".into(), SdbVal::I32(jn)),
-                ("m_XJPS".into(), SdbVal::ArrF64(pt.spring.to_vec())),
+                ("m_XJPS".into(), SdbVal::ArrF64(xjps)),
+                ("m_csys".into(), SdbVal::I32(csys)),
             ]));
         }
         if pt.mass.iter().any(|&m| m != 0.0) {
@@ -2241,7 +2289,7 @@ mod tests {
         let mut c1 = FrameObj::new("C1", "2", "3", "CAB1");
         c1.cable_params = Some(sap_model::CableParams {
             undeformed_length: Some(3.98),
-            target_tension_i: Some(120.0),
+            target_tension_i: None,
             horizontal_tension: None,
             num_segments: 8,
         });

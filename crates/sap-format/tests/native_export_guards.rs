@@ -217,7 +217,13 @@ fn original_physical_assignment_losses_are_rejected_before_write() {
     m.project_info.insert("Owner".into(), "keep".into());
     assert_rejected_unchanged(&m, "project_info");
     let mut m = supported_model();
+    m.points["B"].spring = [10., 0., 0., 0., 0., 0.];
     m.points["B"].spring_coupled = Some([2.; 21]);
+    assert_rejected_unchanged(&m, "spring_coupled");
+    let mut m = supported_model();
+    let mut diag_only = [0.; 21];
+    diag_only[0] = 25.;
+    m.points["B"].spring_coupled = Some(diag_only);
     assert_rejected_unchanged(&m, "spring_coupled");
     let mut m = supported_model();
     m.points["B"].local_axes_matrix = Some([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]);
@@ -225,6 +231,23 @@ fn original_physical_assignment_losses_are_rejected_before_write() {
     let mut m = supported_model();
     m.materials["A992Fy50"].e_ortho = Some([29000., 22000., 13000.]);
     assert_rejected_unchanged(&m, "orthotropic");
+    let mut m = supported_model();
+    {
+        let mat = m.materials.get_mut("A992Fy50").unwrap();
+        mat.e_ortho = Some([28000., 22000., 13000.]);
+        mat.g_ortho = Some([mat.g, 8500., 5000.]);
+        mat.u_ortho = Some([mat.u, 0.25, 0.20]);
+        mat.a_ortho = Some([mat.a, 7.0e-6, 8.0e-6]);
+    }
+    assert_rejected_unchanged(&m, "orthotropic");
+    let mut m = supported_model();
+    m.frames["F"].cable_params = Some(CableParams {
+        undeformed_length: Some(11.95),
+        target_tension_i: Some(50.0),
+        horizontal_tension: None,
+        num_segments: 4,
+    });
+    assert_rejected_unchanged(&m, "cable_params");
 }
 #[test]
 fn incomplete_nonlinear_source_cannot_be_promoted_by_native_roundtrip() {
@@ -385,5 +408,171 @@ fn generated_class_versions_match_independently_observed_v19_tags() {
                 .unwrap(),
         );
         assert_eq!(actual, expected, "{class}");
+    }
+}
+
+#[test]
+fn coupled_and_local_joint_springs_roundtrip_through_native_sdb() {
+    let mut coupled = [0.0; 21];
+    for (idx, slot) in coupled.iter_mut().enumerate() {
+        *slot = (idx as f64 + 1.0) * 12.5;
+    }
+
+    for is_local in [false, true] {
+        let mut m = supported_model();
+        m.points["A"].spring = [100.0, 0.0, 250.0, 0.0, 80000.0, 0.0];
+        m.points["A"].spring_is_local = is_local;
+        m.points["B"].spring_coupled = Some(coupled);
+        m.points["B"].spring_is_local = !is_local;
+
+        let native = pack_model_to_native_sdb(&m).unwrap();
+        let doc = inspect_native_sdb(&native).unwrap();
+        assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+        let spring_records: Vec<_> = doc
+            .records()
+            .iter()
+            .filter(|r| r.class_id == "TYSpring")
+            .collect();
+        assert_eq!(spring_records.len(), 2);
+        for (rec, expected_local) in spring_records.iter().zip([is_local, !is_local]) {
+            let ver_field = rec
+                .fields
+                .iter()
+                .find(|f| f.name.as_deref() == Some("ClassVersion"))
+                .unwrap();
+            let ver = i32::from_le_bytes(
+                native.decompressed_stream[ver_field.offset..ver_field.offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(ver, 1);
+
+            let csys_field = rec
+                .fields
+                .iter()
+                .find(|f| f.name.as_deref() == Some("m_csys"))
+                .unwrap();
+            let csys = i32::from_le_bytes(
+                native.decompressed_stream[csys_field.offset..csys_field.offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            assert_eq!(csys, if expected_local { -1 } else { 1 });
+        }
+
+        let restored = extract_sdb_to_model(&native).unwrap();
+        assert_eq!(restored, m);
+        assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
+    }
+}
+
+#[test]
+fn complete_orthotropic_material_roundtrips_through_native_sdb() {
+    let mut m = supported_model();
+    {
+        let mat = m.materials.get_mut("A992Fy50").unwrap();
+        mat.e = 29000.0;
+        mat.e_ortho = Some([29000.0, 18000.0, 12000.0]);
+        mat.g = 11153.846;
+        mat.g_ortho = Some([11153.846, 7500.0, 4800.0]);
+        mat.u = 0.30;
+        mat.u_ortho = Some([0.30, 0.24, 0.18]);
+        mat.a = 6.5e-6;
+        mat.a_ortho = Some([6.5e-6, 7.2e-6, 8.1e-6]);
+    }
+
+    let native = pack_model_to_native_sdb(&m).unwrap();
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+    let first_mat = doc
+        .records()
+        .iter()
+        .find(|r| r.class_id == "S_Material")
+        .unwrap();
+    let sym_field = first_mat
+        .fields
+        .iter()
+        .find(|f| f.name.as_deref() == Some("m_SymType"))
+        .unwrap();
+    let sym = i32::from_le_bytes(
+        native.decompressed_stream[sym_field.offset..sym_field.offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(sym, 1);
+
+    let restored = extract_sdb_to_model(&native).unwrap();
+    assert_eq!(restored, m);
+    assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
+}
+
+#[test]
+fn cable_m_cable_type_modes_roundtrip_through_native_sdb() {
+    let specs = [
+        (
+            8_i32,
+            CableParams {
+                undeformed_length: Some(11.95),
+                target_tension_i: None,
+                horizontal_tension: None,
+                num_segments: 8,
+            },
+        ),
+        (
+            3_i32,
+            CableParams {
+                undeformed_length: None,
+                target_tension_i: Some(52.5),
+                horizontal_tension: None,
+                num_segments: 12,
+            },
+        ),
+        (
+            5_i32,
+            CableParams {
+                undeformed_length: None,
+                target_tension_i: None,
+                horizontal_tension: Some(41.25),
+                num_segments: 16,
+            },
+        ),
+    ];
+
+    for (expected_code, params) in specs {
+        let mut m = supported_model();
+        let mut cab_sec = FrameSection::default();
+        cab_sec.name = "CAB1".into();
+        cab_sec.material = "A992Fy50".into();
+        cab_sec.prop_type = FramePropType::Circle;
+        cab_sec.area = 0.5;
+        cab_sec.t3 = (4.0 * 0.5 / std::f64::consts::PI).sqrt();
+        m.frame_sections.insert("CAB1".into(), cab_sec);
+        m.frames["F"].section = "CAB1".into();
+        m.frames["F"].cable_params = Some(params.clone());
+
+        let native = pack_model_to_native_sdb(&m).unwrap();
+        let doc = inspect_native_sdb(&native).unwrap();
+        let cable_rec = doc
+            .records()
+            .iter()
+            .find(|r| r.class_id == "S_CableData")
+            .unwrap();
+        let ctype_field = cable_rec
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some("m_CableType"))
+            .unwrap();
+        let actual_code = i32::from_le_bytes(
+            native.decompressed_stream[ctype_field.offset..ctype_field.offset + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(actual_code, expected_code);
+
+        let restored = extract_sdb_to_model(&native).unwrap();
+        assert_eq!(restored.frames["F"].cable_params, Some(params));
+        assert_eq!(restored, m);
     }
 }

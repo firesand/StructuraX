@@ -375,6 +375,103 @@ impl LinearStepper {
         self.check_state()
     }
 
+    pub fn previous_force(&self) -> &[f64] {
+        &self.previous_force
+    }
+
+    pub fn seed_transient_state(
+        &mut self,
+        ts: &sap_model::TransientTerminalState,
+        force0: &[f64],
+    ) -> Result<(), SolverError> {
+        if ts.u.len() != self.n
+            || ts.v.len() != self.n
+            || ts.a.len() != self.n
+            || ts.previous_force.len() != self.n
+            || force0.len() != self.n
+            || ts
+                .u
+                .iter()
+                .chain(&ts.v)
+                .chain(&ts.a)
+                .chain(&ts.previous_force)
+                .chain(force0)
+                .any(|x| !x.is_finite())
+        {
+            return Err(SolverError::InvalidInput(
+                "invalid or mismatched transient continuation state".into(),
+            ));
+        }
+
+        for i in 0..self.n {
+            if self.fixed[i] {
+                self.state.u[i] = 0.0;
+                self.state.v[i] = 0.0;
+                self.state.a[i] = 0.0;
+            } else {
+                self.state.u[i] = ts.u[i];
+                self.state.v[i] = ts.v[i];
+                self.state.a[i] = ts.a[i];
+            }
+        }
+
+        let max_df = (0..self.n)
+            .filter(|&i| !self.fixed[i])
+            .map(|i| (force0[i] - ts.previous_force[i]).abs())
+            .fold(0.0_f64, f64::max);
+
+        if max_df < 1e-15 {
+            self.previous_force.copy_from_slice(&ts.previous_force);
+        } else {
+            for i in 0..self.n {
+                if !self.fixed[i] && self.mass[i] > 0.0 {
+                    self.state.a[i] += (force0[i] - ts.previous_force[i]) / self.mass[i];
+                }
+            }
+            if self.stiffness_damping == 0.0 {
+                if let Some(block) = &self.massless {
+                    let df_z: Vec<f64> = block
+                        .dofs
+                        .iter()
+                        .map(|&i| force0[i] - ts.previous_force[i])
+                        .collect();
+                    if df_z.iter().any(|x| x.abs() >= 1e-15) {
+                        let du_z = block.factor.solve(&df_z)?;
+                        for (&i, du) in block.dofs.iter().zip(du_z) {
+                            self.state.u[i] += du;
+                        }
+                        for i in 0..self.n {
+                            if !self.fixed[i] && self.mass[i] > 0.0 {
+                                let dk_u: f64 = block
+                                    .dofs
+                                    .iter()
+                                    .map(|&j| self.k[i * self.n + j] * (self.state.u[j] - ts.u[j]))
+                                    .sum();
+                                self.state.a[i] -= dk_u / self.mass[i];
+                            }
+                        }
+                    }
+                    let rhs_az: Vec<f64> = block
+                        .dofs
+                        .iter()
+                        .map(|&i| {
+                            -(0..self.n)
+                                .filter(|&j| self.mass[j] > 0.0)
+                                .map(|j| self.k[i * self.n + j] * self.state.a[j])
+                                .sum::<f64>()
+                        })
+                        .collect();
+                    let az = block.factor.solve(&rhs_az)?;
+                    for (&i, val) in block.dofs.iter().zip(az) {
+                        self.state.a[i] = val;
+                    }
+                }
+            }
+            self.previous_force.copy_from_slice(force0);
+        }
+        self.check_state()
+    }
+
     fn check_state(&self) -> Result<(), SolverError> {
         if self
             .state
@@ -643,6 +740,90 @@ impl NonlinearStepper {
             map.insert((sp.link_name.clone(), sp.dof_index), sp.f_prev);
         }
         map
+    }
+
+    pub fn previous_force(&self) -> &[f64] {
+        &self.previous_force
+    }
+
+    pub fn terminal_link_force_states(&self) -> Vec<sap_model::NonlinearLinkForceState> {
+        self.springs
+            .iter()
+            .map(|sp| sap_model::NonlinearLinkForceState {
+                link: sp.link_name.clone(),
+                dof: sp.dof_index,
+                force: sp.f_prev,
+            })
+            .collect()
+    }
+
+    pub fn seed_transient_state(
+        &mut self,
+        ts: &sap_model::TransientTerminalState,
+        force0: &[f64],
+    ) -> Result<(), SolverError> {
+        if ts.u.len() != self.n
+            || ts.v.len() != self.n
+            || ts.a.len() != self.n
+            || ts.previous_force.len() != self.n
+            || force0.len() != self.n
+            || ts
+                .u
+                .iter()
+                .chain(&ts.v)
+                .chain(&ts.a)
+                .chain(&ts.previous_force)
+                .chain(force0)
+                .any(|x| !x.is_finite())
+        {
+            return Err(SolverError::InvalidInput(
+                "invalid or mismatched transient continuation state".into(),
+            ));
+        }
+
+        for i in 0..self.n {
+            if self.fixed[i] {
+                self.state.u[i] = 0.0;
+                self.state.v[i] = 0.0;
+                self.state.a[i] = 0.0;
+            } else {
+                self.state.u[i] = ts.u[i];
+                self.state.v[i] = ts.v[i];
+                self.state.a[i] = ts.a[i];
+            }
+        }
+
+        for sp in &mut self.springs {
+            if let Some(saved) = ts
+                .nonlinear_link_forces
+                .iter()
+                .find(|s| s.link == sp.link_name && s.dof == sp.dof_index)
+            {
+                if !saved.force.is_finite() {
+                    return Err(SolverError::InvalidInput(
+                        "nonfinite persisted nonlinear link force".into(),
+                    ));
+                }
+                sp.f_prev = saved.force;
+            }
+        }
+
+        let max_df = (0..self.n)
+            .filter(|&i| !self.fixed[i])
+            .map(|i| (force0[i] - ts.previous_force[i]).abs())
+            .fold(0.0_f64, f64::max);
+
+        if max_df < 1e-15 {
+            self.previous_force.copy_from_slice(&ts.previous_force);
+        } else {
+            for i in 0..self.n {
+                if !self.fixed[i] && self.mass[i] > 0.0 {
+                    self.state.a[i] += (force0[i] - ts.previous_force[i]) / self.mass[i];
+                }
+            }
+            self.previous_force.copy_from_slice(force0);
+        }
+        Ok(())
     }
 
     pub fn step(&mut self, force: &[f64], case: &LoadCase) -> Result<(), SolverError> {

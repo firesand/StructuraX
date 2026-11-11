@@ -19,14 +19,28 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             .as_ref()
             .and_then(|n| model.load_cases.get(n))
         {
+            if initial.case_type == LoadCaseType::LinearHistory {
+                return Err(unsupported(format!(
+                    "case '{}' requires modal history continuation from '{}', which is not supported",
+                    case.name, initial.name
+                )));
+            }
             if matches!(
                 initial.case_type,
                 LoadCaseType::NonlinearHistory
                     | LoadCaseType::NonlinearDynamic
-                    | LoadCaseType::LinearHistory
+                    | LoadCaseType::LinearDynamic
+            ) && !matches!(
+                case.case_type,
+                LoadCaseType::NonlinearStatic
+                    | LoadCaseType::NonlinearHistory
+                    | LoadCaseType::NonlinearDynamic
                     | LoadCaseType::LinearDynamic
             ) {
-                return Err(unsupported(format!("case '{}' requires history continuation, but terminal velocity, acceleration and internal link state are not stored", case.name)));
+                return Err(unsupported(format!(
+                    "case '{}' requires history continuation into {:?}, which is not supported",
+                    case.name, case.case_type
+                )));
             }
         }
         if matches!(
@@ -132,9 +146,21 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             }
             for f in model.frames.values() {
                 let cp = f.cable_params.as_ref().expect("checked cable-only model");
-                if cp.target_tension_i.is_some() {
+                if cp.undeformed_length.is_some_and(|v| !v.is_finite() || v <= 0.0)
+                    || cp.target_tension_i.is_some_and(|v| !v.is_finite() || v <= 0.0)
+                    || cp.horizontal_tension.is_some_and(|v| !v.is_finite() || v <= 0.0)
+                {
+                    return Err(SolverError::InvalidInput(format!(
+                        "cable '{}' shape initialization parameter must be finite and positive",
+                        f.name
+                    )));
+                }
+                let spec_count = usize::from(cp.undeformed_length.is_some())
+                    + usize::from(cp.target_tension_i.is_some())
+                    + usize::from(cp.horizontal_tension.is_some());
+                if spec_count > 1 {
                     return Err(unsupported(format!(
-                        "cable '{}' target end tension initialization is not implemented",
+                        "cable '{}' specifies multiple competing shape parameters (undeformed length, target end tension, or horizontal tension)",
                         f.name
                     )));
                 }
@@ -145,7 +171,8 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
                         .iter()
                         .chain(&f.joint_offset_j)
                         .any(|x| *x != 0.)
-                    || f.tc_limits.is_some_and(|(c, _, t, _)| c || t)
+                    || f.tc_limits
+                        .is_some_and(|(c, lim_c, t, _)| (c && lim_c != 0.0) || t)
                     || model
                         .frame_sections
                         .get(&f.section)
@@ -177,7 +204,7 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
         for f in model
             .frames
             .values()
-            .filter(|f| f.tc_limits.is_some_and(|(c, _, t, _)| c || t))
+            .filter(|f| f.cable_params.is_none() && f.tc_limits.is_some_and(|(c, _, t, _)| c || t))
         {
             if history
                 || (case.case_type == LoadCaseType::NonlinearStatic

@@ -148,7 +148,7 @@ impl CableElement {
         }
         let ea = e * area;
         let w = norm3(w_vec);
-        if w <= 1e-12 {
+        if w <= 1e-15 {
             let l0 = chord / (1.0 + h_target / ea);
             return Self::from_undeformed_length(
                 x_i_init, x_j_init, area, e, alpha, l0, w_vec, delta_t,
@@ -243,6 +243,256 @@ impl CableElement {
         let lx = norm3(h_vec);
         let h_est = w * lx / (8.0 * sag_ratio);
         Self::from_horizontal_tension(x_i_init, x_j_init, area, e, alpha, h_est, w_vec, delta_t)
+    }
+
+    /// Shape calculator: determine the undeformed length $L_0$ such that a cable spanning
+    /// `chord = x_J - x_I` with axial rigidity `ea = E * A` and downward self-weight `w_self >= 0`
+    /// per unit undeformed length achieves I-end tension `target_ti > 0` on the taut branch.
+    pub fn from_target_tension_i(
+        chord: [f64; 3],
+        ea: f64,
+        target_ti: f64,
+        w_self: f64,
+    ) -> Result<Self, SolverError> {
+        if !ea.is_finite()
+            || ea <= 0.0
+            || !target_ti.is_finite()
+            || target_ti <= 0.0
+            || !w_self.is_finite()
+            || w_self < 0.0
+            || chord.iter().any(|c| !c.is_finite())
+        {
+            return Err(SolverError::InvalidInput(format!(
+                "invalid cable target-tension parameters: EA={ea}, T_I={target_ti}, w_self={w_self}"
+            )));
+        }
+        let l_c = norm3(chord);
+        if l_c <= 1e-12 {
+            return Err(SolverError::InvalidInput(
+                "zero-chord cable cannot be initialized from target I-end tension".into(),
+            ));
+        }
+
+        // Case 1: Weightless cable (w_self <= 1e-15)
+        let l0 = if w_self <= 1e-15 {
+            l_c / (1.0 + target_ti / ea)
+        } else {
+            let lx = chord[0].hypot(chord[1]);
+            let dz = chord[2];
+            // Case 2: Purely vertical cable (lx <= 1e-12) with w_self > 0
+            if lx <= 1e-12 {
+                let a = w_self / (2.0 * ea);
+                let b = 1.0 + target_ti / ea;
+                if dz >= 0.0 {
+                    // End J is above end I: L_c = b * L0 + a * L0^2 (unique positive root)
+                    let disc = (b * b + 4.0 * a * l_c).sqrt();
+                    2.0 * l_c / (b + disc)
+                } else {
+                    // End J is below end I: T_J = T_I - w_self * L0 > 0 requires
+                    // L_c < (T_I / w_self) * (1 + T_I / (2 * EA)) on the taut branch.
+                    let max_taut_lc = (target_ti / w_self) * (1.0 + target_ti / (2.0 * ea));
+                    if l_c >= max_taut_lc * (1.0 - 1e-14) {
+                        return Err(SolverError::InvalidInput(format!(
+                            "target I-end tension {target_ti} is below minimum achievable catenary tension for vertical drop {l_c}"
+                        )));
+                    }
+                    let disc = (b * b - 4.0 * a * l_c).max(0.0).sqrt();
+                    2.0 * l_c / (b + disc)
+                }
+            } else {
+                // Case 3: General horizontal or inclined 2D/3D catenary (lx > 1e-12, w_self > 0)
+                let eval_ti = |l0_try: f64| -> Result<f64, SolverError> {
+                    let (f_i_2d, _, _, _) = solve_catenary_2d(lx, dz, l0_try, ea, w_self, 1.0)?;
+                    Ok(f_i_2d[0].hypot(f_i_2d[1]))
+                };
+
+                // Bracket minimum (L0_min, T_I_min) around L_c
+                let mut mid = l_c;
+                let mut t_mid = eval_ti(mid)?;
+                let mut lo = 0.7 * l_c;
+                let mut t_lo = eval_ti(lo)?;
+                let mut hi = 1.4 * l_c;
+                let mut t_hi = eval_ti(hi)?;
+
+                for _ in 0..60 {
+                    if t_lo > t_mid {
+                        break;
+                    }
+                    hi = mid;
+                    t_hi = t_mid;
+                    mid = lo;
+                    t_mid = t_lo;
+                    lo *= 0.5;
+                    t_lo = eval_ti(lo)?;
+                }
+                for _ in 0..60 {
+                    if t_hi > t_mid {
+                        break;
+                    }
+                    lo = mid;
+                    mid = hi;
+                    t_mid = t_hi;
+                    hi *= 1.5;
+                    t_hi = eval_ti(hi)?;
+                }
+
+                // Golden-section search on [lo, hi] for (l0_min, t_min)
+                let inv_phi = 0.5 * (5.0_f64.sqrt() - 1.0); // ~0.6180339887498949
+                let inv_phi2 = 1.0 - inv_phi; // ~0.3819660112501051
+                let mut a_g = lo;
+                let mut b_g = hi;
+                let mut c_g = a_g + inv_phi2 * (b_g - a_g);
+                let mut d_g = a_g + inv_phi * (b_g - a_g);
+                let mut fc = eval_ti(c_g)?;
+                let mut fd = eval_ti(d_g)?;
+                let mut l0_min = mid;
+                let mut t_min = t_mid;
+                if fc < t_min {
+                    t_min = fc;
+                    l0_min = c_g;
+                }
+                if fd < t_min {
+                    t_min = fd;
+                    l0_min = d_g;
+                }
+                for _ in 0..90 {
+                    if (b_g - a_g) <= 4.0 * f64::EPSILON * b_g.max(l_c) {
+                        break;
+                    }
+                    if fc < fd {
+                        b_g = d_g;
+                        d_g = c_g;
+                        fd = fc;
+                        c_g = a_g + inv_phi2 * (b_g - a_g);
+                        fc = eval_ti(c_g)?;
+                        if fc < t_min {
+                            t_min = fc;
+                            l0_min = c_g;
+                        }
+                    } else {
+                        a_g = c_g;
+                        c_g = d_g;
+                        fc = fd;
+                        d_g = a_g + inv_phi * (b_g - a_g);
+                        fd = eval_ti(d_g)?;
+                        if fd < t_min {
+                            t_min = fd;
+                            l0_min = d_g;
+                        }
+                    }
+                }
+
+                if target_ti < t_min * (1.0 - 1e-11) {
+                    return Err(SolverError::InvalidInput(format!(
+                        "target I-end tension {target_ti} is below minimum achievable catenary tension {t_min}"
+                    )));
+                }
+                if target_ti <= t_min {
+                    l0_min
+                } else {
+                    // Solve T_I(L0) - target_ti = 0 on taut branch (0, l0_min]
+                    let mut b_hi = l0_min;
+                    let mut g_hi = t_min - target_ti; // <= 0
+                    let mut b_lo = (l_c / (1.0 + target_ti / ea)).min(0.99 * l0_min);
+                    let mut g_lo = eval_ti(b_lo)? - target_ti;
+                    for _ in 0..60 {
+                        if g_lo >= 0.0 {
+                            break;
+                        }
+                        b_hi = b_lo;
+                        g_hi = g_lo;
+                        b_lo *= 0.5;
+                        g_lo = eval_ti(b_lo)? - target_ti;
+                    }
+                    if g_lo < 0.0 {
+                        return Err(SolverError::NonConvergence {
+                            case: "CableShape".into(),
+                            iterations: 60,
+                            residual: g_lo.abs(),
+                            reason: "failed to bracket taut branch for target I-end tension".into(),
+                        });
+                    }
+
+                    let mut x_prev = b_hi;
+                    let mut g_prev = g_hi;
+                    let mut x_cur = b_lo;
+                    let mut g_cur = g_lo;
+                    for iter in 0..80 {
+                        if g_cur.abs() <= 1e-13 * target_ti
+                            || (b_hi - b_lo) <= 4.0 * f64::EPSILON * b_hi.max(l_c)
+                        {
+                            break;
+                        }
+                        let width = b_hi - b_lo;
+                        let secant = if (g_cur - g_prev).abs() > 1e-30 && iter % 4 != 3 {
+                            Some(x_cur - g_cur * (x_cur - x_prev) / (g_cur - g_prev))
+                        } else {
+                            None
+                        };
+                        let x_next = match secant {
+                            Some(xs)
+                                if xs > b_lo + 0.05 * width && xs < b_hi - 0.05 * width =>
+                            {
+                                xs
+                            }
+                            _ => 0.5 * (b_lo + b_hi),
+                        };
+                        let g_next = eval_ti(x_next)? - target_ti;
+                        x_prev = x_cur;
+                        g_prev = g_cur;
+                        x_cur = x_next;
+                        g_cur = g_next;
+                        if g_next > 0.0 {
+                            b_lo = x_next;
+                            g_lo = g_next;
+                        } else {
+                            b_hi = x_next;
+                            g_hi = g_next;
+                        }
+                        let _ = (g_lo, g_hi);
+                    }
+                    if g_cur.abs() <= 1e-13 * target_ti {
+                        x_cur
+                    } else {
+                        0.5 * (b_lo + b_hi)
+                    }
+                }
+            }
+        };
+
+        let elem = Self::from_undeformed_length(
+            [0.0; 3],
+            chord,
+            1.0,
+            ea,
+            0.0,
+            l0,
+            [0.0, 0.0, -w_self],
+            0.0,
+        )?;
+        let st = elem.evaluate([0.0; 3], [0.0; 3])?;
+        let residual = (st.tension_i - target_ti).abs();
+        let k_norm = (0..3)
+            .flat_map(|r| (0..3).map(move |c| st.k_tangent[r][c].powi(2)))
+            .sum::<f64>()
+            .sqrt();
+        let force_accuracy = k_norm * COMPATIBILITY_REL_TOL * l0.max(l_c);
+        let tolerance = 1e-11 * target_ti + force_accuracy;
+        if !residual.is_finite() || !tolerance.is_finite() || residual > tolerance {
+            return Err(SolverError::NonConvergence {
+                case: "CableShape".into(),
+                iterations: 80,
+                residual,
+                reason: "target I-end tension initialization did not converge".into(),
+            });
+        }
+        Ok(elem)
+    }
+
+    /// Evaluate the internal forces, tensions, and $6 \times 6$ tangent stiffness of this cable
+    /// at nodal displacements `(u_i, u_j)`.
+    pub fn evaluate(&self, u_i: [f64; 3], u_j: [f64; 3]) -> Result<CableState, SolverError> {
+        evaluate_cable_element(self, u_i, u_j)
     }
 }
 
@@ -463,8 +713,8 @@ pub fn evaluate_cable_element(
     let c_th = 1.0 + elem.alpha * elem.delta_t;
     let w = norm3(elem.w_vec);
 
-    // Case B: Unloaded straight tension-only cable (|w| <= 1e-12)
-    if w <= 1e-12 {
+    // Case B: Unloaded straight tension-only cable (|w| <= 1e-15)
+    if w <= 1e-15 {
         let l_th = (c_th * elem.l0).max(1e-12 * elem.l0);
         let k_elastic = ea / elem.l0;
         let k_reg = 1e-9 * k_elastic;
@@ -523,13 +773,14 @@ pub fn evaluate_cable_element(
         });
     }
 
-    // Case A: Loaded 3D Elastic Catenary (|w| > 1e-12)
+    // Case A: Loaded 3D Elastic Catenary (|w| > 1e-15)
     let ez = [-elem.w_vec[0] / w, -elem.w_vec[1] / w, -elem.w_vec[2] / w];
     let lz = dot3(dx, ez);
     let h_vec = [dx[0] - lz * ez[0], dx[1] - lz * ez[1], dx[2] - lz * ez[2]];
     let lx = norm3(h_vec);
 
-    let (ex, ey, f_i_loc, f_j_loc, k_loc_2d, k_yy, h_val, l_def) = if lx > 1e-11 * elem.l0 {
+    let (ex, ey, f_i_loc, f_j_loc, k_loc_2d, k_yy, h_val, l_def) =
+        if lx > 1e-12_f64.max(1e-14 * elem.l0) {
         let ex = [h_vec[0] / lx, h_vec[1] / lx, h_vec[2] / lx];
         let ey = cross3(ez, ex);
         let (f_i_2d, f_j_2d, k_2d, l_def) = solve_catenary_2d(lx, lz, elem.l0, ea, w, c_th)?;
