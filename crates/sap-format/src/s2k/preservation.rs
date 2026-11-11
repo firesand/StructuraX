@@ -339,6 +339,286 @@ pub(super) fn import_warnings(
     Ok(warnings.into_iter().collect())
 }
 
+/// Check whether the saved source contains anything beyond the supported model
+/// projection. Native synthesis may discard source spelling, never opaque data.
+pub(crate) fn native_projection_issues(
+    saved: &sap_model::S2kPreservation,
+) -> Result<Vec<String>, FormatError> {
+    let (parsed, mut schema) = super::parse_s2k_internal(&saved.source_text, false)?;
+    let canonical = write_s2k_canonical(&parsed.model);
+    if canonical != saved.canonical_baseline {
+        return Ok(vec![
+            "S2K source and its saved projection baseline disagree".into(),
+        ]);
+    }
+    let source_document = document(&saved.source_text);
+    let canonical_document = document(&canonical);
+    let mut issues = Vec::new();
+    let comment_or_blank = |line: &str| {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        line.is_empty() || line.starts_with('$') || line.starts_with(';')
+    };
+    if source_document.prefix.lines().any(|line| {
+        !comment_or_blank(line)
+            && !canonical_document
+                .prefix
+                .lines()
+                .any(|known| known.trim() == line.trim())
+    }) {
+        issues.push("Uninterpreted text before the first S2K table".into());
+    }
+    if source_document
+        .suffix
+        .lines()
+        .any(|line| !comment_or_blank(line) && !line.trim().eq_ignore_ascii_case("END TABLE DATA"))
+    {
+        issues.push("Uninterpreted text after END TABLE DATA".into());
+    }
+    let original = grouped(&source_document)?;
+    let baseline = grouped(&canonical_document)?;
+    let baseline_by_owner: BTreeMap<_, BTreeMap<_, Vec<_>>> = baseline
+        .iter()
+        .map(|(table, rows)| {
+            let mut owners: BTreeMap<_, Vec<_>> = BTreeMap::new();
+            for (_, row) in rows {
+                owners.entry(identity(table, row)).or_default().push(row);
+            }
+            (table, owners)
+        })
+        .collect();
+    // Some canonical fields are generated constants, not parser inputs. Their
+    // exact projected value is harmless (e.g. SymType=Isotropic), but a different
+    // supplied value must remain opaque (e.g. SymType=Orthotropic).
+    for (table, rows) in &original {
+        let mut constant_columns: BTreeMap<String, bool> = BTreeMap::new();
+        for (_, row) in rows {
+            for (key, value) in row {
+                let represented = baseline_by_owner
+                    .get(table)
+                    .and_then(|owners| owners.get(&identity(table, row)))
+                    .into_iter()
+                    .flatten()
+                    .any(|base| {
+                        base.get(key).is_some_and(|projected| {
+                            same_projected_cell(table, key, value, projected)
+                        })
+                    });
+                *constant_columns.entry(key.clone()).or_insert(true) &= represented;
+            }
+        }
+        for (key, represented) in constant_columns {
+            if represented {
+                schema.entry(table.clone()).or_default().insert(key);
+            }
+        }
+        if table == "JOINT COORDINATES"
+            && rows
+                .iter()
+                .any(|(_, row)| translated_coordinates(row, &parsed.model))
+        {
+            schema
+                .entry(table.clone())
+                .or_default()
+                .extend(["COORDSYS", "COORDTYPE"].map(str::to_owned));
+        }
+    }
+    // Empty recognized blocks are syntax, not omitted source records. Keep
+    // unknown blocks in the check even when empty: their meaning is unknown.
+    let checked_source = source_document
+        .blocks
+        .iter()
+        .filter_map(|block| match records(block) {
+            Ok(rows) if supported_table(&block.name) && rows.is_empty() => None,
+            _ => Some(block.raw.as_str()),
+        })
+        .collect::<String>();
+    issues.extend(import_warnings(&checked_source, &canonical, &schema)?);
+    for (table, rows) in original {
+        let mut source_counts = BTreeMap::new();
+        for (_, row) in rows {
+            let translated =
+                table == "JOINT COORDINATES" && translated_coordinates(&row, &parsed.model);
+            for (key, value) in &row {
+                if translated
+                    && matches!(key.as_str(), "COORDSYS" | "COORDTYPE" | "XORR" | "Y" | "Z")
+                {
+                    continue;
+                }
+                let candidates: Vec<_> = baseline_by_owner
+                    .get(&table)
+                    .and_then(|owners| owners.get(&identity(&table, &row)))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|base| base.get(key))
+                    .collect();
+                if !candidates.is_empty()
+                    && !candidates
+                        .iter()
+                        .any(|other| same_projected_cell(&table, key, value, other))
+                {
+                    issues.push(format!("S2K table '{table}' field '{key}' is not represented by its projected value"));
+                }
+            }
+            let alias_groups: &[&[&str]] = if table == "JOINT COORDINATES" && !translated {
+                &[&["GLOBALX", "XORR"], &["GLOBALY", "Y"], &["GLOBALZ", "Z"]]
+            } else if table.starts_with("FUNCTION -") {
+                &[&["PERIOD", "TIME"], &["ACCEL", "VALUE"]]
+            } else {
+                &[]
+            };
+            for aliases in alias_groups {
+                let supplied: Vec<_> = aliases.iter().filter_map(|key| row.get(*key)).collect();
+                if supplied.windows(2).any(|pair| {
+                    pair[0] != pair[1]
+                        && match (
+                            pair[0].replace(',', ".").parse::<f64>(),
+                            pair[1].replace(',', ".").parse::<f64>(),
+                        ) {
+                            (Ok(a), Ok(b)) => a != b,
+                            _ => true,
+                        }
+                }) {
+                    issues.push(format!(
+                        "S2K table '{table}' contains conflicting aliases: {}",
+                        aliases.join("/")
+                    ));
+                }
+            }
+            *source_counts
+                .entry(identity(&table, &row))
+                .or_insert(0usize) += 1;
+        }
+        let mut baseline_counts = BTreeMap::new();
+        for (_, row) in baseline.get(&table).into_iter().flatten() {
+            *baseline_counts
+                .entry(identity(&table, row))
+                .or_insert(0usize) += 1;
+        }
+        if source_counts
+            .iter()
+            .any(|(id, count)| *count > baseline_counts.get(id).copied().unwrap_or(0))
+        {
+            issues.push(format!("S2K table '{table}' contains source records merged or omitted by the supported projection"));
+        }
+    }
+    Ok(issues)
+}
+
+fn translated_coordinates(row: &Row, model: &SapModel) -> bool {
+    if !row
+        .get("COORDTYPE")
+        .is_none_or(|kind| kind.eq_ignore_ascii_case("Cartesian"))
+    {
+        return false;
+    }
+    let csys = row.get("COORDSYS").map(String::as_str).unwrap_or("GLOBAL");
+    let Some(system) = model
+        .coord_systems
+        .get(if csys.eq_ignore_ascii_case("GLOBAL") {
+            "GLOBAL"
+        } else {
+            csys
+        })
+    else {
+        return false;
+    };
+    if system.angles_deg != [0.; 3] {
+        return false;
+    }
+    ["XORR", "Y", "Z"]
+        .into_iter()
+        .zip(["GLOBALX", "GLOBALY", "GLOBALZ"])
+        .enumerate()
+        .all(|(axis, (local, global))| {
+            let number = |key: &str| row.get(key)?.replace(',', ".").parse::<f64>().ok();
+            match (number(local), number(global)) {
+                (Some(local), Some(global)) => {
+                    (local + system.origin[axis] - global).abs()
+                        <= 1e-12 * global.abs().max(local.abs()).max(1.)
+                }
+                _ => false,
+            }
+        })
+}
+
+fn same_projected_cell(table: &str, key: &str, source: &str, projected: &str) -> bool {
+    if same_cell(source, projected) {
+        return true;
+    }
+    if table == "PROGRAM CONTROL" && matches!(key, "CURRUNITS" | "DATABASEUNITS") {
+        return matches!((source.parse::<sap_units::Units>(), projected.parse::<sap_units::Units>()), (Ok(a), Ok(b)) if a == b);
+    }
+    if table == "MATERIAL PROPERTIES 01 - GENERAL" && key == "TYPE" {
+        return matches!(
+            source.to_ascii_uppercase().as_str(),
+            "STEEL"
+                | "CONCRETE"
+                | "CONC"
+                | "ALUMINUM"
+                | "ALUM"
+                | "COLDFORMED"
+                | "COLD FORMED"
+                | "REBAR"
+                | "TENDON"
+                | "NODESIGN"
+        ) && super::parse_mat_type(source) == super::parse_mat_type(projected);
+    }
+    if table == "LOAD PATTERN DEFINITIONS" && key == "TYPE" {
+        return super::parse_load_pat_type(source) != sap_model::LoadPatternType::Other
+            && super::parse_load_pat_type(source) == super::parse_load_pat_type(projected);
+    }
+    if key == "DIR" {
+        let name = source.to_ascii_uppercase();
+        let recognized = matches!(
+            name.as_str(),
+            "LOCAL 1"
+                | "LOCAL1"
+                | "LOCAL 2"
+                | "LOCAL2"
+                | "LOCAL 3"
+                | "LOCAL3"
+                | "X"
+                | "GLOBAL X"
+                | "Y"
+                | "GLOBAL Y"
+                | "Z"
+                | "GLOBAL Z"
+                | "PROJ X"
+                | "PROJECTED X"
+                | "PROJ Y"
+                | "PROJECTED Y"
+                | "PROJ Z"
+                | "PROJECTED Z"
+                | "GRAVITY"
+                | "GRAV"
+                | "PROJ GRAVITY"
+                | "PROJ GRAV"
+        ) || name
+            .parse::<i32>()
+            .is_ok_and(|value| (1..=11).contains(&value));
+        return recognized && super::parse_load_dir(source) == super::parse_load_dir(projected);
+    }
+    false
+}
+
+fn same_cell(source: &str, projected: &str) -> bool {
+    if source.eq_ignore_ascii_case(projected) {
+        return true;
+    }
+    if let (Ok(a), Ok(b)) = (
+        source.replace(',', ".").parse::<f64>(),
+        projected.replace(',', ".").parse::<f64>(),
+    ) {
+        return a == b;
+    }
+    let boolean = |value: &str| match value.to_ascii_uppercase().as_str() {
+        "YES" | "TRUE" | "1" | "Y" | "ON" => Some(true),
+        "NO" | "FALSE" | "0" | "N" | "OFF" => Some(false),
+        _ => None,
+    };
+    matches!((boolean(source), boolean(projected)), (Some(a), Some(b)) if a == b)
+}
+
 pub(super) fn write(model: &SapModel) -> Result<ExportReport, FormatError> {
     let canonical = write_s2k_canonical(model);
     let mut warnings = Vec::new();

@@ -1,5 +1,7 @@
 # StructuraX: review before GitHub publication
 
+**Historical baseline.** Subsequent repairs and explicit unsupported-feature guards are recorded in [the follow-up](../structurax-fixes/REVIEW.md). Findings below describe the pre-repair source.
+
 Date: 2026-10-15. Scope: the current Antigravity/Gemini-attributed workspace changes after the wave-3 manifest, including wave-4 solver/design/native-export code and StructuraX packaging. There was no prior Git history to establish individual edit authorship. Review compared current source, saved manifests, implementation notes, tests and independent reproductions.
 
 ## Verdict

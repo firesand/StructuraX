@@ -1,6 +1,9 @@
 //! Model-editing workflows with validation before mutation.
 use super::*;
-use sap_model::{AreaLoadSurfacePressure, AreaSection, ComboType, LoadCombo, MatType, ShellType};
+use sap_model::{
+    AreaLoadSurfacePressure, AreaSection, CableParams, ComboType, LinkObj, LinkProp, LinkPropType,
+    LoadCombo, MatType, ShellType,
+};
 
 pub(super) struct Workflows {
     pub open: bool,
@@ -13,6 +16,7 @@ pub(super) struct Workflows {
     self_weight: f64,
     force: [f64; 6],
     distributed: f64,
+    frame_load_dir: i32,
     pressure: f64,
     face: i32,
     replace_loads: bool,
@@ -20,12 +24,25 @@ pub(super) struct Workflows {
     mesh: [usize; 2],
     release_i: [bool; 6],
     release_j: [bool; 6],
+    tc_has_comp: bool,
+    tc_comp_limit: f64,
+    tc_has_tens: bool,
+    tc_tens_limit: f64,
+    cable_mode: usize,
+    cable_value: f64,
+    cable_segments: usize,
     combo_name: String,
     combo_type: ComboType,
     terms: Vec<(String, f64)>,
     material: sap_model::Material,
     material_units: Option<Units>,
     frame_section: String,
+    link_prop: LinkProp,
+    link_name: String,
+    link_point_i: String,
+    link_point_j: String,
+    link_grounded: bool,
+    link_angle_deg: f64,
 }
 impl Default for Workflows {
     fn default() -> Self {
@@ -40,6 +57,7 @@ impl Default for Workflows {
             self_weight: 0.0,
             force: [0.0; 6],
             distributed: 0.0,
+            frame_load_dir: 6,
             pressure: 0.0,
             face: -2,
             replace_loads: true,
@@ -47,13 +65,83 @@ impl Default for Workflows {
             mesh: [1, 1],
             release_i: [false; 6],
             release_j: [false; 6],
+            tc_has_comp: true,
+            tc_comp_limit: 0.0,
+            tc_has_tens: false,
+            tc_tens_limit: 0.0,
+            cable_mode: 0,
+            cable_value: 240.0,
+            cable_segments: 16,
             combo_name: "COMB1".into(),
             combo_type: ComboType::LinearAdd,
             terms: vec![("DEAD".into(), 1.0)],
             material: sap_model::Material::default_steel_kip_in(),
             material_units: None,
             frame_section: "FSEC1".into(),
+            link_prop: LinkProp::default(),
+            link_name: "L1".into(),
+            link_point_i: "1".into(),
+            link_point_j: "2".into(),
+            link_grounded: false,
+            link_angle_deg: 0.0,
         }
+    }
+}
+
+impl Workflows {
+    pub(super) fn scale_for_units(&mut self, from: Units, to: Units, model: &SapModel) {
+        if from == to {
+            return;
+        }
+        let fl = from.length_factor_to(to);
+        let ff = from.force_factor_to(to);
+        let f_mass = from.mass_factor_to(to);
+        for d in &mut self.delta {
+            *d *= fl;
+        }
+        for f in &mut self.force[..3] {
+            *f *= ff;
+        }
+        for m in &mut self.force[3..] {
+            *m *= ff * fl;
+        }
+        self.distributed *= ff / fl;
+        self.pressure *= ff / (fl * fl);
+        self.area.thickness_membrane *= fl;
+        self.area.thickness_bending *= fl;
+        self.tc_comp_limit *= ff;
+        self.tc_tens_limit *= ff;
+        if self.cable_mode == 1 {
+            self.cable_value *= fl;
+        } else if self.cable_mode >= 2 {
+            self.cable_value *= ff;
+        }
+        for d in 0..3 {
+            self.link_prop.ke[d] *= ff / fl;
+            self.link_prop.ce[d] *= ff / fl;
+            self.link_prop.k_nl[d] *= ff / fl;
+            if matches!(self.link_prop.link_type, LinkPropType::Gap | LinkPropType::Hook) {
+                self.link_prop.param1[d] *= fl;
+            } else if self.link_prop.link_type == LinkPropType::Damper {
+                self.link_prop.param1[d] *= ff / fl;
+            } else {
+                self.link_prop.param1[d] *= ff;
+            }
+        }
+        for d in 3..6 {
+            self.link_prop.ke[d] *= ff * fl;
+            self.link_prop.ce[d] *= ff * fl;
+            self.link_prop.k_nl[d] *= ff * fl;
+            if !matches!(self.link_prop.link_type, LinkPropType::Gap | LinkPropType::Hook) {
+                self.link_prop.param1[d] *= ff * fl;
+            }
+        }
+        self.link_prop.dj2 *= fl;
+        self.link_prop.dj3 *= fl;
+        self.link_prop.weight *= ff;
+        self.link_prop.mass *= f_mass;
+        self.material_units = None;
+        initialize_material(self, model);
     }
 }
 fn editable(model: &SapModel) -> Result<(), String> {
@@ -354,10 +442,126 @@ fn assign_releases(model: &mut SapModel, i: [bool; 6], j: [bool; 6]) -> Result<S
         "Assigned full releases to {count} frames (partial-fixity springs reset)."
     ))
 }
+fn assign_tc_limits(
+    model: &mut SapModel,
+    limits: Option<(bool, f64, bool, f64)>,
+) -> Result<String, String> {
+    editable(model)?;
+    let count = model.frames.values().filter(|f| f.selected).count();
+    if count == 0 {
+        return Err("Select at least one frame.".into());
+    }
+    if let Some((has_c, comp, has_t, tens)) = limits {
+        if !has_c && !has_t {
+            return Err("Enable at least one tension or compression limit, or click Clear.".into());
+        }
+        if !comp.is_finite() || !tens.is_finite() {
+            return Err("Tension and compression limits must be finite.".into());
+        }
+        if has_c && comp > 0.0 {
+            return Err("Compression limit must be <= 0 (e.g. 0.0 for tension-only bracing).".into());
+        }
+        if has_t && tens < 0.0 {
+            return Err("Tension limit must be >= 0 (e.g. 0.0 for compression-only struts).".into());
+        }
+        if model
+            .frames
+            .values()
+            .any(|f| f.selected && f.cable_params.is_some())
+        {
+            return Err("Clear catenary cable parameters before assigning T/C limits.".into());
+        }
+    }
+    for f in model.frames.values_mut().filter(|f| f.selected) {
+        f.tc_limits = limits;
+    }
+    invalidate(model);
+    Ok(if limits.is_some() {
+        format!("Assigned tension/compression limits to {count} frames.")
+    } else {
+        format!("Cleared tension/compression limits on {count} frames.")
+    })
+}
+fn assign_cable_params(
+    model: &mut SapModel,
+    mode: usize,
+    value: f64,
+    segments: usize,
+) -> Result<String, String> {
+    editable(model)?;
+    let count = model.frames.values().filter(|f| f.selected).count();
+    if count == 0 {
+        return Err("Select at least one frame.".into());
+    }
+    let spec = if mode == 0 {
+        None
+    } else {
+        if !value.is_finite() || value <= 0.0 {
+            return Err("Cable length or tension parameter must be finite and positive.".into());
+        }
+        if !(1..=200).contains(&segments) {
+            return Err("Cable segments must be in 1..=200.".into());
+        }
+        if model
+            .frames
+            .values()
+            .any(|f| f.selected && f.tc_limits.is_some())
+        {
+            return Err("Clear frame T/C limits before converting to a catenary cable.".into());
+        }
+        Some(match mode {
+            1 => CableParams {
+                undeformed_length: Some(value),
+                target_tension_i: None,
+                horizontal_tension: None,
+                num_segments: segments,
+            },
+            2 => CableParams {
+                undeformed_length: None,
+                target_tension_i: None,
+                horizontal_tension: Some(value),
+                num_segments: segments,
+            },
+            _ => CableParams {
+                undeformed_length: None,
+                target_tension_i: Some(value),
+                horizontal_tension: None,
+                num_segments: segments,
+            },
+        })
+    };
+    for f in model.frames.values_mut().filter(|f| f.selected) {
+        f.cable_params = spec.clone();
+    }
+    invalidate(model);
+    Ok(if spec.is_some() {
+        format!("Assigned catenary cable parameters to {count} frames.")
+    } else {
+        format!("Restored standard beam-column formulation on {count} frames.")
+    })
+}
+fn delete_combo(model: &mut SapModel, name: &str) -> Result<String, String> {
+    editable(model)?;
+    if !model.load_combos.contains_key(name) {
+        return Err(format!("Combination '{name}' does not exist."));
+    }
+    if model
+        .load_combos
+        .values()
+        .any(|c| c.name != name && c.cases.iter().any(|(child, _)| child == name))
+    {
+        return Err(format!(
+            "Combination '{name}' is referenced by another combination."
+        ));
+    }
+    model.load_combos.shift_remove(name);
+    invalidate(model);
+    Ok(format!("Deleted combination {name}."))
+}
 #[derive(Clone, Copy)]
 enum LoadAssignment {
     Joint([f64; 6]),
-    Frame(f64),
+    FrameDir(i32, f64),
     Pressure(i32, f64),
 }
 fn assign_load(
@@ -373,7 +577,7 @@ fn assign_load(
             model.points.values().filter(|p| p.selected).count(),
             f.iter().all(|v| v.is_finite()),
         ),
-        LoadAssignment::Frame(w) => (
+        LoadAssignment::FrameDir(_, w) => (
             model.frames.values().filter(|p| p.selected).count(),
             w.is_finite(),
         ),
@@ -406,7 +610,12 @@ fn assign_load(
                 });
             }
         }
-        LoadAssignment::Frame(w) => {
+        LoadAssignment::FrameDir(dir, w) => {
+            let csys = if (1..=3).contains(&dir) {
+                "LOCAL"
+            } else {
+                "GLOBAL"
+            };
             for f in model.frames.values_mut().filter(|f| f.selected) {
                 if replace {
                     f.loads_dist.retain(|l| l.load_pat != pattern);
@@ -414,8 +623,8 @@ fn assign_load(
                 f.loads_dist.push(FrameLoadDistributed {
                     load_pat: pattern.into(),
                     my_type: 1,
-                    dir: 6,
-                    csys: "GLOBAL".into(),
+                    dir,
+                    csys: csys.into(),
                     rel_dist1: 0.0,
                     rel_dist2: 1.0,
                     val1: w,
@@ -465,9 +674,9 @@ impl SapGuiApp {
         initialize_material(&mut state, &self.model);
         let mut open = state.open;
         if open {
-            egui::Window::new("Model Workflows").open(&mut open).default_width(640.0).vscroll(true).show(ctx,|ui| {
-            ui.horizontal(|ui| {for (i,title) in ["Geometry","Loads","Areas","Releases","Combinations","Materials"].iter().enumerate() {ui.selectable_value(&mut state.tab,i,*title);}});
-            ui.label(format!("Units: {}. Selected: {} joints, {} frames, {} areas.",self.model.present_units.s2k_label(),self.model.points.values().filter(|p|p.selected).count(),self.model.frames.values().filter(|p|p.selected).count(),self.model.areas.values().filter(|p|p.selected).count()));
+            egui::Window::new("Model Workflows").open(&mut open).default_width(680.0).vscroll(true).show(ctx,|ui| {
+            ui.horizontal_wrapped(|ui| {for (i,title) in ["Geometry","Loads","Areas","Releases / T-C / Cable","Combinations","Materials","Links"].iter().enumerate() {ui.selectable_value(&mut state.tab,i,*title);}});
+            ui.label(format!("Units: {}. Selected: {} joints, {} frames, {} areas, {} solids, {} links.",self.model.present_units.s2k_label(),self.model.points.values().filter(|p|p.selected).count(),self.model.frames.values().filter(|p|p.selected).count(),self.model.areas.values().filter(|p|p.selected).count(),self.model.solids.values().filter(|s|s.selected).count(),self.model.links.values().filter(|l|l.selected).count()));
             if self.model.is_locked {ui.colored_label(Color32::YELLOW,"Unlock the model from the Edit menu before applying changes.");}
             ui.separator();
             let mut outcome:Option<Result<String,String>>=None;
@@ -497,8 +706,34 @@ impl SapGuiApp {
                     ui.separator();ui.checkbox(&mut state.replace_loads,"Replace this assignment type in this pattern (pressure: same face)");
                     ui.label("Joint forces and moments in GLOBAL axes:");vector(ui,&["FX","FY","FZ"],&mut state.force[..3]);vector(ui,&["MX","MY","MZ"],&mut state.force[3..]);
                     if ui.button("Assign to Selected Joints").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::Joint(state.force),state.replace_loads));}
-                    ui.horizontal(|ui| {ui.label("Frame uniform load, global Z:");ui.add(egui::DragValue::new(&mut state.distributed).speed(0.01));});
-                    if ui.button("Assign to Selected Frames").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::Frame(state.distributed),state.replace_loads));}
+                    ui.horizontal(|ui| {
+                        ui.label("Frame uniform load:");
+                        ui.add(egui::DragValue::new(&mut state.distributed).speed(0.01));
+                        let dir_label = match state.frame_load_dir {
+                            4 => "Global X",
+                            5 => "Global Y",
+                            6 => "Global Z",
+                            10 => "Gravity (-Z)",
+                            2 => "Local 2",
+                            3 => "Local 3",
+                            _ => "Global Z",
+                        };
+                        egui::ComboBox::from_id_salt("wf_frame_load_dir")
+                            .selected_text(dir_label)
+                            .show_ui(ui, |ui| {
+                                for (code, lbl) in [
+                                    (6, "Global Z"),
+                                    (10, "Gravity (-Z)"),
+                                    (4, "Global X"),
+                                    (5, "Global Y"),
+                                    (2, "Local 2"),
+                                    (3, "Local 3"),
+                                ] {
+                                    ui.selectable_value(&mut state.frame_load_dir, code, lbl);
+                                }
+                            });
+                    });
+                    if ui.button("Assign to Selected Frames").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::FrameDir(state.frame_load_dir,state.distributed),state.replace_loads));}
                     ui.separator();ui.horizontal(|ui| {ui.label("Area pressure:");ui.add(egui::DragValue::new(&mut state.pressure).speed(0.001));ui.selectable_value(&mut state.face,-2,"Top");ui.selectable_value(&mut state.face,-1,"Bottom");});
                     ui.label("Positive pressure pushes into the selected face: top -local 3, bottom +local 3.");
                     if ui.button("Assign to Selected Areas").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::Pressure(state.face,state.pressure),state.replace_loads));}
@@ -508,7 +743,7 @@ impl SapGuiApp {
                     egui::ComboBox::from_id_salt("wf_existing_area").selected_text("Read existing section").show_ui(ui,|ui| {for (n,a) in &self.model.area_sections {if ui.button(n).clicked() {state.area=a.clone();ui.close_menu();}}});
                     egui::ComboBox::from_id_salt("wf_area_material").selected_text(&state.area.material).show_ui(ui,|ui| {for n in self.model.materials.keys() {ui.selectable_value(&mut state.area.material,n.clone(),n);}});
                     egui::ComboBox::from_id_salt("wf_shell_type").selected_text(format!("{:?}",state.area.shell_type)).show_ui(ui,|ui| {for kind in [ShellType::ShellThin,ShellType::ShellThick,ShellType::Membrane,ShellType::PlateThin,ShellType::PlateThick] {ui.selectable_value(&mut state.area.shell_type,kind,format!("{kind:?}"));}});
-                    ui.horizontal(|ui| {ui.label("Membrane thickness:");ui.add(egui::DragValue::new(&mut state.area.thickness_membrane).speed(0.1));ui.label("Bending:");ui.add(egui::DragValue::new(&mut state.area.thickness_bending).speed(0.1));});
+                    ui.horizontal(|ui| {ui.label("Membrane thickness:");ui.add(egui::DragValue::new(&mut state.area.thickness_membrane).speed(0.1).range(1e-6..=1e6));ui.label("Bending:");ui.add(egui::DragValue::new(&mut state.area.thickness_bending).speed(0.1).range(1e-6..=1e6));});
                     ui.label("Section modifiers (affect every area using this property):");
                     for (labels,values) in ["F11","F22","F12","M11","M22","M12","V13","V23","Mass","Weight"].chunks(5).zip(state.area.modifiers.chunks_mut(5)) {vector(ui,labels,values);}
                     if ui.button("Save Area Section").clicked() {outcome=Some(save_area(&mut self.model,&state.area));}
@@ -518,8 +753,62 @@ impl SapGuiApp {
                 3=>{
                     ui.label("Checked means a full release. Applying resets existing partial-fixity springs.");
                     for (end,values) in [("I-end",&mut state.release_i),("J-end",&mut state.release_j)] {ui.horizontal(|ui| {ui.label(end);for (label,value) in ["P","V2","V3","T","M2","M3"].iter().zip(values) {ui.checkbox(value,*label);}});}
-                    if ui.button("Read First Selected Frame").clicked() {if let Some(f)=self.model.frames.values().find(|f|f.selected) {state.release_i=f.release_i;state.release_j=f.release_j;} else {outcome=Some(Err("Select a frame first.".into()));}}
-                    if ui.button("Assign Releases to Selected Frames").clicked() {outcome=Some(assign_releases(&mut self.model,state.release_i,state.release_j));}
+                    ui.horizontal(|ui| {
+                        if ui.button("Read First Selected Frame").clicked() {
+                            if let Some(f)=self.model.frames.values().find(|f|f.selected) {
+                                state.release_i=f.release_i;state.release_j=f.release_j;
+                                if let Some((hc,c,ht,t))=f.tc_limits {state.tc_has_comp=hc;state.tc_comp_limit=c;state.tc_has_tens=ht;state.tc_tens_limit=t;}
+                                if let Some(cp)=&f.cable_params {
+                                    state.cable_segments=cp.num_segments;
+                                    if let Some(l0)=cp.undeformed_length {state.cable_mode=1;state.cable_value=l0;}
+                                    else if let Some(h)=cp.horizontal_tension {state.cable_mode=2;state.cable_value=h;}
+                                    else if let Some(ti)=cp.target_tension_i {state.cable_mode=3;state.cable_value=ti;}
+                                } else {state.cable_mode=0;}
+                            } else {outcome=Some(Err("Select a frame first.".into()));}
+                        }
+                        if ui.button("Assign Releases to Selected Frames").clicked() {outcome=Some(assign_releases(&mut self.model,state.release_i,state.release_j));}
+                    });
+                    ui.separator();
+                    ui.label("Nonlinear Frame Tension / Compression Axial Limits (evaluated in NonlinearStatic cases):");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut state.tc_has_comp, "Compression limit (<= 0):");
+                        ui.add(egui::DragValue::new(&mut state.tc_comp_limit).speed(0.5));
+                        ui.checkbox(&mut state.tc_has_tens, "Tension limit (>= 0):");
+                        ui.add(egui::DragValue::new(&mut state.tc_tens_limit).speed(0.5));
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Assign T/C Limits").clicked() {
+                            outcome = Some(assign_tc_limits(&mut self.model, Some((state.tc_has_comp, state.tc_comp_limit, state.tc_has_tens, state.tc_tens_limit))));
+                        }
+                        if ui.button("Clear T/C Limits").clicked() {
+                            outcome = Some(assign_tc_limits(&mut self.model, None));
+                        }
+                    });
+                    ui.separator();
+                    ui.label("Catenary Cable Specification (evaluated in NonlinearStatic cases):");
+                    ui.horizontal(|ui| {
+                        let mode_lbl = match state.cable_mode {
+                            0 => "Standard Beam-Column (Not a Cable)",
+                            1 => "Undeformed Length L0",
+                            2 => "Horizontal Tension H",
+                            _ => "Target Tension at I-end Ti",
+                        };
+                        egui::ComboBox::from_id_salt("wf_cable_mode").selected_text(mode_lbl).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut state.cable_mode, 0, "Standard Beam-Column (Not a Cable)");
+                            ui.selectable_value(&mut state.cable_mode, 1, "Undeformed Length L0");
+                            ui.selectable_value(&mut state.cable_mode, 2, "Horizontal Tension H");
+                            ui.selectable_value(&mut state.cable_mode, 3, "Target Tension at I-end Ti");
+                        });
+                        if state.cable_mode != 0 {
+                            ui.label("Value:");
+                            ui.add(egui::DragValue::new(&mut state.cable_value).speed(1.0).range(1e-6..=1e12));
+                            ui.label("Segments:");
+                            ui.add(egui::DragValue::new(&mut state.cable_segments).range(1..=200));
+                        }
+                    });
+                    if ui.button("Apply Cable / Frame Formulation").clicked() {
+                        outcome = Some(assign_cable_params(&mut self.model, state.cable_mode, state.cable_value, state.cable_segments));
+                    }
                 },
                 4=>{
                     ui.horizontal(|ui| {ui.label("Combination:");ui.text_edit_singleline(&mut state.combo_name);});
@@ -531,10 +820,13 @@ impl SapGuiApp {
                         ui.add(egui::DragValue::new(sf).speed(0.1));if ui.button("Remove").clicked() {remove=Some(i);}
                     });}
                     if let Some(i)=remove {state.terms.remove(i);}
-                    if ui.button("Add Term").clicked() {state.terms.push((self.model.load_cases.keys().next().cloned().unwrap_or_default(),1.0));}
-                    if ui.button("Save Combination").clicked() {outcome=Some(define_combo(&mut self.model,&state.combo_name,state.combo_type,&state.terms));}
-                }
-                _=>{
+                    ui.horizontal(|ui| {
+                        if ui.button("Add Term").clicked() {state.terms.push((self.model.load_cases.keys().next().cloned().unwrap_or_default(),1.0));}
+                        if ui.button("Save Combination").clicked() {outcome=Some(define_combo(&mut self.model,&state.combo_name,state.combo_type,&state.terms));}
+                        if ui.button("Delete Combination").clicked() {outcome=Some(delete_combo(&mut self.model,&state.combo_name));}
+                    });
+                },
+                5=>{
                     ui.label("Isotropic material properties in the displayed model units. Saving an existing name updates every section using it.");
                     egui::ComboBox::from_id_salt("wf_material_existing").selected_text("Read existing material").show_ui(ui,|ui| {for (name,material) in &self.model.materials {if ui.button(name).clicked() {state.material=material.clone();ui.close_menu();}}});
                     ui.horizontal(|ui| {ui.label("Name:");ui.text_edit_singleline(&mut state.material.name);});
@@ -549,9 +841,113 @@ impl SapGuiApp {
                     });
                     ui.label("Shear modulus is calculated as E / [2(1 + Poisson ratio)]. Mass and weight densities are independent inputs.");
                     if ui.button("Save Material").clicked() {outcome=Some(save_material(&mut self.model,&state.material));}
+                },
+                _=>{
+                    ui.label("Define Linear, Damper, Gap or Hook link properties and place 1-joint (grounded) or 2-joint link elements.");
+                    egui::ComboBox::from_id_salt("wf_link_existing").selected_text("Read existing link property").show_ui(ui,|ui| {
+                        for (name,prop) in &self.model.link_props {if ui.button(name).clicked() {state.link_prop=prop.clone();ui.close_menu();}}
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Property Name:");
+                        ui.text_edit_singleline(&mut state.link_prop.name);
+                        let mut ltype = state.link_prop.link_type;
+                        egui::ComboBox::from_id_salt("wf_link_type").selected_text(format!("{ltype:?}")).show_ui(ui,|ui| {
+                            for choice in [LinkPropType::Linear, LinkPropType::Damper, LinkPropType::Gap, LinkPropType::Hook] {
+                                ui.selectable_value(&mut ltype, choice, format!("{choice:?}"));
+                            }
+                        });
+                        if ltype != state.link_prop.link_type {
+                            state.link_prop.link_type = ltype;
+                            if ltype == LinkPropType::Linear {
+                                state.link_prop.dof_nonlinear = [false; 6];
+                            }
+                        }
+                    });
+                    let dof_labels = ["U1", "U2", "U3", "R1", "R2", "R3"];
+                    ui.horizontal(|ui| {
+                        ui.label("Active DOFs:");
+                        for (lbl, flag) in dof_labels.iter().zip(&mut state.link_prop.dof_active) {
+                            ui.checkbox(flag, *lbl);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Fixed DOFs:");
+                        for (lbl, flag) in dof_labels.iter().zip(&mut state.link_prop.dof_fixed) {
+                            ui.checkbox(flag, *lbl);
+                        }
+                    });
+                    if state.link_prop.link_type != LinkPropType::Linear {
+                        ui.horizontal(|ui| {
+                            ui.label("Nonlinear DOFs:");
+                            for (lbl, flag) in dof_labels.iter().zip(&mut state.link_prop.dof_nonlinear) {
+                                ui.checkbox(flag, *lbl);
+                            }
+                        });
+                    }
+                    ui.label("Effective stiffness ke [U1..R3]:");
+                    vector(ui, &dof_labels, &mut state.link_prop.ke);
+                    ui.label("Effective damping ce [U1..R3]:");
+                    vector(ui, &dof_labels, &mut state.link_prop.ce);
+                    if matches!(
+                        state.link_prop.link_type,
+                        LinkPropType::Damper | LinkPropType::Gap | LinkPropType::Hook
+                    ) {
+                        let knl_lbl = if state.link_prop.link_type == LinkPropType::Damper {
+                            "Maxwell series stiffness k_nl [U1..R3]:"
+                        } else {
+                            "Nonlinear stiffness k_nl [U1..R3]:"
+                        };
+                        let p1_lbl = if state.link_prop.link_type == LinkPropType::Damper {
+                            "Nonlinear damping coeff c_nl [U1..R3]:"
+                        } else {
+                            "Initial opening [U1..R3]:"
+                        };
+                        ui.label(knl_lbl);
+                        vector(ui, &dof_labels, &mut state.link_prop.k_nl);
+                        ui.label(p1_lbl);
+                        vector(ui, &dof_labels, &mut state.link_prop.param1);
+                    }
+                    if ui.button("Save Link Property").clicked() {
+                        let mut prop = state.link_prop.clone();
+                        prop.nonlinear_data_complete = true;
+                        outcome = Some(sap_api::set_link_property(&mut self.model, prop.clone()).map(|_| format!("Saved link property {}.", prop.name)));
+                    }
+                    ui.separator();
+                    ui.label("Create or Update Link Element:");
+                    ui.horizontal(|ui| {
+                        ui.label("Link ID:");
+                        ui.text_edit_singleline(&mut state.link_name);
+                        ui.checkbox(&mut state.link_grounded, "1-Joint Grounded Link");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Joint I:");
+                        egui::ComboBox::from_id_salt("wf_link_pi").selected_text(&state.link_point_i).show_ui(ui,|ui| {
+                            for pid in self.model.points.keys() {ui.selectable_value(&mut state.link_point_i, pid.clone(), pid);}
+                        });
+                        if !state.link_grounded {
+                            ui.label("Joint J:");
+                            egui::ComboBox::from_id_salt("wf_link_pj").selected_text(&state.link_point_j).show_ui(ui,|ui| {
+                                for pid in self.model.points.keys() {ui.selectable_value(&mut state.link_point_j, pid.clone(), pid);}
+                            });
+                        }
+                        ui.label("Roll angle (deg):");
+                        ui.add(egui::DragValue::new(&mut state.link_angle_deg).speed(1.0));
+                    });
+                    if ui.button("Save Link Element").clicked() {
+                        let link = LinkObj {
+                            name: state.link_name.clone(),
+                            point_i: state.link_point_i.clone(),
+                            point_j: if state.link_grounded { None } else { Some(state.link_point_j.clone()) },
+                            prop: state.link_prop.name.clone(),
+                            angle_deg: state.link_angle_deg,
+                            selected: false,
+                        };
+                        let lname = link.name.clone();
+                        outcome = Some(sap_api::set_link_object(&mut self.model, link).map(|_| format!("Saved link element {lname}.")));
+                    }
                 }
             }
-            if let Some(result)=outcome {match result {Ok(message)=>{self.status_msg=message;self.draw_first_point=None;self.draw_area_points.clear();self.inspected_frame=None;},Err(error)=>self.status_msg=format!("Edit error: {error}")}}
+            if let Some(result)=outcome {match result {Ok(message)=>{self.status_msg=message;self.draw_first_point=None;self.draw_area_points.clear();self.inspected_frame=None;self.sync_active_case();},Err(error)=>self.status_msg=format!("Edit error: {error}")}}
             ui.separator();ui.label(&self.status_msg);
         });
         }
@@ -644,7 +1040,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assign_load(&mut m, "LIVE", LoadAssignment::Frame(-0.2), true).unwrap();
+        assign_load(&mut m, "LIVE", LoadAssignment::FrameDir(6, -0.2), true).unwrap();
         assign_load(&mut m, "LIVE", LoadAssignment::Pressure(-2, 0.005), true).unwrap();
         let mut section = m.area_sections["ASEC1"].clone();
         section.name = "ROOF".into();
@@ -681,7 +1077,7 @@ mod tests {
         let mut m = model();
         m.case_results.insert("old".into(), Default::default());
         let before = m.clone();
-        assert!(assign_load(&mut m, "MISSING", LoadAssignment::Frame(2.0), true).is_err());
+        assert!(assign_load(&mut m, "MISSING", LoadAssignment::FrameDir(6, 2.0), true).is_err());
         assert!(assign_load(&mut m, "DEAD", LoadAssignment::Joint([f64::NAN; 6]), true).is_err());
         assert!(assign_area(&mut m, "ASEC1", [0, 1]).is_err());
         assert!(define_pattern(&mut m, "BAD", LoadPatternType::Dead, f64::NAN).is_err());
@@ -703,10 +1099,10 @@ mod tests {
     fn replace_loads_is_scoped_and_success_clears_results() {
         let mut m = model();
         define_pattern(&mut m, "LIVE", LoadPatternType::Live, 0.0).unwrap();
-        assign_load(&mut m, "DEAD", LoadAssignment::Frame(-1.0), false).unwrap();
-        assign_load(&mut m, "LIVE", LoadAssignment::Frame(-2.0), false).unwrap();
+        assign_load(&mut m, "DEAD", LoadAssignment::FrameDir(6, -1.0), false).unwrap();
+        assign_load(&mut m, "LIVE", LoadAssignment::FrameDir(6, -2.0), false).unwrap();
         m.case_results.insert("old".into(), Default::default());
-        assign_load(&mut m, "LIVE", LoadAssignment::Frame(-3.0), true).unwrap();
+        assign_load(&mut m, "LIVE", LoadAssignment::FrameDir(6, -3.0), true).unwrap();
         assert_eq!(m.frames["F"].loads_dist.len(), 2);
         assert_eq!(m.frames["F"].loads_dist[0].load_pat, "DEAD");
         assert_eq!(m.frames["F"].loads_dist[1].val1, -3.0);
@@ -723,7 +1119,7 @@ mod tests {
             time: Some(time),
             ..Default::default()
         };
-        for tab in 0..6 {
+        for tab in 0..7 {
             app.workflows.tab = tab;
             let _ = ctx.run(input(tab as f64 + 1.0), |ctx| app.render_workflows(ctx));
             let out = ctx.run(input(tab as f64 + 1.5), |ctx| app.render_workflows(ctx));

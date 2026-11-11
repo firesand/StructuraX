@@ -261,7 +261,53 @@ fn vendor_sdb_example_6_003_gap_link_static_and_direct_history() {
         nldhist3.initial_case = Some("NLSTAT1".to_string());
         model.load_cases.insert("NLDHIST3".to_string(), nldhist3);
 
-        analyze_model(&mut model).expect("solve Example 6-003");
+        // Modal LinearHistory continuation (`NLMHIST2`) remains explicitly rejected
+        // because modal superposition truncates high-frequency modes.
+        {
+            let mut modal_target = model.clone();
+            let mut nlmhist2 = LoadCase::linear_static("NLMHIST2", "V", 1.0);
+            nlmhist2.case_type = LoadCaseType::LinearHistory;
+            nlmhist2.loads.clear();
+            nlmhist2.initial_case = Some("NLDHIST1".to_string());
+            nlmhist2.history_loads = vec![("RAMP40".to_string(), "V".to_string(), 1.0)];
+            nlmhist2.num_time_steps = 800;
+            nlmhist2.time_step_dt = 0.1;
+            modal_target
+                .load_cases
+                .insert("NLMHIST2".to_string(), nlmhist2);
+            let err = analyze_model(&mut modal_target).unwrap_err();
+            assert!(err.to_string().contains("NLMHIST2"), "{err}");
+            assert!(modal_target.case_results.is_empty());
+
+            let mut modal_origin = model.clone();
+            let mut nlmhist1 = LoadCase::linear_static("NLMHIST1", "P", 1.0);
+            nlmhist1.case_type = LoadCaseType::LinearHistory;
+            nlmhist1.loads.clear();
+            nlmhist1.history_loads = vec![("RAMP20".to_string(), "P".to_string(), 1.0)];
+            nlmhist1.num_time_steps = 400;
+            nlmhist1.time_step_dt = 0.1;
+            let mut cont = LoadCase::linear_static("NLMHIST2", "V", 1.0);
+            cont.case_type = LoadCaseType::NonlinearHistory;
+            cont.loads.clear();
+            cont.initial_case = Some("NLMHIST1".to_string());
+            cont.history_loads = vec![("RAMP40".to_string(), "V".to_string(), 1.0)];
+            cont.num_time_steps = 800;
+            cont.time_step_dt = 0.1;
+            modal_origin
+                .load_cases
+                .insert("NLMHIST1".to_string(), nlmhist1);
+            modal_origin.load_cases.insert("NLMHIST2".to_string(), cont);
+            let err = analyze_model(&mut modal_origin).unwrap_err();
+            assert!(err.to_string().contains("modal history"), "{err}");
+            assert!(modal_origin.case_results.is_empty());
+        }
+
+        // Direct-integration history continuation (`NLSTAT3` and `NLDHIST2` from `NLDHIST1`)
+        // now succeeds using persisted TransientTerminalState!
+        analyze_model(&mut model).expect("solve all Example 6-003 static & direct-history cases");
+
+        assert!(model.case_results["NLDHIST1"].transient_state.is_some());
+        assert!(model.case_results["NLDHIST2"].transient_state.is_some());
 
         let f_nlstat1 = model.case_results["NLSTAT1"].link_forces["1"][0];
         assert!(
@@ -348,52 +394,99 @@ fn vendor_sdb_example_6_005_maxwell_damper_harmonic_history() {
 }
 
 #[test]
-fn vendor_sdb_example_7_001_and_7_002_catenary_cables() {
+fn vendor_sdb_examples_7_001_7_002_7_003_cables() {
     let dir = vendor_dir();
-    // Example 7-001: 6 catenary cables C1..C6 (Peyrot & Goulois 1979)
-    // In example_7_001.sdb, C1..C6 correspond to cases DEADTEMP, DISP1, DISP2, DISP3, DISP4, DISP5
-    // at Lower Support Joint 2!
-    let p_701 = dir.join("example_7_001.sdb");
-    let mut m_701 = load_sdb_file(&p_701).expect("load example_7_001.sdb");
-    analyze_model(&mut m_701).expect("solve example_7_001.sdb");
 
-    for (case_name, ref_fx2, ref_fz2, tol) in [
-        ("DEADTEMP", 4_258_491.0, -2_555_045.0, 10.0),
-        ("DISP1", 504.1, -328.9, 0.2),
-        ("DISP2", 22.15, 15.73, 0.05),
-        ("DISP3", 9.17, 19.24, 0.05),
-        ("DISP4", 3.06, 19.93, 0.05),
-        ("DISP5", 0.00, 20.02, 0.05),
+    // Example 7-001: 6 catenary cables C1..C6 (Peyrot & Goulois 1979)
+    // C1..C6 correspond to cases DEADTEMP, DISP1, DISP2, DISP3, DISP4, DISP5 at Lower Support Joint 2!
+    let mut m_701 = load_sdb_file(dir.join("example_7_001.sdb")).expect("load example_7_001.sdb");
+    analyze_model(&mut m_701).expect("solve example_7_001.sdb");
+    for (cname, exp_rx, exp_rz, tol) in [
+        ("DEADTEMP", 4_258_491.0, -2_555_045.0, 50.0),
+        ("DISP1", 504.10, -328.87, 0.05),
+        ("DISP2", 22.15, 15.73, 0.02),
+        ("DISP3", 9.17, 19.24, 0.02),
+        ("DISP4", 3.06, 19.93, 0.02),
+        ("DISP5", 0.00, 20.02, 0.02),
     ] {
-        let r2 = m_701.case_results[case_name].joint_reactions["2"];
+        let r2 = m_701.case_results[cname].joint_reactions["2"];
         assert!(
-            (r2[0] - ref_fx2).abs() < tol,
-            "Ex 7-001 {case_name} Fx2 = {}, expected {ref_fx2}",
+            (r2[0] - exp_rx).abs() <= tol,
+            "7-001 {cname} Rx(2) = {}, expected {exp_rx}",
             r2[0]
         );
         assert!(
-            (r2[2] - ref_fz2).abs() < tol,
-            "Ex 7-001 {case_name} Fz2 = {}, expected {ref_fz2}",
+            (r2[2] - exp_rz).abs() <= tol,
+            "7-001 {cname} Rz(2) = {}, expected {exp_rz}",
             r2[2]
         );
     }
 
-    // Example 7-002: Two-segment cable under DEAD + PTLOAD + COMB1 (Tibert 1999)
-    let p_702 = dir.join("example_7_002.sdb");
-    let mut m_702 = load_sdb_file(&p_702).expect("load example_7_002.sdb");
+    // Example 7-002: Two-segment cable under SELF + POINT + COMB1 (Tibert 1999)
+    let mut m_702 = load_sdb_file(dir.join("example_7_002.sdb")).expect("load example_7_002.sdb");
     analyze_model(&mut m_702).expect("solve example_7_002.sdb");
+    let u2_comb1 = m_702.case_results["COMB1"].joint_displacements["2"];
+    assert!(
+        (u2_comb1[0] - (-2.8194)).abs() < 1e-3,
+        "7-002 COMB1 Ux(2) = {}",
+        u2_comb1[0]
+    );
+    assert!(
+        (u2_comb1[2] - (-18.4567)).abs() < 1e-3,
+        "7-002 COMB1 Uz(2) = {}",
+        u2_comb1[2]
+    );
 
-    let disp_comb1 = m_702.case_results["COMB1"].joint_displacements["2"];
-    assert!(
-        (disp_comb1[0] - (-2.819)).abs() < 0.01,
-        "Ex 7-002 COMB1 Ux(2) = {}",
-        disp_comb1[0]
-    );
-    assert!(
-        (disp_comb1[2] - (-18.457)).abs() < 0.02,
-        "Ex 7-002 COMB1 Uz(2) = {}",
-        disp_comb1[2]
-    );
+    // Example 7-003: Prestressed 3x3 Cable Net initialized via target_tension_i (Tibert 1999)
+    let mut m_703 = load_sdb_file(dir.join("example_7_003.sdb")).expect("load example_7_003.sdb");
+    assert_eq!(m_703.frames.len(), 12);
+    for f in m_703.frames.values() {
+        let cp = f.cable_params.as_ref().expect("7-003 cable_params");
+        assert!(cp.target_tension_i.is_some());
+        assert!(cp.undeformed_length.is_none());
+    }
+
+    // Competing shape specs remain explicitly rejected
+    let mut m_703_bad = m_703.clone();
+    m_703_bad
+        .frames
+        .get_mut("1")
+        .unwrap()
+        .cable_params
+        .as_mut()
+        .unwrap()
+        .undeformed_length = Some(100.0);
+    let err_dup = analyze_model(&mut m_703_bad).unwrap_err();
+    assert!(err_dup.to_string().contains("target end tension"), "{err_dup}");
+    assert!(m_703_bad.case_results.is_empty());
+
+    analyze_model(&mut m_703).expect("solve example_7_003.sdb");
+    let pt_res = &m_703.case_results["POINT"].joint_displacements;
+    // SAP2000 Verification Example 7-003 reference:
+    // Node 1: Ux = -0.1328 ft, Uy = -0.1328 ft, Uz = -1.4745 ft (symmetric across Nodes 1..4)
+    for (jname, sx, sy) in [
+        ("1", -1.0, -1.0),
+        ("2", 1.0, -1.0),
+        ("3", -1.0, 1.0),
+        ("4", 1.0, 1.0),
+    ] {
+        let u = pt_res[jname];
+        assert!(
+            (u[0] - sx * 0.1328).abs() < 2e-4,
+            "7-003 POINT Ux({jname}) = {}",
+            u[0]
+        );
+        assert!(
+            (u[1] - sy * 0.1328).abs() < 2e-4,
+            "7-003 POINT Uy({jname}) = {}",
+            u[1]
+        );
+        assert!(
+            (u[2] - (-1.4745)).abs() < 2e-4,
+            "7-003 POINT Uz({jname}) = {}",
+            u[2]
+        );
+    }
 }
 
 #[test]

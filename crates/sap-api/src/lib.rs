@@ -1,5 +1,5 @@
-//! Open Application Programming Interface (`sap-api`), cleanly implementing the
-//! `SAP2000v19` (`sap2000v19.dll`) `cOAPI` and `cSapModel` automation hierarchy in Rust.
+//! Selected typed Rust facades following the SAP2000 v19 object hierarchy.
+//! This crate is not a COM server or a complete implementation of the vendor API.
 //!
 //! All mutating and query methods follow the CSI OAPI convention of returning `0` (`OAPI_OK`)
 //! on success and non-zero on error.
@@ -8,8 +8,11 @@
 
 mod definitions;
 mod links;
-pub use links::{cLinkObj,cPropLink,set_link_object,set_link_property};
-pub use definitions::{cFunctions, set_case_definition, set_function_definition, validate_case_definition, DefinitionError};
+pub use definitions::{
+    cFunctions, set_case_definition, set_function_definition, validate_case_definition,
+    DefinitionError,
+};
+pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 
 use sap_design::{try_run_concrete_design, try_run_steel_design, ConcreteCode, SteelCode};
 use sap_format::{
@@ -34,12 +37,32 @@ use std::path::{Path, PathBuf};
 pub const OAPI_OK: i32 = 0;
 pub const OAPI_ERR: i32 = 1;
 
+pub(crate) fn is_valid_name(s: &str) -> bool {
+    !s.is_empty() && s == s.trim() && !s.contains('"') && !s.chars().any(char::is_control)
+}
+
+pub(crate) fn is_valid_optional_user_name(s: &str) -> bool {
+    s.is_empty() || is_valid_name(s)
+}
+
+fn is_valid_csys(model: &SapModel, csys: &str) -> bool {
+    csys == csys.trim()
+        && (csys.eq_ignore_ascii_case("GLOBAL")
+            || csys.eq_ignore_ascii_case("LOCAL")
+            || model.coord_systems.get(csys).is_some_and(|system| {
+                system
+                    .origin
+                    .iter()
+                    .chain(&system.angles_deg)
+                    .all(|v| v.is_finite())
+            }))
+}
+
 /// Root OAPI controller (`SAP2000v19.cOAPI` / `SapObject`).
 #[derive(Debug, Clone)]
 pub struct SapObject {
     pub sap_model: cSapModel,
     pub visible: bool,
-    pub current_file: Option<PathBuf>,
 }
 
 impl Default for SapObject {
@@ -53,21 +76,20 @@ impl SapObject {
         Self {
             sap_model: cSapModel::new(Units::KipInF),
             visible: true,
-            current_file: None,
         }
+    }
+
+    /// Returns the active file path delegated from `cSapModel.last_file_path`.
+    pub fn current_file(&self) -> Option<&Path> {
+        self.sap_model.last_file_path.as_deref()
     }
 
     /// Starts the SAP2000 application engine (`cOAPI.ApplicationStart`).
     pub fn application_start(&mut self, units: Units, visible: bool, file_name: &str) -> i32 {
         self.visible = visible;
-        self.current_file = None;
         self.sap_model.initialize_new_model(units);
         if !file_name.trim().is_empty() {
-            let result = self.sap_model.file().open_file(file_name);
-            if result == OAPI_OK {
-                self.current_file = self.sap_model.last_file_path.clone();
-            }
-            return result;
+            return self.sap_model.file().open_file(file_name);
         }
         OAPI_OK
     }
@@ -150,7 +172,14 @@ impl cSapModel {
     }
 
     pub fn set_present_units(&mut self, units: Units) -> i32 {
+        if units == self.inner.present_units {
+            return OAPI_OK;
+        }
+        if self.inner.is_locked {
+            return OAPI_ERR;
+        }
         self.inner.convert_units_in_place(units);
+        self.inner.invalidate_results();
         OAPI_OK
     }
 
@@ -200,8 +229,12 @@ impl cSapModel {
         cSolidObj { api: self }
     }
 
-    pub fn prop_link(&mut self) -> cPropLink<'_> { cPropLink { api: self } }
-    pub fn link_obj(&mut self) -> cLinkObj<'_> { cLinkObj { api: self } }
+    pub fn prop_link(&mut self) -> cPropLink<'_> {
+        cPropLink { api: self }
+    }
+    pub fn link_obj(&mut self) -> cLinkObj<'_> {
+        cLinkObj { api: self }
+    }
 
     pub fn prop_material(&mut self) -> cPropMaterial<'_> {
         cPropMaterial { api: self }
@@ -227,7 +260,9 @@ impl cSapModel {
         cLoadCases { api: self }
     }
 
-    pub fn functions(&mut self) -> cFunctions<'_> { cFunctions { api: self } }
+    pub fn functions(&mut self) -> cFunctions<'_> {
+        cFunctions { api: self }
+    }
 
     pub fn resp_combo(&mut self) -> cRespCombo<'_> {
         cRespCombo { api: self }
@@ -278,6 +313,23 @@ pub struct cFile<'a> {
 }
 
 impl cFile<'_> {
+    fn reset_for_template(&mut self) {
+        let units = self.api.inner.present_units;
+        let materials = self.api.inner.materials.clone();
+        let frame_sections = self.api.inner.frame_sections.clone();
+        let area_sections = self.api.inner.area_sections.clone();
+        self.api.initialize_new_model(units);
+        for (k, v) in materials {
+            self.api.inner.materials.insert(k, v);
+        }
+        for (k, v) in frame_sections {
+            self.api.inner.frame_sections.insert(k, v);
+        }
+        for (k, v) in area_sections {
+            self.api.inner.area_sections.insert(k, v);
+        }
+    }
+
     pub fn new_blank(&mut self) -> i32 {
         let u = self.api.inner.present_units;
         self.api.initialize_new_model(u)
@@ -298,7 +350,10 @@ impl cFile<'_> {
                 self.api.last_file_path = Some(path.to_path_buf());
                 OAPI_OK
             }
-            Err(error) => { self.api.last_file_error=Some(error.to_string()); OAPI_ERR },
+            Err(error) => {
+                self.api.last_file_error = Some(error.to_string());
+                OAPI_ERR
+            }
         }
     }
 
@@ -306,7 +361,11 @@ impl cFile<'_> {
         let path = if file_name.trim().is_empty() {
             match &self.api.last_file_path {
                 Some(p) => p.clone(),
-                None => PathBuf::from("model.s2k"),
+                None => {
+                    self.api.last_file_error =
+                        Some("No active file path for Save; specify a destination path".to_string());
+                    return OAPI_ERR;
+                }
             }
         } else {
             PathBuf::from(file_name)
@@ -324,16 +383,21 @@ impl cFile<'_> {
         };
         match res {
             Ok(warnings) => {
-                self.api.export_warnings=warnings;
-                self.api.last_file_error=None;
+                self.api.export_warnings = warnings;
+                self.api.last_file_error = None;
                 self.api.last_file_path = Some(path);
                 OAPI_OK
             }
-            Err(error) => { self.api.last_file_error=Some(error.to_string()); OAPI_ERR },
+            Err(error) => {
+                self.api.last_file_error = Some(error.to_string());
+                OAPI_ERR
+            }
         }
     }
 
-    /// Exports the active model as a native SAP2000 v19 `cBinaryStream` `.sdb` file.
+    /// Exports the supported model subset as an experimental native `cBinaryStream` file.
+    /// Unsupported/lossy state rejects before writing; vendor runtime acceptance is unverified.
+    /// The destination must be new; written bytes are read back and verified before success.
     pub fn save_native_sdb(&mut self, file_name: &str) -> i32 {
         if file_name.trim().is_empty() {
             self.api.last_file_error = Some("Empty native SDB destination path".to_string());
@@ -343,6 +407,9 @@ impl cFile<'_> {
         self.api.export_warnings.clear();
         match save_native_sdb_file(&self.api.inner, &path) {
             Ok(()) => {
+                self.api.export_warnings.push(
+                    "Experimental native SDB export: vendor application acceptance is unverified; retain the original source.".into(),
+                );
                 self.api.last_file_error = None;
                 self.api.last_file_path = Some(path);
                 OAPI_OK
@@ -361,6 +428,14 @@ impl cFile<'_> {
         restraint: bool,
         beam: &str,
     ) -> i32 {
+        if num_spans == 0
+            || !span_length.is_finite()
+            || span_length <= 0.0
+            || !((num_spans as f64) * span_length).is_finite()
+        {
+            return OAPI_ERR;
+        }
+        self.reset_for_template();
         self.api
             .inner
             .generate_beam(num_spans, span_length, restraint, beam);
@@ -380,6 +455,18 @@ impl cFile<'_> {
         column: &str,
         brace: &str,
     ) -> i32 {
+        if num_stories == 0
+            || num_bays == 0
+            || !story_height.is_finite()
+            || story_height <= 0.0
+            || !bay_width.is_finite()
+            || bay_width <= 0.0
+            || !((num_stories as f64) * story_height).is_finite()
+            || !((num_bays as f64) * bay_width).is_finite()
+        {
+            return OAPI_ERR;
+        }
+        self.reset_for_template();
         self.api.inner.generate_2d_frame(
             temp_type,
             num_stories,
@@ -404,6 +491,16 @@ impl cFile<'_> {
         chord: &str,
         web: &str,
     ) -> i32 {
+        if num_divs == 0
+            || !div_len.is_finite()
+            || div_len <= 0.0
+            || !height.is_finite()
+            || height <= 0.0
+            || !((num_divs.max(2) as f64) * div_len).is_finite()
+        {
+            return OAPI_ERR;
+        }
+        self.reset_for_template();
         self.api
             .inner
             .generate_2d_truss(num_divs, div_len, height, restraint, chord, web);
@@ -425,6 +522,22 @@ impl cFile<'_> {
         column: &str,
         area_sec: &str,
     ) -> i32 {
+        if num_stories == 0
+            || num_bays_x == 0
+            || num_bays_y == 0
+            || !story_height.is_finite()
+            || story_height <= 0.0
+            || !bay_width_x.is_finite()
+            || bay_width_x <= 0.0
+            || !bay_width_y.is_finite()
+            || bay_width_y <= 0.0
+            || !((num_stories as f64) * story_height).is_finite()
+            || !((num_bays_x as f64) * bay_width_x).is_finite()
+            || !((num_bays_y as f64) * bay_width_y).is_finite()
+        {
+            return OAPI_ERR;
+        }
+        self.reset_for_template();
         self.api.inner.generate_3d_frame(
             temp_type,
             num_stories,
@@ -450,9 +563,52 @@ impl cFile<'_> {
         restraint: bool,
         area_sec: &str,
     ) -> i32 {
+        if num_x == 0
+            || num_z == 0
+            || !width_x.is_finite()
+            || width_x <= 0.0
+            || !height_z.is_finite()
+            || height_z <= 0.0
+            || !((num_x as f64) * width_x).is_finite()
+            || !((num_z as f64) * height_z).is_finite()
+        {
+            return OAPI_ERR;
+        }
+        self.reset_for_template();
         self.api
             .inner
             .generate_wall(num_x, width_x, num_z, height_z, restraint, area_sec);
+        OAPI_OK
+    }
+
+    pub fn new_spherical_dome(
+        &mut self,
+        radius: f64,
+        roll_angle_deg: f64,
+        num_angular_divs: usize,
+        num_meridional_divs: usize,
+        restraint: bool,
+        area_sec: &str,
+    ) -> i32 {
+        if num_angular_divs == 0
+            || num_meridional_divs == 0
+            || !radius.is_finite()
+            || radius <= 0.0
+            || !roll_angle_deg.is_finite()
+            || roll_angle_deg <= 0.0
+            || roll_angle_deg > 90.0
+        {
+            return OAPI_ERR;
+        }
+        self.reset_for_template();
+        self.api.inner.generate_dome_shell(
+            radius,
+            roll_angle_deg,
+            num_angular_divs,
+            num_meridional_divs,
+            restraint,
+            area_sec,
+        );
         OAPI_OK
     }
 }
@@ -466,11 +622,12 @@ impl cPointObj<'_> {
     pub fn add_cartesian(&mut self, x: f64, y: f64, z: f64, user_name: &str) -> (i32, String) {
         if self.api.inner.is_locked
             || [x, y, z].iter().any(|v| !v.is_finite())
-            || (!user_name.trim().is_empty() && self.api.inner.points.contains_key(user_name))
+            || !is_valid_optional_user_name(user_name)
+            || (!user_name.is_empty() && self.api.inner.points.contains_key(user_name))
         {
             return (OAPI_ERR, String::new());
         }
-        let name = if user_name.trim().is_empty() {
+        let name = if user_name.is_empty() {
             sap_model::next_numeric_name(self.api.inner.points.keys())
         } else {
             user_name.to_owned()
@@ -568,6 +725,44 @@ impl cPointObj<'_> {
     pub fn count(&self) -> usize {
         self.api.inner.points.len()
     }
+    pub fn get_name_list(&self) -> (i32, Vec<String>) {
+        (OAPI_OK, self.api.inner.points.keys().cloned().collect())
+    }
+    pub fn delete(&mut self, name: &str) -> i32 {
+        if self.api.inner.is_locked || !self.api.inner.points.contains_key(name) {
+            return OAPI_ERR;
+        }
+        let in_use = self
+            .api
+            .inner
+            .frames
+            .values()
+            .any(|f| f.point_i == name || f.point_j == name)
+            || self
+                .api
+                .inner
+                .areas
+                .values()
+                .any(|a| a.points.iter().any(|p| p == name))
+            || self
+                .api
+                .inner
+                .solids
+                .values()
+                .any(|s| s.points.iter().any(|p| p == name))
+            || self
+                .api
+                .inner
+                .links
+                .values()
+                .any(|l| l.point_i == name || l.point_j.as_deref() == Some(name));
+        if in_use {
+            return OAPI_ERR;
+        }
+        self.api.inner.points.shift_remove(name);
+        self.api.inner.invalidate_results();
+        OAPI_OK
+    }
 }
 
 /// Frame / Cable Object API (`SAP2000v19.cFrameObj`).
@@ -588,24 +783,10 @@ impl cFrameObj<'_> {
         OAPI_OK
     }
     fn valid_load(&self, load_pat: &str, my_type: i32, dir: i32, csys: &str) -> bool {
-        let valid_system = csys.eq_ignore_ascii_case("GLOBAL")
-            || csys.eq_ignore_ascii_case("LOCAL")
-            || self
-                .api
-                .inner
-                .coord_systems
-                .get(csys)
-                .is_some_and(|system| {
-                    system
-                        .origin
-                        .iter()
-                        .chain(&system.angles_deg)
-                        .all(|v| v.is_finite())
-                });
         self.api.inner.load_patterns.contains_key(load_pat)
             && (1..=2).contains(&my_type)
             && (1..=11).contains(&dir)
-            && valid_system
+            && is_valid_csys(&self.api.inner, csys)
     }
     pub fn add_by_point(
         &mut self,
@@ -630,11 +811,12 @@ impl cFrameObj<'_> {
             || !length.is_finite()
             || length <= 0.
             || !self.api.inner.frame_sections.contains_key(sec)
-            || (!user_name.trim().is_empty() && self.api.inner.frames.contains_key(user_name))
+            || !is_valid_optional_user_name(user_name)
+            || (!user_name.is_empty() && self.api.inner.frames.contains_key(user_name))
         {
             return (OAPI_ERR, String::new());
         }
-        let name = if user_name.trim().is_empty() {
+        let name = if user_name.is_empty() {
             sap_model::next_numeric_name(self.api.inner.frames.keys())
         } else {
             user_name.to_owned()
@@ -666,7 +848,8 @@ impl cFrameObj<'_> {
             || !length.is_finite()
             || length <= 0.
             || !self.api.inner.frame_sections.contains_key(sec)
-            || (!user_name.trim().is_empty() && self.api.inner.frames.contains_key(user_name))
+            || !is_valid_optional_user_name(user_name)
+            || (!user_name.is_empty() && self.api.inner.frames.contains_key(user_name))
         {
             return (OAPI_ERR, String::new());
         }
@@ -943,6 +1126,17 @@ impl cFrameObj<'_> {
     pub fn count(&self) -> usize {
         self.api.inner.frames.len()
     }
+    pub fn get_name_list(&self) -> (i32, Vec<String>) {
+        (OAPI_OK, self.api.inner.frames.keys().cloned().collect())
+    }
+    pub fn delete(&mut self, name: &str) -> i32 {
+        if self.api.inner.is_locked || !self.api.inner.frames.contains_key(name) {
+            return OAPI_ERR;
+        }
+        self.api.inner.frames.shift_remove(name);
+        self.api.inner.invalidate_results();
+        OAPI_OK
+    }
 }
 
 /// 3D Solid Object API (`SAP2000v19.cSolidObj`).
@@ -964,16 +1158,29 @@ impl cSolidObj<'_> {
         };
         if self.api.inner.is_locked
             || !self.api.inner.solid_sections.contains_key(sec)
-            || points.iter().any(|p| !self.api.inner.points.contains_key(p))
-            || (!user_name.trim().is_empty() && self.api.inner.solids.contains_key(user_name))
+            || points
+                .iter()
+                .any(|p| !self.api.inner.points.contains_key(p))
+            || !is_valid_optional_user_name(user_name)
+            || (!user_name.is_empty() && self.api.inner.solids.contains_key(user_name))
         {
             return (OAPI_ERR, String::new());
         }
-        let name = if user_name.trim().is_empty() {
+        let name = if user_name.is_empty() {
             sap_model::next_numeric_name(self.api.inner.solids.keys())
         } else {
             user_name.to_owned()
         };
+        // Use the solver's geometric contract before inserting or invalidating results.
+        // Collapsed wedge/tetrahedral mappings remain allowed only when their
+        // center and integration-point Jacobians satisfy that same contract.
+        let coords = points.each_ref().map(|id| {
+            let p = &self.api.inner.points[id];
+            [p.x, p.y, p.z]
+        });
+        if sap_solver::solid::validate_solid_geometry(&coords).is_err() {
+            return (OAPI_ERR, String::new());
+        }
         self.api.inner.solids.insert(
             name.clone(),
             SolidObj {
@@ -1005,7 +1212,12 @@ impl cSolidObj<'_> {
         {
             return OAPI_ERR;
         }
-        let solid = self.api.inner.solids.get_mut(name).expect("validated solid");
+        let solid = self
+            .api
+            .inner
+            .solids
+            .get_mut(name)
+            .expect("validated solid");
         if replace {
             solid
                 .loads_surface
@@ -1034,18 +1246,40 @@ impl cSolidObj<'_> {
         {
             return OAPI_ERR;
         }
-        let solid = self.api.inner.solids.get_mut(name).expect("validated solid");
-        if replace {
-            solid.loads_temp.insert(load_pat.to_owned(), val);
+        let solid = self
+            .api
+            .inner
+            .solids
+            .get_mut(name)
+            .expect("validated solid");
+        let prospective = if replace {
+            val
         } else {
-            *solid.loads_temp.entry(load_pat.to_owned()).or_default() += val;
+            solid.loads_temp.get(load_pat).copied().unwrap_or(0.0) + val
+        };
+        if !prospective.is_finite() {
+            return OAPI_ERR;
         }
+        solid.loads_temp.insert(load_pat.to_owned(), prospective);
         self.api.inner.invalidate_results();
         OAPI_OK
     }
 
     pub fn count(&self) -> usize {
         self.api.inner.solids.len()
+    }
+
+    pub fn get_name_list(&self) -> (i32, Vec<String>) {
+        (OAPI_OK, self.api.inner.solids.keys().cloned().collect())
+    }
+
+    pub fn delete(&mut self, name: &str) -> i32 {
+        if self.api.inner.is_locked || !self.api.inner.solids.contains_key(name) {
+            return OAPI_ERR;
+        }
+        self.api.inner.solids.shift_remove(name);
+        self.api.inner.invalidate_results();
+        OAPI_OK
     }
 }
 
@@ -1065,7 +1299,7 @@ impl cPropSolid<'_> {
         incompatible: bool,
     ) -> i32 {
         if self.api.inner.is_locked
-            || name.trim().is_empty()
+            || !is_valid_name(name)
             || !self.api.inner.materials.contains_key(mat_prop)
             || [a, b, c].iter().any(|v| !v.is_finite())
         {
@@ -1154,10 +1388,65 @@ impl cAreaObj<'_> {
         prop_name: &str,
         user_name: &str,
     ) -> (i32, String) {
+        if self.api.inner.is_locked
+            || !is_valid_optional_user_name(user_name)
+            || (!user_name.is_empty() && self.api.inner.areas.contains_key(user_name))
+            || !self.api.inner.area_sections.contains_key(prop_name)
+            || !(3..=4).contains(&points.len())
+        {
+            return (OAPI_ERR, String::new());
+        }
+        for (idx, p) in points.iter().enumerate() {
+            let Some(pt) = self.api.inner.points.get(p) else {
+                return (OAPI_ERR, String::new());
+            };
+            if [pt.x, pt.y, pt.z].iter().any(|v| !v.is_finite())
+                || points[..idx].iter().any(|prev| prev == p)
+            {
+                return (OAPI_ERR, String::new());
+            }
+        }
+        let origin = &self.api.inner.points[&points[0]];
+        let mut coords: Vec<[f64; 3]> = points
+            .iter()
+            .map(|id| {
+                let pt = &self.api.inner.points[id];
+                [pt.x - origin.x, pt.y - origin.y, pt.z - origin.z]
+            })
+            .collect();
+        if coords.iter().flatten().any(|v| !v.is_finite()) {
+            return (OAPI_ERR, String::new());
+        }
+        let scale = coords.iter().flatten().fold(0.0_f64, |s, v| s.max(v.abs()));
+        if !scale.is_finite() || scale <= 0.0 {
+            return (OAPI_ERR, String::new());
+        }
+        for coord in &mut coords {
+            for value in coord {
+                *value /= scale;
+            }
+        }
+        let (_, _, xy) = sap_solver::area::area_local_system(&coords, 0.0);
+        let n = xy.len();
+        let mut orientation = 0.0_f64;
+        for i in 0..n {
+            let a = xy[i];
+            let b = xy[(i + 1) % n];
+            let c = xy[(i + 2) % n];
+            let cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+            if !cross.is_finite() || cross.abs() <= 1e-12 {
+                return (OAPI_ERR, String::new());
+            }
+            if orientation == 0.0 {
+                orientation = cross.signum();
+            } else if cross.signum() != orientation {
+                return (OAPI_ERR, String::new());
+            }
+        }
         if !self.api.prepare_edit() {
             return (OAPI_ERR, String::new());
         }
-        let name = if user_name.trim().is_empty() {
+        let name = if user_name.is_empty() {
             sap_model::next_numeric_name(self.api.inner.areas.keys())
         } else {
             user_name.to_string()
@@ -1175,27 +1464,46 @@ impl cAreaObj<'_> {
         csys: &str,
         replace: bool,
     ) -> i32 {
+        if self.api.inner.is_locked
+            || !self.api.inner.areas.contains_key(name)
+            || !self.api.inner.load_patterns.contains_key(load_pat)
+            || !val.is_finite()
+            || !(1..=11).contains(&dir)
+            || !is_valid_csys(&self.api.inner, csys)
+        {
+            return OAPI_ERR;
+        }
         if !self.api.prepare_edit() {
             return OAPI_ERR;
         }
-        if let Some(a) = self.api.inner.areas.get_mut(name) {
-            if replace {
-                a.loads_uniform.retain(|l| l.load_pat != load_pat);
-            }
-            a.loads_uniform.push(AreaLoadUniform {
-                load_pat: load_pat.to_string(),
-                csys: csys.to_string(),
-                dir,
-                val,
-            });
-            OAPI_OK
-        } else {
-            OAPI_ERR
+        let a = self.api.inner.areas.get_mut(name).expect("validated area");
+        if replace {
+            a.loads_uniform.retain(|l| l.load_pat != load_pat);
         }
+        a.loads_uniform.push(AreaLoadUniform {
+            load_pat: load_pat.to_string(),
+            csys: csys.to_string(),
+            dir,
+            val,
+        });
+        OAPI_OK
     }
 
     pub fn count(&self) -> usize {
         self.api.inner.areas.len()
+    }
+
+    pub fn get_name_list(&self) -> (i32, Vec<String>) {
+        (OAPI_OK, self.api.inner.areas.keys().cloned().collect())
+    }
+
+    pub fn delete(&mut self, name: &str) -> i32 {
+        if self.api.inner.is_locked || !self.api.inner.areas.contains_key(name) {
+            return OAPI_ERR;
+        }
+        self.api.inner.areas.shift_remove(name);
+        self.api.inner.invalidate_results();
+        OAPI_OK
     }
 }
 
@@ -1209,7 +1517,7 @@ impl cPropMaterial<'_> {
     /// Other material families need dedicated defaults/constitutive setters.
     pub fn set_material(&mut self, name: &str, mat_type: MatType) -> i32 {
         if self.api.inner.is_locked
-            || name.trim().is_empty()
+            || !is_valid_name(name)
             || !matches!(
                 mat_type,
                 MatType::Steel | MatType::Concrete | MatType::NoDesign
@@ -1325,11 +1633,53 @@ pub struct cPropFrame<'a> {
 }
 
 impl cPropFrame<'_> {
+    fn valid_base(&self, name: &str, mat_prop: &str) -> bool {
+        !self.api.inner.is_locked
+            && is_valid_name(name)
+            && self.api.inner.materials.contains_key(mat_prop)
+    }
+
+    fn valid_computed_section(sec: &FrameSection) -> bool {
+        sec.area.is_finite()
+            && sec.area > 0.0
+            && sec.i33.is_finite()
+            && sec.i33 > 0.0
+            && sec.i22.is_finite()
+            && sec.i22 > 0.0
+            && [
+                sec.t3,
+                sec.t2,
+                sec.tf,
+                sec.tw,
+                sec.t2b,
+                sec.tfb,
+                sec.as2,
+                sec.as3,
+                sec.torsional_j,
+                sec.s22,
+                sec.s33,
+                sec.z22,
+                sec.z33,
+                sec.r22,
+                sec.r33,
+            ]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.0)
+    }
+
     pub fn set_rectangle(&mut self, name: &str, mat_prop: &str, t3: f64, t2: f64) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop)
+            || !t3.is_finite()
+            || t3 <= 0.0
+            || !t2.is_finite()
+            || t2 <= 0.0
+        {
             return OAPI_ERR;
         }
         let sec = make_rectangular(name, mat_prop, t3, t2);
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
@@ -1346,19 +1696,39 @@ impl cPropFrame<'_> {
         t2b: f64,
         tfb: f64,
     ) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop)
+            || [t3, t2, tf, tw, t2b, tfb]
+                .iter()
+                .any(|v| !v.is_finite() || *v <= 0.0)
+            || !(tf + tfb).is_finite()
+            || tf + tfb >= t3
+            || tw >= t2.min(t2b)
+        {
             return OAPI_ERR;
         }
         let sec = make_i_section(name, mat_prop, t3, t2, tf, tw, t2b, tfb);
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
 
     pub fn set_pipe(&mut self, name: &str, mat_prop: &str, t3: f64, tw: f64) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop)
+            || !t3.is_finite()
+            || t3 <= 0.0
+            || !tw.is_finite()
+            || tw <= 0.0
+            || !(2.0 * tw).is_finite()
+            || 2.0 * tw >= t3
+        {
             return OAPI_ERR;
         }
         let sec = make_pipe(name, mat_prop, t3, tw);
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
@@ -1372,19 +1742,31 @@ impl cPropFrame<'_> {
         tf: f64,
         tw: f64,
     ) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop)
+            || [t3, t2, tf, tw].iter().any(|v| !v.is_finite() || *v <= 0.0)
+            || !(2.0 * tf).is_finite()
+            || 2.0 * tf >= t3
+            || !(2.0 * tw).is_finite()
+            || 2.0 * tw >= t2
+        {
             return OAPI_ERR;
         }
         let sec = make_box_tube(name, mat_prop, t3, t2, tf, tw);
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
 
     pub fn set_circle(&mut self, name: &str, mat_prop: &str, t3: f64) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop) || !t3.is_finite() || t3 <= 0.0 {
             return OAPI_ERR;
         }
         let sec = make_circle(name, mat_prop, t3);
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
@@ -1409,7 +1791,7 @@ impl cPropFrame<'_> {
         r22: f64,
         r33: f64,
     ) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop) {
             return OAPI_ERR;
         }
         let sec = FrameSection {
@@ -1432,6 +1814,9 @@ impl cPropFrame<'_> {
             r33,
             ..Default::default()
         };
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
@@ -1444,7 +1829,10 @@ impl cPropFrame<'_> {
         file_name: &str,
         sect_name: &str,
     ) -> i32 {
-        if !self.api.prepare_edit() {
+        if !self.valid_base(name, mat_prop)
+            || file_name.trim().is_empty()
+            || sect_name.trim().is_empty()
+        {
             return OAPI_ERR;
         }
         let mut path = PathBuf::from(file_name);
@@ -1459,6 +1847,9 @@ impl cPropFrame<'_> {
             return OAPI_ERR;
         };
         sec.name = name.to_string();
+        if !Self::valid_computed_section(&sec) || !self.api.prepare_edit() {
+            return OAPI_ERR;
+        }
         self.api.inner.frame_sections.insert(name.to_string(), sec);
         OAPI_OK
     }
@@ -1495,6 +1886,17 @@ impl cPropArea<'_> {
         thickness: f64,
         bending: f64,
     ) -> i32 {
+        if self.api.inner.is_locked
+            || !is_valid_name(name)
+            || !self.api.inner.materials.contains_key(mat_prop)
+            || !thickness.is_finite()
+            || thickness <= 0.0
+            || !bending.is_finite()
+            || bending <= 0.0
+            || !(1..=6).contains(&(shell_type as i32))
+        {
+            return OAPI_ERR;
+        }
         if !self.api.prepare_edit() {
             return OAPI_ERR;
         }
@@ -1522,6 +1924,24 @@ impl cLoadPatterns<'_> {
         self_wt_multiplier: f64,
         add_load_case: bool,
     ) -> i32 {
+        if self.api.inner.is_locked
+            || !is_valid_name(name)
+            || !self_wt_multiplier.is_finite()
+            || self.api.inner.load_combos.contains_key(name)
+        {
+            return OAPI_ERR;
+        }
+        let expected_case = LoadCase::linear_static(name, name, 1.0);
+        if add_load_case
+            && self
+                .api
+                .inner
+                .load_cases
+                .get(name)
+                .is_some_and(|existing| *existing != expected_case)
+        {
+            return OAPI_ERR;
+        }
         if !self.api.prepare_edit() {
             return OAPI_ERR;
         }
@@ -1537,7 +1957,7 @@ impl cLoadPatterns<'_> {
             self.api
                 .inner
                 .load_cases
-                .insert(name.to_string(), LoadCase::linear_static(name, name, 1.0));
+                .insert(name.to_string(), expected_case);
             if !self.api.selected_cases.contains(&name.to_string()) {
                 self.api.selected_cases.push(name.to_string());
             }
@@ -1546,15 +1966,23 @@ impl cLoadPatterns<'_> {
     }
 
     pub fn set_self_wt_multiplier(&mut self, name: &str, self_wt_multiplier: f64) -> i32 {
+        if self.api.inner.is_locked
+            || !self_wt_multiplier.is_finite()
+            || !self.api.inner.load_patterns.contains_key(name)
+        {
+            return OAPI_ERR;
+        }
         if !self.api.prepare_edit() {
             return OAPI_ERR;
         }
-        if let Some(lp) = self.api.inner.load_patterns.get_mut(name) {
-            lp.self_wt_multiplier = self_wt_multiplier;
-            OAPI_OK
-        } else {
-            OAPI_ERR
-        }
+        let lp = self
+            .api
+            .inner
+            .load_patterns
+            .get_mut(name)
+            .expect("validated pattern");
+        lp.self_wt_multiplier = self_wt_multiplier;
+        OAPI_OK
     }
 }
 
@@ -1565,25 +1993,43 @@ pub struct cLoadCases<'a> {
 
 impl cLoadCases<'_> {
     pub fn set_linear_static(&mut self, name: &str, loads: Vec<(String, f64)>) -> i32 {
-        let mut case=LoadCase::linear_static(name,"",1.0);
-        case.loads=loads.into_iter().map(|(load_name,scale_factor)|LoadCaseAssignment {load_name,scale_factor}).collect();
+        let mut case = LoadCase::linear_static(name, "", 1.0);
+        case.loads = loads
+            .into_iter()
+            .map(|(load_name, scale_factor)| LoadCaseAssignment {
+                load_name,
+                scale_factor,
+            })
+            .collect();
         self.set_definition(case)
     }
     pub fn set_modal_eigen(&mut self, name: &str, max_modes: usize) -> i32 {
-        self.set_definition(LoadCase::modal_eigen(name,max_modes))
+        self.set_definition(LoadCase::modal_eigen(name, max_modes))
     }
     pub fn set_pdelta(&mut self, name: &str, loads: Vec<(String, f64)>) -> i32 {
-        let mut case=LoadCase::linear_static(name,"",1.0);
-        case.case_type=LoadCaseType::NonlinearStatic;
-        case.nl_geom=NLGeomType::PDelta;
-        case.loads=loads.into_iter().map(|(load_name,scale_factor)|LoadCaseAssignment {load_name,scale_factor}).collect();
+        let mut case = LoadCase::linear_static(name, "", 1.0);
+        case.case_type = LoadCaseType::NonlinearStatic;
+        case.nl_geom = NLGeomType::PDelta;
+        case.loads = loads
+            .into_iter()
+            .map(|(load_name, scale_factor)| LoadCaseAssignment {
+                load_name,
+                scale_factor,
+            })
+            .collect();
         self.set_definition(case)
     }
     pub fn set_buckling(&mut self, name: &str, loads: Vec<(String, f64)>, num_modes: usize) -> i32 {
-        let mut case=LoadCase::linear_static(name,"",1.0);
-        case.case_type=LoadCaseType::Buckling;
-        case.num_buckling_modes=num_modes;
-        case.loads=loads.into_iter().map(|(load_name,scale_factor)|LoadCaseAssignment {load_name,scale_factor}).collect();
+        let mut case = LoadCase::linear_static(name, "", 1.0);
+        case.case_type = LoadCaseType::Buckling;
+        case.num_buckling_modes = num_modes;
+        case.loads = loads
+            .into_iter()
+            .map(|(load_name, scale_factor)| LoadCaseAssignment {
+                load_name,
+                scale_factor,
+            })
+            .collect();
         self.set_definition(case)
     }
 }
@@ -1594,7 +2040,41 @@ pub struct cRespCombo<'a> {
 }
 
 impl cRespCombo<'_> {
+    fn combo_reaches(&self, start: &str, target: &str) -> bool {
+        if start == target {
+            return true;
+        }
+        let mut visited = std::collections::BTreeSet::new();
+        let mut stack = vec![start];
+        while let Some(curr) = stack.pop() {
+            if !visited.insert(curr) {
+                continue;
+            }
+            if let Some(combo) = self.api.inner.load_combos.get(curr) {
+                for (dep, _) in &combo.cases {
+                    if dep == target {
+                        return true;
+                    }
+                    if self.api.inner.load_combos.contains_key(dep.as_str())
+                        && !visited.contains(dep.as_str())
+                    {
+                        stack.push(dep.as_str());
+                    }
+                }
+            }
+        }
+        false
+    }
+
     pub fn add(&mut self, name: &str, combo_type: ComboType) -> i32 {
+        if self.api.inner.is_locked
+            || !is_valid_name(name)
+            || self.api.inner.load_cases.contains_key(name)
+            || self.api.inner.load_patterns.contains_key(name)
+            || !(0..=4).contains(&(combo_type as i32))
+        {
+            return OAPI_ERR;
+        }
         if !self.api.prepare_edit() {
             return OAPI_ERR;
         }
@@ -1610,15 +2090,30 @@ impl cRespCombo<'_> {
     }
 
     pub fn set_case_list(&mut self, name: &str, case_name: &str, sf: f64) -> i32 {
+        if self.api.inner.is_locked
+            || !self.api.inner.load_combos.contains_key(name)
+            || !sf.is_finite()
+            || (!self.api.inner.load_cases.contains_key(case_name)
+                && !self.api.inner.load_combos.contains_key(case_name))
+            || self.combo_reaches(case_name, name)
+        {
+            return OAPI_ERR;
+        }
         if !self.api.prepare_edit() {
             return OAPI_ERR;
         }
-        if let Some(combo) = self.api.inner.load_combos.get_mut(name) {
-            combo.cases.push((case_name.to_string(), sf));
-            OAPI_OK
+        let combo = self
+            .api
+            .inner
+            .load_combos
+            .get_mut(name)
+            .expect("validated combo");
+        if let Some(existing) = combo.cases.iter_mut().find(|(c, _)| c == case_name) {
+            existing.1 = sf;
         } else {
-            OAPI_ERR
+            combo.cases.push((case_name.to_string(), sf));
         }
+        OAPI_OK
     }
 }
 
@@ -1636,13 +2131,18 @@ impl cAnalyze<'_> {
     }
 
     pub fn set_run_case_flag(&mut self, name: &str, run: bool, all: bool) -> i32 {
+        if self.api.inner.is_locked {
+            return OAPI_ERR;
+        }
         if all {
             for lc in self.api.inner.load_cases.values_mut() {
                 lc.run_flag = run;
             }
+            self.api.inner.invalidate_results();
             OAPI_OK
         } else if let Some(lc) = self.api.inner.load_cases.get_mut(name) {
             lc.run_flag = run;
+            self.api.inner.invalidate_results();
             OAPI_OK
         } else {
             OAPI_ERR
@@ -1765,6 +2265,135 @@ impl cAnalysisResults<'_> {
             }
         }
         out
+    }
+
+    /// Queries shell/area internal forces and stresses across selected output cases (`cAnalysisResults.AreaForceShell`).
+    pub fn area_force_shell(&self, name: &str) -> (i32, Vec<(String, sap_model::AreaResult)>) {
+        if self.api.inner.case_results.is_empty() || !self.api.inner.areas.contains_key(name) {
+            return (OAPI_ERR, Vec::new());
+        }
+        let mut out = Vec::new();
+        for cname in self
+            .api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+        {
+            if let Some(cr) = self.api.inner.case_results.get(cname) {
+                if let Some(ar) = cr.area_results.get(name) {
+                    out.push((cname.clone(), ar.clone()));
+                }
+            }
+        }
+        (OAPI_OK, out)
+    }
+
+    /// Queries link internal forces `[P, V2, V3, T, M2, M3]` across selected output cases (`cAnalysisResults.LinkForce`).
+    pub fn link_force(&self, name: &str) -> (i32, Vec<(String, [f64; 6])>) {
+        if self.api.inner.case_results.is_empty() || !self.api.inner.links.contains_key(name) {
+            return (OAPI_ERR, Vec::new());
+        }
+        let mut out = Vec::new();
+        for cname in self
+            .api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+        {
+            if let Some(cr) = self.api.inner.case_results.get(cname) {
+                if let Some(&lf) = cr.link_forces.get(name) {
+                    out.push((cname.clone(), lf));
+                }
+            }
+        }
+        (OAPI_OK, out)
+    }
+
+    /// Queries buckling eigenvalues `(case_name, mode_num, factor)` across selected buckling cases (`cAnalysisResults.BucklingFactor`).
+    pub fn buckling_factor(&self) -> (i32, Vec<(String, usize, f64)>) {
+        if self.api.inner.case_results.is_empty() {
+            return (OAPI_ERR, Vec::new());
+        }
+        let mut out = Vec::new();
+        for cname in self
+            .api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+        {
+            if let Some(cr) = self.api.inner.case_results.get(cname) {
+                for (idx, &factor) in cr.buckling_factors.iter().enumerate() {
+                    out.push((cname.clone(), idx + 1, factor));
+                }
+            }
+        }
+        (OAPI_OK, out)
+    }
+
+    /// Queries global base reactions `[FX, FY, FZ, MX, MY, MZ]` across selected output cases (`cAnalysisResults.BaseReact`).
+    pub fn base_react(&self) -> (i32, Vec<(String, [f64; 6])>) {
+        if self.api.inner.case_results.is_empty() {
+            return (OAPI_ERR, Vec::new());
+        }
+        let mut out = Vec::new();
+        for cname in self
+            .api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+        {
+            if self.api.inner.load_cases.get(cname).is_some_and(|lc| {
+                matches!(lc.case_type, LoadCaseType::Modal | LoadCaseType::Buckling)
+            }) {
+                continue;
+            }
+            if let Some(cr) = self.api.inner.case_results.get(cname) {
+                out.push((cname.clone(), cr.base_reactions));
+            }
+        }
+        (OAPI_OK, out)
+    }
+
+    /// Queries modal participating mass ratios across selected modal cases (`cAnalysisResults.ModalParticipatingMassRatios`).
+    pub fn modal_participating_mass_ratios(&self) -> (i32, Vec<(String, ModalModeResult)>) {
+        if self.api.inner.case_results.is_empty() {
+            return (OAPI_ERR, Vec::new());
+        }
+        let mut out = Vec::new();
+        for cname in &self.api.selected_cases {
+            if let Some(cr) = self.api.inner.case_results.get(cname) {
+                for mode in &cr.modes {
+                    out.push((cname.clone(), mode.clone()));
+                }
+            }
+        }
+        (OAPI_OK, out)
+    }
+
+    /// Queries time-history joint displacement traces `(case_name, time_steps, displacements)` across selected cases.
+    pub fn time_history_joint_displ(
+        &self,
+        name: &str,
+    ) -> (i32, Vec<(String, Vec<f64>, Vec<[f64; 6]>)>) {
+        if self.api.inner.case_results.is_empty() || !self.api.inner.points.contains_key(name) {
+            return (OAPI_ERR, Vec::new());
+        }
+        let mut out = Vec::new();
+        for cname in self
+            .api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+        {
+            if let Some(cr) = self.api.inner.case_results.get(cname) {
+                if !cr.time_steps.is_empty() {
+                    if let Some(trace) = cr.time_history_disp.get(name) {
+                        out.push((cname.clone(), cr.time_steps.clone(), trace.clone()));
+                    }
+                }
+            }
+        }
+        (OAPI_OK, out)
     }
 }
 
@@ -2040,6 +2669,9 @@ mod tests {
     #[test]
     fn test_oapi_solid_cable_and_native_sdb_export() {
         let mut api = cSapModel::new(Units::KipInF);
+        // Explicitly choose the native writer's lossless steel-only subset.
+        api.inner.materials.shift_remove("4000Psi");
+        api.inner.area_sections.clear();
         assert_eq!(
             api.prop_solid()
                 .set_prop("BRICK1", "A992Fy50", 0.0, 0.0, 0.0, true),
@@ -2087,7 +2719,9 @@ mod tests {
         assert!(solid_res[0].1.center_stress.s33 < 0.0);
 
         let out = std::env::temp_dir().join(format!("sap-api-native-{}.sdb", std::process::id()));
-        assert_eq!(api.file().save_native_sdb(out.to_str().unwrap()), OAPI_OK);
+        assert_eq!(api.file().save_native_sdb(out.to_str().unwrap()), OAPI_OK,
+            "{:?}", api.last_file_error);
+        assert!(api.export_warnings.iter().any(|w| w.contains("Experimental")));
         let doc = sap_format::inspect_native_sdb_file(&out).unwrap();
         assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
         std::fs::remove_file(out).unwrap();

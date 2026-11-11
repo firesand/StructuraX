@@ -33,6 +33,8 @@ pub enum DesignError {
         frame: String,
         v3: String,
     },
+    #[error("concrete beam minor-axis flexure M2 is unsupported for member '{frame}' because the result schema cannot report side-face reinforcement (M2={m2})")]
+    UnsupportedBeamMinorAxisFlexure { frame: String, m2: String },
     #[error("EC3 local-3 shear is not implemented for section '{section}' of type {kind}")]
     UnsupportedEc3MinorShearSection { section: String, kind: String },
     #[error("EC3 local-3 shear interaction on member '{frame}' is supported only for V3 plus local-2 bending (P=V2=M3=T=0); found P={p}, V2={v2}, M3={m3}, T={t}")]

@@ -1121,6 +1121,24 @@ pub struct ModalModeResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct NonlinearLinkForceState {
+    pub link: String,
+    pub dof: usize,
+    pub force: f64,
+}
+
+/// Persisted terminal state of a direct-integration time-history case for exact continuation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TransientTerminalState {
+    pub point_order: Vec<String>,
+    pub u: Vec<f64>,
+    pub v: Vec<f64>,
+    pub a: Vec<f64>,
+    pub previous_force: Vec<f64>,
+    pub nonlinear_link_forces: Vec<NonlinearLinkForceState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CaseResults {
     pub case_name: String,
     /// Joint displacements `joint_name -> [U1, U2, U3, R1, R2, R3]`
@@ -1144,6 +1162,9 @@ pub struct CaseResults {
     pub time_steps: Vec<f64>,
     pub time_history_disp: IndexMap<String, Vec<[f64; 6]>>,
     pub base_reactions: [f64; 6],
+    /// Terminal dynamic state for chained `initial_case` continuation
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_state: Option<TransientTerminalState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1520,8 +1541,8 @@ impl SapModel {
             }
             if let Some(sc) = &mut p.spring_coupled {
                 let mut idx = 0;
-                for r in 0..6 {
-                    for c in r..6 {
+                for c in 0..6 {
+                    for r in 0..=c {
                         let scale = match (r < 3, c < 3) {
                             (true, true) => ff / fl,
                             (false, false) => fm,
@@ -1616,6 +1637,27 @@ impl SapModel {
             }
             for sl in &mut sol.loads_surface {
                 sl.val *= f_stress;
+            }
+        }
+
+        for lc in self.load_cases.values_mut() {
+            for (_, dir, sf) in &mut lc.spectrum_loads {
+                let upper = dir.trim().to_ascii_uppercase();
+                if !matches!(
+                    upper.as_str(),
+                    "R1" | "RX" | "4" | "R2" | "RY" | "5" | "R3" | "RZ" | "6"
+                ) {
+                    *sf *= fl;
+                }
+            }
+            for (_, pat_or_acc, sf) in &mut lc.history_loads {
+                let upper = pat_or_acc.trim().to_ascii_uppercase();
+                if matches!(
+                    upper.as_str(),
+                    "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
+                ) {
+                    *sf *= fl;
+                }
             }
         }
 
@@ -1747,6 +1789,78 @@ mod tests {
         assert!((lp.ke[3] - 1200.0).abs() < 1e-9); // 100 kip-ft/rad = 1200 kip-in/rad
         assert!((lp.param1[0] - 1.2).abs() < 1e-9); // 0.1 ft gap opening = 1.2 in
         assert!((lp.dj2 - 6.0).abs() < 1e-9); // 0.5 ft = 6.0 in
+    }
+
+    #[test]
+    fn convert_units_scales_dynamic_accelerations_and_column_major_coupled_springs() {
+        let mut model = SapModel::new(Units::KipFtF);
+        model.add_point("1", 0.0, 0.0, 0.0);
+        // Column-major upper triangle: 0=U1U1, 3=U1U3 (F/L), 6=U1R1 (F), 9=R1R1 (F*L), 20=R3R3 (F*L)
+        let mut sc = [0.0; 21];
+        sc[0] = 120.0; // 120 kip/ft -> 10 kip/in
+        sc[3] = 240.0; // 240 kip/ft -> 20 kip/in
+        sc[6] = 50.0;  // 50 kip/rad -> 50 kip/rad
+        sc[9] = 100.0; // 100 kip-ft/rad -> 1200 kip-in/rad
+        sc[20] = 30.0; // 30 kip-ft/rad -> 360 kip-in/rad
+        model.points.get_mut("1").unwrap().spring_coupled = Some(sc);
+
+        let mut spec = LoadCase::linear_static("SPEC", "DEAD", 1.0);
+        spec.case_type = LoadCaseType::ResponseSpectrum;
+        spec.spectrum_loads = vec![
+            ("RS1".into(), "U1".into(), 32.174),
+            ("RS1".into(), "R3".into(), 1.5),
+        ];
+        model.load_cases.insert("SPEC".into(), spec);
+
+        let mut hist = LoadCase::linear_static("HIST", "DEAD", 1.0);
+        hist.case_type = LoadCaseType::LinearHistory;
+        hist.history_loads = vec![
+            ("TH1".into(), "UZ".into(), 32.174),
+            ("TH1".into(), "DEAD".into(), 2.0),
+        ];
+        model.load_cases.insert("HIST".into(), hist);
+
+        model.convert_units_in_place(Units::KipInF);
+
+        let out_sc = model.points["1"].spring_coupled.unwrap();
+        assert!((out_sc[0] - 10.0).abs() < 1e-12);
+        assert!((out_sc[3] - 20.0).abs() < 1e-12);
+        assert!((out_sc[6] - 50.0).abs() < 1e-12);
+        assert!((out_sc[9] - 1200.0).abs() < 1e-12);
+        assert!((out_sc[20] - 360.0).abs() < 1e-12);
+
+        assert!((model.load_cases["SPEC"].spectrum_loads[0].2 - 32.174 * 12.0).abs() < 1e-9);
+        assert!((model.load_cases["SPEC"].spectrum_loads[1].2 - 1.5).abs() < 1e-12);
+        assert!((model.load_cases["HIST"].history_loads[0].2 - 32.174 * 12.0).abs() < 1e-9);
+        assert!((model.load_cases["HIST"].history_loads[1].2 - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn template_generation_clears_stale_s2k_preservation_and_transient_json_roundtrips() {
+        let mut model = SapModel::new(Units::KipInF);
+        model.s2k_preservation = Some(S2kPreservation {
+            source_text: "TABLE: \"OPAQUE\"".into(),
+            canonical_baseline: String::new(),
+        });
+        model.generate_beam(2, 120.0, true, "FSEC1");
+        assert!(model.s2k_preservation.is_none());
+
+        let mut cr = CaseResults::default();
+        cr.transient_state = Some(TransientTerminalState {
+            point_order: vec!["1".into()],
+            u: vec![1.0; 6],
+            v: vec![2.0; 6],
+            a: vec![3.0; 6],
+            previous_force: vec![4.0; 6],
+            nonlinear_link_forces: vec![NonlinearLinkForceState {
+                link: "L1".into(),
+                dof: 0,
+                force: -5.5,
+            }],
+        });
+        let json = serde_json::to_string(&cr).unwrap();
+        let back: CaseResults = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, cr);
     }
 }
 

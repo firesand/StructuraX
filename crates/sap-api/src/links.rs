@@ -2,20 +2,31 @@
 use super::{cSapModel, OAPI_ERR, OAPI_OK};
 use sap_model::{LinkObj, LinkProp, LinkPropType, SapModel};
 
-/// Validate the represented linear/Gap/Hook subset before changing a model.
-pub fn set_link_property(model: &mut SapModel, property: LinkProp) -> Result<(), String> {
+/// Validate the represented linear/Damper/Gap/Hook subset before changing a model.
+pub fn set_link_property(model: &mut SapModel, mut property: LinkProp) -> Result<(), String> {
     if model.is_locked {
         return Err("Model is locked.".into());
     }
-    if property.name.trim().is_empty() || property.name.chars().any(char::is_control) {
-        return Err("Provide a nonempty property name without control characters.".into());
+    if !super::is_valid_name(&property.name) {
+        return Err(
+            "Provide a nonempty, trimmed property name without quotes or control characters."
+                .into(),
+        );
     }
     if !matches!(
         property.link_type,
-        LinkPropType::Linear | LinkPropType::Gap | LinkPropType::Hook
+        LinkPropType::Linear | LinkPropType::Damper | LinkPropType::Gap | LinkPropType::Hook
     ) {
-        return Err("This editor supports linear, gap and hook link properties only.".into());
+        return Err("This editor supports linear, damper, gap and hook link properties only.".into());
     }
+    let valid_param2 = if property.link_type == LinkPropType::Damper {
+        property
+            .param2
+            .iter()
+            .all(|v| v.is_finite() && (*v == 0.0 || (*v - 1.0).abs() <= 1e-9))
+    } else {
+        property.param2.iter().all(|v| v.is_finite() && *v == 0.0)
+    };
     if property
         .ke
         .iter()
@@ -23,12 +34,12 @@ pub fn set_link_property(model: &mut SapModel, property: LinkProp) -> Result<(),
         .chain(&property.k_nl)
         .chain(&property.param1)
         .any(|v| !v.is_finite() || *v < 0.)
-        || property.param2.iter().any(|v| !v.is_finite() || *v != 0.)
+        || !valid_param2
         || [property.dj2, property.dj3, property.mass, property.weight]
             .iter()
             .any(|v| !v.is_finite() || *v < 0.)
     {
-        return Err("Stiffness, damping, opening, distances, mass and weight must be finite and nonnegative; post-yield ratios are not supported for these laws.".into());
+        return Err("Stiffness, damping, opening, distances, mass and weight must be finite and nonnegative; damper exponents must be linear (1.0) and post-yield ratios are not supported for these laws.".into());
     }
     for d in 0..6 {
         if property.dof_fixed[d] && !property.dof_active[d] {
@@ -39,7 +50,16 @@ pub fn set_link_property(model: &mut SapModel, property: LinkProp) -> Result<(),
                 || property.dof_fixed[d]
                 || property.link_type == LinkPropType::Linear)
         {
-            return Err("Nonlinear flags require an active, unfixed Gap/Hook DOF.".into());
+            return Err("Nonlinear flags require an active, unfixed Damper/Gap/Hook DOF.".into());
+        }
+        if property.link_type == LinkPropType::Damper && property.dof_nonlinear[d] {
+            if property.k_nl[d] <= 0.0 {
+                return Err(
+                    "Active nonlinear Maxwell damper DOFs require positive series stiffness k_nl."
+                        .into(),
+                );
+            }
+            property.param2[d] = 1.0;
         }
     }
     if property.link_type != LinkPropType::Linear && !property.nonlinear_data_complete {
@@ -56,10 +76,7 @@ pub fn set_link_object(model: &mut SapModel, link: LinkObj) -> Result<(), String
     if model.is_locked {
         return Err("Model is locked.".into());
     }
-    if link.name.trim().is_empty()
-        || link.name.chars().any(char::is_control)
-        || !link.angle_deg.is_finite()
-    {
+    if !super::is_valid_name(&link.name) || !link.angle_deg.is_finite() {
         return Err("Provide a valid name and finite roll angle.".into());
     }
     if !model.link_props.contains_key(&link.prop) {
@@ -120,10 +137,12 @@ impl cLinkObj<'_> {
         property: &str,
         user_name: &str,
     ) -> (i32, String) {
-        if !user_name.trim().is_empty() && self.api.inner.links.contains_key(user_name) {
+        if !super::is_valid_optional_user_name(user_name)
+            || (!user_name.is_empty() && self.api.inner.links.contains_key(user_name))
+        {
             return (OAPI_ERR, String::new());
         }
-        let name = if user_name.trim().is_empty() {
+        let name = if user_name.is_empty() {
             sap_model::next_numeric_name(self.api.inner.links.keys())
         } else {
             user_name.into()
@@ -149,5 +168,11 @@ impl cLinkObj<'_> {
         self.api.inner.links.shift_remove(name);
         self.api.inner.invalidate_results();
         OAPI_OK
+    }
+    pub fn count(&self) -> usize {
+        self.api.inner.links.len()
+    }
+    pub fn get_name_list(&self) -> (i32, Vec<String>) {
+        (OAPI_OK, self.api.inner.links.keys().cloned().collect())
     }
 }

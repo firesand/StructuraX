@@ -1122,18 +1122,22 @@ pub fn compute_aisc_torsional_capacity(
                 });
             }
             let t = sec.tw.min(sec.tf);
-            if b_outer <= 3.0 * t || h_outer <= 3.0 * t {
+            if b_outer <= 3.0 * sec.tw || h_outer <= 3.0 * sec.tf {
                 return Err(DesignError::UnsupportedClosedSectionTorsion {
                     frame: sec.name.clone(),
                 });
             }
-            let c = 2.0 * (b_outer - t) * (h_outer - t) * t - 4.5 * (4.0 - PI) * t.powi(3);
+            let c =
+                2.0 * (b_outer - sec.tw) * (h_outer - sec.tf) * t - 4.5 * (4.0 - PI) * t.powi(3);
             if c <= 0.0 {
                 return Err(DesignError::UnsupportedClosedSectionTorsion {
                     frame: sec.name.clone(),
                 });
             }
-            let h_over_t = (h_outer.max(b_outer) - 3.0 * t) / t;
+            // Flat width is bounded by webs and is a flange element (tf); flat
+            // depth is bounded by flanges and is a web element (tw).
+            let h_over_t = ((b_outer - 3.0 * sec.tw) / sec.tf)
+                .max((h_outer - 3.0 * sec.tf) / sec.tw);
             if h_over_t > 260.0 {
                 return Err(DesignError::UnsupportedClosedSectionTorsion {
                     frame: sec.name.clone(),
@@ -1345,10 +1349,20 @@ fn run_steel_design_validated(
                         let pr_over_pc = st.p.abs() / pc;
                         let mr3_over_mc3 = st.m3.abs() / phi_mn33.max(1e-12);
                         let mr2_over_mc2 = st.m2.abs() / phi_mn22.max(1e-12);
-                        let vr_over_vc = shear_major_ratio.max(shear_minor_ratio);
+                        let shear_sum = shear_major_ratio + shear_minor_ratio;
                         let tr_over_tc = tr / tc.max(1e-12);
-                        let ratio_h3 = (pr_over_pc + mr3_over_mc3 + mr2_over_mc2)
-                            + (vr_over_vc + tr_over_tc).powi(2);
+                        let shear_torsion_ratio = (shear_sum + tr_over_tc).powi(2);
+                        let ratio_h3 = if matches!(
+                            sec.prop_type,
+                            FramePropType::Pipe | FramePropType::ColdPipe
+                        ) {
+                            pr_over_pc
+                                + mr3_over_mc3.powi(2)
+                                + mr2_over_mc2.powi(2)
+                                + shear_torsion_ratio
+                        } else {
+                            pr_over_pc + mr3_over_mc3 + mr2_over_mc2 + shear_torsion_ratio
+                        };
                         if ratio_h3 > total_ratio {
                             total_ratio = ratio_h3;
                             pr_ratio = pr_over_pc;

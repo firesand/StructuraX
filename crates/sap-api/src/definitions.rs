@@ -15,9 +15,9 @@ fn invalid(reason: impl Into<String>) -> DefinitionError {
     DefinitionError::Invalid(reason.into())
 }
 fn name(value: &str) -> Result<(), DefinitionError> {
-    if value.trim().is_empty() || value.chars().any(char::is_control) {
+    if !super::is_valid_name(value) {
         return Err(invalid(
-            "name must be nonempty and contain no control characters",
+            "name must be nonempty, trimmed, and contain no quotes or control characters",
         ));
     }
     Ok(())
@@ -94,6 +94,8 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             | LoadCaseType::ResponseSpectrum
             | LoadCaseType::LinearHistory
             | LoadCaseType::LinearDynamic
+            | LoadCaseType::NonlinearHistory
+            | LoadCaseType::NonlinearDynamic
     ) {
         return Err(invalid("case type is not supported by this editor"));
     }
@@ -122,11 +124,15 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
     }
     if matches!(
         case.case_type,
-        LoadCaseType::ResponseSpectrum | LoadCaseType::LinearHistory | LoadCaseType::LinearDynamic
+        LoadCaseType::ResponseSpectrum
+            | LoadCaseType::LinearHistory
+            | LoadCaseType::LinearDynamic
+            | LoadCaseType::NonlinearHistory
+            | LoadCaseType::NonlinearDynamic
     ) && case.nl_geom != NLGeomType::None
     {
         return Err(invalid(
-            "linear dynamic/spectrum cases cannot request geometric nonlinearity",
+            "dynamic/spectrum cases cannot request geometric nonlinearity",
         ));
     }
     match case.case_type {
@@ -221,15 +227,35 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                     .get(f)
                     .ok_or_else(|| invalid(format!("missing spectrum function '{f}'")))?;
                 validate_function(function)?;
-                if function.is_time_history
-                    || !matches!(dir.as_str(), "U1" | "U2" | "U3")
-                    || !sf.is_finite()
-                {
-                    return Err(invalid("spectrum requires spectrum functions, directions U1/U2/U3 and finite scales"));
+                let valid_dir = dir == dir.trim()
+                    && matches!(
+                        dir.to_ascii_uppercase().as_str(),
+                        "U1" | "UX" | "X" | "1" | "U2" | "UY" | "Y" | "2" | "U3" | "UZ" | "Z" | "3"
+                    );
+                if function.is_time_history || !valid_dir || !sf.is_finite() {
+                    return Err(invalid(
+                        "spectrum requires spectrum functions, directions U1/UX/X/1, U2/UY/Y/2, or U3/UZ/Z/3, and finite scales",
+                    ));
                 }
             }
         }
-        LoadCaseType::LinearHistory | LoadCaseType::LinearDynamic => {
+        LoadCaseType::LinearHistory
+        | LoadCaseType::LinearDynamic
+        | LoadCaseType::NonlinearHistory
+        | LoadCaseType::NonlinearDynamic => {
+            if matches!(
+                case.case_type,
+                LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
+            ) && (case.max_iterations == 0
+                || case.max_iterations > 10000
+                || !case.convergence_tol.is_finite()
+                || case.convergence_tol <= 0.0
+                || case.convergence_tol >= 1.0)
+            {
+                return Err(invalid(
+                    "nonlinear iteration limit must be 1..10000 and tolerance in (0,1)",
+                ));
+            }
             if case.history_loads.is_empty()
                 || !case.loads.is_empty()
                 || !case.spectrum_loads.is_empty()
@@ -279,10 +305,12 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                         "history requires time-history functions and finite scales",
                     ));
                 }
-                if matches!(
-                    target.trim().to_ascii_uppercase().as_str(),
-                    "U1" | "U2" | "U3" | "UX" | "UY" | "UZ" | "X" | "Y" | "Z"
-                ) {
+                if target == target.trim()
+                    && matches!(
+                        target.to_ascii_uppercase().as_str(),
+                        "U1" | "U2" | "U3" | "UX" | "UY" | "UZ" | "X" | "Y" | "Z"
+                    )
+                {
                     continue;
                 }
                 let pattern = model
@@ -300,6 +328,10 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                         a.loads_uniform.iter().any(|l| &l.load_pat == target)
                             || a.loads_pressure.iter().any(|l| &l.load_pat == target)
                             || a.loads_temp.iter().any(|l| &l.load_pat == target)
+                    })
+                    || model.solids.values().any(|s| {
+                        s.loads_surface.iter().any(|l| &l.load_pat == target)
+                            || s.loads_temp.contains_key(target)
                     })
                     || model
                         .points

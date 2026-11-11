@@ -45,6 +45,8 @@ pub enum FormatError {
     PreservationConflict(String),
     #[error("Invalid SDB file: {0}")]
     InvalidSdb(String),
+    #[error("Experimental native export rejected at {field}: {reason}")]
+    UnsupportedNativeExport { field: String, reason: String },
     #[error("Native case '{case_name}' cannot be imported safely: {reason}")]
     UnsupportedNativeCase { case_name: String, reason: String },
 }
@@ -113,6 +115,7 @@ pub fn load_model_with_report(path: impl AsRef<Path>) -> Result<ImportReport, Fo
         }
         let model = extract_sdb_to_model(&sdb)?;
         let mut warnings = vec!["Native SDB import reads a supported subset. Grid definitions, project metadata, generated/external dynamic-function sources, nonlinear/coupled link parameters, patterned solid loads, and many advanced assignments are omitted; saving cannot preserve the full vendor model.".into()];
+        warnings.push("Independent shear-rebar Fys is not mapped from native data; imported Fys uses Fy as a reconstruction fallback.".into());
         for prop in model
             .link_props
             .values()
@@ -343,7 +346,10 @@ END TABLE DATA"#;
 
     #[test]
     fn test_sdb_real_example_1_001_and_1_002a() {
-        let path_001 = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extracted/files/example_1_001.sdb"));
+        let path_001 = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../extracted/files/example_1_001.sdb"
+        ));
         if path_001.exists() {
             let sdb = read_sdb_file(path_001).expect("read example_1_001.sdb");
             assert!(sdb.program_name.starts_with("SAP2000"));
@@ -377,7 +383,10 @@ END TABLE DATA"#;
             assert_eq!(model, reloaded);
         }
 
-        let path_002a = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extracted/files/example_1_002a.sdb"));
+        let path_002a = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../extracted/files/example_1_002a.sdb"
+        ));
         if path_002a.exists() {
             let model = load_sdb_file(path_002a).expect("load example_1_002a.sdb");
             assert_eq!(model.points.len(), 2);
@@ -410,7 +419,10 @@ END TABLE DATA"#;
         assert_eq!(model, model_back);
 
         // Check vendor SDB files with combinations and verify lossless round-tripping
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extracted/files"));
+        let dir = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../extracted/files"
+        ));
         if dir.exists() {
             let mut checked = 0;
             let mut rejected_unsupported_cases = 0;

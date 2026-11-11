@@ -1,0 +1,73 @@
+{
+  "date": "2026-10-15",
+  "checkpoint": "PR 1 review regression follow-up",
+  "baseline_commit": "5824cceb409343b362dcbc7f2bdd05534d7971db",
+  "production_ready": false,
+  "full_reconstruction_complete": false,
+  "pr_remains_draft": true,
+  "tests": {
+    "all_features": {
+      "command": "cargo test --locked --workspace --all-features",
+      "passed": 230,
+      "failed": 0,
+      "local_vendor_fixtures_present": true
+    },
+    "portable_source_copy": {
+      "command": "cargo test --locked --workspace",
+      "passed": 223,
+      "failed": 0,
+      "vendor_inputs_present": false,
+      "note": "Only Cargo files and crates copied; all eight local crates rebuilt after clearing their cached artifacts. External dependency cache reused. Legacy optional tests return early; seven feature-gated solver fixture tests excluded."
+    }
+  },
+  "strict_clippy": {
+    "command": "cargo clippy --locked --workspace --all-targets --all-features -- -D warnings",
+    "passed": true
+  },
+  "native_build": {
+    "command": "cargo build --locked --workspace",
+    "passed": true
+  },
+  "selected_references": {
+    "command": "target/debug/structurax verify",
+    "passed": 59,
+    "total": 59,
+    "vendor_runtime_comparison": false
+  },
+  "cable_sweep": {
+    "cases": 488,
+    "cases_exceeding_prior_cutoff": 92,
+    "max_measured_relative_H_error": 2.8391333728450263e-10,
+    "independent_physical_relative_limit": 1e-09,
+    "unit_rescaling_cases": 12,
+    "note": "Independent documented grid; original reviewer 480-case grid unavailable."
+  },
+  "native_io_and_cli": {
+    "fault_injection": "silent truncation, equal-size corruption, write failure, invalid serialized container",
+    "overwrite_checks": "shared library/API/CLI refuse existing files; Unix symlinks refused",
+    "actual_cli_smoke": "handwritten S2K export and disk inspection succeed; repeated destination and opaque column refuse; original inputs/output unchanged"
+  },
+  "optional_format_corpus": {
+    "inventory_and_exact_copy": 336,
+    "strict_s2k_roundtrips": 334,
+    "strict_native_roundtrips": 329,
+    "incomplete_law_export_refusals": 5,
+    "unsupported_imports": 2
+  },
+  "new_test_functions_since_baseline": 16,
+  "remaining_limits": "See REVIEW.md: restricted S2K projection, native Fys fallback, unsupported physics; no vendor/runtime/full-code acceptance.",
+  "toolchain": "rustc 1.99.0 (b940084d7 2026-09-28)",
+  "source_manifest": "docs/review/structurax-followup/source-manifest.json",
+  "source_manifest_sha256": "01795500d8b5b7ad4755797d5395b5f7f7f6f2c30a2ca913616c4db6c0c44441",
+  "debug_binary_sha256": "a759b73e6d96cc1a53228ed28de001146e84e279af657bd7409ef556120341d1",
+  "log_sha256": {
+    "target/review/structurax-followup/workspace-tests.log": "ec72faf6240ffe8428790c6a28002b92798d779420f5d21fe8cc0e30dc9a6bbb",
+    "target/review/structurax-followup/portable-tests.log": "775f2daec527e85e189554b36c5aa6ffe65f900458bfd2b2a2a86583df0b45ad",
+    "target/review/structurax-followup/clippy.log": "1773e62227ddf3cbba4e5fdce7b0bdb694ac94a74e05cf8d500a804feb50a893",
+    "target/review/structurax-followup/build.log": "1820fefd5f664d8791e59441f689ae14b4b3dc6e9ad5fba838daa1cbebec8487",
+    "target/review/structurax-followup/verify.log": "3fd999ebc8eb9d0b03495888bbe2584e3dab4bfef7ceb5fa7991658af69589f2",
+    "target/review/structurax-followup/io-tests.log": "d0702ba61524dc6adef083a8406b99ca1325d3eaceecb21cc72f7a0a36f0aa4e",
+    "target/review/structurax-followup/cable-sweep.log": "d2de8efd5bb11688600af4377a69df79de4386730c229ebc6252fc1aca57a74a",
+    "target/review/structurax-followup/cli-smoke.json": "ca0d4188946091a32e1508e3fc86ed909f7d41b860f0d4d25b52740ad8c6aae9"
+  }
+}

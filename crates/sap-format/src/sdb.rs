@@ -26,6 +26,38 @@ use crate::FormatError;
 pub mod native;
 pub use native::{pack_model_to_native_sdb, save_native_sdb_file};
 
+// Native materials store Windows COLORREF integers. Keep the common canonical
+// names and preserve every other integer exactly rather than guessing a name.
+fn native_material_color(value: i32) -> String {
+    match value {
+        0x000000 => "Black".into(),
+        0x0000ff => "Red".into(),
+        0x00ff00 => "Green".into(),
+        0xff0000 => "Blue".into(),
+        0x00ffff => "Yellow".into(),
+        0xff00ff => "Magenta".into(),
+        0xffff00 => "Cyan".into(),
+        0xffffff => "White".into(),
+        0x808080 => "Gray".into(),
+        _ => format!("ColorRef:{value}"),
+    }
+}
+
+fn material_colorref(value: &str) -> Option<i32> {
+    match value {
+        "Black" => Some(0x000000),
+        "Red" => Some(0x0000ff),
+        "Green" => Some(0x00ff00),
+        "Blue" => Some(0xff0000),
+        "Yellow" => Some(0x00ffff),
+        "Magenta" => Some(0xff00ff),
+        "Cyan" => Some(0xffff00),
+        "White" => Some(0xffffff),
+        "Gray" => Some(0x808080),
+        _ => value.strip_prefix("ColorRef:")?.parse().ok(),
+    }
+}
+
 const SDB_SCHEMAS_TXT: &str = include_str!("sdb_schemas.txt");
 
 /// Maximum allowed decompressed `.sdb` stream size (128 MiB) to prevent decompression bombs.
@@ -951,6 +983,10 @@ fn check_native_dynamic_assignment(
     }
 }
 
+/// Diagonal entry positions in SAP2000's 21-term column-wise upper-triangular
+/// joint spring array (`[U1U1, U1U2, U2U2, U1U3, U2U3, U3U3, U1R1, ..., R3R3]`).
+pub(crate) const SPRING_DIAG_INDICES: [usize; 6] = [0, 2, 5, 9, 14, 20];
+
 fn coordinate_name(names: &[String], index: i32) -> Result<String, FormatError> {
     if index <= 0 {
         return Ok("LOCAL".to_string());
@@ -1163,19 +1199,69 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             7 => MatType::Tendon,
             _ => MatType::Steel,
         };
+        let sym_type = m.get("m_SymType").and_then(SdbVal::as_i32).unwrap_or(0);
+        match sym_type {
+            0 | 1 => {}
+            3 if matches!(mat_type, MatType::Rebar | MatType::Tendon) => {}
+            other => {
+                return Err(FormatError::InvalidSdb(format!(
+                    "Unsupported material symmetry type m_SymType={other} on material '{name}' ({mat_type:?})"
+                )));
+            }
+        }
         let mut mat = Material {
             name: name.clone(),
             mat_type,
             ..Material::default_steel_kip_in()
         };
-        if let Some(mts) = m.get("m_Mt").and_then(|v| v.as_arr_obj()) {
-            if let Some(mt0) = mts.first() {
-                if let Some(w) = mt0.get("m_w").and_then(|v| v.as_f64()) {
-                    mat.unit_weight = w;
+        if let Some(color) = m.get("m_color").and_then(SdbVal::as_i32) {
+            mat.color = native_material_color(color);
+        }
+        let mt0 = m
+            .get("m_Mt")
+            .and_then(SdbVal::as_arr_obj)
+            .and_then(|mts| mts.first());
+        if sym_type == 1 {
+            let Some(mt0) = mt0 else {
+                return Err(FormatError::InvalidSdb(format!(
+                    "Orthotropic material '{name}' lacks S_MT mechanical properties"
+                )));
+            };
+            let take3 = |field: &str| -> Result<[f64; 3], FormatError> {
+                let arr = mt0.get(field).and_then(SdbVal::as_arr_f64).ok_or_else(|| {
+                    FormatError::InvalidSdb(format!(
+                        "Orthotropic material '{name}' lacks '{field}' array"
+                    ))
+                })?;
+                if arr.len() < 3 {
+                    return Err(FormatError::InvalidSdb(format!(
+                        "Orthotropic material '{name}' field '{field}' has length {} (expected >= 3)",
+                        arr.len()
+                    )));
                 }
-                if let Some(mass) = mt0.get("m_m").and_then(|v| v.as_f64()) {
-                    mat.unit_mass = mass;
-                }
+                Ok([arr[0], arr[1], arr[2]])
+            };
+            let eo = take3("m_e")?;
+            let go = take3("m_g")?;
+            let uo = take3("m_u")?;
+            let ao = take3("m_a")?;
+            mat.e = eo[0];
+            mat.e_ortho = Some(eo);
+            mat.g = go[0];
+            mat.g_ortho = Some(go);
+            mat.u = uo[0];
+            mat.u_ortho = Some(uo);
+            mat.a = ao[0];
+            mat.a_ortho = Some(ao);
+        }
+        if let Some(mt0) = mt0 {
+            if let Some(w) = mt0.get("m_w").and_then(|v| v.as_f64()) {
+                mat.unit_weight = w;
+            }
+            if let Some(mass) = mt0.get("m_m").and_then(|v| v.as_f64()) {
+                mat.unit_mass = mass;
+            }
+            if sym_type != 1 {
                 if let Some(es) = mt0.get("m_e").and_then(|v| v.as_arr_f64()) {
                     if let Some(&e1) = es.first() {
                         mat.e = e1;
@@ -1196,21 +1282,25 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                         mat.a = a1;
                     }
                 }
-                if let Some(sp) = mt0.get("m_SteelProps").and_then(|v| v.as_obj()) {
-                    if let Some(fy) = sp.get("m_fy").and_then(|v| v.as_f64()) {
-                        mat.fy = fy;
-                    }
-                    if let Some(fu) = sp.get("m_Fu").and_then(|v| v.as_f64()) {
-                        mat.fu = fu;
-                    }
+            }
+            if let Some(sp) = mt0.get("m_SteelProps").and_then(|v| v.as_obj()) {
+                if let Some(fy) = sp.get("m_fy").and_then(|v| v.as_f64()) {
+                    mat.fy = fy;
                 }
-                if let Some(cp) = mt0.get("m_ConcreteProps").and_then(|v| v.as_obj()) {
-                    if let Some(fc) = cp.get("m_fc").and_then(|v| v.as_f64()) {
-                        mat.fc = fc;
-                    }
+                if let Some(fu) = sp.get("m_Fu").and_then(|v| v.as_f64()) {
+                    mat.fu = fu;
+                }
+            }
+            if let Some(cp) = mt0.get("m_ConcreteProps").and_then(|v| v.as_obj()) {
+                if let Some(fc) = cp.get("m_fc").and_then(|v| v.as_f64()) {
+                    mat.fc = fc;
                 }
             }
         }
+        // SapModel's independent shear-rebar Fys has no observed native scalar.
+        // Use the material yield as a reconstruction fallback; native synthesis
+        // rejects an independent Fys which this projection cannot preserve.
+        mat.fys = mat.fy;
         model.materials.insert(name, mat);
     }
 
@@ -1707,12 +1797,56 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
         }
         let jn = sp.get("m_jn").and_then(|v| v.as_i32()).unwrap_or(0) as usize;
         if let Some(jname) = pt_names.get(jn).filter(|s| !s.is_empty()) {
-            if let (Some(pt), Some(xjps)) = (
-                model.points.get_mut(jname),
-                sp.get("m_XJPS").and_then(|v| v.as_arr_f64()),
-            ) {
-                for i in 0..6.min(xjps.len()) {
-                    pt.spring[i] = xjps[i];
+            let csys = sp.get("m_csys").and_then(SdbVal::as_i32).unwrap_or(1);
+            let spring_is_local = if csys <= 0 {
+                true
+            } else if csys == 1
+                && coord_names
+                    .get(1)
+                    .filter(|s| !s.is_empty())
+                    .is_none_or(|s| s.eq_ignore_ascii_case("GLOBAL"))
+            {
+                false
+            } else {
+                let csys_name = coordinate_name(&coord_names, csys)?;
+                if csys_name.eq_ignore_ascii_case("GLOBAL") {
+                    false
+                } else {
+                    return Err(FormatError::InvalidSdb(format!(
+                        "Unsupported joint spring coordinate system '{csys_name}' (m_csys={csys}) on joint '{jname}'"
+                    )));
+                }
+            };
+            if let Some(pt) = model.points.get_mut(jname) {
+                pt.spring_is_local = spring_is_local;
+                if let Some(xjps) = sp.get("m_XJPS").and_then(|v| v.as_arr_f64()) {
+                    match xjps.len() {
+                        21 => {
+                            let has_off_diag = xjps.iter().enumerate().any(|(idx, &val)| {
+                                !SPRING_DIAG_INDICES.contains(&idx) && val != 0.0
+                            });
+                            if has_off_diag {
+                                let mut coupled = [0.0; 21];
+                                coupled.copy_from_slice(xjps);
+                                pt.spring = [0.0; 6];
+                                pt.spring_coupled = Some(coupled);
+                            } else {
+                                for (d, &idx) in SPRING_DIAG_INDICES.iter().enumerate() {
+                                    pt.spring[d] = xjps[idx];
+                                }
+                                pt.spring_coupled = None;
+                            }
+                        }
+                        6 => {
+                            pt.spring.copy_from_slice(xjps);
+                            pt.spring_coupled = None;
+                        }
+                        other => {
+                            return Err(FormatError::InvalidSdb(format!(
+                                "Unexpected TYSpring m_XJPS length {other} on joint '{jname}' (expected 21 or 6)"
+                            )));
+                        }
+                    }
                 }
             }
         }
@@ -1785,19 +1919,38 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     .and_then(SdbVal::as_bool)
                     .unwrap_or(false);
                 if !model_using_frames {
+                    let cable_type = cd.get("m_CableType").and_then(SdbVal::as_i32).unwrap_or(0);
+                    let undef_len = cd
+                        .get("m_UndeformedLength")
+                        .and_then(SdbVal::as_f64)
+                        .filter(|&v| v > 0.0);
+                    let tension_i = cd
+                        .get("m_TensionI")
+                        .and_then(SdbVal::as_f64)
+                        .filter(|&v| v > 0.0);
+                    let horiz_tension = cd
+                        .get("m_HorizTensionComp")
+                        .and_then(SdbVal::as_f64)
+                        .filter(|&v| v > 0.0);
+                    let (undeformed_length, target_tension_i, horizontal_tension) = match cable_type
+                    {
+                        3 => (None, tension_i, None),
+                        5 => (None, None, horiz_tension),
+                        8 => (undef_len, None, None),
+                        _ => {
+                            if undef_len.is_some() {
+                                (undef_len, None, None)
+                            } else if tension_i.is_some() {
+                                (None, tension_i, None)
+                            } else {
+                                (None, None, horiz_tension)
+                            }
+                        }
+                    };
                     fr.cable_params = Some(sap_model::CableParams {
-                        undeformed_length: cd
-                            .get("m_UndeformedLength")
-                            .and_then(SdbVal::as_f64)
-                            .filter(|&v| v > 0.0),
-                        target_tension_i: cd
-                            .get("m_TensionI")
-                            .and_then(SdbVal::as_f64)
-                            .filter(|&v| v > 0.0),
-                        horizontal_tension: cd
-                            .get("m_HorizTensionComp")
-                            .and_then(SdbVal::as_f64)
-                            .filter(|&v| v > 0.0),
+                        undeformed_length,
+                        target_tension_i,
+                        horizontal_tension,
                         num_segments: cd
                             .get("m_NumSegs")
                             .and_then(SdbVal::as_i32)
@@ -2791,5 +2944,167 @@ mod tests {
         assert_eq!(coordinate_name(&names, 1).unwrap(), "GLOBAL");
         assert_eq!(coordinate_name(&names, 2).unwrap(), "ROTATED");
         assert!(coordinate_name(&names, 3).is_err());
+    }
+
+    #[test]
+    fn unrepresented_material_symtype_or_spring_csys_is_rejected() {
+        let mut model = SapModel::new(Units::KipInF);
+        model.coord_systems.insert(
+            "ROTATED".into(),
+            sap_model::CoordSystem {
+                name: "ROTATED".into(),
+                origin: [0.0; 3],
+                angles_deg: [45.0, 0.0, 0.0],
+                grids: Vec::new(),
+            },
+        );
+        let mut p1 = PointObj::new("1", 0.0, 0.0, 0.0);
+        p1.spring[2] = 50.0;
+        model.points.insert("1".into(), p1);
+
+        let base = native::pack_model_to_native_sdb(&model).unwrap();
+        let doc = native::inspect_native_sdb(&base).unwrap();
+
+        let mat_span = doc
+            .records()
+            .iter()
+            .find(|r| r.class_id == "S_Material")
+            .unwrap()
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some("m_SymType"))
+            .unwrap();
+        let mut bad_mat = base.clone();
+        bad_mat.decompressed_stream[mat_span.offset..mat_span.offset + 4]
+            .copy_from_slice(&2_i32.to_le_bytes());
+        let err = extract_sdb_to_model(&bad_mat).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidSdb(_)), "{err}");
+
+        let sp_span = doc
+            .records()
+            .iter()
+            .find(|r| r.class_id == "TYSpring")
+            .unwrap()
+            .fields
+            .iter()
+            .find(|f| f.name.as_deref() == Some("m_csys"))
+            .unwrap();
+        let mut bad_sp = base.clone();
+        bad_sp.decompressed_stream[sp_span.offset..sp_span.offset + 4]
+            .copy_from_slice(&2_i32.to_le_bytes());
+        let err = extract_sdb_to_model(&bad_sp).unwrap_err();
+        assert!(matches!(err, FormatError::InvalidSdb(_)), "{err}");
+    }
+
+    #[test]
+    fn vendor_springs_orthotropic_materials_and_cables_extract_and_roundtrip() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../extracted/files");
+        if !directory.exists() {
+            return;
+        }
+        let load = |name: &str| {
+            extract_sdb_to_model(&read_sdb_file(directory.join(name)).unwrap()).unwrap()
+        };
+
+        // 1. 21-term TYSpring fixtures (m_csys = -1 LOCAL)
+        let s1005b = load("example_1_005b.sdb");
+        let sprung_b: Vec<_> = s1005b
+            .points
+            .values()
+            .filter(|p| p.spring.iter().any(|&k| k != 0.0) || p.spring_coupled.is_some())
+            .collect();
+        assert_eq!(sprung_b.len(), 1);
+        assert!(sprung_b[0].spring_is_local);
+        assert_eq!(sprung_b[0].spring, [0.0, 0.0, 10.0, 0.0, 0.0, 0.0]);
+        assert_eq!(sprung_b[0].spring_coupled, None);
+        assert_eq!(
+            extract_sdb_to_model(&native::pack_model_to_native_sdb(&s1005b).unwrap()).unwrap(),
+            s1005b
+        );
+
+        let s1005d = load("example_1_005d.sdb");
+        let sprung_d: Vec<_> = s1005d
+            .points
+            .values()
+            .filter(|p| p.spring.iter().any(|&k| k != 0.0) || p.spring_coupled.is_some())
+            .collect();
+        assert_eq!(sprung_d.len(), 1);
+        assert!(sprung_d[0].spring_is_local);
+        assert_eq!(sprung_d[0].spring, [0.0, 0.0, 0.0, 0.0, 80000.0, 0.0]);
+        assert_eq!(sprung_d[0].spring_coupled, None);
+        assert_eq!(
+            extract_sdb_to_model(&native::pack_model_to_native_sdb(&s1005d).unwrap()).unwrap(),
+            s1005d
+        );
+
+        // 2. Orthotropic S_Material (m_SymType = 1) fixtures
+        for fixture in [
+            "example_2_015a_thick.sdb",
+            "example_2_015a_thin.sdb",
+            "example_2_015b_thick.sdb",
+            "example_2_015b_thin.sdb",
+            "example_2_015c_thick.sdb",
+            "example_2_015d_thick.sdb",
+        ] {
+            let m = load(fixture);
+            let ortho: Vec<_> = m
+                .materials
+                .values()
+                .filter(|mat| mat.e_ortho.is_some())
+                .collect();
+            assert!(!ortho.is_empty(), "{fixture} expected orthotropic material");
+            for mat in ortho {
+                assert!(mat.g_ortho.is_some(), "{fixture}: {}", mat.name);
+                assert!(mat.u_ortho.is_some(), "{fixture}: {}", mat.name);
+                assert!(mat.a_ortho.is_some(), "{fixture}: {}", mat.name);
+                assert_eq!(mat.e, mat.e_ortho.unwrap()[0]);
+                assert_eq!(mat.g, mat.g_ortho.unwrap()[0]);
+                assert_eq!(mat.u, mat.u_ortho.unwrap()[0]);
+                assert_eq!(mat.a, mat.a_ortho.unwrap()[0]);
+            }
+            assert_eq!(
+                extract_sdb_to_model(&native::pack_model_to_native_sdb(&m).unwrap()).unwrap(),
+                m,
+                "{fixture}"
+            );
+        }
+
+        // 3. S_CableData m_CableType governing specification fixtures
+        for fixture in ["example_7_001.sdb", "example_7_002.sdb"] {
+            let m = load(fixture);
+            let cables: Vec<_> = m
+                .frames
+                .values()
+                .filter_map(|f| f.cable_params.as_ref())
+                .collect();
+            assert!(!cables.is_empty(), "{fixture}");
+            for cp in cables {
+                assert!(cp.undeformed_length.is_some(), "{fixture}");
+                assert!(cp.target_tension_i.is_none(), "{fixture}");
+                assert!(cp.horizontal_tension.is_none(), "{fixture}");
+            }
+            assert_eq!(
+                extract_sdb_to_model(&native::pack_model_to_native_sdb(&m).unwrap()).unwrap(),
+                m,
+                "{fixture}"
+            );
+        }
+
+        let c7003 = load("example_7_003.sdb");
+        let cables_7003: Vec<_> = c7003
+            .frames
+            .values()
+            .filter_map(|f| f.cable_params.as_ref())
+            .collect();
+        assert_eq!(cables_7003.len(), 12);
+        for cp in cables_7003 {
+            assert!(cp.undeformed_length.is_none());
+            assert!(cp.target_tension_i.is_some());
+            assert!(cp.horizontal_tension.is_none());
+        }
+        assert_eq!(
+            extract_sdb_to_model(&native::pack_model_to_native_sdb(&c7003).unwrap()).unwrap(),
+            c7003
+        );
     }
 }

@@ -74,8 +74,14 @@ pub(crate) struct LinearStepper {
 
 impl LinearStepper {
     #[cfg(test)]
-    pub fn new(k: &[f64], mass: &[f64], fixed: &[bool], case: &LoadCase,
-        force: &[f64], force_slope: &[f64]) -> Result<Self, SolverError> {
+    pub fn new(
+        k: &[f64],
+        mass: &[f64],
+        fixed: &[bool],
+        case: &LoadCase,
+        force: &[f64],
+        force_slope: &[f64],
+    ) -> Result<Self, SolverError> {
         Self::with_element_damping(k, mass, fixed, case, force, force_slope, &vec![0.; k.len()])
     }
 
@@ -90,7 +96,12 @@ impl LinearStepper {
     ) -> Result<Self, SolverError> {
         validate_parameters(case)?;
         let n = mass.len();
-        if k.len() != n * n || element_damping.len() != n*n || fixed.len() != n || force.len() != n || force_slope.len() != n {
+        if k.len() != n * n
+            || element_damping.len() != n * n
+            || fixed.len() != n
+            || force.len() != n
+            || force_slope.len() != n
+        {
             return Err(SolverError::InvalidInput(
                 "dynamic system dimensions differ".into(),
             ));
@@ -110,7 +121,10 @@ impl LinearStepper {
         // A general singular first-order/algebraic block requires a separate DAE
         // reduction. Reject it instead of silently projecting away dashpot forces.
         for i in 0..n {
-            if !fixed[i] && mass[i] == 0.0 && (0..n).any(|j| !fixed[j] && element_damping[i*n+j] != 0.) {
+            if !fixed[i]
+                && mass[i] == 0.0
+                && (0..n).any(|j| !fixed[j] && element_damping[i * n + j] != 0.)
+            {
                 return Err(SolverError::UnsupportedInput("link damping on a free massless coordinate requires general DAE initialization".into()));
             }
         }
@@ -141,7 +155,11 @@ impl LinearStepper {
         let a4 = gamma / beta - 1.0;
         let a5 = h * (gamma / (2.0 * beta) - 1.0);
         let (alpha_m, beta_k) = case.rayleigh_damping;
-        let mut c: Vec<f64> = k.iter().zip(element_damping).map(|(kij, cij)| beta_k * kij + cij).collect();
+        let mut c: Vec<f64> = k
+            .iter()
+            .zip(element_damping)
+            .map(|(kij, cij)| beta_k * kij + cij)
+            .collect();
         for i in 0..n {
             c[i * n + i] += alpha_m * mass[i];
         }
@@ -353,6 +371,103 @@ impl LinearStepper {
                     }
                 }
             }
+        }
+        self.check_state()
+    }
+
+    pub fn previous_force(&self) -> &[f64] {
+        &self.previous_force
+    }
+
+    pub fn seed_transient_state(
+        &mut self,
+        ts: &sap_model::TransientTerminalState,
+        force0: &[f64],
+    ) -> Result<(), SolverError> {
+        if ts.u.len() != self.n
+            || ts.v.len() != self.n
+            || ts.a.len() != self.n
+            || ts.previous_force.len() != self.n
+            || force0.len() != self.n
+            || ts
+                .u
+                .iter()
+                .chain(&ts.v)
+                .chain(&ts.a)
+                .chain(&ts.previous_force)
+                .chain(force0)
+                .any(|x| !x.is_finite())
+        {
+            return Err(SolverError::InvalidInput(
+                "invalid or mismatched transient continuation state".into(),
+            ));
+        }
+
+        for i in 0..self.n {
+            if self.fixed[i] {
+                self.state.u[i] = 0.0;
+                self.state.v[i] = 0.0;
+                self.state.a[i] = 0.0;
+            } else {
+                self.state.u[i] = ts.u[i];
+                self.state.v[i] = ts.v[i];
+                self.state.a[i] = ts.a[i];
+            }
+        }
+
+        let max_df = (0..self.n)
+            .filter(|&i| !self.fixed[i])
+            .map(|i| (force0[i] - ts.previous_force[i]).abs())
+            .fold(0.0_f64, f64::max);
+
+        if max_df < 1e-15 {
+            self.previous_force.copy_from_slice(&ts.previous_force);
+        } else {
+            for i in 0..self.n {
+                if !self.fixed[i] && self.mass[i] > 0.0 {
+                    self.state.a[i] += (force0[i] - ts.previous_force[i]) / self.mass[i];
+                }
+            }
+            if self.stiffness_damping == 0.0 {
+                if let Some(block) = &self.massless {
+                    let df_z: Vec<f64> = block
+                        .dofs
+                        .iter()
+                        .map(|&i| force0[i] - ts.previous_force[i])
+                        .collect();
+                    if df_z.iter().any(|x| x.abs() >= 1e-15) {
+                        let du_z = block.factor.solve(&df_z)?;
+                        for (&i, du) in block.dofs.iter().zip(du_z) {
+                            self.state.u[i] += du;
+                        }
+                        for i in 0..self.n {
+                            if !self.fixed[i] && self.mass[i] > 0.0 {
+                                let dk_u: f64 = block
+                                    .dofs
+                                    .iter()
+                                    .map(|&j| self.k[i * self.n + j] * (self.state.u[j] - ts.u[j]))
+                                    .sum();
+                                self.state.a[i] -= dk_u / self.mass[i];
+                            }
+                        }
+                    }
+                    let rhs_az: Vec<f64> = block
+                        .dofs
+                        .iter()
+                        .map(|&i| {
+                            -(0..self.n)
+                                .filter(|&j| self.mass[j] > 0.0)
+                                .map(|j| self.k[i * self.n + j] * self.state.a[j])
+                                .sum::<f64>()
+                        })
+                        .collect();
+                    let az = block.factor.solve(&rhs_az)?;
+                    for (&i, val) in block.dofs.iter().zip(az) {
+                        self.state.a[i] = val;
+                    }
+                }
+            }
+            self.previous_force.copy_from_slice(force0);
         }
         self.check_state()
     }
@@ -578,17 +693,15 @@ impl NonlinearStepper {
 
         // Compute initial acceleration at massive DOFs when starting from rest at u0
         let mut a_init = vec![0.0; n];
-        if u_init.is_none() {
-            let mut r_nl0 = vec![0.0; n];
-            for sp in &springs {
-                sp.add_force(&mut r_nl0, sp.f_prev);
-            }
-            for i in 0..n {
-                if !fixed[i] && mass[i] > 0.0 {
-                    let resistance: f64 =
-                        (0..n).map(|j| k_linear[i * n + j] * u0[j]).sum::<f64>() + r_nl0[i];
-                    a_init[i] = (force0[i] - resistance) / mass[i];
-                }
+        let mut r_nl0 = vec![0.0; n];
+        for sp in &springs {
+            sp.add_force(&mut r_nl0, sp.f_prev);
+        }
+        for i in 0..n {
+            if !fixed[i] && mass[i] > 0.0 {
+                let resistance: f64 =
+                    (0..n).map(|j| k_linear[i * n + j] * u0[j]).sum::<f64>() + r_nl0[i];
+                a_init[i] = (force0[i] - resistance) / mass[i];
             }
         }
 
@@ -629,6 +742,90 @@ impl NonlinearStepper {
         map
     }
 
+    pub fn previous_force(&self) -> &[f64] {
+        &self.previous_force
+    }
+
+    pub fn terminal_link_force_states(&self) -> Vec<sap_model::NonlinearLinkForceState> {
+        self.springs
+            .iter()
+            .map(|sp| sap_model::NonlinearLinkForceState {
+                link: sp.link_name.clone(),
+                dof: sp.dof_index,
+                force: sp.f_prev,
+            })
+            .collect()
+    }
+
+    pub fn seed_transient_state(
+        &mut self,
+        ts: &sap_model::TransientTerminalState,
+        force0: &[f64],
+    ) -> Result<(), SolverError> {
+        if ts.u.len() != self.n
+            || ts.v.len() != self.n
+            || ts.a.len() != self.n
+            || ts.previous_force.len() != self.n
+            || force0.len() != self.n
+            || ts
+                .u
+                .iter()
+                .chain(&ts.v)
+                .chain(&ts.a)
+                .chain(&ts.previous_force)
+                .chain(force0)
+                .any(|x| !x.is_finite())
+        {
+            return Err(SolverError::InvalidInput(
+                "invalid or mismatched transient continuation state".into(),
+            ));
+        }
+
+        for i in 0..self.n {
+            if self.fixed[i] {
+                self.state.u[i] = 0.0;
+                self.state.v[i] = 0.0;
+                self.state.a[i] = 0.0;
+            } else {
+                self.state.u[i] = ts.u[i];
+                self.state.v[i] = ts.v[i];
+                self.state.a[i] = ts.a[i];
+            }
+        }
+
+        for sp in &mut self.springs {
+            if let Some(saved) = ts
+                .nonlinear_link_forces
+                .iter()
+                .find(|s| s.link == sp.link_name && s.dof == sp.dof_index)
+            {
+                if !saved.force.is_finite() {
+                    return Err(SolverError::InvalidInput(
+                        "nonfinite persisted nonlinear link force".into(),
+                    ));
+                }
+                sp.f_prev = saved.force;
+            }
+        }
+
+        let max_df = (0..self.n)
+            .filter(|&i| !self.fixed[i])
+            .map(|i| (force0[i] - ts.previous_force[i]).abs())
+            .fold(0.0_f64, f64::max);
+
+        if max_df < 1e-15 {
+            self.previous_force.copy_from_slice(&ts.previous_force);
+        } else {
+            for i in 0..self.n {
+                if !self.fixed[i] && self.mass[i] > 0.0 {
+                    self.state.a[i] += (force0[i] - ts.previous_force[i]) / self.mass[i];
+                }
+            }
+            self.previous_force.copy_from_slice(force0);
+        }
+        Ok(())
+    }
+
     pub fn step(&mut self, force: &[f64], case: &LoadCase) -> Result<(), SolverError> {
         let weight = 1.0 + self.alpha;
         let mut rhs_linear = vec![0.0; self.n];
@@ -648,9 +845,9 @@ impl NonlinearStepper {
                         + self.a2 * self.state.v[i]
                         + self.a3 * self.state.a[i]);
             for j in 0..self.n {
-                rhs_linear[i] +=
-                    self.c[i * self.n + j] * (weight * q_vec[j] + self.alpha * self.state.v[j])
-                        + self.alpha * self.k[i * self.n + j] * self.state.u[j];
+                rhs_linear[i] += self.c[i * self.n + j]
+                    * (weight * q_vec[j] + self.alpha * self.state.v[j])
+                    + self.alpha * self.k[i * self.n + j] * self.state.u[j];
             }
         }
         for sp in &self.springs {
@@ -741,19 +938,27 @@ impl NonlinearStepper {
                 stage_u[i] = 0.0;
             }
         }
-        let max_iters = case.max_iterations.max(20);
-        let tol = case.convergence_tol.clamp(1e-12, 1e-4);
+        let max_iters = case.max_iterations;
+        let tol = case.convergence_tol;
 
         for iter in 0..=max_iters {
             let (residual, tangent) = eval_res_tan(&stage_u);
             let scale = (0..self.n)
                 .filter(|&i| !self.fixed[i])
                 .map(|i| rhs_linear[i].abs().max((residual[i] + rhs_linear[i]).abs()))
-                .fold(1e-12, f64::max);
+                .fold(0.0, f64::max);
             let norm = (0..self.n)
                 .filter(|&i| !self.fixed[i])
                 .map(|i| residual[i].abs())
                 .fold(0.0, f64::max);
+            if residual.iter().chain(&stage_u).any(|x| !x.is_finite()) || !scale.is_finite() {
+                return Err(SolverError::NonConvergence {
+                    case: case.name.clone(),
+                    iterations: iter,
+                    residual: norm,
+                    reason: "nonfinite nonlinear dynamic residual or state".into(),
+                });
+            }
             if norm <= tol * scale {
                 break;
             }
@@ -786,18 +991,37 @@ impl NonlinearStepper {
                 }
                 slope = residual.iter().zip(&direction).map(|(r, p)| r * p).sum();
                 if !slope.is_finite() || slope >= 0.0 {
-                    break;
+                    return Err(SolverError::NonConvergence {
+                        case: case.name.clone(),
+                        iterations: iter,
+                        residual: norm,
+                        reason: "no nonlinear dynamic descent direction".into(),
+                    });
                 }
             }
             let mut hi = 1.0;
-            for _ in 0..40 {
-                if eval_dir_deriv(&stage_u, &direction, hi) >= 0.0 {
+            let mut bracketed = false;
+            for _ in 0..80 {
+                let derivative = eval_dir_deriv(&stage_u, &direction, hi);
+                if !derivative.is_finite() {
+                    break;
+                }
+                if derivative >= 0.0 {
+                    bracketed = true;
                     break;
                 }
                 hi *= 2.0;
             }
+            if !bracketed {
+                return Err(SolverError::NonConvergence {
+                    case: case.name.clone(),
+                    iterations: iter,
+                    residual: norm,
+                    reason: "nonlinear dynamic line search failed to bracket equilibrium".into(),
+                });
+            }
             let mut lo = 0.0;
-            for _ in 0..40 {
+            for _ in 0..80 {
                 let mid = 0.5 * (lo + hi);
                 if eval_dir_deriv(&stage_u, &direction, mid) < 0.0 {
                     lo = mid;

@@ -10,6 +10,7 @@ impl SapModel {
         restraint: bool,
         section: &str,
     ) {
+        self.s2k_preservation = None;
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -99,6 +100,7 @@ impl SapModel {
         brace_sec: &str,
         eccentricity: f64,
     ) {
+        self.s2k_preservation = None;
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -272,6 +274,7 @@ impl SapModel {
         chord_sec: &str,
         web_sec: &str,
     ) {
+        self.s2k_preservation = None;
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -380,6 +383,7 @@ impl SapModel {
         col_sec: &str,
         area_sec: &str,
     ) {
+        self.s2k_preservation = None;
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -559,6 +563,7 @@ impl SapModel {
         restraint: bool,
         area_sec: &str,
     ) {
+        self.s2k_preservation = None;
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -630,6 +635,7 @@ impl SapModel {
         restraint: bool,
         area_sec: &str,
     ) {
+        self.s2k_preservation = None;
         self.points.clear();
         self.frames.clear();
         self.areas.clear();

@@ -3,6 +3,10 @@
 //! This is deliberately separate from `pack_model_to_sdb`: preserving a vendor document
 //! is not the same operation as initializing all native records from a `SapModel`.
 
+mod export_guard;
+mod class_versions;
+mod verified_file;
+
 use super::*;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -641,7 +645,7 @@ impl BinarySdbWriter {
     fn write_prim(
         &mut self,
         ptype: &str,
-        prop_name: Option<&str>,
+        _prop_name: Option<&str>,
         val: Option<&SdbVal>,
     ) -> Result<(), FormatError> {
         match ptype {
@@ -649,12 +653,7 @@ impl BinarySdbWriter {
             "u1" => self.write_u8(val.and_then(SdbVal::as_i32).unwrap_or(0) as u8),
             "i2" => self.write_i16(val.and_then(SdbVal::as_i32).unwrap_or(0) as i16),
             "i4" => {
-                let default_i4 = if prop_name == Some("ClassVersion") {
-                    1
-                } else {
-                    0
-                };
-                self.write_i32(val.and_then(SdbVal::as_i32).unwrap_or(default_i4));
+                self.write_i32(val.and_then(SdbVal::as_i32).unwrap_or(0));
             }
             "i8" => {
                 let v = match val {
@@ -757,6 +756,12 @@ impl BinarySdbWriter {
         self.write_bool(true);
         self.write_string(class_id);
         for st in steps {
+            if st.prop.as_deref() == Some("ClassVersion") {
+                let version = class_versions::observed_class_version(class_id).ok_or_else(||
+                    export_guard::unsupported(format!("class_versions.{class_id}"), "no unambiguous observed v19 class tag; export will not guess"))?;
+                self.write_i32(version);
+                continue;
+            }
             let val = st.prop.as_deref().and_then(|p| overrides.get(p));
             match st.kind.as_str() {
                 "struct" => {
@@ -844,9 +849,11 @@ fn csys_index(coord_index: &HashMap<String, i32>, name: &str) -> i32 {
     }
 }
 
-/// Serializes a [`SapModel`] into a genuine SAP2000 v19 `cBinaryStream` [`SdbFile`] container
-/// that passes [`inspect_native_sdb`] and [`extract_sdb_to_model`].
+/// Experimental synthesis of a schema-checked v19-style native stream. Vendor
+/// application acceptance is unverified. Unsupported or lossy state is rejected;
+/// analysis/design results and lock state are intentionally not serialized.
 pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError> {
+    export_guard::validate(model)?;
     let mut w = BinarySdbWriter::new();
 
     // 1. Header strings
@@ -929,22 +936,50 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ),
             ("m_fc".into(), SdbVal::F64(mat.fc)),
         ]);
+        let is_ortho = mat.e_ortho.is_some()
+            || mat.u_ortho.is_some()
+            || mat.g_ortho.is_some()
+            || mat.a_ortho.is_some();
+        let sym_type = if is_ortho {
+            1
+        } else if matches!(mat.mat_type, MatType::Rebar | MatType::Tendon) {
+            3
+        } else {
+            0
+        };
+        let e_arr = mat.e_ortho.map_or_else(|| vec![mat.e; 3], |v| v.to_vec());
+        let g_arr = mat.g_ortho.map_or_else(|| vec![mat.g; 3], |v| v.to_vec());
+        let mut u_arr = vec![0.0; 15];
+        if let Some(uo) = mat.u_ortho {
+            u_arr[..3].copy_from_slice(&uo);
+        } else {
+            u_arr[..3].fill(mat.u);
+        }
+        let mut a_arr = vec![0.0; 6];
+        if let Some(ao) = mat.a_ortho {
+            a_arr[..3].copy_from_slice(&ao);
+        } else {
+            a_arr[..3].fill(mat.a);
+        }
         let mt0 = HashMap::from([
             ("__class_id".into(), SdbVal::Str("S_MT".into())),
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_w".into(), SdbVal::F64(mat.unit_weight)),
             ("m_m".into(), SdbVal::F64(mat.unit_mass)),
-            ("m_e".into(), SdbVal::ArrF64(vec![mat.e; 3])),
-            ("m_g".into(), SdbVal::ArrF64(vec![mat.g; 3])),
-            ("m_u".into(), SdbVal::ArrF64(vec![mat.u; 3])),
-            ("m_a".into(), SdbVal::ArrF64(vec![mat.a; 3])),
+            ("m_e".into(), SdbVal::ArrF64(e_arr)),
+            ("m_g".into(), SdbVal::ArrF64(g_arr)),
+            ("m_u".into(), SdbVal::ArrF64(u_arr)),
+            ("m_a".into(), SdbVal::ArrF64(a_arr)),
             ("m_SteelProps".into(), SdbVal::Obj(steel_props)),
             ("m_ConcreteProps".into(), SdbVal::Obj(conc_props)),
         ]);
         raw_materials.push(HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(mat.name.clone())),
+            ("m_color".into(), SdbVal::I32(material_colorref(&mat.color).ok_or_else(||
+                export_guard::unsupported(format!("materials.{}.color", mat.name), "color has no supported exact COLORREF encoding"))?)),
             ("m_mtype".into(), SdbVal::I32(mtype)),
+            ("m_SymType".into(), SdbVal::I32(sym_type)),
             ("m_NumberMTs".into(), SdbVal::I32(1)),
             ("m_Mt".into(), SdbVal::ArrObj(vec![mt0])),
         ]));
@@ -1023,10 +1058,9 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 }
             }
             for seg in &sec.non_prismatic {
-                if let (Some(&st_idx), Some(&en_idx)) = (
-                    fsec_index.get(&seg.start_sec),
-                    fsec_index.get(&seg.end_sec),
-                ) {
+                if let (Some(&st_idx), Some(&en_idx)) =
+                    (fsec_index.get(&seg.start_sec), fsec_index.get(&seg.end_sec))
+                {
                     raw_vs.push(HashMap::from([
                         ("m_snumber".into(), SdbVal::I32(p_idx)),
                         ("m_Start".into(), SdbVal::I32(st_idx)),
@@ -1245,15 +1279,28 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_IR".into(), SdbVal::ArrI32(ir)),
         ]);
         if let Some((lim_c_exists, lim_c, lim_t_exists, lim_t)) = fr.tc_limits {
-            l_map.insert("m_LimitCompressionExists".into(), SdbVal::Bool(lim_c_exists));
+            l_map.insert(
+                "m_LimitCompressionExists".into(),
+                SdbVal::Bool(lim_c_exists),
+            );
             l_map.insert("m_LimitCompression".into(), SdbVal::F64(lim_c));
             l_map.insert("m_LimitTensionExists".into(), SdbVal::Bool(lim_t_exists));
             l_map.insert("m_LimitTension".into(), SdbVal::F64(lim_t));
         }
         if let Some(ref cp) = fr.cable_params {
+            let cable_type = if cp.undeformed_length.is_some() {
+                8
+            } else if cp.target_tension_i.is_some() {
+                3
+            } else if cp.horizontal_tension.is_some() {
+                5
+            } else {
+                8
+            };
             let cd_map = HashMap::from([
                 ("__class_id".into(), SdbVal::Str("S_CableData".into())),
                 ("m_ModelUsingFrames".into(), SdbVal::Bool(false)),
+                ("m_CableType".into(), SdbVal::I32(cable_type)),
                 ("m_NumSegs".into(), SdbVal::I32(cp.num_segments as i32)),
                 (
                     "m_UndeformedLength".into(),
@@ -1441,11 +1488,23 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 ]));
             }
         }
-        if pt.spring.iter().any(|&k| k != 0.0) {
+        if pt.spring.iter().any(|&k| k != 0.0) || pt.spring_coupled.is_some() || pt.spring_is_local
+        {
+            let xjps = if let Some(coupled) = pt.spring_coupled {
+                coupled.to_vec()
+            } else {
+                let mut arr = vec![0.0; 21];
+                for (d, &idx) in SPRING_DIAG_INDICES.iter().enumerate() {
+                    arr[idx] = pt.spring[d];
+                }
+                arr
+            };
+            let csys = if pt.spring_is_local { -1 } else { 1 };
             raw_springs.push(HashMap::from([
                 ("m_alive".into(), SdbVal::Bool(true)),
                 ("m_jn".into(), SdbVal::I32(jn)),
-                ("m_XJPS".into(), SdbVal::ArrF64(pt.spring.to_vec())),
+                ("m_XJPS".into(), SdbVal::ArrF64(xjps)),
+                ("m_csys".into(), SdbVal::I32(csys)),
             ]));
         }
         if pt.mass.iter().any(|&m| m != 0.0) {
@@ -1541,7 +1600,10 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(lp.name.clone())),
             ("m_type".into(), SdbVal::I32(ptype)),
-            ("m_SelfWTMultiplier".into(), SdbVal::F64(lp.self_wt_multiplier)),
+            (
+                "m_SelfWTMultiplier".into(),
+                SdbVal::F64(lp.self_wt_multiplier),
+            ),
         ]));
     }
     w.write_struct_array("LOADPATTERNARRAY", &raw_load_patterns)?;
@@ -1764,7 +1826,10 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_jn".into(), SdbVal::I32(jn)),
                     ("m_LC".into(), SdbVal::I32(lc)),
-                    ("m_csys".into(), SdbVal::I32(csys_index(&coord_index, &lf.csys))),
+                    (
+                        "m_csys".into(),
+                        SdbVal::I32(csys_index(&coord_index, &lf.csys)),
+                    ),
                     ("m_F".into(), SdbVal::ArrF64(lf.force.to_vec())),
                 ]));
             }
@@ -1775,7 +1840,10 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_jn".into(), SdbVal::I32(jn)),
                     ("m_LC".into(), SdbVal::I32(lc)),
-                    ("m_csys".into(), SdbVal::I32(csys_index(&coord_index, &ld.csys))),
+                    (
+                        "m_csys".into(),
+                        SdbVal::I32(csys_index(&coord_index, &ld.csys)),
+                    ),
                     ("m_d".into(), SdbVal::ArrF64(ld.displ.to_vec())),
                 ]));
             }
@@ -1808,7 +1876,10 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_n".into(), SdbVal::I32(fn_idx)),
                     ("m_lc".into(), SdbVal::I32(lc)),
-                    ("m_csys".into(), SdbVal::I32(csys_index(&coord_index, &lp.csys))),
+                    (
+                        "m_csys".into(),
+                        SdbVal::I32(csys_index(&coord_index, &lp.csys)),
+                    ),
                     ("m_kt".into(), SdbVal::I32(lp.my_type)),
                     ("m_Kd".into(), SdbVal::I32(lp.dir)),
                     ("m_RD".into(), SdbVal::F64(lp.rel_dist)),
@@ -1822,7 +1893,10 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_n".into(), SdbVal::I32(fn_idx)),
                     ("m_lc".into(), SdbVal::I32(lc)),
-                    ("m_csys".into(), SdbVal::I32(csys_index(&coord_index, &ld.csys))),
+                    (
+                        "m_csys".into(),
+                        SdbVal::I32(csys_index(&coord_index, &ld.csys)),
+                    ),
                     ("m_kt".into(), SdbVal::I32(ld.my_type)),
                     ("m_Kd".into(), SdbVal::I32(ld.dir)),
                     ("m_RDA".into(), SdbVal::F64(ld.rel_dist1)),
@@ -1869,7 +1943,10 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_n".into(), SdbVal::I32(an_idx)),
                     ("m_LC".into(), SdbVal::I32(lc)),
-                    ("m_csys".into(), SdbVal::I32(csys_index(&coord_index, &lu.csys))),
+                    (
+                        "m_csys".into(),
+                        SdbVal::I32(csys_index(&coord_index, &lu.csys)),
+                    ),
                     ("m_Kd".into(), SdbVal::I32(lu.dir)),
                     ("m_P".into(), SdbVal::F64(lu.val)),
                 ]));
@@ -2045,19 +2122,27 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     w.write_string(""); // ModelLog
     w.write_i32(0); // DateTimeStamp
 
-    Ok(SdbFile {
+    let sdb = SdbFile {
         program_name: "SAP2000".to_string(),
         program_version: model.program_version.clone(),
         file_version: "19.00".to_string(),
         thumbnail_png: DEFAULT_THUMBNAIL_PNG.to_vec(),
         decompressed_stream: w.data,
-    })
+    };
+    let projected = extract_sdb_to_model(&sdb)?;
+    export_guard::verify_projection(model, &projected)?;
+    Ok(sdb)
 }
 
-/// Serializes a [`SapModel`] into a genuine SAP2000 v19 native `.sdb` file on disk.
+/// Save an experimental checked native projection to a new destination.
+/// Validation and packing finish before creation; existing files are never
+/// overwritten. Written bytes are synchronized, read back and inspected before
+/// success. Failed writes/checks remove the newly created incomplete output.
+/// No vendor runtime compatibility or arbitrary-model serialization is claimed.
 pub fn save_native_sdb_file(model: &SapModel, path: impl AsRef<Path>) -> Result<(), FormatError> {
     let sdb = pack_model_to_native_sdb(model)?;
-    write_sdb_file(path, &sdb)
+    let bytes = write_sdb_bytes(&sdb)?;
+    verified_file::write_new(path.as_ref(), &bytes)
 }
 
 #[cfg(test)]
@@ -2075,6 +2160,7 @@ mod tests {
             return;
         }
         let mut checked = 0;
+        let mut verified_classes = std::collections::BTreeSet::new();
         for entry in std::fs::read_dir(directory).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().and_then(|p| p.to_str()) != Some("sdb") {
@@ -2088,6 +2174,14 @@ mod tests {
                 bytes,
                 "compressed container copy changed"
             );
+            for record in document.records() {
+                let Some(expected) = class_versions::observed_class_version(&record.class_id) else { continue; };
+                let field = record.fields.iter().find(|f| f.name.as_deref() == Some("ClassVersion"))
+                    .unwrap_or_else(|| panic!("{}: {} lacks class tag", path.display(), record.class_id));
+                let actual = i32::from_le_bytes(document.source.decompressed_stream[field.offset..field.offset + 4].try_into().unwrap());
+                assert_eq!(actual, expected, "{}: {} tag mismatch", path.display(), record.class_id);
+                verified_classes.insert(record.class_id.clone());
+            }
             let inventory = document.inventory();
             assert_eq!(inventory.parsed_bytes, inventory.stream_bytes);
             assert_eq!(inventory.top_level.first().unwrap().offset, 0);
@@ -2108,6 +2202,7 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 336, "Only {} native fixtures checked", checked);
+        assert_eq!(verified_classes.len(), 48, "Every emitted class tag needs source evidence");
     }
 
     #[test]
@@ -2168,10 +2263,6 @@ mod tests {
         model.points.insert("2".into(), p2);
         model.points.insert("3".into(), p3);
 
-        for mat in model.materials.values_mut() {
-            mat.fys = 50.0;
-            mat.color = "Blue".into();
-        }
         let mut cab_sec = FrameSection::default();
         cab_sec.name = "CAB1".into();
         cab_sec.material = "A992Fy50".into();
@@ -2198,7 +2289,7 @@ mod tests {
         let mut c1 = FrameObj::new("C1", "2", "3", "CAB1");
         c1.cable_params = Some(sap_model::CableParams {
             undeformed_length: Some(3.98),
-            target_tension_i: Some(120.0),
+            target_tension_i: None,
             horizontal_tension: None,
             num_segments: 8,
         });
@@ -2254,6 +2345,8 @@ mod tests {
             return;
         }
         let mut checked = 0usize;
+        let mut rejected_incomplete = 0usize;
+        let mut native_checked = 0usize;
         let mut nonlinear_links_checked = 0usize;
         let mut cables_checked = 0usize;
         for entry in std::fs::read_dir(directory).unwrap() {
@@ -2286,8 +2379,20 @@ mod tests {
                 path.display()
             );
 
-            let native_sdb = pack_model_to_native_sdb(&model)
-                .unwrap_or_else(|e| panic!("{} native pack failed: {}", path.display(), e));
+            checked += 1;
+            let native_sdb = match pack_model_to_native_sdb(&model) {
+                Ok(sdb) => sdb,
+                Err(FormatError::UnsupportedNativeExport { field, reason })
+                    if model.link_props.iter().any(|(name, prop)| {
+                        !prop.nonlinear_data_complete
+                            && field == format!("link_props.{name}.nonlinear_data_complete")
+                    }) => {
+                        eprintln!("{}: correctly rejected incomplete native source law ({reason})", path.display());
+                        rejected_incomplete += 1;
+                        continue;
+                    }
+                Err(e) => panic!("{} native pack failed: {}", path.display(), e),
+            };
             let doc = inspect_native_sdb(&native_sdb)
                 .unwrap_or_else(|e| panic!("{} native inspect failed: {}", path.display(), e));
             assert_eq!(
@@ -2304,10 +2409,16 @@ mod tests {
                 "{}: native SDB round-trip mismatch",
                 path.display()
             );
-            checked += 1;
+            native_checked += 1;
         }
+        eprintln!("Vendor projection: {checked} S2K roundtrips, {native_checked} checked native roundtrips, {rejected_incomplete} incomplete-source native rejections");
+        assert_eq!(checked, native_checked + rejected_incomplete);
+        assert!(native_checked > 0, "No supported native models checked");
         assert!(checked >= 334, "Only {} vendor models checked", checked);
-        assert!(nonlinear_links_checked > 0, "Expected nonlinear link fixtures");
+        assert!(
+            nonlinear_links_checked > 0,
+            "Expected nonlinear link fixtures"
+        );
         assert!(cables_checked > 0, "Expected cable fixtures");
     }
 }

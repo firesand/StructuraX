@@ -2,7 +2,7 @@
 
 StructuraX is an experimental native structural-analysis and member-design application written in Rust. It has an egui desktop interface, a command-line interface, and typed Rust APIs. The internal crates retain their `sap-*` names from the reconstruction workspace.
 
-**Development status:** selected analytical checks pass; full SAP2000 compatibility and engineering acceptance have not been established. The `1.0.0` package version is inherited metadata, not a certification or declaration of production readiness. See [current review](docs/review/structurax-latest/REVIEW.md) before relying on the newer solver and export paths.
+**Development status:** selected analytical checks pass; full SAP2000 compatibility and engineering acceptance have not been established. The `1.0.0` package version is inherited metadata, not a certification or declaration of production readiness. See [review follow-up](docs/review/structurax-followup/REVIEW.md) before relying on the newer solver and export paths.
 
 ## Implemented areas
 
@@ -36,9 +36,11 @@ cargo run --locked --bin structurax -- analyze model.s2k --design --output resul
 # Inspect a locally supplied section library
 cargo run --locked --bin structurax -- inspect-pro /path/to/aisc14.pro W14X90
 
-# Experimental native export; output must not already exist
+# Experimental native export of a supported projection; output must not exist
 cargo run --locked --bin structurax -- export-native-sdb model.s2k output.sdb
 ```
+
+Native synthesis accepts supported handwritten S2K tables while retaining the original input. Unknown tables/columns and unrepresented assignments still reject with diagnostics. Native exports through the CLI, API and GUI all require a new destination; written bytes are synchronized and read back before success. Use S2K/private snapshots for supported preservation workflows and native byte-copy for an unchanged original.
 
 ## Validation
 
