@@ -500,6 +500,10 @@ struct DynamicLinkSpring {
     param1: f64,
     param2: f64,
     f_prev: f64,
+    /// Plastic Wen law with its state at the start of the current step.
+    wen: Option<crate::nonlinear::WenLaw>,
+    d_ref: f64,
+    z_ref: f64,
 }
 
 impl DynamicLinkSpring {
@@ -512,6 +516,10 @@ impl DynamicLinkSpring {
             sap_model::LinkPropType::Gap | sap_model::LinkPropType::Hook => {
                 crate::nonlinear::law(self.kind, self.k_nl, self.param1, d)
             }
+            sap_model::LinkPropType::PlasticWen => self
+                .wen
+                .as_ref()
+                .map_or((0.0, 0.0), |law| law.eval(self.d_ref, self.z_ref, d)),
             sap_model::LinkPropType::Damper => crate::nonlinear::damper_law(
                 self.k_nl,
                 self.param1,
@@ -578,6 +586,7 @@ impl NonlinearStepper {
         force0: &[f64],
         element_damping: &[f64],
         u_init: Option<&[f64]>,
+        hysteresis: &[sap_model::LinkHysteresisState],
     ) -> Result<Self, SolverError> {
         validate_parameters(case)?;
         let n = mass.len();
@@ -651,7 +660,29 @@ impl NonlinearStepper {
                         param1: prop.param1[d],
                         param2: prop.param2[d],
                         f_prev: 0.0,
+                        wen: None,
+                        d_ref: 0.0,
+                        z_ref: 0.0,
                     };
+                    if sp.kind == sap_model::LinkPropType::PlasticWen {
+                        let law = crate::nonlinear::wen_law_for(prop, d, &object.name)?;
+                        let d0 = sp.deformation(&u0);
+                        let (d_ref, z_ref) = hysteresis
+                            .iter()
+                            .find(|state| state.link == object.name && state.dof == d)
+                            .map_or((0.0, 0.0), |state| (state.deformation, state.z));
+                        if !d_ref.is_finite() || !z_ref.is_finite() || z_ref.abs() > 1.0 {
+                            return Err(SolverError::InvalidInput(format!(
+                                "link '{}' has an invalid persisted hysteretic state",
+                                object.name
+                            )));
+                        }
+                        // Bring the inherited state to the initial deformation.
+                        sp.z_ref = law.advance(d_ref, z_ref, d0).0;
+                        sp.d_ref = d0;
+                        sp.f_prev = law.force(d0, sp.z_ref);
+                        sp.wen = Some(law);
+                    }
                     if matches!(
                         sp.kind,
                         sap_model::LinkPropType::Gap | sap_model::LinkPropType::Hook
@@ -757,7 +788,21 @@ impl NonlinearStepper {
             .collect()
     }
 
-    pub fn seed_transient_state(
+/// Hysteretic state of path-dependent link DOFs at the current time.
+    pub fn terminal_hysteresis(&self) -> Vec<sap_model::LinkHysteresisState> {
+        self.springs
+            .iter()
+            .filter(|sp| sp.wen.is_some())
+            .map(|sp| sap_model::LinkHysteresisState {
+                link: sp.link_name.clone(),
+                dof: sp.dof_index,
+                deformation: sp.d_ref,
+                z: sp.z_ref,
+            })
+            .collect()
+    }
+
+        pub fn seed_transient_state(
         &mut self,
         ts: &sap_model::TransientTerminalState,
         force0: &[f64],
@@ -1064,6 +1109,11 @@ impl NonlinearStepper {
             let d = sp.deformation(&next.u);
             let (f, _) = sp.eval(d, q_link, self.h, self.a1);
             sp.f_prev = f;
+            if let Some(law) = &sp.wen {
+                // Commit the hysteretic state reached at the end of the step.
+                sp.z_ref = law.advance(sp.d_ref, sp.z_ref, d).0;
+                sp.d_ref = d;
+            }
         }
 
         self.state = next;

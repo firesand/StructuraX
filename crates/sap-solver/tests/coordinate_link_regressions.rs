@@ -460,11 +460,23 @@ fn unsupported_pressure_and_nonlinear_constitutive_inputs_are_not_silently_linea
     // Effective stiffness remains valid for an unstressed linear case.
     analyze_model(&mut m).unwrap();
     m.load_cases["S"].case_type = LoadCaseType::NonlinearStatic;
-    m.link_props["P"].link_type = LinkPropType::PlasticWen;
-    assert!(analyze_model(&mut m)
-        .unwrap_err()
-        .to_string()
-        .contains("constitutive iteration"));
+    // Plastic Wen is implemented (plastic_wen_regressions.rs); every other
+    // family beyond Gap/Hook/Damper must still be refused.
+    for kind in [
+        LinkPropType::MultiLinearElastic,
+        LinkPropType::MultiLinearPlastic,
+        LinkPropType::RubberIsolator,
+        LinkPropType::FrictionIsolator,
+        LinkPropType::TCFrictionIsolator,
+        LinkPropType::TriplePendulumIsolator,
+    ] {
+        m.link_props["P"].link_type = kind;
+        assert!(analyze_model(&mut m)
+            .unwrap_err()
+            .to_string()
+            .contains("constitutive iteration"));
+        assert!(m.case_results.is_empty());
+    }
 }
 
 #[test]

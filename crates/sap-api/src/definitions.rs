@@ -114,6 +114,22 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             "case is referenced as a modal source by a response-spectrum case",
         ));
     }
+    if let Some(control) = &case.displacement_control {
+        let monitored_ok = control
+            .monitored
+            .as_ref()
+            .is_some_and(|(point, dof)| model.points.contains_key(point) && *dof < 6);
+        if case.case_type != LoadCaseType::NonlinearStatic
+            || case.nl_geom != NLGeomType::None
+            || !control.target.is_finite()
+            || control.target <= 0.0
+            || !monitored_ok
+        {
+            return Err(invalid(
+                "displacement control needs a small-displacement nonlinear static case, a positive finite target and an existing monitored joint displacement",
+            ));
+        }
+    }
     for load in &case.loads {
         if !model.load_patterns.contains_key(&load.load_name) || !load.scale_factor.is_finite() {
             return Err(invalid(format!(
@@ -256,6 +272,15 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                     "nonlinear iteration limit must be 1..10000 and tolerance in (0,1)",
                 ));
             }
+            if matches!(
+                case.case_type,
+                LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+            ) && case.modal_damping != 0.0
+            {
+                return Err(invalid(
+                    "modal damping is not implemented for history cases; set it to zero and use Rayleigh damping, or use a direct-integration case type",
+                ));
+            }
             if case.history_loads.is_empty()
                 || !case.loads.is_empty()
                 || !case.spectrum_loads.is_empty()
@@ -345,6 +370,21 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
         _ => unreachable!(),
     }
     Ok(())
+}
+/// Remove one entry of the model's unmodeled source data. This is the explicit
+/// decision to analyze the affected cases without that imported data; nothing
+/// removes an entry implicitly.
+pub fn discard_unmodeled_source(
+    model: &mut SapModel,
+    index: usize,
+) -> Result<sap_model::UnmodeledSourceData, DefinitionError> {
+    unlocked(model)?;
+    if index >= model.unmodeled_source.len() {
+        return Err(invalid("no unmodeled source entry at that position"));
+    }
+    let entry = model.unmodeled_source.remove(index);
+    model.invalidate_results();
+    Ok(entry)
 }
 pub fn set_case_definition(model: &mut SapModel, case: LoadCase) -> Result<(), DefinitionError> {
     unlocked(model)?;

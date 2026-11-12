@@ -97,7 +97,10 @@ fn fixed_thermal_gradient_reactions_satisfy_equilibrium_and_zero_euler_deflectio
             let inertia = if kind == 2 { 4. } else { 2. };
             for station in &r.frame_forces["F"] {
                 let gradient = start + (end - start) * station.rel_dist;
-                let bending = if kind == 2 { station.m3 } else { -station.m2 };
+                // A positive gradient lengthens the positive face; restrained,
+                // that face is compressed, which is a positive moment about
+                // either axis in the SAP2000 convention.
+                let bending = if kind == 2 { station.m3 } else { station.m2 };
                 let shear = if kind == 2 { station.v2 } else { station.v3 };
                 close(bending, E * inertia * ALPHA * gradient);
                 close(shear, -E * inertia * ALPHA * (end - start) / LENGTH);
@@ -142,7 +145,7 @@ fn fixed_linear_gradient_with_shear_matches_closed_form_compatible_curvature() {
             close(station.local_disp[(kind - 1) as usize], exact);
             close(if kind == 2 { station.v2 } else { station.v3 }, -slope);
             close(
-                if kind == 2 { station.m3 } else { -station.m2 },
+                if kind == 2 { station.m3 } else { station.m2 },
                 ei * ALPHA * (start + end) / 2. + slope * (x - LENGTH / 2.),
             );
         }

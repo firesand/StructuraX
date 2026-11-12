@@ -126,6 +126,13 @@ fn new_case(kind: LoadCaseType, name: &str) -> LoadCase {
     if kind == LoadCaseType::Modal {
         case = LoadCase::modal_eigen(name, 12);
     }
+    // Modal history types are integrated directly and take no modal damping.
+    if matches!(
+        kind,
+        LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+    ) {
+        case.modal_damping = 0.0;
+    }
     case
 }
 fn text_choice(
@@ -272,6 +279,33 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                             .max_decimals(12),
                     );
                 });
+                // Displacement control arrives from imported files or the API. It is
+                // shown so an imported push is not silently treated as full load.
+                let mut use_full_load = false;
+                if let Some(control) = &case.displacement_control {
+                    ui.horizontal(|ui| {
+                        let monitored = control.monitored.as_ref().map_or_else(
+                            || "an unsupported monitored quantity".to_string(),
+                            |(joint, dof)| {
+                                format!(
+                                    "joint {joint} {}",
+                                    ["U1", "U2", "U3", "R1", "R2", "R3"]
+                                        .get(*dof)
+                                        .copied()
+                                        .unwrap_or("?")
+                                )
+                            },
+                        );
+                        ui.label(format!(
+                            "Displacement control: load scaled until {monitored} moves {}.",
+                            control.target
+                        ));
+                        use_full_load = ui.button("Use full load instead").clicked();
+                    });
+                }
+                if use_full_load {
+                    case.displacement_control = None;
+                }
                 ui.label("Element applicability and convergence are checked when analysis runs.");
             }
             if case.case_type == LoadCaseType::Buckling {
@@ -337,6 +371,17 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
         | LoadCaseType::LinearDynamic
         | LoadCaseType::NonlinearHistory
         | LoadCaseType::NonlinearDynamic => {
+            if matches!(
+                case.case_type,
+                LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+            ) {
+                // An imported modal history may carry a modal damping ratio. It is
+                // shown because analysis refuses the case until it is zero.
+                ui.horizontal(|ui| {
+                    ui.label("Modal damping ratio (not implemented for history cases; must be 0, use Rayleigh damping):");
+                    ui.add(egui::DragValue::new(&mut case.modal_damping).speed(0.005));
+                });
+            }
             if matches!(
                 case.case_type,
                 LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
@@ -442,6 +487,34 @@ impl SapGuiApp {
                     if let Some((name,run))=toggle {
                         if self.model.is_locked {outcome=Some(Err("Unlock the model before changing run selection.".into()));}
                         else {self.model.load_cases[&name].run_flag=run;self.model.invalidate_results();outcome=Some(Ok(format!("Case {name}: run={run}.")));if state.case.name==name {state.case.run_flag=run;}}
+                    }
+                    if !self.model.unmodeled_source.is_empty() {
+                        ui.separator();
+                        ui.colored_label(Color32::YELLOW, "Imported data that is not modeled. Affected cases will not analyze until an entry is discarded:");
+                        let mut discard = None;
+                        for (index, entry) in self.model.unmodeled_source.iter().enumerate() {
+                            let scope = match &entry.scope {
+                                sap_model::UnmodeledScope::AllCases => "all cases".to_string(),
+                                sap_model::UnmodeledScope::NonlinearCases => "nonlinear cases".to_string(),
+                                sap_model::UnmodeledScope::DynamicCases => "modal, spectrum and history cases".to_string(),
+                                sap_model::UnmodeledScope::AllButLinearStatic => "all cases except linear static from zero".to_string(),
+                                sap_model::UnmodeledScope::LoadPattern(name) => format!("cases using load pattern {name}"),
+                                sap_model::UnmodeledScope::Case(name) => format!("case {name}"),
+                            };
+                            ui.horizontal(|ui| {
+                                ui.label(format!("{} ({scope})", entry.description));
+                                if ui.button("Discard and analyze without it").clicked() {
+                                    discard = Some(index);
+                                }
+                            });
+                        }
+                        if let Some(index) = discard {
+                            outcome = Some(
+                                sap_api::discard_unmodeled_source(&mut self.model, index)
+                                    .map(|entry| format!("Discarded: {}.", entry.description))
+                                    .map_err(|e| e.to_string()),
+                            );
+                        }
                     }
                 } else {
                     egui::ComboBox::from_id_salt("analysis_read_function").selected_text("Read existing function").show_ui(ui,|ui| {

@@ -22,8 +22,10 @@ use sap_units::Units;
 use crate::s2k::write_s2k;
 use crate::s2k::{parse_s2k, try_write_s2k_with_report};
 use crate::FormatError;
+use sap_model::{UnmodeledScope, UnmodeledSourceData};
 
 pub mod native;
+mod skipped;
 pub use native::{pack_model_to_native_sdb, save_native_sdb_file};
 
 // Native materials store Windows COLORREF integers. Keep the common canonical
@@ -1126,10 +1128,15 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
     let raw_pd_force = r.read_struct_array(true)?;
     let raw_fmodifier = r.read_struct_array(true)?;
     let raw_ffixity = r.read_struct_array(true)?;
-    let _foffset = r.read_struct_array(false)?;
-    for _ in 0..8 {
-        let _ = r.read_struct_array(false)?;
-    }
+    let raw_foffset = r.read_struct_array(true)?;
+    let _fspring = r.read_struct_array(false)?;
+    let _fmass = r.read_struct_array(false)?;
+    let _ffireproofing = r.read_struct_array(false)?;
+    let raw_shmodifier = r.read_struct_array(true)?;
+    let _shspring = r.read_struct_array(false)?;
+    let raw_shmass = r.read_struct_array(true)?;
+    let raw_shmesh = r.read_struct_array(true)?;
+    let _sspring = r.read_struct_array(false)?;
 
     // s (0x06001dd2): LoadPattern, AnalysisCase, Combo, Loads
     let raw_load_patterns = r.read_struct_array(true)?;
@@ -1164,9 +1171,13 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
     } // ShSLoad..SoPPLoad
     let raw_sospload = r.read_struct_array(true)?;
     let raw_sotload = r.read_struct_array(true)?;
-    for _ in 0..5 {
+    let _sosload = r.read_struct_array(false)?;
+    // Link gravity loads are not modeled; they are read so their presence is
+    // recorded instead of the load silently disappearing.
+    let raw_nlgload = r.read_struct_array(true)?;
+    for _ in 0..3 {
         let _ = r.read_struct_array(false)?;
-    } // SoSLoad..Seastate
+    } // NLDefLoad..Seastate
     for _ in 0..9 {
         let _ = r.read_struct_array(false)?;
     } // wave records
@@ -1443,30 +1454,48 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 modifiers[i] = msf[i];
             }
         }
-        let stype = a.get("m_SType").and_then(|v| v.as_i32()).unwrap_or(1);
-        let shell_type = match stype {
-            1 => ShellType::ShellThin,
-            2 => ShellType::ShellThick,
-            3 => ShellType::PlateThin,
-            4 => ShellType::PlateThick,
-            5 => ShellType::Membrane,
-            6 => ShellType::ShellLayered,
-            _ => ShellType::ShellThin,
+        // Native area-section type. `m_ElementType` is 0 shell, 1 plane,
+        // 2 axisymmetric solid. For shells the native `m_SType` is not the OAPI
+        // enumeration: every "thin" verification file and every untouched
+        // default section (the vendor default is Shell-Thin) stores 4, and
+        // every "thick" verification file stores 1. For planes the six
+        // "plane strain" verification files store 2 and the others 1. No other
+        // code occurs in the corpus; an unknown one is recorded, not guessed.
+        let stype = a.get("m_SType").and_then(|v| v.as_i32()).unwrap_or(4);
+        let element_type = a.get("m_ElementType").and_then(|v| v.as_i32()).unwrap_or(0);
+        let (prop_type, shell_type, plane_type, known) = match (element_type, stype) {
+            (0, 4) => (AreaPropType::Shell, ShellType::ShellThin, PlaneType::PlaneStress, true),
+            (0, 1) => (AreaPropType::Shell, ShellType::ShellThick, PlaneType::PlaneStress, true),
+            (1, 1) => (AreaPropType::Plane, ShellType::ShellThin, PlaneType::PlaneStress, true),
+            (1, 2) => (AreaPropType::Plane, ShellType::ShellThin, PlaneType::PlaneStrain, true),
+            (2, _) => (AreaPropType::ASolid, ShellType::ShellThin, PlaneType::PlaneStress, true),
+            _ => (AreaPropType::Shell, ShellType::ShellThin, PlaneType::PlaneStress, false),
         };
+        if !known && native_alive(a) {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!(
+                    "area section '{name}' has element type {element_type} and section type {stype}, whose meaning is not established (imported as a thin shell)"
+                ),
+            });
+        }
         let asec = AreaSection {
             name: name.clone(),
             material: mat_name,
-            prop_type: AreaPropType::Shell,
+            prop_type,
             shell_type,
-            plane_type: PlaneType::PlaneStress,
+            plane_type,
             mat_angle_deg: a.get("m_Ang").and_then(|v| v.as_f64()).unwrap_or(0.0),
             thickness_membrane: a.get("m_Thickness").and_then(|v| v.as_f64()).unwrap_or(1.0),
             thickness_bending: a.get("m_bending").and_then(|v| v.as_f64()).unwrap_or(1.0),
+            // The native flag is 1 when incompatible modes are OFF: every
+            // "comp" verification file stores 1, every "incomp" file and every
+            // untouched default (the vendor default is on) stores 0.
             incompatible_modes: a
                 .get("m_Incompatible")
                 .and_then(|v| v.as_i32())
-                .unwrap_or(1)
-                != 0,
+                .unwrap_or(0)
+                == 0,
             drilling_dof: a
                 .get("m_IncludeDrillingDOF")
                 .and_then(|v| v.as_bool())
@@ -1500,11 +1529,13 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 name,
                 material,
                 mat_angle_deg: native_floats(prop, "m_Matang"),
+                // 1 means incompatible modes are off, as for area sections:
+                // Example 5-002 "comp" files store 1 and "incomp" files 0.
                 incompatible_modes: prop
                     .get("m_Incompatible")
                     .and_then(SdbVal::as_i32)
                     .unwrap_or(0)
-                    != 0,
+                    == 0,
                 modifiers: [1.0; 8],
             },
         );
@@ -1526,6 +1557,13 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             .unwrap_or(&[]);
         let mut param1 = [0.0; 6];
         let mut param2 = [0.0; 6];
+        // Third `m_param` row: the Wen yield exponent (Example 6-008 stores
+        // yield 50, ratio 0.1 and exponent 1 for U2 in rows 1-3). It is kept
+        // only for that law so other families keep their existing projection.
+        let mut param3 = [0.0; 6];
+        if link_type == LinkPropType::PlasticWen && raw_param.len() >= 18 {
+            param3.copy_from_slice(&raw_param[12..18]);
+        }
         if raw_param.len() >= 12 {
             param1.copy_from_slice(&raw_param[0..6]);
             param2.copy_from_slice(&raw_param[6..12]);
@@ -1544,8 +1582,8 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                             | LinkPropType::Gap
                             | LinkPropType::Hook
                             | LinkPropType::Damper
-                            | LinkPropType::PlasticWen
-                    ) && raw_param.len() >= 12)));
+                    ) && raw_param.len() >= 12)
+                    || (link_type == LinkPropType::PlasticWen && raw_param.len() >= 18)));
         model.link_props.insert(
             name.clone(),
             LinkProp {
@@ -1560,6 +1598,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 k_nl: native_floats(prop, "m_k"),
                 param1,
                 param2,
+                param3,
                 dj2: prop.get("m_dj2").and_then(SdbVal::as_f64).unwrap_or(0.0),
                 dj3: prop.get("m_dj3").and_then(SdbVal::as_f64).unwrap_or(0.0),
                 mass: prop.get("m_m").and_then(SdbVal::as_f64).unwrap_or(0.0),
@@ -1869,6 +1908,8 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
     }
 
     // Convert Lines / Frames (1-based index -> Frame name)
+    let mut cables_meshed_at_joints: Vec<String> = Vec::new();
+    let mut lines_meshed_at_crossings: Vec<String> = Vec::new();
     let mut fr_names = Vec::with_capacity(raw_lines.len() + 1);
     fr_names.push(String::new());
     for (idx, l) in raw_lines.iter().enumerate() {
@@ -1896,6 +1937,38 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             .unwrap_or_else(|| p2_idx.to_string());
         let line_type = l.get("m_LineType").and_then(SdbVal::as_i32).unwrap_or(0);
         let is_cable = matches!(line_type, 1 | 2);
+        // Type 3 is a tendon object (the nine corpus files with tendon loads
+        // are the nine with this type). Reading it as a frame member with
+        // whatever frame section its index selects (a W18X35 beam in Example
+        // 1-009) would invent structure, so it is recorded and not imported.
+        if !matches!(line_type, 0..=2) {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: if line_type == 3 {
+                    format!("tendon object '{name}' (not imported)")
+                } else {
+                    format!("line object '{name}' of unrecognized type {line_type} (not imported)")
+                },
+            });
+            continue;
+        }
+        // A mirrored insertion point swaps the sides the cardinal point is
+        // counted from. No corpus line sets either flag; it is not modeled.
+        if insertion_is_mirrored(l) {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!("mirrored insertion point of frame '{name}'"),
+            });
+        }
+        let mesh = line_auto_mesh(l, &name, is_cable);
+        model.unmodeled_source.extend(mesh.records);
+        let (mesh_segments, mesh_at_joints) = (mesh.segments, mesh.at_joints);
+        if is_cable && mesh_at_joints {
+            cables_meshed_at_joints.push(name.clone());
+        }
+        if mesh.at_crossings {
+            lines_meshed_at_crossings.push(name.clone());
+        }
         let san = l.get("m_sanalysis").and_then(|v| v.as_i32()).unwrap_or(1) as usize;
         let sec_name = if is_cable {
             cable_prop_names
@@ -1912,6 +1985,10 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 .unwrap_or_else(|| "FSEC1".to_string())
         };
         let mut fr = FrameObj::new(name.clone(), p1, p2, sec_name);
+        if !is_cable {
+            fr.auto_mesh_segments = mesh_segments;
+            fr.auto_mesh_at_joints = mesh_at_joints;
+        }
         if is_cable {
             if let Some(cd) = l.get("m_CableData").and_then(SdbVal::as_obj) {
                 let model_using_frames = cd
@@ -2015,6 +2092,28 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             }
         }
     }
+    // Insertion-point joint offsets (`FOffset`). One corpus record exists
+    // (Example 1-011); see `frame_joint_offset` for what is read.
+    for record in raw_foffset.iter().filter(|r| native_alive(r)) {
+        let index = record.get("m_n").and_then(SdbVal::as_i32).unwrap_or(0) as usize;
+        let Some(name) = fr_names.get(index).filter(|s| !s.is_empty()).cloned() else {
+            continue;
+        };
+        match frame_joint_offset(record) {
+            Ok(offset) => {
+                if let Some(frame) = model.frames.get_mut(&name) {
+                    frame.joint_offset_i = offset;
+                    frame.joint_offset_j = offset;
+                    frame.joint_offset_is_global = false;
+                }
+            }
+            Err(reason) => model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!("joint offsets of frame '{name}' ({reason})"),
+            }),
+        }
+    }
+
     for fmod in &raw_fmodifier {
         if !fmod
             .get("m_alive")
@@ -2162,11 +2261,27 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             },
         );
     }
+    let mut link_names = vec![String::new()];
     for (index, link) in raw_links.iter().enumerate() {
+        let name = native_name(link, "m_name", &(index + 1).to_string());
+        link_names.push(if native_alive(link) {
+            name.clone()
+        } else {
+            String::new()
+        });
         if !native_alive(link) {
             continue;
         }
-        let name = native_name(link, "m_name", &(index + 1).to_string());
+        // Example 6-008 orients its link with this flag and plane/axis vectors
+        // that are not interpreted; only the roll angle is imported.
+        if link.get("m_UserAxes").and_then(SdbVal::as_bool) == Some(true) {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!(
+                    "advanced local axes of link '{name}' (only the roll angle is imported)"
+                ),
+            });
+        }
         let raw_points = link
             .get("m_point")
             .and_then(SdbVal::as_arr_i32)
@@ -2376,12 +2491,58 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             }
         }
         lc.modal_damping = ac.get("m_Damp").and_then(SdbVal::as_f64).unwrap_or(0.05);
+        if matches!(ctype_code, 5 | 6) {
+            // Modal history damping. Type 4 is a constant ratio in m_Damp. Types 1
+            // and 2 are mass/stiffness proportional: Example 6-011a stores type 2
+            // with f1 = 1, f2 = 10, ratio 0.0059 and exactly the Rayleigh
+            // coefficients those give in m_dd, which are imported below. Their
+            // m_Damp is then not the active damping.
+            if matches!(ac.get("m_DampType").and_then(SdbVal::as_i32), Some(1 | 2)) {
+                lc.modal_damping = 0.0;
+            }
+            let count = |key: &str| ac.get(key).and_then(SdbVal::as_i32).unwrap_or(0);
+            if count("m_numberMDs") > 0 || count("m_numberFDs") > 0 {
+                model.unmodeled_source.push(UnmodeledSourceData {
+                    scope: UnmodeledScope::Case(name.clone()),
+                    description: format!(
+                        "per-mode or interpolated modal damping of case '{name}'"
+                    ),
+                });
+            }
+        }
         lc.modal_combo = match ac.get("m_modc").and_then(SdbVal::as_i32).unwrap_or(1) {
             2 => ModalComboMethod::Srss,
             3 => ModalComboMethod::AbsSum,
             _ => ModalComboMethod::Cqc,
         };
         if let Some(sc) = ac.get("m_SolControl").and_then(|v| v.as_obj()) {
+            // Nonlinear static load application: m_control 2 is displacement
+            // control (Example 6-008 stores control 2, target 10 and one
+            // monitored joint record for its "push to 10 in" case).
+            if ctype_code == 2 && sc.get("m_control").and_then(SdbVal::as_i32) == Some(2) {
+                let monitored = match ac.get("m_djoints") {
+                    Some(SdbVal::ArrObj(items)) if items.len() == 1 => {
+                        let item = &items[0];
+                        let joint = item.get("m_jn").and_then(SdbVal::as_i32).unwrap_or(0);
+                        let dof = item.get("m_dof").and_then(SdbVal::as_i32).unwrap_or(0);
+                        let plain_joint = item.get("m_DType").and_then(SdbVal::as_i32) == Some(1)
+                            && item.get("m_sf").and_then(SdbVal::as_f64) == Some(1.0);
+                        usize::try_from(joint)
+                            .ok()
+                            .and_then(|index| pt_names.get(index))
+                            .filter(|name| !name.is_empty() && plain_joint && (1..=6).contains(&dof))
+                            .map(|name| (name.clone(), (dof - 1) as usize))
+                    }
+                    _ => None,
+                };
+                lc.displacement_control = Some(sap_model::DisplacementControl {
+                    target: sc.get("m_TargetDisp").and_then(SdbVal::as_f64).unwrap_or(0.0),
+                    monitored,
+                    // 1 is the value every default case carries; the vendor
+                    // default is conjugate-displacement stepping.
+                    conjugate: sc.get("m_DispType").and_then(SdbVal::as_i32) != Some(2),
+                });
+            }
             if let Some(steps) = sc.get("m_nstep").and_then(SdbVal::as_i32) {
                 lc.num_time_steps = steps.max(0) as usize;
             }
@@ -2588,6 +2749,31 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             }
         }
     }
+    for load in &raw_nlgload {
+        if !native_alive(load) {
+            continue;
+        }
+        let multiplier = |key: &str| load.get(key).and_then(SdbVal::as_f64).unwrap_or(0.0);
+        if ["m_Ux", "m_Uy", "m_UZ"].iter().all(|key| multiplier(key) == 0.0) {
+            continue;
+        }
+        let index = |key: &str| load.get(key).and_then(SdbVal::as_i32).unwrap_or(0) as usize;
+        let link = link_names.get(index("m_n")).filter(|n| !n.is_empty());
+        let pattern = lpat_names.get(index("m_lc")).filter(|n| !n.is_empty());
+        model.unmodeled_source.push(match (link, pattern) {
+            (Some(link), Some(pattern)) => UnmodeledSourceData {
+                scope: UnmodeledScope::LoadPattern(pattern.clone()),
+                description: format!(
+                    "gravity load on link '{link}' in load pattern '{pattern}'"
+                ),
+            },
+            // An unresolved reference cannot be scoped; refuse everything.
+            _ => UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: "a link gravity load with an unresolved link or load pattern".into(),
+            },
+        });
+    }
     for fd in &raw_fdload {
         if !fd.get("m_alive").and_then(|v| v.as_bool()).unwrap_or(true) {
             continue;
@@ -2777,12 +2963,420 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
         }
     }
 
+    // Object-level area assignments: property modifiers, added mass and the
+    // N x N auto-mesh. They live in their own sections, keyed by area index.
+    let assigned_area = |record: &HashMap<String, SdbVal>| -> Option<String> {
+        let index = record.get("m_n").and_then(SdbVal::as_i32).unwrap_or(0);
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| ar_names.get(index))
+            .filter(|name| !name.is_empty())
+            .cloned()
+    };
+    let unassigned = |what: &str| UnmodeledSourceData {
+        scope: UnmodeledScope::AllCases,
+        description: format!("an area {what} assignment that could not be read"),
+    };
+    for record in raw_shmodifier.iter().filter(|r| native_alive(r)) {
+        let factors = record.get("m_sf").and_then(SdbVal::as_arr_f64);
+        match (
+            assigned_area(record).and_then(|name| model.areas.get_mut(&name)),
+            factors,
+        ) {
+            (Some(area), Some(factors)) if factors.len() == 10 => {
+                area.modifiers.copy_from_slice(factors);
+            }
+            _ => model.unmodeled_source.push(unassigned("property-modifier")),
+        }
+    }
+    for record in raw_shmass.iter().filter(|r| native_alive(r)) {
+        let mass = record.get("m_mpa").and_then(SdbVal::as_f64);
+        match (
+            assigned_area(record).and_then(|name| model.areas.get_mut(&name)),
+            mass,
+        ) {
+            (Some(area), Some(mass)) if mass.is_finite() && mass >= 0.0 => {
+                area.mass_per_area = mass;
+            }
+            _ => model.unmodeled_source.push(unassigned("added-mass")),
+        }
+    }
+    for record in raw_shmesh.iter().filter(|r| native_alive(r)) {
+        let Some(name) = assigned_area(record).filter(|n| model.areas.contains_key(n)) else {
+            model.unmodeled_source.push(unassigned("auto-mesh"));
+            continue;
+        };
+        let integer = |key: &str| record.get(key).and_then(SdbVal::as_i32).unwrap_or(0);
+        let flag = |key: &str| record.get(key).and_then(SdbVal::as_bool).unwrap_or(false);
+        let (mesh_type, n1, n2) = (integer("m_MeshType"), integer("m_n1"), integer("m_n2"));
+        let corners: Vec<[bool; 6]> = model.areas[&name]
+            .points
+            .iter()
+            .filter_map(|point| model.points.get(point))
+            .map(|point| point.restraint)
+            .collect();
+        // The solver restrains a mesh joint on an edge in the DOFs restrained
+        // at both ends of that edge, and an interior joint in the DOFs
+        // restrained at all four corners. That equals the vendor options only
+        // when they are on, or when there is nothing for them to act on.
+        let shared = |a: usize, b: usize| (0..6).any(|d| corners[a][d] && corners[b][d]);
+        let representable = mesh_type == 1
+            // Unequal counts need the vendor edge order, which no corpus file
+            // with restraints on edges exercises.
+            && n1 == n2
+            && n1 >= 1
+            && corners.len() == 4
+            && !flag("m_PointOnEdgeFromLine")
+            && !flag("m_PointOnEdgeFromPoint")
+            && !flag("m_ExtendCookieCutLines")
+            && !flag("m_SubMesh")
+            && !flag("m_LocalAxesOnEdge")
+            && !flag("m_LocalAxesOnFace")
+            && (flag("m_RestraintsOnEdge") || !(0..4).any(|c| shared(c, (c + 1) % 4)))
+            && (flag("m_RestraintsOnFace")
+                || !(0..6).any(|d| corners.iter().all(|corner| corner[d])));
+        if representable {
+            if let Some(area) = model.areas.get_mut(&name) {
+                area.auto_mesh = (n1 as usize, n2 as usize);
+            }
+        } else {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!(
+                    "auto-mesh assignment of area '{name}' ({n1} x {n2}, type {mesh_type}) with options that are not modeled"
+                ),
+            });
+        }
+    }
+
+    // A cable is solved between its end joints only. If it is flagged for
+    // subdivision at joints and a joint lies on its chord, the source connects
+    // them and this model does not.
+    for name in &cables_meshed_at_joints {
+        if let Some(joint) = model.frames.get(name).and_then(|f| joint_on_chord(&model, f)) {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!(
+                    "auto-subdivision of cable '{name}' at joint '{joint}', which lies on it"
+                ),
+            });
+        }
+    }
+
+    // Subdivision where two line objects cross away from a joint would create
+    // a joint connecting them. That is not modeled; it is recorded when such
+    // a crossing exists.
+    for name in &lines_meshed_at_crossings {
+        if let Some(other) = model.frames.get(name).and_then(|f| crossing_line(&model, f)) {
+            model.unmodeled_source.push(UnmodeledSourceData {
+                scope: UnmodeledScope::AllCases,
+                description: format!(
+                    "auto-subdivision of frame '{name}' where it crosses line object '{other}'"
+                ),
+            });
+        }
+    }
+
+    // Sections that carry analysis-relevant data but are not interpreted
+    // above (line springs, added masses, auto-mesh, hinges, several load
+    // types, ...) are recorded so they are not silently dropped.
+    skipped::record(sdb, &lpat_names, &mut model);
+
     Ok(model)
+}
+
+/// Whether a native line object mirrors its insertion point about local 2 or 3.
+fn insertion_is_mirrored(line: &HashMap<String, SdbVal>) -> bool {
+    ["m_Mirror2", "m_mirror3"]
+        .iter()
+        .any(|flag| line.get(*flag).and_then(SdbVal::as_bool) == Some(true))
+}
+
+/// The joint offset of a native `FOffset` record, in the element local system
+/// and equal at both ends.
+///
+/// The one corpus record (Example 1-011, +12 in along global Z at both ends of
+/// a member whose local 2 axis is global Z) stores a 3 x 2 array
+/// `[0, 0, 12, 12, 0, 0]` with coordinate system code -1. That fixes the
+/// layout as [component][end] and the code -1 as the local system. It does not
+/// show which column is which end, or any other coordinate system code, so
+/// unequal ends and other codes are not read.
+fn frame_joint_offset(record: &HashMap<String, SdbVal>) -> Result<[f64; 3], String> {
+    let values = record
+        .get("m_P")
+        .and_then(SdbVal::as_arr_f64)
+        .filter(|values| values.len() == 6)
+        .ok_or_else(|| "not three components at two ends".to_string())?;
+    let csys = record.get("m_csys").and_then(SdbVal::as_i32).unwrap_or(0);
+    if csys != -1 {
+        return Err(format!("coordinate system code {csys} is not the local system"));
+    }
+    if (0..3).any(|c| values[2 * c] != values[2 * c + 1]) {
+        return Err("they differ between the ends, whose order in the record is not established".to_string());
+    }
+    Ok([values[0], values[2], values[4]])
+}
+
+/// The automatic-subdivision assignment of a native line object.
+struct LineAutoMesh {
+    /// Number of segments (`0` where none is asked for).
+    segments: usize,
+    /// Subdivision at joints lying on the object.
+    at_joints: bool,
+    /// Subdivision where the object crosses other line objects.
+    at_crossings: bool,
+    /// Parts of the assignment that are not modeled whatever the geometry.
+    records: Vec<UnmodeledSourceData>,
+}
+
+/// Reads `m_AutoMesh`, `m_automeshn`, `m_AutoMeshAtPoints`, `m_AutoMeshAtLines`
+/// and `m_AutoMeshMaxLength` of a line object. The solver models a segment
+/// count and subdivision at joints for frame objects; a maximum segment length
+/// and a segment count on a cable are recorded instead.
+fn line_auto_mesh(line: &HashMap<String, SdbVal>, name: &str, is_cable: bool) -> LineAutoMesh {
+    let flag = |field: &str| line.get(field).and_then(SdbVal::as_bool) == Some(true);
+    let mut mesh = LineAutoMesh {
+        segments: 0,
+        at_joints: false,
+        at_crossings: false,
+        records: Vec::new(),
+    };
+    if !flag("m_AutoMesh") {
+        return mesh;
+    }
+    mesh.segments = line
+        .get("m_automeshn")
+        .and_then(SdbVal::as_i32)
+        .unwrap_or(0)
+        .max(0) as usize;
+    mesh.at_joints = flag("m_AutoMeshAtPoints");
+    mesh.at_crossings = flag("m_AutoMeshAtLines");
+    let max_length = line
+        .get("m_AutoMeshMaxLength")
+        .and_then(SdbVal::as_f64)
+        .unwrap_or(0.0);
+    if max_length != 0.0 {
+        mesh.records.push(UnmodeledSourceData {
+            scope: UnmodeledScope::AllButLinearStatic,
+            description: format!(
+                "auto-subdivision of frame '{name}' to a maximum segment length of {max_length}"
+            ),
+        });
+    }
+    if is_cable && mesh.segments > 1 {
+        mesh.records.push(UnmodeledSourceData {
+            scope: UnmodeledScope::AllButLinearStatic,
+            description: format!(
+                "auto-subdivision of cable '{name}' into {} segments",
+                mesh.segments
+            ),
+        });
+    }
+    mesh
+}
+
+/// A joint lying on the straight line between the ends of `frame`, strictly
+/// inside it (one millionth of its length from the line and from both ends).
+fn joint_on_chord(model: &SapModel, frame: &FrameObj) -> Option<String> {
+    let (pi, pj) = (
+        model.points.get(&frame.point_i)?,
+        model.points.get(&frame.point_j)?,
+    );
+    let axis = [pj.x - pi.x, pj.y - pi.y, pj.z - pi.z];
+    let length2: f64 = axis.iter().map(|c| c * c).sum();
+    if length2 <= 0.0 {
+        return None;
+    }
+    model
+        .points
+        .values()
+        .find(|p| {
+            if p.name == frame.point_i || p.name == frame.point_j {
+                return false;
+            }
+            let rel = [p.x - pi.x, p.y - pi.y, p.z - pi.z];
+            let t = (0..3).map(|c| rel[c] * axis[c]).sum::<f64>() / length2;
+            let off2: f64 = (0..3).map(|c| (rel[c] - t * axis[c]).powi(2)).sum();
+            t > 1e-6 && t < 1.0 - 1e-6 && off2 <= 1e-12 * length2
+        })
+        .map(|p| p.name.clone())
+}
+
+/// Another line object that crosses `frame` strictly inside both, so at a
+/// joint of neither. Parallel and collinear objects do not cross.
+fn crossing_line(model: &SapModel, frame: &FrameObj) -> Option<String> {
+    let ends = |f: &FrameObj| {
+        let (a, b) = (model.points.get(&f.point_i)?, model.points.get(&f.point_j)?);
+        Some(([a.x, a.y, a.z], [b.x, b.y, b.z]))
+    };
+    let (a0, a1) = ends(frame)?;
+    let dot = |x: &[f64; 3], y: &[f64; 3]| (0..3).map(|c| x[c] * y[c]).sum::<f64>();
+    model
+        .frames
+        .values()
+        .find(|other| {
+            if other.name == frame.name {
+                return false;
+            }
+            let Some((b0, b1)) = ends(other) else {
+                return false;
+            };
+            let d1: [f64; 3] = std::array::from_fn(|c| a1[c] - a0[c]);
+            let d2: [f64; 3] = std::array::from_fn(|c| b1[c] - b0[c]);
+            let r: [f64; 3] = std::array::from_fn(|c| a0[c] - b0[c]);
+            let (a, e, f) = (dot(&d1, &d1), dot(&d2, &d2), dot(&d2, &r));
+            let (b, c) = (dot(&d1, &d2), dot(&d1, &r));
+            let denom = a * e - b * b;
+            if a <= 0.0 || e <= 0.0 || denom <= 1e-12 * a * e {
+                return false;
+            }
+            // Closest points: a0 + s d1 and b0 + t d2.
+            let s = (b * f - c * e) / denom;
+            let t = (a * f - b * c) / denom;
+            let gap2: f64 = (0..3)
+                .map(|k| (r[k] + s * d1[k] - t * d2[k]).powi(2))
+                .sum();
+            let inside = |v: f64| v > 1e-6 && v < 1.0 - 1e-6;
+            inside(s) && inside(t) && gap2 <= 1e-12 * a.max(e)
+        })
+        .map(|other| other.name.clone())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_joint_offsets_are_read_only_in_the_one_verified_form() {
+        let record = |values: &[f64], csys: i32| -> HashMap<String, SdbVal> {
+            HashMap::from([
+                ("m_P".to_string(), SdbVal::ArrF64(values.to_vec())),
+                ("m_csys".to_string(), SdbVal::I32(csys)),
+            ])
+        };
+        // The Example 1-011 record: +12 along local 2 at both ends.
+        assert_eq!(
+            frame_joint_offset(&record(&[0.0, 0.0, 12.0, 12.0, 0.0, 0.0], -1)),
+            Ok([0.0, 12.0, 0.0])
+        );
+        assert_eq!(
+            frame_joint_offset(&record(&[1.0, 1.0, -2.0, -2.0, 3.5, 3.5], -1)),
+            Ok([1.0, -2.0, 3.5])
+        );
+        // Another coordinate system, unequal ends and a wrong size are not read.
+        assert!(frame_joint_offset(&record(&[0.0, 0.0, 12.0, 12.0, 0.0, 0.0], 0))
+            .unwrap_err()
+            .contains("coordinate system code 0"));
+        assert!(frame_joint_offset(&record(&[0.0, 0.0, 12.0, 6.0, 0.0, 0.0], -1))
+            .unwrap_err()
+            .contains("differ between the ends"));
+        assert!(frame_joint_offset(&record(&[0.0, 12.0, 0.0], -1)).is_err());
+
+        // Either mirror flag marks the insertion point as mirrored.
+        let line = |a: bool, b: bool| -> HashMap<String, SdbVal> {
+            HashMap::from([
+                ("m_Mirror2".to_string(), SdbVal::Bool(a)),
+                ("m_mirror3".to_string(), SdbVal::Bool(b)),
+            ])
+        };
+        assert!(!insertion_is_mirrored(&line(false, false)));
+        assert!(!insertion_is_mirrored(&HashMap::new()));
+        assert!(insertion_is_mirrored(&line(true, false)));
+        assert!(insertion_is_mirrored(&line(false, true)));
+    }
+
+    #[test]
+    fn line_auto_mesh_reads_what_is_modeled_and_records_the_rest() {
+        let line = |fields: &[(&str, SdbVal)]| -> HashMap<String, SdbVal> {
+            fields.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
+        };
+        // Not enabled: stale values behind the flag are ignored.
+        let off = line(&[
+            ("m_AutoMesh", SdbVal::Bool(false)),
+            ("m_automeshn", SdbVal::I32(8)),
+            ("m_AutoMeshAtPoints", SdbVal::Bool(true)),
+            ("m_AutoMeshMaxLength", SdbVal::F64(24.0)),
+        ]);
+        let mesh = line_auto_mesh(&off, "1", false);
+        assert_eq!((mesh.segments, mesh.at_joints, mesh.at_crossings), (0, false, false));
+        assert!(mesh.records.is_empty());
+
+        let on = line(&[
+            ("m_AutoMesh", SdbVal::Bool(true)),
+            ("m_automeshn", SdbVal::I32(16)),
+            ("m_AutoMeshAtPoints", SdbVal::Bool(true)),
+            ("m_AutoMeshAtLines", SdbVal::Bool(true)),
+        ]);
+        let mesh = line_auto_mesh(&on, "1", false);
+        assert_eq!((mesh.segments, mesh.at_joints, mesh.at_crossings), (16, true, true));
+        assert!(mesh.records.is_empty());
+
+        // A negative count is no count.
+        let negative = line(&[("m_AutoMesh", SdbVal::Bool(true)), ("m_automeshn", SdbVal::I32(-3))]);
+        assert_eq!(line_auto_mesh(&negative, "1", false).segments, 0);
+
+        // A maximum segment length is not modeled.
+        let limited = line(&[
+            ("m_AutoMesh", SdbVal::Bool(true)),
+            ("m_AutoMeshMaxLength", SdbVal::F64(24.0)),
+        ]);
+        let mesh = line_auto_mesh(&limited, "B7", false);
+        assert_eq!(
+            mesh.records,
+            [UnmodeledSourceData {
+                scope: UnmodeledScope::AllButLinearStatic,
+                description: "auto-subdivision of frame 'B7' to a maximum segment length of 24"
+                    .to_string(),
+            }]
+        );
+
+        // Neither is a segment count on a cable object.
+        let mesh = line_auto_mesh(&on, "C1", true);
+        assert_eq!(
+            mesh.records,
+            [UnmodeledSourceData {
+                scope: UnmodeledScope::AllButLinearStatic,
+                description: "auto-subdivision of cable 'C1' into 16 segments".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn joints_on_a_chord_and_line_crossings_are_found_by_geometry() {
+        let mut m = SapModel::default();
+        m.add_point("A", 0.0, 0.0, 0.0);
+        m.add_point("B", 10.0, 0.0, 0.0);
+        m.add_frame("AB", "A", "B", "FSEC1");
+        assert_eq!(joint_on_chord(&m, &m.frames["AB"]), None);
+        assert_eq!(crossing_line(&m, &m.frames["AB"]), None);
+
+        // Beyond the end, off the line, and on it.
+        m.add_point("BEYOND", 12.0, 0.0, 0.0);
+        m.add_point("OFF", 4.0, 0.001, 0.0);
+        assert_eq!(joint_on_chord(&m, &m.frames["AB"]), None);
+        m.add_point("ON", 4.0, 0.0, 0.0);
+        assert_eq!(joint_on_chord(&m, &m.frames["AB"]), Some("ON".to_string()));
+
+        // A T-junction ends at a joint of the other object: not a crossing.
+        m.add_point("T", 4.0, 5.0, 0.0);
+        m.add_frame("TEE", "ON", "T", "FSEC1");
+        assert_eq!(crossing_line(&m, &m.frames["AB"]), None);
+        // Parallel, collinear and skew objects do not cross either.
+        m.add_point("P1", 0.0, 3.0, 0.0);
+        m.add_point("P2", 10.0, 3.0, 0.0);
+        m.add_frame("PARALLEL", "P1", "P2", "FSEC1");
+        m.add_frame("COLLINEAR", "ON", "BEYOND", "FSEC1");
+        m.add_point("S1", 6.0, -5.0, 2.0);
+        m.add_point("S2", 6.0, 5.0, 2.0);
+        m.add_frame("SKEW", "S1", "S2", "FSEC1");
+        assert_eq!(crossing_line(&m, &m.frames["AB"]), None);
+        // A true crossing inside both, with no joint there.
+        m.add_point("X1", 7.0, -5.0, 0.0);
+        m.add_point("X2", 7.0, 5.0, 0.0);
+        m.add_frame("CROSS", "X1", "X2", "FSEC1");
+        assert_eq!(crossing_line(&m, &m.frames["AB"]), Some("CROSS".to_string()));
+        assert_eq!(crossing_line(&m, &m.frames["CROSS"]), Some("AB".to_string()));
+    }
 
     #[test]
     fn unsupported_native_history_or_spectrum_excitation_is_an_explicit_error() {

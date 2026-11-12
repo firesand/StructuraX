@@ -11,6 +11,8 @@ impl SapModel {
         section: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -101,6 +103,8 @@ impl SapModel {
         eccentricity: f64,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -275,6 +279,8 @@ impl SapModel {
         web_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -384,6 +390,8 @@ impl SapModel {
         area_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -564,6 +572,8 @@ impl SapModel {
         area_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
@@ -636,6 +646,8 @@ impl SapModel {
         area_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();

@@ -576,3 +576,420 @@ fn cable_m_cable_type_modes_roundtrip_through_native_sdb() {
         assert_eq!(restored, m);
     }
 }
+
+fn wen_pushover_model() -> SapModel {
+    let mut m = supported_model();
+    m.points["A"].restraint = [true; 6];
+    let mut prop = LinkProp {
+        name: "PLAW".into(),
+        link_type: LinkPropType::PlasticWen,
+        ..LinkProp::default()
+    };
+    prop.dof_active = [false, true, false, false, false, false];
+    prop.dof_nonlinear[1] = true;
+    prop.ke = [0.; 6];
+    prop.k_nl[1] = 100.;
+    prop.param1[1] = 50.;
+    prop.param2[1] = 0.1;
+    prop.param3 = [1., 1., 2., 2., 2., 2.];
+    m.link_props.insert("PLAW".into(), prop);
+    m.links.insert(
+        "L".into(),
+        LinkObj {
+            name: "L".into(),
+            point_i: "B".into(),
+            point_j: None,
+            prop: "PLAW".into(),
+            angle_deg: 0.,
+            selected: false,
+        },
+    );
+    let mut push = LoadCase::linear_static("PUSH", "DEAD", 1.);
+    push.case_type = LoadCaseType::NonlinearStatic;
+    push.displacement_control = Some(DisplacementControl {
+        target: 10.,
+        monitored: Some(("B".into(), 2)),
+        conjugate: true,
+    });
+    m.load_cases.insert("PUSH".into(), push);
+    let mut back = LoadCase::linear_static("BACK", "DEAD", -1.);
+    back.case_type = LoadCaseType::NonlinearStatic;
+    back.initial_case = Some("PUSH".into());
+    back.displacement_control = Some(DisplacementControl {
+        target: 20.,
+        monitored: Some(("B".into(), 2)),
+        conjugate: false,
+    });
+    m.load_cases.insert("BACK".into(), back);
+    m
+}
+
+#[test]
+fn wen_exponent_and_displacement_control_roundtrip_natively_and_through_s2k() {
+    let m = wen_pushover_model();
+    let native = pack_model_to_native_sdb(&m).unwrap();
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+    // One monitored-displacement record per displacement-controlled case.
+    assert_eq!(doc.inventory().classes["TYNLCDisp"], 2);
+    let r = extract_sdb_to_model(&native).unwrap();
+    assert_eq!(r.link_props["PLAW"], m.link_props["PLAW"]);
+    assert_eq!(r.load_cases["PUSH"], m.load_cases["PUSH"]);
+    assert_eq!(r.load_cases["BACK"], m.load_cases["BACK"]);
+    assert!(r.load_cases["DEAD"].displacement_control.is_none());
+
+    let text = write_s2k(&m);
+    assert!(text.contains("RustDisplTarget=10") && text.contains("RustDisplDOF=U3"));
+    assert!(text.contains("Param3=2"));
+    let s = parse_s2k(&text).unwrap();
+    assert_eq!(s.link_props["PLAW"], m.link_props["PLAW"]);
+    assert_eq!(s.load_cases["PUSH"], m.load_cases["PUSH"]);
+    assert_eq!(s.load_cases["BACK"], m.load_cases["BACK"]);
+    assert!(parse_s2k(&text.replace("RustDisplDOF=U3", "RustDisplDOF=UZ")).is_err());
+
+    // A model reopened from that S2K text keeps its source for preservation;
+    // the extension columns must count as represented data, so native
+    // synthesis and a second S2K save still work and agree.
+    let native_again = pack_model_to_native_sdb(&s).unwrap();
+    let r2 = extract_sdb_to_model(&native_again).unwrap();
+    assert_eq!(r2.link_props["PLAW"], m.link_props["PLAW"]);
+    assert_eq!(r2.load_cases["PUSH"], m.load_cases["PUSH"]);
+    let report = sap_format::try_write_s2k_with_report(&s).unwrap();
+    let again = parse_s2k(&report.text).unwrap();
+    assert_eq!(again.link_props["PLAW"], m.link_props["PLAW"]);
+    assert_eq!(again.load_cases["BACK"], m.load_cases["BACK"]);
+    assert!(!report
+        .warnings
+        .iter()
+        .any(|w| w.contains("Param3") || w.contains("RustDispl")));
+}
+
+#[test]
+fn unrepresentable_displacement_control_and_parameter_rows_are_not_exported() {
+    let mut m = wen_pushover_model();
+    m.load_cases["PUSH"].displacement_control.as_mut().unwrap().monitored = None;
+    assert_rejected_unchanged(&m, "load_cases.PUSH.displacement_control");
+    let mut m = wen_pushover_model();
+    m.load_cases["PUSH"].displacement_control.as_mut().unwrap().monitored =
+        Some(("MISSING".into(), 2));
+    assert_rejected_unchanged(&m, "load_cases.PUSH.displacement_control");
+    let mut m = wen_pushover_model();
+    m.load_cases["PUSH"].displacement_control.as_mut().unwrap().monitored = Some(("B".into(), 6));
+    assert_rejected_unchanged(&m, "load_cases.PUSH.displacement_control");
+    let mut m = wen_pushover_model();
+    m.load_cases["PUSH"].case_type = LoadCaseType::LinearStatic;
+    assert_rejected_unchanged(&m, "load_cases.PUSH.displacement_control");
+    // The third parameter row is only written for the Wen law; elsewhere it
+    // would be lost on reimport, so the roundtrip check refuses the export.
+    let mut m = wen_pushover_model();
+    m.link_props["PLAW"].link_type = LinkPropType::Gap;
+    assert_rejected_unchanged(&m, "link_props.PLAW.param3");
+}
+
+fn unmodeled(scope: UnmodeledScope, description: &str) -> UnmodeledSourceData {
+    UnmodeledSourceData {
+        scope,
+        description: description.into(),
+    }
+}
+
+#[test]
+fn unmodeled_source_entries_survive_s2k_and_block_native_synthesis() {
+    let mut m = supported_model();
+    m.unmodeled_source = vec![
+        unmodeled(
+            UnmodeledScope::AllCases,
+            "advanced local axes of link '1' (only the roll angle is imported)",
+        ),
+        unmodeled(UnmodeledScope::NonlinearCases, "2 frame hinge assignment(s)"),
+        unmodeled(UnmodeledScope::DynamicCases, "2 frame added-mass assignments"),
+        unmodeled(
+            UnmodeledScope::LoadPattern("WIND X-1".into()),
+            "gravity load on link \"A\" in load pattern 'WIND X-1'",
+        ),
+        unmodeled(
+            UnmodeledScope::Case("NLMHIST1".into()),
+            "per-mode or interpolated modal damping of case 'NLMHIST1'",
+        ),
+    ];
+    let text = write_s2k(&m);
+    assert!(text.contains("TABLE:  \"RUST UNMODELED SOURCE DATA\""));
+    let reopened = parse_s2k(&text).unwrap();
+    assert_eq!(reopened.unmodeled_source, m.unmodeled_source);
+    // A second save from the reopened model (with its retained source) agrees.
+    let again = parse_s2k(&sap_format::try_write_s2k_with_report(&reopened).unwrap().text).unwrap();
+    assert_eq!(again.unmodeled_source, m.unmodeled_source);
+
+    // Discarding one entry from a model that still retains its S2K source: the
+    // save must drop that row, keep the others, and not bring the row back.
+    // (A source that differs from the canonical text is retained; a comment
+    // line is enough.)
+    let mut edited = parse_s2k(&format!("$ handwritten note\n{text}")).unwrap();
+    assert!(edited.s2k_preservation.is_some());
+    assert_eq!(edited.unmodeled_source, m.unmodeled_source);
+    let discarded = edited.unmodeled_source.remove(1);
+    assert_eq!(discarded.description, "2 frame hinge assignment(s)");
+    let saved = sap_format::try_write_s2k_with_report(&edited).unwrap();
+    assert!(!saved.text.contains("frame hinge assignment"));
+    let after = parse_s2k(&saved.text).unwrap();
+    assert_eq!(after.unmodeled_source, edited.unmodeled_source);
+    assert_eq!(after.unmodeled_source.len(), 4);
+    // Discarding all of them removes the table.
+    edited.unmodeled_source.clear();
+    let saved = sap_format::try_write_s2k_with_report(&edited).unwrap();
+    assert!(!saved.text.contains("RUST UNMODELED SOURCE DATA"));
+    assert!(parse_s2k(&saved.text).unwrap().unmodeled_source.is_empty());
+
+    // Synthesis would write a file that silently lacks the data.
+    assert_rejected_unchanged(&m, "unmodeled_source");
+    assert!(pack_model_to_native_sdb(&reopened)
+        .unwrap_err()
+        .to_string()
+        .contains("unmodeled_source"));
+    // Discarding the entries is what makes the model exportable.
+    m.unmodeled_source.clear();
+    pack_model_to_native_sdb(&m).unwrap();
+
+    // A row that cannot be understood must not read as "nothing is missing".
+    for (from, to) in [
+        ("Scope=Nonlinear", "Scope=Sometimes"),
+        ("Scope=Pattern   Target=\"WIND X-1\"", "Scope=Pattern   Target=\"\""),
+        ("Description=\"2 frame hinge assignment(s)\"", "Description=\"\""),
+    ] {
+        assert!(text.contains(from), "{from}");
+        assert!(parse_s2k(&text.replace(from, to)).is_err(), "{to}");
+    }
+}
+
+/// A modal history whose damping is carried as Rayleigh coefficients is written
+/// with the "direct coefficients" damping type, so a reader does not take the
+/// coefficients for inactive data next to a zero constant ratio.
+#[test]
+fn proportional_modal_history_damping_keeps_its_native_damping_type() {
+    let mut m = supported_model();
+    m.functions.insert(
+        "RAMP".into(),
+        DynamicFunction {
+            name: "RAMP".into(),
+            is_time_history: true,
+            damping_ratio: 0.,
+            points: vec![(0., 0.), (1., 1.)],
+        },
+    );
+    let mut history = LoadCase::linear_static("MHIST", "DEAD", 1.);
+    history.loads.clear();
+    history.case_type = LoadCaseType::LinearHistory;
+    history.history_loads = vec![("RAMP".into(), "DEAD".into(), 1.)];
+    history.modal_damping = 0.;
+    history.rayleigh_damping = (0.0741, 0.0002);
+    m.load_cases.insert("MHIST".into(), history);
+    let recovered = extract_sdb_to_model(&pack_model_to_native_sdb(&m).unwrap()).unwrap();
+    assert_eq!(recovered.load_cases["MHIST"], m.load_cases["MHIST"]);
+
+    // A constant ratio together with coefficients has no single native
+    // damping type; the readback differs and the export is refused.
+    m.load_cases["MHIST"].modal_damping = 0.02;
+    assert_rejected_unchanged(&m, "load_cases.MHIST.modal_damping");
+}
+
+#[test]
+fn s2k_modal_history_cases_default_to_zero_modal_damping() {
+    let mut m = supported_model();
+    let mut history = LoadCase::linear_static("H", "DEAD", 1.);
+    history.case_type = LoadCaseType::LinearHistory;
+    history.modal_damping = 0.;
+    m.load_cases.insert("H".into(), history);
+    let mut spectrum_default = LoadCase::linear_static("S", "DEAD", 1.);
+    spectrum_default.case_type = LoadCaseType::NonlinearStatic;
+    m.load_cases.insert("S".into(), spectrum_default);
+    let text = write_s2k(&m);
+    // A handwritten row that states no ConstDamp: a modal history gets none,
+    // every other type keeps the general 0.05 default.
+    let without: String = text
+        .lines()
+        .map(|line| match line.find("ConstDamp=") {
+            Some(start) => {
+                let rest = &line[start..];
+                let end = rest.find("   ").map_or(line.len(), |i| start + i + 3);
+                format!("{}{}", &line[..start], &line[end..])
+            }
+            None => line.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!without.contains("ConstDamp"));
+    let parsed = parse_s2k(&without).unwrap();
+    assert_eq!(parsed.load_cases["H"].modal_damping, 0.0);
+    assert_eq!(parsed.load_cases["S"].modal_damping, 0.05);
+    // A stated ratio is kept, so analysis can refuse it instead of losing it.
+    let stated = parse_s2k(&text.replacen("ConstDamp=0 ", "ConstDamp=0.02 ", 1)).unwrap();
+    assert_eq!(
+        stated.load_cases.values().filter(|c| c.modal_damping == 0.02).count(),
+        1
+    );
+}
+
+/// Object-level area assignments are written to the sections where the corpus
+/// keeps them and read back from there: an N x N auto-mesh (`ShMesh`), added
+/// mass (`ShMass`) and property modifiers (`ShModifier`).
+#[test]
+fn area_mesh_mass_and_modifiers_roundtrip_natively_and_through_s2k() {
+    let mut m = supported_model();
+    m.add_point("C", 12., 12., 0.);
+    m.add_point("D", 0., 12., 0.);
+    let mut area = AreaObj::new(
+        "A1",
+        vec!["A".into(), "B".into(), "C".into(), "D".into()],
+        m.area_sections.keys().next().unwrap().clone(),
+    );
+    area.auto_mesh = (4, 4);
+    area.mass_per_area = 7.35e-7;
+    area.modifiers[6] = 1000.;
+    area.modifiers[7] = 1000.;
+    m.areas.insert("A1".into(), area);
+    // A second, plain area gets no records.
+    m.add_point("E", 24., 0., 0.);
+    m.add_point("F", 24., 12., 0.);
+    m.areas.insert(
+        "A2".into(),
+        AreaObj::new(
+            "A2",
+            vec!["B".into(), "E".into(), "F".into(), "C".into()],
+            m.area_sections.keys().next().unwrap().clone(),
+        ),
+    );
+    let native = pack_model_to_native_sdb(&m).unwrap();
+    let classes = &inspect_native_sdb(&native).unwrap().inventory().classes.clone();
+    assert_eq!(
+        (classes["TYShMesh"], classes["TYSMass"], classes["TYShModifier"]),
+        (1, 1, 1)
+    );
+    let r = extract_sdb_to_model(&native).unwrap();
+    assert_eq!(r.areas["A1"], m.areas["A1"]);
+    assert_eq!(r.areas["A2"], m.areas["A2"]);
+    assert!(r.unmodeled_source.is_empty());
+    let s = parse_s2k(&write_s2k(&m)).unwrap();
+    assert_eq!(s.areas["A1"], m.areas["A1"]);
+
+    // Unequal counts have no verified native edge order.
+    m.areas["A1"].auto_mesh = (2, 4);
+    assert_rejected_unchanged(&m, "areas.A1.auto_mesh");
+    assert_eq!(parse_s2k(&write_s2k(&m)).unwrap().areas["A1"].auto_mesh, (2, 4));
+}
+
+/// Native area-section type codes follow the corpus, not the OAPI enumeration:
+/// thin and thick shells and plane stress/strain have observed codes; plate,
+/// membrane and layered sections do not and are refused.
+#[test]
+fn area_section_types_roundtrip_or_are_refused() {
+    for (prop_type, shell_type, plane_type) in [
+        (AreaPropType::Shell, ShellType::ShellThin, PlaneType::PlaneStress),
+        (AreaPropType::Shell, ShellType::ShellThick, PlaneType::PlaneStress),
+        (AreaPropType::Plane, ShellType::ShellThin, PlaneType::PlaneStress),
+        (AreaPropType::Plane, ShellType::ShellThin, PlaneType::PlaneStrain),
+        (AreaPropType::ASolid, ShellType::ShellThin, PlaneType::PlaneStress),
+    ] {
+        let mut m = supported_model();
+        let name = m.area_sections.keys().next().unwrap().clone();
+        m.area_sections[&name].prop_type = prop_type;
+        m.area_sections[&name].shell_type = shell_type;
+        m.area_sections[&name].plane_type = plane_type;
+        let r = extract_sdb_to_model(&pack_model_to_native_sdb(&m).unwrap()).unwrap();
+        assert_eq!(r.area_sections[&name], m.area_sections[&name]);
+        let s = parse_s2k(&write_s2k(&m)).unwrap();
+        assert_eq!(s.area_sections[&name], m.area_sections[&name]);
+    }
+    for shell_type in [
+        ShellType::PlateThin,
+        ShellType::PlateThick,
+        ShellType::Membrane,
+        ShellType::ShellLayered,
+    ] {
+        let mut m = supported_model();
+        let name = m.area_sections.keys().next().unwrap().clone();
+        m.area_sections[&name].shell_type = shell_type;
+        assert_rejected_unchanged(&m, &format!("area_sections.{name}.shell_type"));
+    }
+}
+
+/// Automatic frame subdivision is stored on the line object: the enabling
+/// flag, subdivision at joints, and the segment count. It roundtrips natively
+/// and through S2K, and frames without it are written as before.
+#[test]
+fn frame_auto_subdivision_roundtrips_natively_and_through_s2k() {
+    let mut m = supported_model();
+    let frame = m.frames.keys().next().unwrap().clone();
+    let (i, j, section) = {
+        let f = &m.frames[frame.as_str()];
+        (f.point_i.clone(), f.point_j.clone(), f.section.clone())
+    };
+    m.add_frame("SEG", i.clone(), j.clone(), section.clone());
+    m.frames["SEG"].auto_mesh_segments = 16;
+    m.add_frame("JNT", i.clone(), j.clone(), section.clone());
+    m.frames["JNT"].auto_mesh_at_joints = true;
+    m.add_frame("BOTH", i, j, section);
+    m.frames["BOTH"].auto_mesh_segments = 10;
+    m.frames["BOTH"].auto_mesh_at_joints = true;
+
+    let native = pack_model_to_native_sdb(&m).unwrap();
+    let r = extract_sdb_to_model(&native).unwrap();
+    assert!(r.unmodeled_source.is_empty(), "{:?}", r.unmodeled_source);
+    let s = parse_s2k(&write_s2k(&m)).unwrap();
+    for model in [&r, &s] {
+        for (name, original) in &m.frames {
+            let read = &model.frames[name];
+            assert_eq!(
+                (read.auto_mesh_segments, read.auto_mesh_at_joints),
+                (original.auto_mesh_segments, original.auto_mesh_at_joints),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            (model.frames[frame.as_str()].auto_mesh_segments, model.frames[frame.as_str()].auto_mesh_at_joints),
+            (0, false)
+        );
+    }
+    // The S2K columns appear only on the frames that have the assignment.
+    let text = write_s2k(&m);
+    assert_eq!(text.matches("MeshSegments=").count(), 2);
+    assert_eq!(text.matches("MeshAtJoints=Yes").count(), 2);
+
+    // A count that does not fit the native integer is refused, not truncated.
+    m.frames["SEG"].auto_mesh_segments = i32::MAX as usize + 1;
+    assert_rejected_unchanged(&m, "frames.SEG.auto_mesh_segments");
+}
+
+/// Insertion-point joint offsets are written to `FOffset` in the form the
+/// corpus shows (element local, equal at both ends, a 3 x 2 array) and read
+/// back; the forms with no native evidence are refused, and S2K carries all.
+#[test]
+fn frame_joint_offsets_roundtrip_natively_in_the_verified_form_only() {
+    let mut m = supported_model();
+    m.frames["F"].cardinal_point = 1;
+    m.frames["F"].stiff_transform = true;
+    m.frames["F"].joint_offset_is_global = false;
+    m.frames["F"].joint_offset_i = [0.0, 12.0, -1.5];
+    m.frames["F"].joint_offset_j = [0.0, 12.0, -1.5];
+    // Partial fixity shares the per-end array layout.
+    m.frames["F"].release_j[5] = true;
+    m.frames["F"].end_spring[5] = 250.0;
+
+    let native = pack_model_to_native_sdb(&m).unwrap();
+    let classes = &inspect_native_sdb(&native).unwrap().inventory().classes.clone();
+    assert_eq!((classes["TYFOffset"], classes["TYFFixity"]), (1, 1));
+    let r = extract_sdb_to_model(&native).unwrap();
+    assert_eq!(r.frames["F"], m.frames["F"]);
+    assert!(r.unmodeled_source.is_empty());
+    assert_eq!(parse_s2k(&write_s2k(&m)).unwrap().frames["F"], m.frames["F"]);
+
+    // Offsets that differ between the ends, or are given in the global
+    // system, have no verified native form.
+    let mut unequal = m.clone();
+    unequal.frames["F"].joint_offset_j = [0.0, 6.0, -1.5];
+    assert_rejected_unchanged(&unequal, "frames.F.joint_offset_j");
+    assert_eq!(parse_s2k(&write_s2k(&unequal)).unwrap().frames["F"], unequal.frames["F"]);
+    let mut global = m.clone();
+    global.frames["F"].joint_offset_is_global = true;
+    assert_rejected_unchanged(&global, "frames.F.joint_offset_is_global");
+    assert_eq!(parse_s2k(&write_s2k(&global)).unwrap().frames["F"], global.frames["F"]);
+}

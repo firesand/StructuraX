@@ -2,7 +2,7 @@
 use super::{cSapModel, OAPI_ERR, OAPI_OK};
 use sap_model::{LinkObj, LinkProp, LinkPropType, SapModel};
 
-/// Validate the represented linear/Damper/Gap/Hook subset before changing a model.
+/// Validate the represented linear/Damper/Gap/Hook/plastic Wen subset before changing a model.
 pub fn set_link_property(model: &mut SapModel, mut property: LinkProp) -> Result<(), String> {
     if model.is_locked {
         return Err("Model is locked.".into());
@@ -15,18 +15,37 @@ pub fn set_link_property(model: &mut SapModel, mut property: LinkProp) -> Result
     }
     if !matches!(
         property.link_type,
-        LinkPropType::Linear | LinkPropType::Damper | LinkPropType::Gap | LinkPropType::Hook
+        LinkPropType::Linear
+            | LinkPropType::Damper
+            | LinkPropType::Gap
+            | LinkPropType::Hook
+            | LinkPropType::PlasticWen
     ) {
-        return Err("This editor supports linear, damper, gap and hook link properties only.".into());
+        return Err(
+            "This editor supports linear, damper, gap, hook and plastic Wen link properties only."
+                .into(),
+        );
     }
+    let wen = property.link_type == LinkPropType::PlasticWen;
     let valid_param2 = if property.link_type == LinkPropType::Damper {
         property
             .param2
             .iter()
             .all(|v| v.is_finite() && (*v == 0.0 || (*v - 1.0).abs() <= 1e-9))
+    } else if wen {
+        // Post-yield stiffness ratio.
+        property.param2.iter().all(|v| (0.0..=1.0).contains(v))
     } else {
         property.param2.iter().all(|v| v.is_finite() && *v == 0.0)
     };
+    // The third parameter row is the Wen yield exponent; other laws have none.
+    let valid_param3 = property
+        .param3
+        .iter()
+        .all(|v| *v == 0.0 || (wen && (1.0..=20.0).contains(v)));
+    if !valid_param3 {
+        return Err("The third nonlinear parameter is the plastic Wen yield exponent: 1 to 20 for a Wen DOF, zero otherwise.".into());
+    }
     if property
         .ke
         .iter()
@@ -50,7 +69,16 @@ pub fn set_link_property(model: &mut SapModel, mut property: LinkProp) -> Result
                 || property.dof_fixed[d]
                 || property.link_type == LinkPropType::Linear)
         {
-            return Err("Nonlinear flags require an active, unfixed Damper/Gap/Hook DOF.".into());
+            return Err(
+                "Nonlinear flags require an active, unfixed Damper/Gap/Hook/plastic Wen DOF."
+                    .into(),
+            );
+        }
+        if wen
+            && property.dof_nonlinear[d]
+            && (property.k_nl[d] <= 0.0 || property.param1[d] <= 0.0 || property.param3[d] < 1.0)
+        {
+            return Err("A nonlinear plastic Wen DOF needs positive stiffness k_nl, positive yield force (param1), post-yield ratio in [0, 1] (param2) and yield exponent in [1, 20] (param3).".into());
         }
         if property.link_type == LinkPropType::Damper && property.dof_nonlinear[d] {
             if property.k_nl[d] <= 0.0 {

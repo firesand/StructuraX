@@ -1,8 +1,8 @@
 {
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
-  "snapshot_date": "2026-10-15",
-  "snapshot_note": "Post-review correctness repairs: constitutive reaction recovery, explicit unsupported-input guards, checked native export and verified design formula corrections. Full product/vendor parity remains unestablished.",
+  "snapshot_date": "2026-11-12",
+  "snapshot_note": "Post-review correctness repairs: constitutive reaction recovery, explicit unsupported-input guards, checked native export and verified design formula corrections. Full product/vendor parity remains unestablished. Amended 2026-11-12: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md).",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
     "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
@@ -58,9 +58,21 @@
         {
           "file": "docs/reconstruction/beam-workflows.md",
           "note": "Independent simply supported, cantilever and two-span analytical tests expose and verify station recovery correction."
+        },
+        {
+          "file": "docs/reconstruction/frame-auto-mesh.md",
+          "note": "Automatic frame subdivision: published per-mesh values of Examples 1-006, 1-014, 1-016, 1-017 and 1-019, equivalence with hand-split members, and refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/frame_insertion_point_regressions.rs",
+          "note": "Example 1-011 published values, closed forms for eccentric axial load, equality under subdivision, and refusals."
+        },
+        {
+          "file": "docs/reconstruction/frame-insertion-point.md",
+          "note": "Insertion-point transformation: scope, bounds, evidence, native FOffset layout, and the M2 sign correction."
         }
       ],
-      "limits": "Frame theory and loads still require broader vendor fixture comparisons; the selected synthetic benchmark suite is not full v19 validation."
+      "limits": "Frame theory and loads still require broader vendor fixture comparisons; the selected synthetic benchmark suite is not full v19 validation. Automatic frame subdivision (a number of segments, or at joints lying on the frame) is analyzed and results are reported per object; it is refused with cables, member T/C limits, end length offsets, a segment count together with joints on the span, and area-mesh joints on the frame. Subdivision at crossings with other objects and by maximum segment length is not modeled. A frame insertion point (cardinal point other than the centroid, or joint offsets) with stiffness transformation is modeled as rigid arms for equal offsets across the member, doubly symmetric shapes and linear static cases only; other cases and forms are refused. Frame M2 follows the SAP2000 sign convention as of 2026-11-12 (it had the opposite sign)."
     },
     {
       "id": "frame-geometric-nonlinearity",
@@ -91,7 +103,7 @@
           "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "No general large-displacement corotational frame/shell behavior. Capped frames with geometric nonlinearity and unsupported loading/offset combinations reject."
+      "limits": "No general large-displacement corotational frame/shell behavior. Capped frames with geometric nonlinearity and unsupported loading/offset combinations reject. Displacement-controlled nonlinear static is limited to small displacements, one monitored joint displacement and a monotonically increasing load factor; see docs/reconstruction/solver-wen.md."
     },
     {
       "id": "frame-modal-buckling-spectrum",
@@ -118,9 +130,13 @@
           "file": "crates/sap-solver/src/lib.rs",
           "lines": "2111-2345",
           "note": "Response spectrum path."
+        },
+        {
+          "file": "crates/sap-solver/tests/frame_span_load_regressions.rs",
+          "note": "Closed-form Euler buckling under two scaled load patterns; closed-form span-moment diagrams."
         }
       ],
-      "limits": "Not all vendor modal options or response-spectrum functions/combination rules are exposed. Validate modes, participation, buckling factors, damping, directionality, and result combinations against reference outputs."
+      "limits": "Not all vendor modal options or response-spectrum functions/combination rules are exposed. Validate modes, participation, buckling factors, damping, directionality, and result combinations against reference outputs. A buckling case with no initial case buckles under its own load patterns at their scale factors; with an initial case it uses that case's frame forces. Buckling factors are checked against Example 1-019 (three meshes) and an Euler column only."
     },
     {
       "id": "time-history",
@@ -232,7 +248,7 @@
     {
       "id": "links",
       "area": "solver",
-      "feature": "Effective linear/viscous links and bounded nonlinear Gap/Hook/Maxwell response, with constitutive history reaction recovery.",
+      "feature": "Effective linear/viscous links and bounded nonlinear Gap/Hook/Maxwell/plastic Wen response, with constitutive history reaction recovery and hysteretic state continuation.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -250,9 +266,13 @@
         {
           "file": "docs/reconstruction/solver-fixes.md",
           "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+        },
+        {
+          "file": "docs/reconstruction/solver-wen.md",
+          "note": "Plastic Wen law (CSI Analysis Reference; Software Verification Example 6-008 published values), displacement-controlled nonlinear static, bounds and tolerances."
         }
       ],
-      "limits": "Other nonlinear laws and unvalidated geometric coupling remain unsupported. Wilson-theta Maxwell internal-state integration rejects. General massless damping and exact fixed link constraints remain limited."
+      "limits": "Multi-linear, isolator and bilinear/friction-spring damper laws and unvalidated geometric coupling remain unsupported. A Wen deformation reversal inside one load case, Wen with frame member limits, and Wilson-theta integration of Wen or Maxwell internal states reject. General massless damping and exact fixed link constraints remain limited. Link gravity loads and advanced link local axes are not modeled; native import records them and analysis refuses the affected cases."
     },
     {
       "id": "cables-and-member-limits",
@@ -409,7 +429,7 @@
           "note": "Wave 4 extraction of NLLINKPROPARRAY.m_param, single-joint grounded links, parametric Sine functions, and CABLEPROPERTYARRAY / S_CableData."
         }
       ],
-      "limits": "Native inventory and source-preserving serialization cover all schema-known records in the checked 336-file local corpus, but only recognized schema paths become SapModel fields."
+      "limits": "Native inventory and source-preserving serialization cover all schema-known records in the checked 336-file local corpus, but only recognized schema paths become SapModel fields. Data in sections the importer does not interpret (frame hinges, tendons, line/area/solid springs, frame added mass, area auto-mesh options the model cannot express, link gravity loads, advanced link axes, several load types, per-mode modal damping) is recorded as unmodeled source data that blocks analysis and native synthesis; 50 of 336 corpus files carry such data and 283 remain exportable. See docs/reconstruction/unmodeled-source.md for what the pass does not cover. The N x N area auto-mesh, area added mass and object-level area modifiers are imported, and the native shell-type, element-type and incompatible-modes codes are corrected (docs/reconstruction/area-import.md)."
     },
     {
       "id": "native-sdb-preservation",
@@ -522,7 +542,7 @@
     {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "60 live reference checks across 13 benchmark families plus vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
+      "feature": "70 live reference checks across 15 benchmark families plus vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
       "status": "implemented-partial",
       "evidence": [
         {

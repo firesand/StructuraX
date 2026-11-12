@@ -313,6 +313,19 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         }
     }
     for (name, case) in &model.load_cases {
+        if let Some(control) = &case.displacement_control {
+            // The native record is written only for nonlinear static cases with
+            // one plain joint displacement; anything else would not read back.
+            let monitored_ok = control.monitored.as_ref().is_some_and(|(point, dof)| {
+                model.points.contains_key(point) && *dof < 6
+            });
+            if case.case_type != sap_model::LoadCaseType::NonlinearStatic || !monitored_ok {
+                return Err(unsupported(
+                    format!("load_cases.{name}.displacement_control"),
+                    "displacement control needs a nonlinear static case and one existing monitored joint displacement",
+                ));
+            }
+        }
         if let Some(target) = &case.initial_case {
             reference(
                 model.load_cases.contains_key(target),
@@ -367,6 +380,15 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
             return Err(unsupported(format!("link_props.{name}.nonlinear_data_complete"),"incomplete source law data cannot be certified by synthesizing a parameter vector; use a private snapshot"));
         }
     }
+    if let Some(entry) = model.unmodeled_source.first() {
+        return Err(unsupported(
+            "unmodeled_source",
+            format!(
+                "the source carried data this model does not represent ({}); a synthesized file would silently omit it",
+                entry.description
+            ),
+        ));
+    }
     if !model.project_info.is_empty() {
         return Err(unsupported(
             "project_info",
@@ -397,6 +419,62 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
             return Err(unsupported(
                 format!("points.{name}.local_axes_matrix"),
                 "explicit joint axis-matrix serialization is not implemented",
+            ));
+        }
+    }
+    for (name, section) in &model.area_sections {
+        // Only thin and thick shells have an observed native section-type code.
+        if section.prop_type == sap_model::AreaPropType::Shell
+            && !matches!(
+                section.shell_type,
+                sap_model::ShellType::ShellThin | sap_model::ShellType::ShellThick
+            )
+        {
+            return Err(unsupported(
+                format!("area_sections.{name}.shell_type"),
+                "only thin and thick shell sections have an observed native type code",
+            ));
+        }
+    }
+    for (name, area) in &model.areas {
+        // The native auto-mesh record is written for equal counts only; the
+        // vendor edge order for unequal counts is not established.
+        if area.auto_mesh.0 != area.auto_mesh.1 {
+            return Err(unsupported(
+                format!("areas.{name}.auto_mesh"),
+                "unequal auto-mesh counts have no verified native edge order; mesh the area explicitly or use S2K",
+            ));
+        }
+    }
+    for (name, frame) in &model.frames {
+        if frame.auto_mesh_segments > i32::MAX as usize {
+            return Err(unsupported(
+                format!("frames.{name}.auto_mesh_segments"),
+                "requires an i32 segment count",
+            ));
+        }
+        // Joint offsets are written in the one form the corpus shows: element
+        // local, equal at both ends.
+        if frame.joint_offset_i != [0.0; 3] || frame.joint_offset_j != [0.0; 3] {
+            if frame.joint_offset_is_global {
+                return Err(unsupported(
+                    format!("frames.{name}.joint_offset_is_global"),
+                    "global joint offsets have no verified native coordinate-system code; give them in the element local system or use S2K",
+                ));
+            }
+            if frame.joint_offset_i != frame.joint_offset_j {
+                return Err(unsupported(
+                    format!("frames.{name}.joint_offset_j"),
+                    "joint offsets that differ between the ends have no verified native end order; use S2K",
+                ));
+            }
+        }
+        // The segment count of a cable object is its own cable setting; what
+        // an automatic frame subdivision count means on one is not established.
+        if frame.cable_params.is_some() && frame.auto_mesh_segments > 1 {
+            return Err(unsupported(
+                format!("frames.{name}.auto_mesh_segments"),
+                "automatic frame subdivision of a cable object has no verified native meaning",
             ));
         }
     }

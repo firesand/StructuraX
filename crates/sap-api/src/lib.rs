@@ -9,8 +9,8 @@
 mod definitions;
 mod links;
 pub use definitions::{
-    cFunctions, set_case_definition, set_function_definition, validate_case_definition,
-    DefinitionError,
+    cFunctions, discard_unmodeled_source, set_case_definition, set_function_definition,
+    validate_case_definition, DefinitionError,
 };
 pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 
@@ -1070,6 +1070,89 @@ impl cFrameObj<'_> {
             return OAPI_ERR;
         }
         self.edit_frame(name, |f| f.modifiers = modifiers)
+    }
+    /// Insertion point of a frame object (`FrameObj.SetInsertionPoint`): the
+    /// cardinal point `1..=11` (10 is the centroid) and the joint offsets at
+    /// the two ends, in the element local or the global system. With
+    /// `stiff_transform` on, the element is set off from its joints on rigid
+    /// arms; analysis implements that for equal offsets across the member
+    /// axis, doubly symmetric shapes and linear static cases, and refuses the
+    /// rest. With it off the frame is analyzed at its centroid. Mirroring
+    /// about local 2 is not represented and is refused here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_insertion_point(
+        &mut self,
+        name: &str,
+        cardinal_point: i32,
+        mirror2: bool,
+        stiff_transform: bool,
+        offset1: [f64; 3],
+        offset2: [f64; 3],
+        csys: &str,
+    ) -> i32 {
+        let is_global = if csys.eq_ignore_ascii_case("Global") {
+            true
+        } else if csys.eq_ignore_ascii_case("Local") {
+            false
+        } else {
+            return OAPI_ERR;
+        };
+        if !(1..=11).contains(&cardinal_point)
+            || mirror2
+            || offset1.iter().chain(&offset2).any(|v| !v.is_finite())
+        {
+            return OAPI_ERR;
+        }
+        self.edit_frame(name, |f| {
+            f.cardinal_point = cardinal_point;
+            f.stiff_transform = stiff_transform;
+            f.joint_offset_i = offset1;
+            f.joint_offset_j = offset2;
+            f.joint_offset_is_global = is_global;
+        })
+    }
+    /// Automatic subdivision of a frame object for analysis
+    /// (`FrameObj.SetAutoMesh`). Subdivision at joints lying on the object and
+    /// into a number of segments are analyzed. Subdivision at intersections
+    /// with other objects and a maximum segment length are not, and are
+    /// refused here rather than stored and ignored.
+    pub fn set_auto_mesh(
+        &mut self,
+        name: &str,
+        auto_mesh: bool,
+        auto_mesh_at_points: bool,
+        auto_mesh_at_lines: bool,
+        num_segs: i32,
+        auto_mesh_max_length: f64,
+    ) -> i32 {
+        if !(0..=10_000).contains(&num_segs)
+            || auto_mesh_max_length != 0.0
+            || (auto_mesh && auto_mesh_at_lines)
+        {
+            return OAPI_ERR;
+        }
+        if self
+            .api
+            .inner
+            .frames
+            .get(name)
+            .is_some_and(|f| f.cable_params.is_some() && auto_mesh && num_segs > 1)
+        {
+            return OAPI_ERR;
+        }
+        self.edit_frame(name, |f| {
+            f.auto_mesh_segments = if auto_mesh { num_segs as usize } else { 0 };
+            f.auto_mesh_at_joints = auto_mesh && auto_mesh_at_points;
+        })
+    }
+    /// `(auto_mesh, auto_mesh_at_points, num_segs)` of a frame object.
+    pub fn get_auto_mesh(&self, name: &str) -> Option<(bool, bool, i32)> {
+        let frame = self.api.inner.frames.get(name)?;
+        Some((
+            frame.auto_mesh_segments > 0 || frame.auto_mesh_at_joints,
+            frame.auto_mesh_at_joints,
+            i32::try_from(frame.auto_mesh_segments).ok()?,
+        ))
     }
     pub fn set_tc_limits(
         &mut self,

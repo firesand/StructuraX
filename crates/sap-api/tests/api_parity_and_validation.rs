@@ -720,6 +720,8 @@ fn damper_link_spectrum_directions_and_expanded_results_queries() {
     );
     let mut nlh = LoadCase::linear_static("NLH", "DEAD", 1.0);
     nlh.case_type = LoadCaseType::NonlinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    nlh.modal_damping = 0.;
     nlh.loads.clear();
     nlh.history_loads = vec![("STEP".into(), "DEAD".into(), 1.0)];
     nlh.num_time_steps = 40;

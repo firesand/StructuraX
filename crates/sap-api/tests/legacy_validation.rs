@@ -341,3 +341,76 @@ fn ambiguous_coincident_joint_identity_rejects_coordinate_creation_atomically() 
     );
     assert_eq!(a.inner.frames["explicit"].point_i, "coincident_A");
 }
+
+#[test]
+fn frame_auto_mesh_stores_what_is_analyzed_and_refuses_the_rest() {
+    let mut a = api();
+    assert_eq!(a.frame_obj().get_auto_mesh("F"), Some((false, false, 0)));
+    assert_eq!(a.frame_obj().set_auto_mesh("F", true, true, false, 8, 0.0), OAPI_OK);
+    assert_eq!(a.frame_obj().get_auto_mesh("F"), Some((true, true, 8)));
+    assert!(a.inner.case_results.is_empty());
+
+    // Refused without changing the stored assignment: intersections with
+    // other objects, a maximum segment length, a negative or huge count, an
+    // unknown frame.
+    let before = a.inner.clone();
+    for (at_lines, segments, max_length) in
+        [(true, 2, 0.0), (false, 2, 12.0), (false, -1, 0.0), (false, 10_001, 0.0), (false, 2, f64::NAN)]
+    {
+        assert_eq!(
+            a.frame_obj().set_auto_mesh("F", true, false, at_lines, segments, max_length),
+            OAPI_ERR
+        );
+    }
+    assert_eq!(a.frame_obj().set_auto_mesh("MISSING", true, true, false, 2, 0.0), OAPI_ERR);
+    assert_eq!(a.frame_obj().get_auto_mesh("MISSING"), None);
+    assert_eq!(a.inner, before);
+
+    // Turning it off clears both settings whatever else is passed.
+    assert_eq!(a.frame_obj().set_auto_mesh("F", false, true, false, 5, 0.0), OAPI_OK);
+    assert_eq!(a.frame_obj().get_auto_mesh("F"), Some((false, false, 0)));
+}
+
+#[test]
+fn frame_insertion_point_is_validated_and_stored() {
+    let mut a = api();
+    let before = a.inner.clone();
+    for (cardinal, mirror, offset, csys) in [
+        (0, false, [0.0; 3], "Local"),
+        (12, false, [0.0; 3], "Local"),
+        (8, true, [0.0; 3], "Local"),
+        (8, false, [0.0, f64::NAN, 0.0], "Local"),
+        (8, false, [0.0; 3], "CSYS1"),
+    ] {
+        assert_eq!(
+            a.frame_obj()
+                .set_insertion_point("F", cardinal, mirror, true, offset, [0.0; 3], csys),
+            OAPI_ERR
+        );
+    }
+    assert_eq!(
+        a.frame_obj()
+            .set_insertion_point("MISSING", 8, false, true, [0.0; 3], [0.0; 3], "Local"),
+        OAPI_ERR
+    );
+    assert_eq!(a.inner, before);
+
+    assert_eq!(
+        a.frame_obj().set_insertion_point(
+            "F",
+            8,
+            false,
+            false,
+            [0.0, 0.0, 12.0],
+            [0.0, 1.0, 12.0],
+            "global"
+        ),
+        OAPI_OK
+    );
+    let frame = &a.inner.frames["F"];
+    assert_eq!((frame.cardinal_point, frame.stiff_transform), (8, false));
+    assert_eq!(frame.joint_offset_i, [0.0, 0.0, 12.0]);
+    assert_eq!(frame.joint_offset_j, [0.0, 1.0, 12.0]);
+    assert!(frame.joint_offset_is_global);
+    assert!(a.inner.case_results.is_empty());
+}

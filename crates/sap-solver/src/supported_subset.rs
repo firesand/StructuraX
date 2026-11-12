@@ -57,6 +57,20 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
                 case.name
             )));
         }
+        if matches!(
+            case.case_type,
+            LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
+        ) && case.time_integration == sap_model::TimeIntegrationMethod::WilsonTheta
+            && model.link_props.values().any(|p| {
+                p.link_type == sap_model::LinkPropType::PlasticWen
+                    && (0..6).any(|d| p.dof_active[d] && p.dof_nonlinear[d] && !p.dof_fixed[d])
+            })
+        {
+            return Err(unsupported(format!(
+                "case '{}' Wilson-theta integration of plastic Wen links is not implemented",
+                case.name
+            )));
+        }
         if history && case.nl_geom != NLGeomType::None {
             return Err(unsupported(format!(
                 "case '{}' requests geometric nonlinearity in history integration",
