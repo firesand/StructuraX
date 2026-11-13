@@ -813,10 +813,38 @@ fn run_concrete_design_validated(
                 else {
                     continue;
                 };
+                // Moment-strength floors of the framing type (ACI only): the
+                // positive strength at each end is at least a fraction of
+                // the negative strength there, and both strengths at every
+                // section are at least a fraction of the largest end
+                // strength (ACI 318-14 18.6.3.2 special, 18.4.2.2
+                // intermediate). They act on the design moments, as in
+                // SAP2000, so the minimum-steel rules apply afterwards.
+                let (end_fraction, span_fraction) = match (code, frame.concrete_framing) {
+                    (ConcreteCode::Aci318, sap_model::ConcreteFramingType::SwaySpecial) => (0.5, 0.25),
+                    (ConcreteCode::Aci318, sap_model::ConcreteFramingType::SwayIntermediate) => {
+                        (1.0 / 3.0, 0.2)
+                    }
+                    _ => (0.0, 0.0),
+                };
+                let end_positive = |st: &sap_model::FrameStationResult| {
+                    st.m3.max(0.0).max(end_fraction * (-st.m3).max(0.0))
+                };
+                // The ends are the stations at the two ends of the member.
+                let is_end = |st: &sap_model::FrameStationResult| {
+                    st.rel_dist <= 1e-6 || st.rel_dist >= 1.0 - 1e-6
+                };
+                let largest_end = stations
+                    .iter()
+                    .filter(|st| is_end(st))
+                    .map(|st| end_positive(st).max((-st.m3).max(0.0)))
+                    .fold(0.0_f64, f64::max);
                 for st in stations {
                     // Positive M3 -> bottom tension; Negative M3 -> top tension
-                    let m_pos = st.m3.max(0.0);
-                    let m_neg = (-st.m3).max(0.0);
+                    let at_end = is_end(st);
+                    let m_pos = if at_end { end_positive(st) } else { st.m3.max(0.0) }
+                        .max(span_fraction * largest_end);
+                    let m_neg = (-st.m3).max(0.0).max(span_fraction * largest_end);
                     let vu2 = st.v2.abs();
                     let vu3 = st.v3.abs();
 

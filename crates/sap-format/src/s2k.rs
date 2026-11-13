@@ -1508,6 +1508,30 @@ pub(super) fn parse_s2k_internal(
                     if let Some(at_joints) = get_bool(&row, "MeshAtJoints") {
                         fr.auto_mesh_at_joints = at_joints;
                     }
+                    if let Some(framing) = get_str(&row, "ConcFraming") {
+                        fr.concrete_framing = match framing.to_ascii_uppercase().as_str() {
+                            "SPECIAL" => sap_model::ConcreteFramingType::SwaySpecial,
+                            "INTERMEDIATE" => sap_model::ConcreteFramingType::SwayIntermediate,
+                            "ORDINARY" => sap_model::ConcreteFramingType::SwayOrdinary,
+                            "NONSWAY" => sap_model::ConcreteFramingType::NonSway,
+                            other => {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "frame '{fname}' has an unknown ConcFraming value '{other}'"
+                                )))
+                            }
+                        };
+                    }
+                    if get_bool(&row, "SteelOverwrite") == Some(true) {
+                        fr.steel_overwrite = Some(sap_model::SteelDesignOverwrite {
+                            l_ratio_major: get_f64(&row, "SteelL33"),
+                            l_ratio_minor: get_f64(&row, "SteelL22"),
+                            l_ratio_ltb: get_f64(&row, "SteelLtb"),
+                            k_major: get_f64(&row, "SteelK33"),
+                            k_minor: get_f64(&row, "SteelK22"),
+                            cb: get_f64(&row, "SteelCb"),
+                            is_sway: get_bool(&row, "SteelSway") == Some(true),
+                        });
+                    }
                 }
             }
             "FRAME SECTION ASSIGNMENTS" => {
@@ -3183,6 +3207,32 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             }
             if f.auto_mesh_at_joints {
                 out.push_str("   MeshAtJoints=Yes");
+            }
+            // Design overwrites, written only where they differ from the
+            // defaults (reconstruction extension columns).
+            match f.concrete_framing {
+                sap_model::ConcreteFramingType::SwaySpecial => {}
+                sap_model::ConcreteFramingType::SwayIntermediate => out.push_str("   ConcFraming=Intermediate"),
+                sap_model::ConcreteFramingType::SwayOrdinary => out.push_str("   ConcFraming=Ordinary"),
+                sap_model::ConcreteFramingType::NonSway => out.push_str("   ConcFraming=NonSway"),
+            }
+            if let Some(o) = &f.steel_overwrite {
+                out.push_str("   SteelOverwrite=Yes");
+                for (column, value) in [
+                    ("SteelL33", o.l_ratio_major),
+                    ("SteelL22", o.l_ratio_minor),
+                    ("SteelLtb", o.l_ratio_ltb),
+                    ("SteelK33", o.k_major),
+                    ("SteelK22", o.k_minor),
+                    ("SteelCb", o.cb),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!("   {column}={value}"));
+                    }
+                }
+                if o.is_sway {
+                    out.push_str("   SteelSway=Yes");
+                }
             }
             out.push('\n');
         }

@@ -1330,3 +1330,41 @@ fn coord_system_grids_roundtrip_through_native_sdb() {
     assert_eq!(restored, m);
     assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
 }
+
+/// Design overwrites (concrete framing type, steel unbraced lengths and
+/// factors) are kept by S2K and refused by native synthesis, which has no
+/// place for them.
+#[test]
+fn design_overwrites_roundtrip_through_s2k_and_block_native_synthesis() {
+    let mut m = supported_model();
+    m.add_frame("G", "A", "B", "FSEC1");
+    m.add_frame("H", "A", "B", "FSEC1");
+    // Defaults write nothing.
+    let text = write_s2k(&m);
+    assert!(!text.contains("ConcFraming") && !text.contains("SteelOverwrite"));
+    pack_model_to_native_sdb(&m).unwrap();
+
+    m.frames["F"].concrete_framing = ConcreteFramingType::SwayOrdinary;
+    m.frames["G"].concrete_framing = ConcreteFramingType::SwayIntermediate;
+    m.frames["H"].concrete_framing = ConcreteFramingType::NonSway;
+    m.frames["G"].steel_overwrite = Some(SteelDesignOverwrite {
+        l_ratio_ltb: Some(0.25),
+        k_minor: Some(1.2),
+        cb: Some(1.14),
+        is_sway: true,
+        ..Default::default()
+    });
+    // An overwrite with every item program determined is still an overwrite.
+    m.frames["H"].steel_overwrite = Some(SteelDesignOverwrite::default());
+    let s = parse_s2k(&write_s2k(&m)).unwrap();
+    for name in ["F", "G", "H"] {
+        assert_eq!(s.frames[name], m.frames[name], "{name}");
+    }
+    assert!(parse_s2k(&write_s2k(&m).replace("ConcFraming=Ordinary", "ConcFraming=Ductile")).is_err());
+
+    assert_rejected_unchanged(&m, "frames.F.concrete_framing");
+    for frame in m.frames.values_mut() {
+        frame.concrete_framing = ConcreteFramingType::SwaySpecial;
+    }
+    assert_rejected_unchanged(&m, "frames.G.steel_overwrite");
+}

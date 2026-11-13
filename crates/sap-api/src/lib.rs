@@ -2588,6 +2588,34 @@ pub struct cDesignSteel<'a> {
 }
 
 impl cDesignSteel<'_> {
+    /// Sets (`Some`) or clears (`None`) the steel design overwrites of a frame:
+    /// unbraced length ratios, effective length factors, Cb and the sway flag.
+    /// Items left `None` stay program determined. Design overwrites do not
+    /// change the analysis, so the model may be locked; steel design results
+    /// are cleared.
+    pub fn set_overwrite(
+        &mut self,
+        name: &str,
+        overwrite: Option<sap_model::SteelDesignOverwrite>,
+    ) -> i32 {
+        if let Some(o) = &overwrite {
+            let items = [o.l_ratio_major, o.l_ratio_minor, o.l_ratio_ltb, o.k_major, o.k_minor, o.cb];
+            if items.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
+                return OAPI_ERR;
+            }
+        }
+        let Some(frame) = self.api.inner.frames.get_mut(name) else {
+            return OAPI_ERR;
+        };
+        frame.steel_overwrite = overwrite;
+        self.api.inner.steel_design_results.clear();
+        OAPI_OK
+    }
+
+    pub fn get_overwrite(&self, name: &str) -> Option<&sap_model::SteelDesignOverwrite> {
+        self.api.inner.frames.get(name)?.steel_overwrite.as_ref()
+    }
+
     pub fn set_code(&mut self, code_name: &str) -> i32 {
         if SteelCode::try_from_code_str(code_name).is_err() {
             return OAPI_ERR;
@@ -2619,6 +2647,24 @@ pub struct cDesignConcrete<'a> {
 }
 
 impl cDesignConcrete<'_> {
+    /// Sets the framing type of a frame (the "Framing Type" overwrite). For
+    /// ACI beam design, Sway Special and Sway Intermediate apply the end and
+    /// span moment-strength rules; their capacity-based shear, column and
+    /// joint provisions are not implemented. Concrete design results are
+    /// cleared; the model may be locked.
+    pub fn set_framing_type(&mut self, name: &str, framing: sap_model::ConcreteFramingType) -> i32 {
+        let Some(frame) = self.api.inner.frames.get_mut(name) else {
+            return OAPI_ERR;
+        };
+        frame.concrete_framing = framing;
+        self.api.inner.concrete_design_results.clear();
+        OAPI_OK
+    }
+
+    pub fn get_framing_type(&self, name: &str) -> Option<sap_model::ConcreteFramingType> {
+        Some(self.api.inner.frames.get(name)?.concrete_framing)
+    }
+
     pub fn set_code(&mut self, code_name: &str) -> i32 {
         if ConcreteCode::try_from_code_str(code_name).is_err() {
             return OAPI_ERR;

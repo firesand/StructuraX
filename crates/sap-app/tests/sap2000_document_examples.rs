@@ -302,19 +302,85 @@ fn v14_continuous_concrete_beam_matches_printed_forces_and_top_steel() {
     close("top steel against the document [mm2]", design.as_top * 1e6, 130.6, 0.05);
 
     // Bottom steel. The document prints 6.447E-05 m2, which is the steel for
-    // a design moment of 489.452 kgf-m, half the support moment: SAP2000's
-    // default "Sway Special" framing type applies the seismic rule that the
-    // positive capacity at a joint is at least half the negative one. This
-    // project has no framing types, so it designs for the actual maximum
-    // positive moment in the span.
-    let seismic_rule = 4.0 / 3.0 * aci_flexural_steel(0.5 * at_b.m3.abs(), fc, fy, b, d);
-    close("document's bottom steel explained [mm2]", seismic_rule * 1e6, 64.47, 0.01);
+    // a design moment of 489.452 kgf-m, half the support moment: the member
+    // has SAP2000's default "Sway Special" framing type, whose positive
+    // strength at a joint is at least half the negative strength there
+    // (ACI 318-14 18.6.3.2). That is the default framing type here as well.
+    assert_eq!(m.frames["F1"].concrete_framing, ConcreteFramingType::SwaySpecial);
+    let special = 4.0 / 3.0 * aci_flexural_steel(0.5 * at_b.m3.abs(), fc, fy, b, d);
+    close("bottom steel against the closed form", design.as_bot, special, 1e-9);
+    close("bottom steel against the document [mm2]", design.as_bot * 1e6, 64.47, 0.01);
+
+    // Sway Intermediate asks for one third of the end strength (18.4.2.2),
+    // which here is below the maximum positive moment in the span, so both
+    // it and Sway Ordinary design the bottom steel for that moment. Closed
+    // form for the span: M(x) = -657.85 + 1065.73 x - 573 x^2 / 2.
     let positive = stations.iter().map(|s| s.m3).fold(0.0, f64::max);
-    // Closed form for the span: M(x) = -657.85 + 1065.73 x - 573 x^2 / 2.
     close("maximum positive moment", positive, -657.8467 + 1065.7343f64.powi(2) / (2.0 * 573.0), 0.05);
-    let bottom = 4.0 / 3.0 * aci_flexural_steel(positive, fc, fy, b, d);
-    close("bottom steel against the closed form", design.as_bot, bottom, 1e-9);
-    assert!(design.as_bot < seismic_rule);
+    assert!(positive > at_b.m3.abs() / 3.0 && positive < 0.5 * at_b.m3.abs());
+    let ordinary = 4.0 / 3.0 * aci_flexural_steel(positive, fc, fy, b, d);
+    for framing in [ConcreteFramingType::SwayIntermediate, ConcreteFramingType::SwayOrdinary, ConcreteFramingType::NonSway] {
+        m.frames["F1"].concrete_framing = framing;
+        try_run_concrete_design(&mut m).unwrap();
+        let design = &m.concrete_design_results["F1"];
+        close("bottom steel without the one-half rule", design.as_bot, ordinary, 1e-9);
+        close("top steel is the same for every framing type", design.as_top, top, 1e-9);
+    }
+    assert!(ordinary < special);
+}
+
+/// The moment-strength floors of the framing types on a beam whose end moments
+/// differ: closed forms from the ACI clauses, kN and m.
+#[test]
+fn concrete_framing_types_apply_the_aci_moment_strength_floors() {
+    let (fc, fy) = (30.0e3, 400.0e3);
+    let build = |framing: ConcreteFramingType| {
+        let mut m = base(Units::KnMC, true);
+        material(&mut m, "4000Psi", "C30", |c| c.fc = fc);
+        material(&mut m, "A992Fy50", "BJTD40", |s| s.fy = fy);
+        let mut section = make_rectangular("B30x50", "C30", 0.5, 0.3);
+        section.concrete_rebar = beam_rebar("BJTD40", 0.05);
+        m.frame_sections.insert("B30x50".into(), section);
+        beam_line(&mut m, &[0.0, 6.0], "B30x50", 13);
+        m.frames["F1"].concrete_framing = framing;
+        // Results by hand: hogging 240 kN-m at I and 90 kN-m at J, sagging
+        // 20 kN-m at mid-span, linear in between.
+        let mut results = CaseResults { case_name: "U".into(), ..Default::default() };
+        let moment = |s: f64| if s <= 0.5 { -240.0 + 520.0 * s } else { 20.0 - 220.0 * (s - 0.5) };
+        results.frame_forces.insert(
+            "F1".into(),
+            (0..=12)
+                .map(|k| {
+                    let s = k as f64 / 12.0;
+                    FrameStationResult { station: 6.0 * s, rel_dist: s, m3: moment(s), ..Default::default() }
+                })
+                .collect(),
+        );
+        m.case_results.insert("U".into(), results);
+        try_run_concrete_design(&mut m).unwrap();
+        m.concrete_design_results["F1"].clone()
+    };
+    let (b, d) = (0.3, 0.45);
+    let steel = |moment: f64| {
+        let required = aci_flexural_steel(moment, fc, fy, b, d);
+        // Minimum 1.4 b d / fy (MPa), waived when a third more than required is provided.
+        required.max((1.4e3 * b * d / fy).min(4.0 / 3.0 * required))
+    };
+    // Ordinary: the largest hogging moment on top, the sagging moment below.
+    let ordinary = build(ConcreteFramingType::SwayOrdinary);
+    close("ordinary top", ordinary.as_top, steel(240.0), 1e-9);
+    close("ordinary bottom", ordinary.as_bot, steel(20.0), 1e-9);
+    // Special: bottom steel for half the largest end hogging moment (120),
+    // which also exceeds a quarter of it; the top is unchanged because 240
+    // governs over the quarter rule.
+    let special = build(ConcreteFramingType::SwaySpecial);
+    close("special top", special.as_top, steel(240.0), 1e-9);
+    close("special bottom", special.as_bot, steel(120.0), 1e-9);
+    // Intermediate: one third at the end (80).
+    let intermediate = build(ConcreteFramingType::SwayIntermediate);
+    close("intermediate top", intermediate.as_top, steel(240.0), 1e-9);
+    close("intermediate bottom", intermediate.as_bot, steel(80.0), 1e-9);
+    assert!(ordinary.as_bot < intermediate.as_bot && intermediate.as_bot < special.as_bot);
 }
 
 // ---------------------------------------------------------------------------
@@ -463,7 +529,7 @@ fn v20_ebook_concrete_beam_design_matches_the_printed_steel() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn v20_ebook_steel_beam_matches_the_printed_ratio_only_when_braced() {
+fn v20_ebook_steel_beam_matches_the_printed_ratio_when_braced() {
     let mut m = base(Units::KnMC, true);
     material(&mut m, "A992Fy50", "Baja", |s| {
         s.e = 200000.0e3;
@@ -473,10 +539,10 @@ fn v20_ebook_steel_beam_matches_the_printed_ratio_only_when_braced() {
         s.fy = 240.0e3;
         s.fu = 370.0e3;
     });
-    // W30X99 as a parametric I without fillets: d 29.7, bf 10.5, tf 0.670,
-    // tw 0.520 in. It has 1 % less area and plastic modulus than the table.
+    // W30X99 with the AISC table properties, as the document imports it from
+    // the section database (no section database ships with this project).
     let inch = 0.0254;
-    let section = make_i_section(
+    let mut section = make_i_section(
         "W30X99",
         "Baja",
         29.7 * inch,
@@ -486,7 +552,16 @@ fn v20_ebook_steel_beam_matches_the_printed_ratio_only_when_braced() {
         10.5 * inch,
         0.670 * inch,
     );
-    close("plastic modulus [cm3] against the table value", section.z33 * 1e6, 5113.0, 0.012 * 5113.0);
+    section.area = 29.1 * inch.powi(2);
+    section.i33 = 3990.0 * inch.powi(4);
+    section.s33 = 269.0 * inch.powi(3);
+    section.z33 = 312.0 * inch.powi(3);
+    section.r33 = 11.7 * inch;
+    section.i22 = 128.0 * inch.powi(4);
+    section.s22 = 24.5 * inch.powi(3);
+    section.z22 = 38.6 * inch.powi(3);
+    section.r22 = 2.10 * inch;
+    section.torsional_j = 3.77 * inch.powi(4);
     let plastic_capacity = 0.9 * section.z33 * 240.0e3;
     m.frame_sections.insert("W30X99".into(), section);
     beam_line(&mut m, &[0.0, 10.0], "W30X99", 41);
@@ -501,24 +576,27 @@ fn v20_ebook_steel_beam_matches_the_printed_ratio_only_when_braced() {
 
     // The document prints a P-M ratio of 0.201, which is Mu / (0.9 Z Fy):
     // the full plastic moment, with no lateral-torsional buckling reduction.
-    // That is what this project gives when the compression flange is braced.
-    let braced = HashMap::from([(
-        "F1".to_string(),
-        SteelMemberOverwrite {
-            l_ratio_ltb: Some(0.001),
-            ..Default::default()
-        },
-    )]);
-    try_run_steel_design_with_overwrites(&mut m, &braced).unwrap();
+    // That is the result for a beam whose compression flange is braced,
+    // which is set here as the member's stored steel design overwrite (the
+    // setting the GUI and the API write).
+    m.frames["F1"].steel_overwrite = Some(SteelDesignOverwrite {
+        l_ratio_ltb: Some(0.01),
+        ..Default::default()
+    });
+    try_run_steel_design(&mut m).unwrap();
     let ratio = m.steel_design_results["F1"].total_ratio;
     close("braced ratio against the closed form", ratio, mu / plastic_capacity, 1e-9);
-    close("braced ratio against the document", ratio, 0.201, 0.003);
+    close("braced ratio against the document", ratio, 0.201, 5e-4);
 
     // With no overwrite the beam is unbraced over its 10 m span, beyond Lr,
-    // and elastic lateral-torsional buckling governs. Hand check with the
-    // table properties (AISC 360 F2-3 and F2-4, Cb = 1.14, rts 66.5 mm,
-    // J 1.569e6 mm4, Sx 4.408e6 mm3, ho 737 mm): Fcr = 135.5 MPa,
-    // phi Mn = 537.6 kN-m, ratio 0.413.
+    // and elastic lateral-torsional buckling governs, as the vendor's steel
+    // design manual specifies for the default (the unsupported length; see
+    // the AISC 360-05 Example 001 test below, which this project matches).
+    // Hand check (AISC 360 F2-3 and F2-4, Cb = 1.136, rts 66.5 mm, J 1.569e6
+    // mm4, Sx 4.408e6 mm3, ho 737 mm): Fcr = 135.5 MPa, phi Mn = 537.6 kN-m,
+    // ratio 0.413. The document's 0.201 is not what SAP2000's documented
+    // default gives for this beam.
+    m.frames["F1"].steel_overwrite = None;
     try_run_steel_design(&mut m).unwrap();
     let unbraced = &m.steel_design_results["F1"];
     close("unbraced ratio against the hand check", unbraced.total_ratio, 0.413, 0.02 * 0.413);
@@ -777,5 +855,189 @@ fn v20_ebook_building_periods_approach_the_printed_values_on_a_coarser_mesh() {
     for direction in 0..2 {
         let mass: f64 = modes.iter().map(|mode| mode.modal_mass_ratios[direction]).sum();
         close("modal mass in 12 modes", mass, 0.99405, 0.005);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CSI Software Verification, AISC 360-05 Example 001: W18X50 beam, 35 ft span,
+// 0.45 klf dead and 0.75 klf live, flexural strength for three unbraced
+// lengths. Kip and inch.
+// ---------------------------------------------------------------------------
+
+fn aisc_360_05_example_001() -> SapModel {
+    let mut m = base(Units::KipInF, true);
+    material(&mut m, "A992Fy50", "A572Gr50", |s| {
+        s.e = 29000.0;
+        s.fy = 50.0;
+        s.fu = 65.0;
+    });
+    // Section properties as the example lists them.
+    let mut section = make_i_section("W18X50", "A572Gr50", 18.0, 7.5, 0.57, 0.355, 7.5, 0.57);
+    section.area = 14.7;
+    section.s33 = 88.9;
+    section.z33 = 101.0;
+    section.i33 = 800.0;
+    section.i22 = 40.1;
+    section.r22 = 1.652;
+    section.torsional_j = 1.240;
+    m.frame_sections.insert("W18X50".into(), section);
+    beam_line(&mut m, &[0.0, 420.0], "W18X50", 41);
+    m.points["J1"].restraint = PIN;
+    m.points["J2"].restraint = ROLLER;
+    pattern(&mut m, "D", 0.0);
+    pattern(&mut m, "L", 0.0);
+    gravity_udl(&mut m, "F1", "D", 0.0, 1.0, 0.45 / 12.0);
+    gravity_udl(&mut m, "F1", "L", 0.0, 1.0, 0.75 / 12.0);
+    combo(&mut m, "1.2D+1.6L", &[("D", 1.2), ("L", 1.6)]);
+    analyze_model(&mut m).unwrap();
+    m
+}
+
+#[test]
+fn vendor_aisc_360_05_example_001_flexural_strengths_match() {
+    let mut m = aisc_360_05_example_001();
+    // Mu = 1.74 x 35^2 / 8 = 266.4375 kip-ft.
+    close("factored moment [kip-ft]", max_abs_m3(&m, "1.2D+1.6L") / 12.0, 266.4375, 1e-9);
+    // Published SAP2000 values: unbraced length [ft], Cb, phi Mn [kip-ft].
+    for (unbraced, cb, strength) in [(5.0, 1.004, 378.750), (11.667, 1.015, 307.124), (35.0, 1.138, 94.377)] {
+        let overwrite = SteelMemberOverwrite {
+            l_ratio_ltb: Some(unbraced / 35.0),
+            cb: Some(cb),
+            ..Default::default()
+        };
+        try_run_steel_design_with_overwrites(&mut m, &HashMap::from([("F1".to_string(), overwrite)])).unwrap();
+        let got = m.steel_design_results["F1"].phi_mn33 / 12.0;
+        close(&format!("phi Mn at Lb = {unbraced} ft"), got, strength, 0.002 * strength);
+    }
+    // With Cb left to the program it is computed within each unbraced
+    // segment and the smallest governs. The example's independent values
+    // (AISC formula) are Cb = 1.002, 1.014 and 1.136, giving 378.750,
+    // 306.657 and 94.218 kip-ft.
+    for (unbraced, strength) in [(5.0, 378.750), (11.667, 306.657), (35.0, 94.218)] {
+        m.frames["F1"].steel_overwrite = Some(SteelDesignOverwrite {
+            l_ratio_ltb: Some(unbraced / 35.0),
+            ..Default::default()
+        });
+        try_run_steel_design(&mut m).unwrap();
+        let got = m.steel_design_results["F1"].phi_mn33 / 12.0;
+        close(&format!("phi Mn at Lb = {unbraced} ft, automatic Cb"), got, strength, 0.002 * strength);
+    }
+    // With no overwrite at all the beam is unbraced over its whole span.
+    m.frames["F1"].steel_overwrite = None;
+    try_run_steel_design(&mut m).unwrap();
+    close("phi Mn with program defaults", m.steel_design_results["F1"].phi_mn33 / 12.0, 94.218, 0.002 * 94.218);
+
+    // An unbraced length set longer than the member takes Cb = 1.0, as the
+    // vendor's steel design manual states for SAP2000.
+    let strength = |m: &mut SapModel, overwrite: SteelDesignOverwrite| {
+        m.frames["F1"].steel_overwrite = Some(overwrite);
+        try_run_steel_design(m).unwrap();
+        m.steel_design_results["F1"].phi_mn33
+    };
+    let longer = SteelDesignOverwrite { l_ratio_ltb: Some(1.5), ..Default::default() };
+    let automatic = strength(&mut m, longer.clone());
+    let unity = strength(&mut m, SteelDesignOverwrite { cb: Some(1.0), ..longer.clone() });
+    let gradient = strength(&mut m, SteelDesignOverwrite { cb: Some(1.136), ..longer });
+    close("Cb defaults to 1.0 beyond the member length", automatic, unity, 1e-9);
+    assert!(gradient > 1.1 * unity);
+
+    // A stored overwrite that is not a positive number stops the design
+    // instead of reaching the capacity formulas.
+    for bad in [
+        SteelDesignOverwrite { l_ratio_ltb: Some(-1.0), ..Default::default() },
+        SteelDesignOverwrite { k_minor: Some(0.0), ..Default::default() },
+        SteelDesignOverwrite { cb: Some(f64::NAN), ..Default::default() },
+    ] {
+        m.frames["F1"].steel_overwrite = Some(bad);
+        let error = try_run_steel_design(&mut m).unwrap_err().to_string();
+        assert!(error.contains("member 'F1'") && error.contains("finite and positive"), "{error}");
+        assert!(m.steel_design_results.is_empty());
+    }
+    // A bracing spacing far below the member length is continuous bracing.
+    let continuous = strength(&mut m, SteelDesignOverwrite { l_ratio_ltb: Some(1e-9), ..Default::default() });
+    close("continuously braced strength [kip-ft]", continuous / 12.0, 378.750, 1e-6 * 378.750);
+}
+
+/// Stored effective-length overwrites change the compression strength by the
+/// Euler closed form. A slender pinned column, W18X50 about its minor axis:
+/// in the elastic range phi Pn = 0.9 x 0.877 x pi^2 E A / (K L / r)^2.
+#[test]
+fn stored_steel_length_and_k_overwrites_follow_the_euler_closed_form() {
+    let mut m = aisc_360_05_example_001();
+    // Add an axial load so the member is a beam-column with a compression check.
+    pattern(&mut m, "P", 0.0);
+    joint_force(&mut m, "J2", "P", [-5.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+    analyze_model(&mut m).unwrap();
+    let (e, area, r22, length) = (29000.0, 14.7, 1.652, 420.0);
+    let euler = |k: f64, ratio: f64| {
+        let slenderness: f64 = k * ratio * length / r22;
+        // Elastic buckling governs beyond 4.71 sqrt(E / Fy) = 113.4.
+        assert!(slenderness > 113.5, "{slenderness}");
+        0.9 * 0.877 * std::f64::consts::PI.powi(2) * e * area / slenderness.powi(2)
+    };
+    for (overwrite, expected) in [
+        (SteelDesignOverwrite::default(), euler(1.0, 1.0)),
+        (SteelDesignOverwrite { k_minor: Some(2.0), ..Default::default() }, euler(2.0, 1.0)),
+        (SteelDesignOverwrite { l_ratio_minor: Some(0.5), ..Default::default() }, euler(1.0, 0.5)),
+        (SteelDesignOverwrite { k_minor: Some(1.2), l_ratio_minor: Some(0.75), ..Default::default() }, euler(1.2, 0.75)),
+    ] {
+        m.frames["F1"].steel_overwrite = Some(overwrite.clone());
+        try_run_steel_design(&mut m).unwrap();
+        let got = m.steel_design_results["F1"].phi_pnc;
+        close(&format!("phi Pn for {overwrite:?}"), got, expected, 1e-6 * expected);
+    }
+    // Eurocode 3 reads the same stored lengths: halving the minor length
+    // raises the buckling resistance.
+    m.steel_design_code = "Eurocode 3-2005".into();
+    m.frames["F1"].steel_overwrite = None;
+    try_run_steel_design(&mut m).unwrap();
+    let full = m.steel_design_results["F1"].phi_pnc;
+    m.frames["F1"].steel_overwrite = Some(SteelDesignOverwrite { l_ratio_minor: Some(0.5), ..Default::default() });
+    try_run_steel_design(&mut m).unwrap();
+    assert!(m.steel_design_results["F1"].phi_pnc > 2.0 * full);
+}
+
+// ---------------------------------------------------------------------------
+// CSI Software Verification, ACI 318-14 Example 001: simply supported beam
+// 10 x 16 in (d = 13.5 in), 10 ft span, ultimate load 9.736 kip/ft, fc 4 ksi,
+// fy 60 ksi. Kip and inch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn vendor_aci_318_14_example_001_flexural_steel_matches_for_every_framing_type() {
+    for framing in [ConcreteFramingType::SwaySpecial, ConcreteFramingType::SwayOrdinary] {
+        let mut m = base(Units::KipInF, true);
+        material(&mut m, "4000Psi", "Conc", |c| {
+            c.e = 3600.0;
+            c.u = 0.2;
+            c.g = 1500.0;
+            c.fc = 4.0;
+        });
+        material(&mut m, "A992Fy50", "Rebar", |s| s.fy = 60.0);
+        let mut section = make_rectangular("Conc Bm 10x16", "Conc", 16.0, 10.0);
+        section.concrete_rebar = beam_rebar("Rebar", 2.5);
+        m.frame_sections.insert("Conc Bm 10x16".into(), section);
+        beam_line(&mut m, &[0.0, 120.0], "Conc Bm 10x16", 41);
+        m.points["J1"].restraint = PIN;
+        m.points["J2"].restraint = ROLLER;
+        m.frames["F1"].concrete_framing = framing;
+        pattern(&mut m, "Ultimate", 0.0);
+        gravity_udl(&mut m, "F1", "Ultimate", 0.0, 1.0, 9.736 / 12.0);
+        analyze_model(&mut m).unwrap();
+        // Published: Mu = 1460.4 kip-in and As = 2.37 in2. The beam has no end
+        // moments, so the seismic framing types change nothing.
+        close("design moment", max_abs_m3(&m, "Ultimate"), 1460.4, 0.05);
+        try_run_concrete_design(&mut m).unwrap();
+        let design = &m.concrete_design_results["F1"];
+        close("tension steel [in2]", design.as_bot, 2.37, 0.005);
+        close("tension steel against the closed form", design.as_bot, aci_flexural_steel(1460.4, 4.0, 60.0, 10.0, 13.5), 1e-6);
+        assert_eq!(design.as_top, 0.0);
+        // The published Av/s = 0.041 in2/in is for the shear at d from the
+        // support, 37.73 kip; this project reports the largest value over the
+        // stations, which is at the support: Vu = 48.68 kip,
+        // Av/s = (Vu - phi Vc) / (phi fy d) with phi Vc = 0.75 x 2 sqrt(4000) psi x b d.
+        let phi_vc = 0.75 * 2.0 * 4000.0f64.sqrt() / 1000.0 * 10.0 * 13.5;
+        close("stirrups at the support", design.av_over_s, (48.68 - phi_vc) / (0.75 * 60.0 * 13.5), 1e-4);
+        close("stirrups at d from the support, by the same formula", (37.73 - phi_vc) / (0.75 * 60.0 * 13.5), 0.041, 5e-4);
     }
 }

@@ -457,6 +457,20 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                 "requires an i32 segment count",
             ));
         }
+        // Design overwrites have no native representation here; a synthesized
+        // file would drop them and the design would silently change.
+        if frame.concrete_framing != sap_model::ConcreteFramingType::default() {
+            return Err(unsupported(
+                format!("frames.{name}.concrete_framing"),
+                "a concrete framing type other than the default is not written natively; use S2K",
+            ));
+        }
+        if frame.steel_overwrite.is_some() {
+            return Err(unsupported(
+                format!("frames.{name}.steel_overwrite"),
+                "steel design overwrites are not written natively; use S2K",
+            ));
+        }
         // Joint offsets are written in the one form the corpus shows: element
         // local, equal at both ends.
         if frame.joint_offset_i != [0.0; 3] || frame.joint_offset_j != [0.0; 3] {

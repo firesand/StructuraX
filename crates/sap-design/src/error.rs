@@ -22,6 +22,13 @@ pub enum DesignError {
     UnsupportedSteelMaterial { frame: String, material: String },
     #[error("steel design does not yet implement the closed-section torsion interaction for member '{frame}'")]
     UnsupportedClosedSectionTorsion { frame: String },
+    #[error("steel design overwrite '{item}' of member '{frame}' is {value}; it must be finite and positive")]
+    InvalidSteelOverwrite {
+        frame: String,
+        item: &'static str,
+        /// The offending value, as text (the error type is `Eq`).
+        value: String,
+    },
     #[error("{discipline} design has no frame force demand for member '{frame}'")]
     MissingDemand {
         discipline: &'static str,

@@ -726,6 +726,51 @@ pub struct FrameObj {
     /// object between its ends.
     #[serde(default)]
     pub auto_mesh_at_joints: bool,
+    /// Concrete frame design framing type (ACI ductility class).
+    #[serde(default)]
+    pub concrete_framing: ConcreteFramingType,
+    /// Steel frame design overwrites; `None` uses the program defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steel_overwrite: Option<SteelDesignOverwrite>,
+}
+
+/// Concrete frame design framing type, as in the SAP2000 concrete design
+/// overwrites. The default is Sway Special, which SAP2000 derives from its
+/// default seismic design category D.
+///
+/// For ACI beam design, Sway Special requires the positive moment strength at
+/// each end to be at least one half of the negative strength there, and both
+/// strengths at every section to be at least one quarter of the largest end
+/// strength (ACI 318-14 18.6.3.2). Sway Intermediate uses one third and one
+/// fifth (18.4.2.2). Capacity-based shear, column and joint provisions of
+/// these framing types are not implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ConcreteFramingType {
+    #[default]
+    SwaySpecial,
+    SwayIntermediate,
+    SwayOrdinary,
+    NonSway,
+}
+
+/// Steel frame design overwrites of one member, after `cDesignSteel.SetOverwrite`.
+/// `None` in a field keeps the program-determined value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SteelDesignOverwrite {
+    /// Unbraced length ratio for major-axis buckling ($L_{33} / L$)
+    pub l_ratio_major: Option<f64>,
+    /// Unbraced length ratio for minor-axis buckling ($L_{22} / L$)
+    pub l_ratio_minor: Option<f64>,
+    /// Unbraced length ratio for lateral-torsional buckling ($L_{ltb} / L$)
+    pub l_ratio_ltb: Option<f64>,
+    /// Effective length factor $K_{33}$ (major axis)
+    pub k_major: Option<f64>,
+    /// Effective length factor $K_{22}$ (minor axis)
+    pub k_minor: Option<f64>,
+    /// Moment gradient factor $C_b$ (`None` = computed from the moment diagram)
+    pub cb: Option<f64>,
+    /// Sway frame flag for automatic alignment-chart $K$-factor calculation
+    pub is_sway: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -773,6 +818,8 @@ impl FrameObj {
             selected: false,
             auto_mesh_segments: 0,
             auto_mesh_at_joints: false,
+            concrete_framing: ConcreteFramingType::default(),
+            steel_overwrite: None,
         }
     }
 }

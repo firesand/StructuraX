@@ -1,5 +1,5 @@
 use sap_api::{cSapModel, OAPI_ERR, OAPI_OK};
-use sap_model::{CaseResults, PointLoadForce};
+use sap_model::{CaseResults, ConcreteFramingType, PointLoadForce, SteelDesignOverwrite};
 use sap_units::Units;
 
 fn api() -> cSapModel {
@@ -413,4 +413,32 @@ fn frame_insertion_point_is_validated_and_stored() {
     assert_eq!(frame.joint_offset_j, [0.0, 1.0, 12.0]);
     assert!(frame.joint_offset_is_global);
     assert!(a.inner.case_results.is_empty());
+}
+
+#[test]
+fn design_overwrites_are_validated_and_clear_only_design_results() {
+    let mut a = api();
+    a.inner.is_locked = true;
+    assert_eq!(a.design_concrete().get_framing_type("F"), Some(ConcreteFramingType::SwaySpecial));
+    assert_eq!(a.design_concrete().set_framing_type("F", ConcreteFramingType::SwayOrdinary), OAPI_OK);
+    assert_eq!(a.design_concrete().get_framing_type("F"), Some(ConcreteFramingType::SwayOrdinary));
+    assert_eq!(a.design_concrete().set_framing_type("MISSING", ConcreteFramingType::NonSway), OAPI_ERR);
+
+    let braced = SteelDesignOverwrite { l_ratio_ltb: Some(0.25), ..Default::default() };
+    assert_eq!(a.design_steel().set_overwrite("F", Some(braced.clone())), OAPI_OK);
+    assert_eq!(a.design_steel().get_overwrite("F"), Some(&braced));
+    // Refused without changing the stored overwrite.
+    for bad in [
+        SteelDesignOverwrite { l_ratio_ltb: Some(0.0), ..Default::default() },
+        SteelDesignOverwrite { k_major: Some(-1.0), ..Default::default() },
+        SteelDesignOverwrite { cb: Some(f64::NAN), ..Default::default() },
+    ] {
+        assert_eq!(a.design_steel().set_overwrite("F", Some(bad)), OAPI_ERR);
+    }
+    assert_eq!(a.design_steel().set_overwrite("MISSING", None), OAPI_ERR);
+    assert_eq!(a.design_steel().get_overwrite("F"), Some(&braced));
+    // Analysis results and the lock are untouched.
+    assert!(a.inner.is_locked && a.inner.case_results.contains_key("OLD"));
+    assert_eq!(a.design_steel().set_overwrite("F", None), OAPI_OK);
+    assert_eq!(a.design_steel().get_overwrite("F"), None);
 }
