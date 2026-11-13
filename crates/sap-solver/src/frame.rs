@@ -492,10 +492,7 @@ pub fn condense_releases_and_springs(
         let (released, ks) = if dof < 6 {
             (frame.release_i[dof], frame.start_spring[dof].max(0.0))
         } else {
-            (
-                frame.release_j[dof - 6],
-                frame.end_spring[dof - 6].max(0.0),
-            )
+            (frame.release_j[dof - 6], frame.end_spring[dof - 6].max(0.0))
         };
         if !released {
             continue;
@@ -541,12 +538,7 @@ pub fn condense_releases_and_springs(
 
 /// Applies rigid end-zone offset transformation $\mathbf{T}_{\text{rigid}}$ ($d_I = r_z a_I, d_J = r_z a_J$)
 /// to both the $12 \times 12$ stiffness matrix and $12 \times 1$ fixed-end force vector.
-pub fn apply_rigid_offsets(
-    k: &mut [[f64; 12]; 12],
-    fef: &mut [f64; 12],
-    di: f64,
-    dj: f64,
-) {
+pub fn apply_rigid_offsets(k: &mut [[f64; 12]; 12], fef: &mut [f64; 12], di: f64, dj: f64) {
     if di.abs() < 1e-14 && dj.abs() < 1e-14 {
         return;
     }
@@ -695,15 +687,24 @@ pub fn resolve_load_dir_to_local(
 /// Projected force intensity uses sin(theta); projected moment intensity uses
 /// cos(theta), per CSI Analysis Reference Manual p.140. Projection is a length
 /// magnitude and is invariant under reversal of member connectivity.
-fn distributed_load_dir_to_local(dir: i32, value: f64, axes: &[[f64;3];3], my_type: i32) -> [f64;3] {
+fn distributed_load_dir_to_local(
+    dir: i32,
+    value: f64,
+    axes: &[[f64; 3]; 3],
+    my_type: i32,
+) -> [f64; 3] {
     if my_type == 2 {
-        let projection_axis = match dir { 7..=9 => Some((dir-7) as usize), 11 => Some(2), _ => None };
+        let projection_axis = match dir {
+            7..=9 => Some((dir - 7) as usize),
+            11 => Some(2),
+            _ => None,
+        };
         if let Some(axis) = projection_axis {
-            let direction = if dir == 11 { 10 } else { dir-3 };
-            return resolve_load_dir_to_local(direction, value*axes[0][axis].abs(), axes, false);
+            let direction = if dir == 11 { 10 } else { dir - 3 };
+            return resolve_load_dir_to_local(direction, value * axes[0][axis].abs(), axes, false);
         }
     }
-    resolve_load_dir_to_local(dir,value,axes,true)
+    resolve_load_dir_to_local(dir, value, axes, true)
 }
 
 #[inline]
@@ -896,28 +897,42 @@ pub fn compute_flexible_fef_for_pattern(
     // then restrain it with the actual flexible stiffness. This is compatible
     // with finite shear stiffness and variable sections; midpoint EI formulas
     // are not sufficient for a longitudinally varying thermal curvature.
-    let mut thermal_free = [0.;12];
+    let mut thermal_free = [0.; 12];
     for lt in &frame.loads_temp {
-        if lt.load_pat != pat_name { continue; }
+        if lt.load_pat != pat_name {
+            continue;
+        }
         let (pat_i, pat_j) = if let Some(pname) = &lt.pattern_name {
-            (pt_i.pattern_values.get(pname).copied().unwrap_or(1.0),
-             pt_j.pattern_values.get(pname).copied().unwrap_or(1.0))
-        } else { (1.,1.) };
+            (
+                pt_i.pattern_values.get(pname).copied().unwrap_or(1.0),
+                pt_j.pattern_values.get(pname).copied().unwrap_or(1.0),
+            )
+        } else {
+            (1., 1.)
+        };
         let strain_i = mat.a * lt.val * pat_i * sf;
         let strain_j = mat.a * lt.val * pat_j * sf;
-        let rotation = 0.5 * lf * (strain_i+strain_j);
-        let transverse = -lf*lf*(2.*strain_i+strain_j)/6.;
+        let rotation = 0.5 * lf * (strain_i + strain_j);
+        let transverse = -lf * lf * (2. * strain_i + strain_j) / 6.;
         match lt.my_type {
             1 => thermal_free[6] += rotation,
-            2 => { thermal_free[7] += transverse; thermal_free[11] -= rotation; }
-            3 => { thermal_free[8] += transverse; thermal_free[10] += rotation; }
+            2 => {
+                thermal_free[7] += transverse;
+                thermal_free[11] -= rotation;
+            }
+            3 => {
+                thermal_free[8] += transverse;
+                thermal_free[10] += rotation;
+            }
             _ => {}
         }
     }
     if thermal_free.iter().any(|x| *x != 0.) {
-        let stiffness = compute_flexible_local_stiffness(model,frame,sec,mat,lf);
+        let stiffness = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
         for row in 0..12 {
-            fef[row] -= (0..12).map(|col| stiffness[row][col]*thermal_free[col]).sum::<f64>();
+            fef[row] -= (0..12)
+                .map(|col| stiffness[row][col] * thermal_free[col])
+                .sum::<f64>();
         }
     }
 
@@ -962,12 +977,12 @@ pub fn recover_frame_stations(
     let m3_j = f_end_local[11];
     let _ = (p_j, v2_j, v3_j, t_j);
 
-    let mut property_breaks = vec![0.,1.];
+    let mut property_breaks = vec![0., 1.];
     if sec.prop_type == FramePropType::Variable {
-        let mut position=0.;
-        for (_, segment_length) in resolve_non_prismatic_segments(&sec.non_prismatic,length) {
+        let mut position = 0.;
+        for (_, segment_length) in resolve_non_prismatic_segments(&sec.non_prismatic, length) {
             position += segment_length;
-            property_breaks.push((position/length).clamp(0.,1.));
+            property_breaks.push((position / length).clamp(0., 1.));
         }
     }
     property_breaks.sort_by(f64::total_cmp);
@@ -975,18 +990,23 @@ pub fn recover_frame_stations(
     // Use identical segment-aware gravity quadrature for partial and full-span
     // force/moment integrals. Midpoint weight gives the wrong first moment for
     // tapered sections and cannot be used for the end-equilibrium correction.
-    let gravity_integrals = |x: f64, direction: [f64;3], scale: f64| {
-        let mut sum=[0.;5]; // axial, shear2, shear3, moment2, moment3
+    let gravity_integrals = |x: f64, direction: [f64; 3], scale: f64| {
+        let mut sum = [0.; 5]; // axial, shear2, shear3, moment2, moment3
         for span in property_breaks.windows(2) {
-            let lo=span[0]*length;let hi=(span[1]*length).min(x);
-            if hi <= lo { continue; }
-            for (&node,&weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
-                let at=lo+node*(hi-lo);
-                let props=eval_section_props_at(model,frame,sec,mat,at/length,length);
-                let dw=props.weight_per_len*weight*(hi-lo)*scale;
-                for d in 0..3 { sum[d] += direction[d]*dw; }
-                sum[3] -= (x-at)*direction[2]*dw;
-                sum[4] += (x-at)*direction[1]*dw;
+            let lo = span[0] * length;
+            let hi = (span[1] * length).min(x);
+            if hi <= lo {
+                continue;
+            }
+            for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+                let at = lo + node * (hi - lo);
+                let props = eval_section_props_at(model, frame, sec, mat, at / length, length);
+                let dw = props.weight_per_len * weight * (hi - lo) * scale;
+                for d in 0..3 {
+                    sum[d] += direction[d] * dw;
+                }
+                sum[3] -= (x - at) * direction[2] * dw;
+                sum[4] += (x - at) * direction[1] * dw;
             }
         }
         sum
@@ -1023,8 +1043,10 @@ pub fn recover_frame_stations(
                 || grav_mult[2].abs() > 1e-15
             {
                 let local_g = global_vec_to_local(grav_mult, e_axes);
-                let integrals=gravity_integrals(x,local_g,*sf);
-                for d in 0..3 { int_f[d] += integrals[d]; }
+                let integrals = gravity_integrals(x, local_g, *sf);
+                for d in 0..3 {
+                    int_f[d] += integrals[d];
+                }
                 int_m2 += integrals[3];
                 int_m3 += integrals[4];
             }
@@ -1047,7 +1069,8 @@ pub fn recover_frame_stations(
                     let frac = (s_eval - s1) / (s2 - s1);
                     let q_val = (ld.val1 + (ld.val2 - ld.val1) * frac) * sf;
                     let d_len = w_g * ds_active * length;
-                    let dq = distributed_load_dir_to_local(ld.dir, q_val * d_len, e_axes, ld.my_type);
+                    let dq =
+                        distributed_load_dir_to_local(ld.dir, q_val * d_len, e_axes, ld.my_type);
                     if ld.my_type == 1 {
                         int_f[0] += dq[0];
                         int_f[1] += dq[1];
@@ -1106,7 +1129,7 @@ pub fn recover_frame_stations(
                     grav_mult[2] += gm[2];
                 }
                 let local_g = global_vec_to_local(grav_mult, e_axes);
-                let integrals=gravity_integrals(length,local_g,*sf);
+                let integrals = gravity_integrals(length, local_g, *sf);
                 m2_l += integrals[3];
                 m3_l += integrals[4];
                 for ld in &frame.loads_dist {
@@ -1167,50 +1190,85 @@ pub fn recover_frame_stations(
     // retain their exact piecewise-polynomial integrals for prismatic members.
     let mut breaks = property_breaks.clone();
     for load in &frame.loads_dist {
-        breaks.extend([load.rel_dist1.clamp(0.,1.),load.rel_dist2.clamp(0.,1.)]);
+        breaks.extend([load.rel_dist1.clamp(0., 1.), load.rel_dist2.clamp(0., 1.)]);
     }
-    for load in &frame.loads_point { breaks.push(load.rel_dist.clamp(0.,1.)); }
+    for load in &frame.loads_point {
+        breaks.push(load.rel_dist.clamp(0., 1.));
+    }
     breaks.sort_by(f64::total_cmp);
     breaks.dedup();
     // Thermal axial strain and transverse curvature are independent of the
     // elastic section forces. Positive gradients lengthen the positive local
     // face, giving negative transverse curvature in either bending plane.
     let thermal_at = |s: f64| {
-        let mut strain = [0.;3];
+        let mut strain = [0.; 3];
         for load in &frame.loads_temp {
-            if !(1..=3).contains(&load.my_type) { continue; }
-            let scale: f64 = case_loads.iter().filter(|(p,_)| p == &load.load_pat).map(|(_,sf)| sf).sum();
+            if !(1..=3).contains(&load.my_type) {
+                continue;
+            }
+            let scale: f64 = case_loads
+                .iter()
+                .filter(|(p, _)| p == &load.load_pat)
+                .map(|(_, sf)| sf)
+                .sum();
             let profile = if let Some(pattern) = &load.pattern_name {
-                let i = model.points[&frame.point_i].pattern_values.get(pattern).copied().unwrap_or(1.);
-                let j = model.points[&frame.point_j].pattern_values.get(pattern).copied().unwrap_or(1.);
-                i+(j-i)*s
-            } else { 1. };
-            let axis=(load.my_type-1) as usize;
-            strain[axis] += if axis == 0 { 1. } else { -1. } * mat.a*load.val*scale*profile;
+                let i = model.points[&frame.point_i]
+                    .pattern_values
+                    .get(pattern)
+                    .copied()
+                    .unwrap_or(1.);
+                let j = model.points[&frame.point_j]
+                    .pattern_values
+                    .get(pattern)
+                    .copied()
+                    .unwrap_or(1.);
+                i + (j - i) * s
+            } else {
+                1.
+            };
+            let axis = (load.my_type - 1) as usize;
+            strain[axis] += if axis == 0 { 1. } else { -1. } * mat.a * load.val * scale * profile;
         }
         strain
     };
-    let shear_modulus = if mat.g > 1e-12 { mat.g } else { mat.e/(2.*(1.+mat.u)) };
+    let shear_modulus = if mat.g > 1e-12 {
+        mat.g
+    } else {
+        mat.e / (2. * (1. + mat.u))
+    };
     let integrate = |s: f64| {
-        let x=s*length;
-        let mut integral=[0.;3];
+        let x = s * length;
+        let mut integral = [0.; 3];
         for span in breaks.windows(2) {
-            let lo=span[0]; let hi=span[1].min(s);
-            if hi <= lo { continue; }
-            for (&node,&weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
-                let at=lo+node*(hi-lo);
-                let ds=weight*(hi-lo)*length;
-                let [p,v2,v3,_,m2,m3]=section_forces(at);
-                let props=eval_section_props_at(model,frame,sec,mat,at,length);
-                if props.area > 0. { integral[0] += ds*p/(mat.e*props.area); }
-                if props.i33 > 0. { integral[1] += ds*(x-at*length)*m3/(mat.e*props.i33); }
-                if props.i22 > 0. { integral[2] -= ds*(x-at*length)*m2/(mat.e*props.i22); }
-                if props.as2 > 0. { integral[1] += ds*v2/(shear_modulus*props.as2); }
-                if props.as3 > 0. { integral[2] += ds*v3/(shear_modulus*props.as3); }
-                let thermal=thermal_at(at);
-                integral[0] += ds*thermal[0];
-                integral[1] += ds*(x-at*length)*thermal[1];
-                integral[2] += ds*(x-at*length)*thermal[2];
+            let lo = span[0];
+            let hi = span[1].min(s);
+            if hi <= lo {
+                continue;
+            }
+            for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+                let at = lo + node * (hi - lo);
+                let ds = weight * (hi - lo) * length;
+                let [p, v2, v3, _, m2, m3] = section_forces(at);
+                let props = eval_section_props_at(model, frame, sec, mat, at, length);
+                if props.area > 0. {
+                    integral[0] += ds * p / (mat.e * props.area);
+                }
+                if props.i33 > 0. {
+                    integral[1] += ds * (x - at * length) * m3 / (mat.e * props.i33);
+                }
+                if props.i22 > 0. {
+                    integral[2] -= ds * (x - at * length) * m2 / (mat.e * props.i22);
+                }
+                if props.as2 > 0. {
+                    integral[1] += ds * v2 / (shear_modulus * props.as2);
+                }
+                if props.as3 > 0. {
+                    integral[2] += ds * v3 / (shear_modulus * props.as3);
+                }
+                let thermal = thermal_at(at);
+                integral[0] += ds * thermal[0];
+                integral[1] += ds * (x - at * length) * thermal[1];
+                integral[2] += ds * (x - at * length) * thermal[2];
             }
         }
         integral
@@ -1218,12 +1276,16 @@ pub fn recover_frame_stations(
     // Rigid-zone kinematics need a separate mapping from flexible-face output
     // stations to joint locations; retain previous interpolation for that path.
     let integrate_deflection = frame.end_offset_i == 0. && frame.end_offset_j == 0.;
-    let full = if integrate_deflection { integrate(1.) } else { [0.;3] };
+    let full = if integrate_deflection {
+        integrate(1.)
+    } else {
+        [0.; 3]
+    };
 
     for idx in 0..n_sta {
         let s = (idx as f64) / ((n_sta - 1) as f64);
-        let x = s*length;
-        let [p,v2,v3,t,m2,m3] = section_forces(s);
+        let x = s * length;
+        let [p, v2, v3, t, m2, m3] = section_forces(s);
         // Hermite interpolation of local displacements [u1, u2, u3]
         let n1 = 1.0 - 3.0 * s * s + 2.0 * s * s * s;
         let n2 = length * (s - 2.0 * s * s + s * s * s);
@@ -1244,9 +1306,13 @@ pub fn recover_frame_stations(
             m2,
             m3,
             local_disp: if integrate_deflection {
-                let partial=integrate(s);
-                std::array::from_fn(|d| (1.-s)*u_local[d]+s*u_local[6+d]+partial[d]-s*full[d])
-            } else { [u1_s,u2_s,u3_s] },
+                let partial = integrate(s);
+                std::array::from_fn(|d| {
+                    (1. - s) * u_local[d] + s * u_local[6 + d] + partial[d] - s * full[d]
+                })
+            } else {
+                [u1_s, u2_s, u3_s]
+            },
         });
     }
 

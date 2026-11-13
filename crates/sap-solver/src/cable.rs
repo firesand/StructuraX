@@ -430,11 +430,7 @@ impl CableElement {
                             None
                         };
                         let x_next = match secant {
-                            Some(xs)
-                                if xs > b_lo + 0.05 * width && xs < b_hi - 0.05 * width =>
-                            {
-                                xs
-                            }
+                            Some(xs) if xs > b_lo + 0.05 * width && xs < b_hi - 0.05 * width => xs,
                             _ => 0.5 * (b_lo + b_hi),
                         };
                         let g_next = eval_ti(x_next)? - target_ti;
@@ -781,45 +777,45 @@ pub fn evaluate_cable_element(
 
     let (ex, ey, f_i_loc, f_j_loc, k_loc_2d, k_yy, h_val, l_def) =
         if lx > 1e-12_f64.max(1e-14 * elem.l0) {
-        let ex = [h_vec[0] / lx, h_vec[1] / lx, h_vec[2] / lx];
-        let ey = cross3(ez, ex);
-        let (f_i_2d, f_j_2d, k_2d, l_def) = solve_catenary_2d(lx, lz, elem.l0, ea, w, c_th)?;
-        let h_val = f_j_2d[0];
-        let k_yy = h_val / lx;
-        (ex, ey, f_i_2d, f_j_2d, k_2d, k_yy, h_val, l_def)
-    } else {
-        // Purely vertical cable limit (lx -> 0, H = 0)
-        let ex = any_perpendicular_unit(ez);
-        let ey = cross3(ez, ex);
-        let total_w = w * elem.l0;
-        let l_lim = c_th * elem.l0 + total_w * elem.l0 / (2.0 * ea);
-        let (f4, k_zz) = if lz.abs() <= l_lim {
-            // Hanging vertical loop: both ends pull upward (F2 >= 0, F4 >= 0)
-            let denom = 2.0 * elem.l0 * (1.0 / (2.0 * ea) + c_th / total_w);
-            (0.5 * total_w + lz / denom, 1.0 / denom)
-        } else if lz < -l_lim {
-            // Taut vertical cable stretched downward
-            let k_ax = ea / elem.l0;
-            (0.5 * total_w + k_ax * (lz + c_th * elem.l0), k_ax)
+            let ex = [h_vec[0] / lx, h_vec[1] / lx, h_vec[2] / lx];
+            let ey = cross3(ez, ex);
+            let (f_i_2d, f_j_2d, k_2d, l_def) = solve_catenary_2d(lx, lz, elem.l0, ea, w, c_th)?;
+            let h_val = f_j_2d[0];
+            let k_yy = h_val / lx;
+            (ex, ey, f_i_2d, f_j_2d, k_2d, k_yy, h_val, l_def)
         } else {
-            // Taut vertical cable stretched upward
-            let k_ax = ea / elem.l0;
-            (0.5 * total_w + k_ax * (lz - c_th * elem.l0), k_ax)
+            // Purely vertical cable limit (lx -> 0, H = 0)
+            let ex = any_perpendicular_unit(ez);
+            let ey = cross3(ez, ex);
+            let total_w = w * elem.l0;
+            let l_lim = c_th * elem.l0 + total_w * elem.l0 / (2.0 * ea);
+            let (f4, k_zz) = if lz.abs() <= l_lim {
+                // Hanging vertical loop: both ends pull upward (F2 >= 0, F4 >= 0)
+                let denom = 2.0 * elem.l0 * (1.0 / (2.0 * ea) + c_th / total_w);
+                (0.5 * total_w + lz / denom, 1.0 / denom)
+            } else if lz < -l_lim {
+                // Taut vertical cable stretched downward
+                let k_ax = ea / elem.l0;
+                (0.5 * total_w + k_ax * (lz + c_th * elem.l0), k_ax)
+            } else {
+                // Taut vertical cable stretched upward
+                let k_ax = ea / elem.l0;
+                (0.5 * total_w + k_ax * (lz - c_th * elem.l0), k_ax)
+            };
+            let f2 = total_w - f4;
+            let k_lat = (w).max(1e-6 * ea / elem.l0);
+            let l_def = c_th * elem.l0 + (f2 * f2.abs() + f4 * f4.abs()) / (2.0 * ea * w);
+            (
+                ex,
+                ey,
+                [0.0, f2],
+                [0.0, f4],
+                [[k_lat, 0.0], [0.0, k_zz]],
+                k_lat,
+                0.0,
+                l_def,
+            )
         };
-        let f2 = total_w - f4;
-        let k_lat = (w).max(1e-6 * ea / elem.l0);
-        let l_def = c_th * elem.l0 + (f2 * f2.abs() + f4 * f4.abs()) / (2.0 * ea * w);
-        (
-            ex,
-            ey,
-            [0.0, f2],
-            [0.0, f4],
-            [[k_lat, 0.0], [0.0, k_zz]],
-            k_lat,
-            0.0,
-            l_def,
-        )
-    };
 
     // Transform local forces (f_x * ex + f_z * ez) to global Cartesian axes
     let mut f_i = [0.0; 3];
@@ -1066,36 +1062,49 @@ pub mod tc_limits {
         pub compression_limit: Option<f64>,
     }
 
-    /// Evaluate the clamped axial force $P$, consistent axial tangent stiffness $k_{T,\text{axial}}$,
+    /// Evaluate the clamped average axial force $P_{\text{avg}}$, consistent axial tangent stiffness $k_{T,\text{axial}}$,
     /// and active flag (`true` = elastic within limits, `false` = clamped at T/C limit) given:
     /// - `ea_over_l`: linear elastic axial stiffness $EA / L > 0$
     /// - `delta_u_axial`: axial elongation $u_{J,a} - u_{I,a}$
-    /// - `p0_axial`: initial/thermal axial force offset $P_0$
+    /// - `p0_axial`: initial/fixed-end axial force offset $P_0 = 0.5(f_{\text{FEF}}[6] - f_{\text{FEF}}[0])$
+    /// - `w_axial`: total span axial load $W_{\text{axial}} = -(f_{\text{FEF}}[0] + f_{\text{FEF}}[6])$
     /// - `limits`: optional tension and compression limits
     /// - `eps_reg_scale`: small positive tangent regularization factor when clamped (e.g. `1e-9`)
     pub fn eval_frame_tc_axial(
         ea_over_l: f64,
         delta_u_axial: f64,
         p0_axial: f64,
+        w_axial: f64,
         limits: FrameTcLimits,
         eps_reg_scale: f64,
     ) -> (f64, f64, bool) {
-        let p_trial = ea_over_l * delta_u_axial + p0_axial;
+        let p_trial_avg = ea_over_l * delta_u_axial + p0_axial;
         let k_reg = (eps_reg_scale.max(1e-12)) * ea_over_l;
+        let half_w = 0.5 * w_axial.abs();
+        let p_max_trial = p_trial_avg + half_w;
+        let p_min_trial = p_trial_avg - half_w;
 
-        if let Some(t_lim) = limits.tension_limit {
-            let p_max = t_lim.max(0.0);
-            if p_trial > p_max {
-                return (p_max, k_reg, false);
+        let t_viol = limits
+            .tension_limit
+            .map(|t| (t.max(0.0), p_max_trial - t.max(0.0)))
+            .filter(|(_, v)| *v > 0.0);
+        let c_viol = limits
+            .compression_limit
+            .map(|c| (-c.abs(), -c.abs() - p_min_trial))
+            .filter(|(_, v)| *v > 0.0);
+
+        match (t_viol, c_viol) {
+            (Some((t_lim, over_t)), Some((c_bound, over_c))) => {
+                if over_t >= over_c {
+                    (t_lim - half_w, k_reg, false)
+                } else {
+                    (c_bound + half_w, k_reg, false)
+                }
             }
+            (Some((t_lim, _)), None) => (t_lim - half_w, k_reg, false),
+            (None, Some((c_bound, _))) => (c_bound + half_w, k_reg, false),
+            (None, None) => (p_trial_avg, ea_over_l, true),
         }
-        if let Some(c_lim) = limits.compression_limit {
-            let p_min = -c_lim.abs();
-            if p_trial < p_min {
-                return (p_min, k_reg, false);
-            }
-        }
-        (p_trial, ea_over_l, true)
     }
 
     /// Apply Frame Tension/Compression limits directly to a local 12-DOF frame internal
@@ -1108,12 +1117,14 @@ pub mod tc_limits {
         eps_reg_scale: f64,
     ) -> bool {
         let ea_over_l = k_local[0][0];
-        let p_trial = f_local[6];
+        let p_trial_avg = 0.5 * (f_local[6] - f_local[0]);
+        let w_axial = -(f_local[0] + f_local[6]);
         let (p_clamped, k_ax, active) =
-            eval_frame_tc_axial(ea_over_l, 0.0, p_trial, limits, eps_reg_scale);
+            eval_frame_tc_axial(ea_over_l, 0.0, p_trial_avg, w_axial, limits, eps_reg_scale);
         if !active {
-            f_local[0] = -p_clamped;
-            f_local[6] = p_clamped;
+            let f_mean = 0.5 * (f_local[0] + f_local[6]);
+            f_local[0] = f_mean - p_clamped;
+            f_local[6] = f_mean + p_clamped;
             k_local[0][0] = k_ax;
             k_local[6][6] = k_ax;
             k_local[0][6] = -k_ax;
@@ -1272,12 +1283,12 @@ mod tests {
             tension_limit: None,
             compression_limit: Some(0.0),
         };
-        let (p_tens, k_tens, act_t) = eval_frame_tc_axial(ea_l, 0.05, 0.0, t_only, 1e-9);
+        let (p_tens, k_tens, act_t) = eval_frame_tc_axial(ea_l, 0.05, 0.0, 0.0, t_only, 1e-9);
         assert!(act_t);
         assert!((p_tens - 50.0).abs() < 1e-12);
         assert!((k_tens - ea_l).abs() < 1e-12);
 
-        let (p_comp, k_comp, act_c) = eval_frame_tc_axial(ea_l, -0.05, 0.0, t_only, 1e-9);
+        let (p_comp, k_comp, act_c) = eval_frame_tc_axial(ea_l, -0.05, 0.0, 0.0, t_only, 1e-9);
         assert!(!act_c);
         assert_eq!(p_comp, 0.0);
         assert!((k_comp - 1e-6).abs() < 1e-15);
@@ -1287,12 +1298,17 @@ mod tests {
             tension_limit: Some(30.0),
             compression_limit: Some(-20.0),
         };
-        let (p_hi, _, act_hi) = eval_frame_tc_axial(ea_l, 0.05, 0.0, bounded, 1e-9);
+        let (p_hi, _, act_hi) = eval_frame_tc_axial(ea_l, 0.05, 0.0, 0.0, bounded, 1e-9);
         assert!(!act_hi);
         assert!((p_hi - 30.0).abs() < 1e-12);
 
-        let (p_lo, _, act_lo) = eval_frame_tc_axial(ea_l, -0.05, 0.0, bounded, 1e-9);
+        let (p_lo, _, act_lo) = eval_frame_tc_axial(ea_l, -0.05, 0.0, 0.0, bounded, 1e-9);
         assert!(!act_lo);
         assert!((p_lo - (-20.0)).abs() < 1e-12);
+
+        // Span load check: w_axial = 10, compression limit = 0 -> clamped avg force = 0 + 5.0 = 5.0
+        let (p_span, _, act_span) = eval_frame_tc_axial(ea_l, 0.0, 0.0, 10.0, t_only, 1e-9);
+        assert!(!act_span);
+        assert!((p_span - 5.0).abs() < 1e-12);
     }
 }

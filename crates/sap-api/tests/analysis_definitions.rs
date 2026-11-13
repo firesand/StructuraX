@@ -75,7 +75,9 @@ fn spectrum_editor_selects_real_modal_dependency_and_known_oscillator_response()
     s.spectrum_loads = vec![("SA".into(), "U1".into(), 1.)];
     assert_eq!(a.load_cases().set_definition(s), OAPI_OK);
     assert_eq!(a.analyze().run_analysis(), OAPI_OK);
-    assert!((a.inner.case_results["MODES"].modes[0].period_sec - std::f64::consts::PI).abs() < 1e-9);
+    assert!(
+        (a.inner.case_results["MODES"].modes[0].period_sec - std::f64::consts::PI).abs() < 1e-9
+    );
     assert!((a.inner.case_results["S"].joint_displacements["J"][0] - 0.5).abs() < 1e-9);
 }
 #[test]

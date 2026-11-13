@@ -261,8 +261,7 @@ fn vendor_sdb_example_6_003_gap_link_static_and_direct_history() {
         nldhist3.initial_case = Some("NLSTAT1".to_string());
         model.load_cases.insert("NLDHIST3".to_string(), nldhist3);
 
-        // Modal LinearHistory continuation (`NLMHIST2`) remains explicitly rejected
-        // because modal superposition truncates high-frequency modes.
+        // Modal continuation verification
         {
             let mut modal_target = model.clone();
             let mut nlmhist2 = LoadCase::linear_static("NLMHIST2", "V", 1.0);
@@ -297,9 +296,14 @@ fn vendor_sdb_example_6_003_gap_link_static_and_direct_history() {
                 .load_cases
                 .insert("NLMHIST1".to_string(), nlmhist1);
             modal_origin.load_cases.insert("NLMHIST2".to_string(), cont);
-            let err = analyze_model(&mut modal_origin).unwrap_err();
-            assert!(err.to_string().contains("modal history"), "{err}");
-            assert!(modal_origin.case_results.is_empty());
+            analyze_model(&mut modal_origin)
+                .expect("modal_origin solves with NLMHIST1 continuation");
+            assert!(modal_origin.case_results["NLMHIST1"]
+                .transient_state
+                .is_some());
+            assert!(modal_origin.case_results["NLMHIST2"]
+                .transient_state
+                .is_some());
         }
 
         // Direct-integration history continuation (`NLSTAT3` and `NLDHIST2` from `NLDHIST1`)
@@ -457,7 +461,10 @@ fn vendor_sdb_examples_7_001_7_002_7_003_cables() {
         .unwrap()
         .undeformed_length = Some(100.0);
     let err_dup = analyze_model(&mut m_703_bad).unwrap_err();
-    assert!(err_dup.to_string().contains("target end tension"), "{err_dup}");
+    assert!(
+        err_dup.to_string().contains("target end tension"),
+        "{err_dup}"
+    );
     assert!(m_703_bad.case_results.is_empty());
 
     analyze_model(&mut m_703).expect("solve example_7_003.sdb");

@@ -37,11 +37,21 @@ pub(crate) fn validate_parameters(case: &LoadCase) -> Result<(), SolverError> {
     Ok(())
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct DynamicState {
+#[derive(Clone, Debug, Default)]
+pub struct DynamicState {
     pub u: Vec<f64>,
     pub v: Vec<f64>,
     pub a: Vec<f64>,
+}
+
+impl DynamicState {
+    pub fn zeros(n: usize) -> Self {
+        Self {
+            u: vec![0.0; n],
+            v: vec![0.0; n],
+            a: vec![0.0; n],
+        }
+    }
 }
 
 struct MasslessBlock {
@@ -472,6 +482,10 @@ impl LinearStepper {
         self.check_state()
     }
 
+    pub fn project_modal_state(&self, modes: &[Vec<f64>]) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+        project_to_modal_coordinates(modes, &self.mass, &self.state)
+    }
+
     fn check_state(&self) -> Result<(), SolverError> {
         if self
             .state
@@ -487,6 +501,62 @@ impl LinearStepper {
         }
         Ok(())
     }
+}
+
+/// Project physical dynamic state vectors onto mass-orthonormal mode shapes.
+///
+/// For mass-orthonormal modes $\boldsymbol{\phi}_m^T \mathbf{M} \boldsymbol{\phi}_n = \delta_{mn}$,
+/// the generalized modal coordinates are:
+/// $q_m = \boldsymbol{\phi}_m^T \mathbf{M} \mathbf{u} = \sum_i M_i \phi_{m,i} u_i$
+/// $\dot{q}_m = \boldsymbol{\phi}_m^T \mathbf{M} \mathbf{v} = \sum_i M_i \phi_{m,i} v_i$
+/// $\ddot{q}_m = \boldsymbol{\phi}_m^T \mathbf{M} \mathbf{a} = \sum_i M_i \phi_{m,i} a_i$
+pub fn project_to_modal_coordinates(
+    modes: &[Vec<f64>],
+    mass: &[f64],
+    state: &DynamicState,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut q = Vec::with_capacity(modes.len());
+    let mut v = Vec::with_capacity(modes.len());
+    let mut a = Vec::with_capacity(modes.len());
+    for phi in modes {
+        let mut qm = 0.0;
+        let mut vm = 0.0;
+        let mut am = 0.0;
+        for (i, &m) in mass.iter().enumerate() {
+            if m > 0.0 && i < phi.len() && i < state.u.len() {
+                let p = phi[i];
+                qm += m * p * state.u[i];
+                vm += m * p * state.v[i];
+                am += m * p * state.a[i];
+            }
+        }
+        q.push(qm);
+        v.push(vm);
+        a.push(am);
+    }
+    (q, v, a)
+}
+
+/// Reconstruct physical dynamic state from modal coordinates: $\mathbf{u} = \sum_m \boldsymbol{\phi}_m q_m$.
+pub fn reconstruct_from_modal_coordinates(
+    modes: &[Vec<f64>],
+    q: &[f64],
+    v: &[f64],
+    a: &[f64],
+    n: usize,
+) -> DynamicState {
+    let mut state = DynamicState::zeros(n);
+    for (m_idx, phi) in modes.iter().enumerate() {
+        let qm = q.get(m_idx).copied().unwrap_or(0.0);
+        let vm = v.get(m_idx).copied().unwrap_or(0.0);
+        let am = a.get(m_idx).copied().unwrap_or(0.0);
+        for i in 0..n.min(phi.len()) {
+            state.u[i] += phi[i] * qm;
+            state.v[i] += phi[i] * vm;
+            state.a[i] += phi[i] * am;
+        }
+    }
+    state
 }
 
 #[derive(Clone)]

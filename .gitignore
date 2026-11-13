@@ -3,9 +3,10 @@
 /target_*/
 **/*.rs.bk
 
-# Vendor extracted files & local reverse-engineering toolchains
+# Vendor extracted files, local agent state & reverse-engineering toolchains
 /extracted/
 /tools/
+/.agents/
 
 # OS & editor files
 .DS_Store

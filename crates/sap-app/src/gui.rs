@@ -3,8 +3,8 @@
 //! Parametric Structural Templates wizard, `.pro` section database importer, interactive
 //! member diagram inspector, Database Tables viewer, and Verification Benchmark Suite runner.
 
-mod workflows;
 mod analysis;
+mod workflows;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
 use sap_design::{try_run_concrete_design, try_run_steel_design};
@@ -464,12 +464,7 @@ impl SapGuiApp {
         }
     }
 
-    fn replace_model(
-        &mut self,
-        new_model: SapModel,
-        status: String,
-        import_warnings: Vec<String>,
-    ) {
+    fn replace_model(&mut self, new_model: SapModel, status: String, import_warnings: Vec<String>) {
         let old_u = self.model.present_units;
         let new_u = new_model.present_units;
         self.model = new_model;
@@ -730,7 +725,10 @@ impl SapGuiApp {
                     ui.close_menu();
                 }
                 ui.separator();
-                if ui.button("Open / Save Model (.s2k / .sdb)... (Ctrl+O)").clicked() {
+                if ui
+                    .button("Open / Save Model (.s2k / .sdb)... (Ctrl+O)")
+                    .clicked()
+                {
                     self.show_file_modal = true;
                     ui.close_menu();
                 }
@@ -765,19 +763,39 @@ impl SapGuiApp {
                     ui.close_menu();
                 }
                 if ui.button("Select All Objects").clicked() {
-                    for p in self.model.points.values_mut() { p.selected = true; }
-                    for f in self.model.frames.values_mut() { f.selected = true; }
-                    for a in self.model.areas.values_mut() { a.selected = true; }
-                    for s in self.model.solids.values_mut() { s.selected = true; }
-                    for l in self.model.links.values_mut() { l.selected = true; }
+                    for p in self.model.points.values_mut() {
+                        p.selected = true;
+                    }
+                    for f in self.model.frames.values_mut() {
+                        f.selected = true;
+                    }
+                    for a in self.model.areas.values_mut() {
+                        a.selected = true;
+                    }
+                    for s in self.model.solids.values_mut() {
+                        s.selected = true;
+                    }
+                    for l in self.model.links.values_mut() {
+                        l.selected = true;
+                    }
                     ui.close_menu();
                 }
                 if ui.button("Clear Selection").clicked() {
-                    for p in self.model.points.values_mut() { p.selected = false; }
-                    for f in self.model.frames.values_mut() { f.selected = false; }
-                    for a in self.model.areas.values_mut() { a.selected = false; }
-                    for s in self.model.solids.values_mut() { s.selected = false; }
-                    for l in self.model.links.values_mut() { l.selected = false; }
+                    for p in self.model.points.values_mut() {
+                        p.selected = false;
+                    }
+                    for f in self.model.frames.values_mut() {
+                        f.selected = false;
+                    }
+                    for a in self.model.areas.values_mut() {
+                        a.selected = false;
+                    }
+                    for s in self.model.solids.values_mut() {
+                        s.selected = false;
+                    }
+                    for l in self.model.links.values_mut() {
+                        l.selected = false;
+                    }
                     ui.close_menu();
                 }
                 if ui.button("Delete Selected Objects (Del)").clicked() {
@@ -842,7 +860,11 @@ impl SapGuiApp {
 
             ui.menu_button("Define", |ui| {
                 for (label, tab) in [("Analysis Cases...", 0), ("Dynamic Functions...", 1)] {
-                    if ui.button(label).clicked() { self.analysis_editor.open=true; self.analysis_editor.tab=tab; ui.close_menu(); }
+                    if ui.button(label).clicked() {
+                        self.analysis_editor.open = true;
+                        self.analysis_editor.tab = tab;
+                        ui.close_menu();
+                    }
                 }
                 for (label, tab) in [
                     ("Materials...", 5),
@@ -851,7 +873,10 @@ impl SapGuiApp {
                     ("Link Properties & Elements...", 6),
                     ("Load Combinations...", 4),
                 ] {
-                    if ui.button(label).clicked() { self.open_workflow(tab); ui.close_menu(); }
+                    if ui.button(label).clicked() {
+                        self.open_workflow(tab);
+                        ui.close_menu();
+                    }
                 }
                 if ui.button("Frame Sections & .PRO Library...").clicked() {
                     self.show_section_modal = true;
@@ -870,7 +895,10 @@ impl SapGuiApp {
                     ("Frame Releases / T-C Limits / Cable...", 3),
                     ("Link Elements...", 6),
                 ] {
-                    if ui.button(label).clicked() { self.open_workflow(tab); ui.close_menu(); }
+                    if ui.button(label).clicked() {
+                        self.open_workflow(tab);
+                        ui.close_menu();
+                    }
                 }
                 if ui.button("Assign Joint / Frame / Area Loads...").clicked() {
                     self.show_assign_load_modal = true;
@@ -1143,11 +1171,14 @@ impl SapGuiApp {
             );
         }
         if !self.export_warnings.is_empty() {
-            ui.collapsing(format!("Export warnings ({})", self.export_warnings.len()), |ui| {
-                for warning in &self.export_warnings {
-                    ui.label(warning);
-                }
-            });
+            ui.collapsing(
+                format!("Export warnings ({})", self.export_warnings.len()),
+                |ui| {
+                    for warning in &self.export_warnings {
+                        ui.label(warning);
+                    }
+                },
+            );
         }
         ui.label(RichText::new(&self.model.model_name).strong());
         ui.separator();
@@ -1209,7 +1240,10 @@ impl SapGuiApp {
                             };
                             ui.checkbox(
                                 &mut fr.selected,
-                                format!("{tag} {id}: {}->{} [{}]", fr.point_i, fr.point_j, fr.section),
+                                format!(
+                                    "{tag} {id}: {}->{} [{}]",
+                                    fr.point_i, fr.point_j, fr.section
+                                ),
                             );
                             if ui
                                 .small_button("🔍")
@@ -1238,10 +1272,7 @@ impl SapGuiApp {
                     .default_open(false)
                     .show(ui, |ui| {
                         for (id, sol) in &mut self.model.solids {
-                            ui.checkbox(
-                                &mut sol.selected,
-                                format!("Solid {id} [{}]", sol.section),
-                            );
+                            ui.checkbox(&mut sol.selected, format!("Solid {id} [{}]", sol.section));
                         }
                     });
             }
@@ -1281,7 +1312,10 @@ impl SapGuiApp {
                         let is_act = &self.active_case == name;
                         let run_tag = if lc.run_flag { "" } else { " [Off]" };
                         if ui
-                            .selectable_label(is_act, format!("{name} ({:?}){run_tag}", lc.case_type))
+                            .selectable_label(
+                                is_act,
+                                format!("{name} ({:?}){run_tag}", lc.case_type),
+                            )
                             .clicked()
                         {
                             self.active_case = name.clone();
@@ -1301,10 +1335,7 @@ impl SapGuiApp {
                     for (name, combo) in &self.model.load_combos {
                         let is_act = &self.active_case == name;
                         if ui
-                            .selectable_label(
-                                is_act,
-                                format!("{name} ({:?})", combo.combo_type),
-                            )
+                            .selectable_label(is_act, format!("{name} ({:?})", combo.combo_type))
                             .clicked()
                         {
                             self.active_case = name.clone();
@@ -1493,9 +1524,12 @@ impl SapGuiApp {
             if !p[0].is_finite() || !p[1].is_finite() || !p[2].is_finite() {
                 return screen_center;
             }
-            let dx = ((p[0] - center_3d[0]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
-            let dy = ((p[1] - center_3d[1]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
-            let dz = ((p[2] - center_3d[2]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
+            let dx =
+                ((p[0] - center_3d[0]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
+            let dy =
+                ((p[1] - center_3d[1]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
+            let dz =
+                ((p[2] - center_3d[2]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
             let (sx, sy) = match proj {
                 ViewProjection::Perspective3D => {
                     let (syaw, cyaw) = self.yaw_rad.sin_cos();
@@ -1690,29 +1724,27 @@ impl SapGuiApp {
             if !valid {
                 continue;
             }
-            let fill_col = if let (
-                DisplayMode::SolidContour(sol_comp),
-                Some(cr),
-                Some((_, lo, hi)),
-            ) = (self.display_mode, case_res, contour_range)
-            {
-                if let Some(sr) = cr.solid_results.get(sid) {
-                    let s = &sr.center_stress;
-                    let v = match sol_comp {
-                        SolidComponent::S11 => s.s11,
-                        SolidComponent::S22 => s.s22,
-                        SolidComponent::S33 => s.s33,
-                        SolidComponent::VonMises => s.von_mises,
-                    };
-                    normalized_contour_color(v, lo, hi, 115)
+            let fill_col =
+                if let (DisplayMode::SolidContour(sol_comp), Some(cr), Some((_, lo, hi))) =
+                    (self.display_mode, case_res, contour_range)
+                {
+                    if let Some(sr) = cr.solid_results.get(sid) {
+                        let s = &sr.center_stress;
+                        let v = match sol_comp {
+                            SolidComponent::S11 => s.s11,
+                            SolidComponent::S22 => s.s22,
+                            SolidComponent::S33 => s.s33,
+                            SolidComponent::VonMises => s.von_mises,
+                        };
+                        normalized_contour_color(v, lo, hi, 115)
+                    } else {
+                        Color32::from_rgba_unmultiplied(110, 130, 175, 45)
+                    }
+                } else if solid.selected {
+                    Color32::from_rgba_unmultiplied(255, 200, 60, 80)
                 } else {
-                    Color32::from_rgba_unmultiplied(110, 130, 175, 45)
-                }
-            } else if solid.selected {
-                Color32::from_rgba_unmultiplied(255, 200, 60, 80)
-            } else {
-                Color32::from_rgba_unmultiplied(110, 145, 190, 42)
-            };
+                    Color32::from_rgba_unmultiplied(110, 145, 190, 42)
+                };
             let stroke_col = if self.display_mode == DisplayMode::Deformed {
                 Color32::from_rgb(80, 255, 160)
             } else if solid.selected {
@@ -1774,37 +1806,35 @@ impl SapGuiApp {
                         Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(95, 115, 140, 90)),
                     ));
                 }
-                let active_poly = if self.display_mode == DisplayMode::Deformed && poly_def.len() >= 3
-                {
-                    &poly_def
-                } else {
-                    &poly_undef
-                };
-                let fill_col = if let (
-                    DisplayMode::ShellContour(scomp),
-                    Some(cr),
-                    Some((_, lo, hi)),
-                ) = (self.display_mode, case_res, contour_range)
-                {
-                    if let Some(ar) = cr.area_results.get(aid) {
-                        let val = match scomp {
-                            ShellComponent::F11 => ar.f11,
-                            ShellComponent::F22 => ar.f22,
-                            ShellComponent::M11 => ar.m11,
-                            ShellComponent::M22 => ar.m22,
-                            ShellComponent::SvmTop => ar.svm_top,
-                        };
-                        normalized_contour_color(val, lo, hi, 145)
+                let active_poly =
+                    if self.display_mode == DisplayMode::Deformed && poly_def.len() >= 3 {
+                        &poly_def
                     } else {
-                        Color32::from_rgba_unmultiplied(60, 120, 180, 65)
-                    }
-                } else if area.selected {
-                    Color32::from_rgba_unmultiplied(255, 200, 60, 90)
-                } else if self.display_mode == DisplayMode::Deformed {
-                    Color32::from_rgba_unmultiplied(70, 220, 150, 55)
-                } else {
-                    Color32::from_rgba_unmultiplied(60, 120, 180, 55)
-                };
+                        &poly_undef
+                    };
+                let fill_col =
+                    if let (DisplayMode::ShellContour(scomp), Some(cr), Some((_, lo, hi))) =
+                        (self.display_mode, case_res, contour_range)
+                    {
+                        if let Some(ar) = cr.area_results.get(aid) {
+                            let val = match scomp {
+                                ShellComponent::F11 => ar.f11,
+                                ShellComponent::F22 => ar.f22,
+                                ShellComponent::M11 => ar.m11,
+                                ShellComponent::M22 => ar.m22,
+                                ShellComponent::SvmTop => ar.svm_top,
+                            };
+                            normalized_contour_color(val, lo, hi, 145)
+                        } else {
+                            Color32::from_rgba_unmultiplied(60, 120, 180, 65)
+                        }
+                    } else if area.selected {
+                        Color32::from_rgba_unmultiplied(255, 200, 60, 90)
+                    } else if self.display_mode == DisplayMode::Deformed {
+                        Color32::from_rgba_unmultiplied(70, 220, 150, 55)
+                    } else {
+                        Color32::from_rgba_unmultiplied(60, 120, 180, 55)
+                    };
                 let edge_col = if self.display_mode == DisplayMode::Deformed {
                     Color32::from_rgb(80, 255, 160)
                 } else if area.selected {
@@ -1860,7 +1890,11 @@ impl SapGuiApp {
                             let v = pl.val * sf;
                             if v.abs() > 1e-12 {
                                 // Top face (-2) pushes along -local 3; Bottom face (-1) pushes along +local 3
-                                let sign = if pl.face == -2 { -v.signum() } else { v.signum() };
+                                let sign = if pl.face == -2 {
+                                    -v.signum()
+                                } else {
+                                    v.signum()
+                                };
                                 let dir = [normal[0] * sign, normal[1] * sign, normal[2] * sign];
                                 draw_world_force_arrow(&painter, &project, c3, dir, span_f64);
                             }
@@ -2241,7 +2275,9 @@ impl SapGuiApp {
                         }
                         if let Some((peak_pos, peak_val)) = outline
                             .iter()
-                            .filter(|(pos, val)| pos.x.is_finite() && pos.y.is_finite() && val.is_finite())
+                            .filter(|(pos, val)| {
+                                pos.x.is_finite() && pos.y.is_finite() && val.is_finite()
+                            })
                             .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
                         {
                             if peak_val.abs() > 1e-4 {
@@ -2465,7 +2501,8 @@ impl SapGuiApp {
                         if self.ensure_unlocked() {
                             if let Some(first) = self.draw_first_point.take() {
                                 if first != jid {
-                                    let fid = sap_model::next_numeric_name(self.model.frames.keys());
+                                    let fid =
+                                        sap_model::next_numeric_name(self.model.frames.keys());
                                     let sec = self
                                         .model
                                         .frame_sections
@@ -2544,7 +2581,10 @@ impl SapGuiApp {
                     let t = (i as f64 + 0.5) / steps as f64;
                     let v = lo + t * (hi - lo);
                     let sub = Rect::from_min_size(
-                        Pos2::new(leg_rect.left() + 6.0 + i as f32 * bar_w, leg_rect.top() + 18.0),
+                        Pos2::new(
+                            leg_rect.left() + 6.0 + i as f32 * bar_w,
+                            leg_rect.top() + 18.0,
+                        ),
                         Vec2::new(bar_w + 0.5, 8.0),
                     );
                     painter.rect_filled(sub, 0.0, normalized_contour_color(v, lo, hi, 230));
@@ -2769,7 +2809,8 @@ impl SapGuiApp {
 
     fn load_benchmark_1_004(&mut self) {
         let mut m = SapModel::new(Units::KipInF);
-        m.model_name = "StructuraX Verification Example 1-004 (Rotated Local Axes 30 deg)".to_string();
+        m.model_name =
+            "StructuraX Verification Example 1-004 (Rotated Local Axes 30 deg)".to_string();
         m.load_patterns.clear();
         m.load_cases.clear();
         let mut sec = FrameSection::default();
@@ -3214,33 +3255,35 @@ impl SapGuiApp {
             .show(ctx, |ui| {
                 if let Some(cr) = self.model.case_results.get(&self.active_case) {
                     if let Some(stations) = cr.frame_forces.get(&fid) {
-                        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
-                            egui::Grid::new("station_grid")
-                                .striped(true)
-                                .spacing([14.0, 4.0])
-                                .show(ui, |ui| {
-                                    ui.strong("Station");
-                                    ui.strong("P (Axial)");
-                                    ui.strong("V2 (Shear)");
-                                    ui.strong("V3");
-                                    ui.strong("T (Torque)");
-                                    ui.strong("M2 (Minor)");
-                                    ui.strong("M3 (Major)");
-                                    ui.strong("u2 (Defl)");
-                                    ui.end_row();
-                                    for st in stations {
-                                        ui.monospace(format!("{:.2}", st.station));
-                                        ui.monospace(format!("{:.3}", st.p));
-                                        ui.monospace(format!("{:.3}", st.v2));
-                                        ui.monospace(format!("{:.3}", st.v3));
-                                        ui.monospace(format!("{:.3}", st.t));
-                                        ui.monospace(format!("{:.3}", st.m2));
-                                        ui.monospace(format!("{:.3}", st.m3));
-                                        ui.monospace(format!("{:.5}", st.local_disp[1]));
+                        egui::ScrollArea::vertical()
+                            .max_height(360.0)
+                            .show(ui, |ui| {
+                                egui::Grid::new("station_grid")
+                                    .striped(true)
+                                    .spacing([14.0, 4.0])
+                                    .show(ui, |ui| {
+                                        ui.strong("Station");
+                                        ui.strong("P (Axial)");
+                                        ui.strong("V2 (Shear)");
+                                        ui.strong("V3");
+                                        ui.strong("T (Torque)");
+                                        ui.strong("M2 (Minor)");
+                                        ui.strong("M3 (Major)");
+                                        ui.strong("u2 (Defl)");
                                         ui.end_row();
-                                    }
-                                });
-                        });
+                                        for st in stations {
+                                            ui.monospace(format!("{:.2}", st.station));
+                                            ui.monospace(format!("{:.3}", st.p));
+                                            ui.monospace(format!("{:.3}", st.v2));
+                                            ui.monospace(format!("{:.3}", st.v3));
+                                            ui.monospace(format!("{:.3}", st.t));
+                                            ui.monospace(format!("{:.3}", st.m2));
+                                            ui.monospace(format!("{:.3}", st.m3));
+                                            ui.monospace(format!("{:.5}", st.local_disp[1]));
+                                            ui.end_row();
+                                        }
+                                    });
+                            });
                     } else {
                         ui.label("No frame station forces for the selected case/combination.");
                     }
@@ -3344,6 +3387,7 @@ impl SapGuiApp {
                                             "Combo",
                                             "As Top",
                                             "As Bot",
+                                            "As Side",
                                             "Av/s",
                                             "PMM Ratio",
                                             "Status",
@@ -3359,6 +3403,7 @@ impl SapGuiApp {
                                             ui.label(&res.governing_combo);
                                             ui.monospace(format!("{:.4}", res.as_top));
                                             ui.monospace(format!("{:.4}", res.as_bot));
+                                            ui.monospace(format!("{:.4}", res.as_side));
                                             ui.monospace(format!("{:.5}", res.av_over_s));
                                             ui.monospace(if res.is_column {
                                                 format!("{:.4}", res.pmm_ratio)
@@ -4504,6 +4549,7 @@ mod tests {
             is_column: false,
             as_top: 2.5,
             as_bot: 1.8,
+            as_side: 0.0,
             av_over_s: 0.12,
             pmm_ratio: 0.0,
             min_rebar_area: 0.6,

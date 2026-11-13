@@ -3,8 +3,8 @@
 //! This is deliberately separate from `pack_model_to_sdb`: preserving a vendor document
 //! is not the same operation as initializing all native records from a `SapModel`.
 
-mod export_guard;
 mod class_versions;
+mod export_guard;
 mod verified_file;
 
 use super::*;
@@ -757,8 +757,13 @@ impl BinarySdbWriter {
         self.write_string(class_id);
         for st in steps {
             if st.prop.as_deref() == Some("ClassVersion") {
-                let version = class_versions::observed_class_version(class_id).ok_or_else(||
-                    export_guard::unsupported(format!("class_versions.{class_id}"), "no unambiguous observed v19 class tag; export will not guess"))?;
+                let version =
+                    class_versions::observed_class_version(class_id).ok_or_else(|| {
+                        export_guard::unsupported(
+                            format!("class_versions.{class_id}"),
+                            "no unambiguous observed v19 class tag; export will not guess",
+                        )
+                    })?;
                 self.write_i32(version);
                 continue;
             }
@@ -799,8 +804,13 @@ impl BinarySdbWriter {
                     if let Some(SdbVal::ArrF64(arr)) = val {
                         if !arr.is_empty() {
                             self.write_bool(true);
-                            self.write_i32(arr.len() as i32);
-                            self.write_i32(1);
+                            if arr.len() == 9 {
+                                self.write_i32(3);
+                                self.write_i32(3);
+                            } else {
+                                self.write_i32(arr.len() as i32);
+                                self.write_i32(1);
+                            }
                             for &x in arr {
                                 self.write_f64(x);
                             }
@@ -867,7 +877,162 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
         ("m_DBUnits".into(), SdbVal::I32(model.database_units as i32)),
     ]);
     w.write_struct("S_ProjectStartUp", &startup)?;
-    w.write_empty_struct(); // ProjectInformation
+    let mut user_infos = Vec::new();
+    for (k, v) in &model.project_info {
+        match k.as_str() {
+            "Company Name" | "Client Name" | "Project Name" | "Project Number" | "Model Name"
+            | "Model Description" | "Revision Number" | "Frame Type" | "Engineer" | "Checker"
+            | "Supervisor" | "Issue Code" | "Design Code" => {}
+            _ => {
+                user_infos.push(HashMap::from([
+                    (
+                        "__class_id".into(),
+                        SdbVal::Str("S_ProjectInfoByUser".into()),
+                    ),
+                    ("m_Item".into(), SdbVal::Str(k.clone())),
+                    ("m_data".into(), SdbVal::Str(v.clone())),
+                ]));
+            }
+        }
+    }
+    let proj_info = HashMap::from([
+        (
+            "m_CompanyName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Company Name")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_ClientName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Client Name")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_ProjectName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Project Name")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_ProjectNumber".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Project Number")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_ModelName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Model Name")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_ModelDescription".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Model Description")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_RevisionNumber".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Revision Number")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_FrameType".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Frame Type")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_EngineerName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Engineer")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_CheckerName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Checker")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_SupervisorName".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Supervisor")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_IssueCode".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Issue Code")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_designcode".into(),
+            SdbVal::Str(
+                model
+                    .project_info
+                    .get("Design Code")
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        ),
+        (
+            "m_NumberUserInfos".into(),
+            SdbVal::I32(user_infos.len() as i32),
+        ),
+        ("m_UserInfo".into(), SdbVal::ArrObj(user_infos)),
+    ]);
+    w.write_struct("S_ProjectInfo", &proj_info)?;
     w.write_empty_struct_array(); // Standards
     w.write_empty_struct(); // AnalysisModelDateTimeStamp
     let run_params = HashMap::from([(
@@ -891,9 +1056,53 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     let mut raw_coords = Vec::with_capacity(coord_entries.len());
     for (idx, cs) in coord_entries.iter().enumerate() {
         coord_index.insert(cs.name.clone(), (idx + 1) as i32);
+        let mut guide_x = Vec::new();
+        let mut guide_y = Vec::new();
+        let mut guide_z = Vec::new();
+        for g in &cs.grids {
+            let (target, dir) = match g.axis.to_ascii_uppercase().as_str() {
+                "X" => (&mut guide_x, 0),
+                "Y" => (&mut guide_y, 1),
+                "Z" => (&mut guide_z, 2),
+                _ => continue,
+            };
+            let bubble_switch = g.bubble_loc.eq_ignore_ascii_case("Start");
+            let guide_map = HashMap::from([
+                ("__class_id".into(), SdbVal::Str("S_GUIDE".into())),
+                ("m_id".into(), SdbVal::Str(g.id.clone())),
+                ("m_GuideNo".into(), SdbVal::I32(target.len() as i32)),
+                ("m_GuideDir".into(), SdbVal::I32(dir)),
+                ("m_Ordinate".into(), SdbVal::F64(g.coordinate)),
+                ("m_xa".into(), SdbVal::F64(0.0)),
+                ("m_ya".into(), SdbVal::F64(0.0)),
+                ("m_xb".into(), SdbVal::F64(0.0)),
+                ("m_Yb".into(), SdbVal::F64(0.0)),
+                ("m_xc".into(), SdbVal::F64(0.0)),
+                ("m_yc".into(), SdbVal::F64(0.0)),
+                ("m_ltype".into(), SdbVal::I32(0)),
+                ("m_type".into(), SdbVal::I32(1)),
+                ("m_color".into(), SdbVal::I32(8421504)),
+                ("m_ColorByUser".into(), SdbVal::Bool(false)),
+                ("m_BubbleSize".into(), SdbVal::F64(0.0)),
+                ("m_BubbleSwitch".into(), SdbVal::Bool(bubble_switch)),
+                ("m_ZTop".into(), SdbVal::I32(0)),
+                ("m_ZBot".into(), SdbVal::I32(0)),
+                ("m_Visible".into(), SdbVal::Bool(g.visible)),
+                ("m_Selected".into(), SdbVal::Bool(false)),
+                ("m_alive".into(), SdbVal::Bool(true)),
+            ]);
+            target.push(guide_map);
+        }
         raw_coords.push(HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_csname".into(), SdbVal::Str(cs.name.clone())),
+            ("m_CoordType".into(), SdbVal::I32(1)),
+            ("m_TGLX".into(), SdbVal::I32(guide_x.len() as i32)),
+            ("m_TGLY".into(), SdbVal::I32(guide_y.len() as i32)),
+            ("m_TGLZ".into(), SdbVal::I32(guide_z.len() as i32)),
+            ("m_GuideX".into(), SdbVal::ArrObj(guide_x)),
+            ("m_GuideY".into(), SdbVal::ArrObj(guide_y)),
+            ("m_GuideZ".into(), SdbVal::ArrObj(guide_z)),
             ("m_Ux".into(), SdbVal::F64(cs.origin[0])),
             ("m_Uy".into(), SdbVal::F64(cs.origin[1])),
             ("m_UZ".into(), SdbVal::F64(cs.origin[2])),
@@ -936,6 +1145,14 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ),
             ("m_fc".into(), SdbVal::F64(mat.fc)),
         ]);
+        let rebar_props = HashMap::from([
+            (
+                "__class_id".into(),
+                SdbVal::Str("S_MaterialPropertiesRebar".into()),
+            ),
+            ("m_fy".into(), SdbVal::F64(mat.fys)),
+            ("m_Fu".into(), SdbVal::F64(mat.fu)),
+        ]);
         let is_ortho = mat.e_ortho.is_some()
             || mat.u_ortho.is_some()
             || mat.g_ortho.is_some()
@@ -972,12 +1189,20 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_a".into(), SdbVal::ArrF64(a_arr)),
             ("m_SteelProps".into(), SdbVal::Obj(steel_props)),
             ("m_ConcreteProps".into(), SdbVal::Obj(conc_props)),
+            ("m_RebarProps".into(), SdbVal::Obj(rebar_props)),
         ]);
         raw_materials.push(HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(mat.name.clone())),
-            ("m_color".into(), SdbVal::I32(material_colorref(&mat.color).ok_or_else(||
-                export_guard::unsupported(format!("materials.{}.color", mat.name), "color has no supported exact COLORREF encoding"))?)),
+            (
+                "m_color".into(),
+                SdbVal::I32(material_colorref(&mat.color).ok_or_else(|| {
+                    export_guard::unsupported(
+                        format!("materials.{}.color", mat.name),
+                        "color has no supported exact COLORREF encoding",
+                    )
+                })?),
+            ),
             ("m_mtype".into(), SdbVal::I32(mtype)),
             ("m_SymType".into(), SdbVal::I32(sym_type)),
             ("m_NumberMTs".into(), SdbVal::I32(1)),
@@ -1225,7 +1450,7 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     let mut raw_points = Vec::with_capacity(model.points.len());
     for (idx, pt) in model.points.values().enumerate() {
         pt_index.insert(pt.name.clone(), (idx + 1) as i32);
-        raw_points.push(HashMap::from([
+        let mut p_map = HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(pt.name.clone())),
             ("m_gx".into(), SdbVal::F64(pt.x)),
@@ -1238,7 +1463,17 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_B".into(), SdbVal::F64(pt.local_axes_deg[1])),
             ("m_c".into(), SdbVal::F64(pt.local_axes_deg[2])),
             ("m_Selected".into(), SdbVal::Bool(pt.selected)),
-        ]));
+        ]);
+        if let Some(mat) = pt.local_axes_matrix {
+            let t_vec = vec![
+                mat[0][0], mat[0][1], mat[0][2], mat[1][0], mat[1][1], mat[1][2], mat[2][0],
+                mat[2][1], mat[2][2],
+            ];
+            p_map.insert("m_UserAxes".into(), SdbVal::I32(1));
+            p_map.insert("m_T".into(), SdbVal::ArrF64(t_vec.clone()));
+            p_map.insert("m_tg".into(), SdbVal::ArrF64(t_vec));
+        }
+        raw_points.push(p_map);
     }
     w.write_struct_array("S_POINTOBJECTS", &raw_points)?;
 
@@ -2175,11 +2410,29 @@ mod tests {
                 "compressed container copy changed"
             );
             for record in document.records() {
-                let Some(expected) = class_versions::observed_class_version(&record.class_id) else { continue; };
-                let field = record.fields.iter().find(|f| f.name.as_deref() == Some("ClassVersion"))
-                    .unwrap_or_else(|| panic!("{}: {} lacks class tag", path.display(), record.class_id));
-                let actual = i32::from_le_bytes(document.source.decompressed_stream[field.offset..field.offset + 4].try_into().unwrap());
-                assert_eq!(actual, expected, "{}: {} tag mismatch", path.display(), record.class_id);
+                let Some(expected) = class_versions::observed_class_version(&record.class_id)
+                else {
+                    continue;
+                };
+                let field = record
+                    .fields
+                    .iter()
+                    .find(|f| f.name.as_deref() == Some("ClassVersion"))
+                    .unwrap_or_else(|| {
+                        panic!("{}: {} lacks class tag", path.display(), record.class_id)
+                    });
+                let actual = i32::from_le_bytes(
+                    document.source.decompressed_stream[field.offset..field.offset + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                assert_eq!(
+                    actual,
+                    expected,
+                    "{}: {} tag mismatch",
+                    path.display(),
+                    record.class_id
+                );
                 verified_classes.insert(record.class_id.clone());
             }
             let inventory = document.inventory();
@@ -2202,7 +2455,11 @@ mod tests {
             checked += 1;
         }
         assert!(checked >= 336, "Only {} native fixtures checked", checked);
-        assert_eq!(verified_classes.len(), 48, "Every emitted class tag needs source evidence");
+        assert_eq!(
+            verified_classes.len(),
+            52,
+            "Every emitted class tag needs source evidence"
+        );
     }
 
     #[test]
@@ -2386,11 +2643,15 @@ mod tests {
                     if model.link_props.iter().any(|(name, prop)| {
                         !prop.nonlinear_data_complete
                             && field == format!("link_props.{name}.nonlinear_data_complete")
-                    }) => {
-                        eprintln!("{}: correctly rejected incomplete native source law ({reason})", path.display());
-                        rejected_incomplete += 1;
-                        continue;
-                    }
+                    }) =>
+                {
+                    eprintln!(
+                        "{}: correctly rejected incomplete native source law ({reason})",
+                        path.display()
+                    );
+                    rejected_incomplete += 1;
+                    continue;
+                }
                 Err(e) => panic!("{} native pack failed: {}", path.display(), e),
             };
             let doc = inspect_native_sdb(&native_sdb)

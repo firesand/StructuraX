@@ -91,7 +91,10 @@ mod tests {
         save_native_sdb_file(&model, &output).unwrap();
         assert_eq!(std::fs::read(&output).unwrap(), bytes);
         let imported = crate::load_model_with_report(&output).unwrap();
-        assert!(imported.warnings.iter().any(|warning| warning.contains("Fys uses Fy")));
+        assert!(imported
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Fys uses Fy")));
         let error = save_native_sdb_file(&model, &output).unwrap_err();
         assert!(error.to_string().contains("without overwriting"));
         assert_eq!(std::fs::read(&output).unwrap(), bytes);

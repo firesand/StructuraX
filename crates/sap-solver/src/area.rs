@@ -148,7 +148,9 @@ fn compute_quad4_local_stiffness(
     let tb = sec.thickness_bending;
 
     let has_membrane = match sec.prop_type {
-        AreaPropType::Shell => !matches!(sec.shell_type, ShellType::PlateThin | ShellType::PlateThick),
+        AreaPropType::Shell => {
+            !matches!(sec.shell_type, ShellType::PlateThin | ShellType::PlateThick)
+        }
         AreaPropType::Plane | AreaPropType::ASolid => true,
     };
     let has_bending = match sec.prop_type {
@@ -161,8 +163,16 @@ fn compute_quad4_local_stiffness(
     let dm = if sec.prop_type == AreaPropType::Plane && sec.plane_type == PlaneType::PlaneStrain {
         let c = e * tm / ((1.0 + nu) * (1.0 - 2.0 * nu));
         [
-            [c * (1.0 - nu) * mods[0], c * nu * (mods[0] * mods[1]).sqrt(), 0.0],
-            [c * nu * (mods[0] * mods[1]).sqrt(), c * (1.0 - nu) * mods[1], 0.0],
+            [
+                c * (1.0 - nu) * mods[0],
+                c * nu * (mods[0] * mods[1]).sqrt(),
+                0.0,
+            ],
+            [
+                c * nu * (mods[0] * mods[1]).sqrt(),
+                c * (1.0 - nu) * mods[1],
+                0.0,
+            ],
             [0.0, 0.0, g * tm * mods[2]],
         ]
     } else {
@@ -532,8 +542,8 @@ pub fn compute_area_local_loads(
                         }
                     } else if lt.my_type == 2 {
                         // Through-thickness gradient Delta T_3 -> bending moment M_th = E * tb^3 * alpha * grad / (12 * (1 - nu))
-                        let m_th = e * sec.thickness_bending.powi(3) * mat.a * val
-                            / (12.0 * (1.0 - nu));
+                        let m_th =
+                            e * sec.thickness_bending.powi(3) * mat.a * val / (12.0 * (1.0 - nu));
                         for i in 0..4 {
                             f_loc[6 * i + 3] += m_th * mods[4] * dndy[i] * d_omega;
                             f_loc[6 * i + 4] -= m_th * mods[3] * dndx[i] * d_omega;
@@ -576,13 +586,7 @@ pub fn recover_area_result(
     let u24: [f64; 24] = if u_local.len() >= 24 {
         std::array::from_fn(|i| u_local[i])
     } else {
-        std::array::from_fn(|i| {
-            if i < 18 {
-                u_local[i]
-            } else {
-                u_local[i - 6]
-            }
-        })
+        std::array::from_fn(|i| if i < 18 { u_local[i] } else { u_local[i - 6] })
     };
 
     let mut mods = [1.0; 10];

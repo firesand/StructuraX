@@ -790,14 +790,14 @@ pub fn compute_ec3_capacities(
     let m_crd_22 = (wz * fy) / gamma_m0;
 
     // 5. Shear resistance Vpl,Rd = Av * (fy / sqrt(3)) / gamma_M0
-    let av = if sec.as2 > 0.0 {
-        sec.as2
-    } else if sec.t3 > 0.0 && sec.tw > 0.0 {
-        sec.t3 * sec.tw
-    } else {
-        0.5 * ag
-    };
-    let v_crd = (av * fy) / (3.0_f64.sqrt() * gamma_m0);
+    let v_crd = crate::shear::compute_ec3_major_shear(sec, mat).unwrap_or_else(|_| {
+        let av = if sec.t3 > 0.0 && sec.tw > 0.0 {
+            sec.t3 * sec.tw
+        } else {
+            0.5 * ag
+        };
+        (av * fy) / (3.0_f64.sqrt() * gamma_m0)
+    });
 
     (n_brd, n_trd, m_brd_33, m_crd_22, v_crd, compactness)
 }
@@ -1136,8 +1136,8 @@ pub fn compute_aisc_torsional_capacity(
             }
             // Flat width is bounded by webs and is a flange element (tf); flat
             // depth is bounded by flanges and is a web element (tw).
-            let h_over_t = ((b_outer - 3.0 * sec.tw) / sec.tf)
-                .max((h_outer - 3.0 * sec.tf) / sec.tw);
+            let h_over_t =
+                ((b_outer - 3.0 * sec.tw) / sec.tf).max((h_outer - 3.0 * sec.tf) / sec.tw);
             if h_over_t > 260.0 {
                 return Err(DesignError::UnsupportedClosedSectionTorsion {
                     frame: sec.name.clone(),
@@ -1206,28 +1206,6 @@ fn run_steel_design_validated(
                     name == frame_name && stations.iter().any(|st| st.v3.abs() > 1e-9)
                 })
             });
-        if has_ec3_v3 {
-            for (_, frames) in &combo_forces {
-                for (_, stations) in frames.iter().filter(|(name, _)| name == frame_name) {
-                    for st in stations.iter().filter(|st| st.v3.abs() > 1e-9) {
-                        let tol = 1e-9 * st.v3.abs().max(1.0);
-                        if st.p.abs() > tol
-                            || st.v2.abs() > tol
-                            || st.m3.abs() > tol
-                            || st.t.abs() > tol
-                        {
-                            return Err(DesignError::UnsupportedEc3ShearInteraction {
-                                frame: frame_name.clone(),
-                                p: st.p.to_string(),
-                                v2: st.v2.to_string(),
-                                m3: st.m3.to_string(),
-                                t: st.t.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
         let ow = overwrites.get(frame_name);
         let l_clear = frame_clear_length(model, frame).max(1e-6);
         let l33 = ow.and_then(|o| o.l_ratio_major).unwrap_or(1.0) * l_clear;
@@ -1267,7 +1245,7 @@ fn run_steel_design_validated(
 
         let phi_vn3 = match code {
             SteelCode::Eurocode3 if has_ec3_v3 => compute_ec3_minor_shear(sec, mat)?,
-            SteelCode::Eurocode3 => 0.0,
+            SteelCode::Eurocode3 => compute_ec3_minor_shear(sec, mat).unwrap_or(0.0),
             _ => compute_aisc_minor_shear(sec, mat, is_asd)?,
         };
 
@@ -1295,9 +1273,7 @@ fn run_steel_design_validated(
             };
 
             for st in stations {
-                // For EC3 high local-3 shear, the reported minor-axis capacity
-                // must match the reduced capacity used by the ratio below.
-                // All other code/station paths retain the section capacity.
+                let mut reported_phi_mn33 = phi_mn33;
                 let mut reported_phi_mn22 = phi_mn22;
                 let (
                     mut total_ratio,
@@ -1306,24 +1282,140 @@ fn run_steel_design_validated(
                     mut mr_minor_ratio,
                     shear_major_ratio,
                     mut eq_name,
-                ) = if code == SteelCode::Eurocode3 && has_ec3_v3 && st.v3.abs() > 1e-9 {
-                    let shear_ratio = st.v3.abs() / phi_vn3.max(1e-12);
-                    let rho = if shear_ratio > 0.5 {
-                        (2.0 * shear_ratio - 1.0).powi(2)
+                ) = if code == SteelCode::Eurocode3 {
+                    let r_v2 = st.v2.abs() / phi_vn2.max(1e-12);
+                    let r_v3 = if phi_vn3 > 0.0 {
+                        st.v3.abs() / phi_vn3
                     } else {
                         0.0
                     };
-                    let reduced_mc = ((1.0 - rho) * phi_mn22).max(1e-12);
-                    reported_phi_mn22 = reduced_mc;
-                    let minor_ratio = st.m2.abs() / reduced_mc;
-                    (
-                        shear_ratio.max(minor_ratio),
-                        0.0,
-                        0.0,
-                        minor_ratio,
-                        0.0,
-                        "EC3-6.2.6+6.2.8(3)",
-                    )
+
+                    let rho2 = if r_v2 > 0.5 {
+                        (2.0 * r_v2 - 1.0).powi(2)
+                    } else {
+                        0.0
+                    };
+                    let rho3 = if r_v3 > 0.5 {
+                        (2.0 * r_v3 - 1.0).powi(2)
+                    } else {
+                        0.0
+                    };
+
+                    let reduced_m3 = if rho2 > 0.0 {
+                        let m_red = match sec.prop_type {
+                            FramePropType::I | FramePropType::Channel => {
+                                let n = 1.0;
+                                let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
+                                let aw = hw * sec.tw;
+                                let wpl = if sec.z33 > 1e-9 {
+                                    sec.z33
+                                } else {
+                                    sec.s33.max(1e-9)
+                                };
+                                (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::T => {
+                                let n = 1.0;
+                                let hw = (sec.t3 - sec.tf).max(1e-6);
+                                let aw = hw * sec.tw;
+                                let wpl = if sec.z33 > 1e-9 {
+                                    sec.z33
+                                } else {
+                                    sec.s33.max(1e-9)
+                                };
+                                (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::Box
+                            | FramePropType::ColdBox
+                            | FramePropType::DbChannel
+                            | FramePropType::DblAngle => {
+                                let n = 2.0;
+                                let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
+                                let aw = hw * sec.tw;
+                                let wpl = if sec.z33 > 1e-9 {
+                                    sec.z33
+                                } else {
+                                    sec.s33.max(1e-9)
+                                };
+                                (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
+                            }
+                            _ => (1.0 - rho2) * phi_mn33,
+                        };
+                        m_red.min(phi_mn33).max(1e-12)
+                    } else {
+                        phi_mn33
+                    };
+                    reported_phi_mn33 = reduced_m3;
+
+                    let reduced_m2 = if rho3 > 0.0 {
+                        let m_red = match sec.prop_type {
+                            FramePropType::T => {
+                                let n = 1.0;
+                                let af = sec.t2 * sec.tf;
+                                let wpl = if sec.z22 > 1e-9 {
+                                    sec.z22
+                                } else {
+                                    sec.s22.max(1e-9)
+                                };
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::I
+                            | FramePropType::Channel
+                            | FramePropType::Box
+                            | FramePropType::ColdBox
+                            | FramePropType::DblAngle => {
+                                let n = 2.0;
+                                let af = sec.t2 * sec.tf;
+                                let wpl = if sec.z22 > 1e-9 {
+                                    sec.z22
+                                } else {
+                                    sec.s22.max(1e-9)
+                                };
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::DbChannel => {
+                                let n = 4.0;
+                                let af = sec.t2 * sec.tf;
+                                let wpl = if sec.z22 > 1e-9 {
+                                    sec.z22
+                                } else {
+                                    sec.s22.max(1e-9)
+                                };
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            _ => (1.0 - rho3) * phi_mn22,
+                        };
+                        m_red.min(phi_mn22).max(1e-12)
+                    } else {
+                        phi_mn22
+                    };
+                    reported_phi_mn22 = reduced_m2;
+
+                    let pc = if st.p >= 0.0 {
+                        phi_pnt.max(1e-12)
+                    } else {
+                        phi_pnc.max(1e-12)
+                    };
+                    let pr_part = st.p.abs() / pc;
+                    let mr3_part = st.m3.abs() / reduced_m3;
+                    let mr2_part = st.m2.abs() / reduced_m2;
+
+                    let tot = if matches!(
+                        sec.prop_type,
+                        FramePropType::Pipe | FramePropType::ColdPipe | FramePropType::Circle
+                    ) {
+                        pr_part + (mr3_part * mr3_part + mr2_part * mr2_part).sqrt()
+                    } else {
+                        pr_part + mr3_part + mr2_part
+                    };
+
+                    let eq = if rho2 > 0.0 || rho3 > 0.0 {
+                        "EC3-6.2.6+6.2.8(3)"
+                    } else {
+                        "EC3-6.2"
+                    };
+
+                    (tot, pr_part, mr3_part, mr2_part, r_v2, eq)
                 } else {
                     evaluate_station_interaction(
                         code, st.p, st.v2, st.m3, st.m2, phi_pnc, phi_pnt, phi_mn33, phi_mn22,
@@ -1374,7 +1466,15 @@ fn run_steel_design_validated(
                 }
 
                 let gov_ratio = total_ratio.max(shear_major_ratio).max(shear_minor_ratio);
-                let gov_eq = if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
+                let gov_eq = if code == SteelCode::Eurocode3 {
+                    if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
+                        "EC3-6.2.6 (V3)"
+                    } else if shear_major_ratio > total_ratio {
+                        "EC3-6.2.6 (V2)"
+                    } else {
+                        eq_name
+                    }
+                } else if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
                     "G7/G2-1 (V3)"
                 } else if shear_major_ratio > total_ratio {
                     "G2-1"
@@ -1410,7 +1510,7 @@ fn run_steel_design_validated(
                         shear_minor_ratio,
                         phi_pnc,
                         phi_pnt,
-                        phi_mn33,
+                        phi_mn33: reported_phi_mn33,
                         phi_mn22: reported_phi_mn22,
                         phi_vn2,
                         phi_vn3,

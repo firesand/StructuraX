@@ -1,6 +1,6 @@
 //! Explicit boundaries for the wave-4 formulations. Unsupported assignments must
 //! fail before assembly instead of being silently discarded by a narrower path.
-use crate::{frame, SolverError};
+use crate::SolverError;
 use sap_model::{LoadCaseType, NLGeomType, SapModel};
 
 pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
@@ -19,23 +19,19 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             .as_ref()
             .and_then(|n| model.load_cases.get(n))
         {
-            if initial.case_type == LoadCaseType::LinearHistory {
-                return Err(unsupported(format!(
-                    "case '{}' requires modal history continuation from '{}', which is not supported",
-                    case.name, initial.name
-                )));
-            }
             if matches!(
                 initial.case_type,
                 LoadCaseType::NonlinearHistory
                     | LoadCaseType::NonlinearDynamic
                     | LoadCaseType::LinearDynamic
+                    | LoadCaseType::LinearHistory
             ) && !matches!(
                 case.case_type,
                 LoadCaseType::NonlinearStatic
                     | LoadCaseType::NonlinearHistory
                     | LoadCaseType::NonlinearDynamic
                     | LoadCaseType::LinearDynamic
+                    | LoadCaseType::LinearHistory
             ) {
                 return Err(unsupported(format!(
                     "case '{}' requires history continuation into {:?}, which is not supported",
@@ -146,9 +142,15 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             }
             for f in model.frames.values() {
                 let cp = f.cable_params.as_ref().expect("checked cable-only model");
-                if cp.undeformed_length.is_some_and(|v| !v.is_finite() || v <= 0.0)
-                    || cp.target_tension_i.is_some_and(|v| !v.is_finite() || v <= 0.0)
-                    || cp.horizontal_tension.is_some_and(|v| !v.is_finite() || v <= 0.0)
+                if cp
+                    .undeformed_length
+                    .is_some_and(|v| !v.is_finite() || v <= 0.0)
+                    || cp
+                        .target_tension_i
+                        .is_some_and(|v| !v.is_finite() || v <= 0.0)
+                    || cp
+                        .horizontal_tension
+                        .is_some_and(|v| !v.is_finite() || v <= 0.0)
                 {
                     return Err(SolverError::InvalidInput(format!(
                         "cable '{}' shape initialization parameter must be finite and positive",
@@ -231,47 +233,6 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
                     .is_some_and(|s| !s.non_prismatic.is_empty())
             {
                 return Err(unsupported(format!("frame '{}' member limits with releases, offsets or nonprismatic properties are not implemented", f.name)));
-            }
-            let pi = model
-                .points
-                .get(&f.point_i)
-                .ok_or_else(|| SolverError::PointNotFound(f.point_i.clone()))?;
-            let pj = model
-                .points
-                .get(&f.point_j)
-                .ok_or_else(|| SolverError::PointNotFound(f.point_j.clone()))?;
-            let (_, axes) =
-                frame::frame_local_axes([pi.x, pi.y, pi.z], [pj.x, pj.y, pj.z], f.angle_deg);
-            let axial = |dir, value| {
-                frame::resolve_load_dir_to_local(dir, value, &axes, true)[0].abs()
-                    > 1e-14 * value.abs()
-            };
-            let loads = super::accumulated_nonlinear_static_loads(model, case);
-            let active = |p: &str| loads.iter().any(|(name, sf)| name == p && *sf != 0.);
-            if f.loads_dist.iter().any(|l| {
-                active(&l.load_pat)
-                    && l.my_type == 1
-                    && (axial(l.dir, l.val1) || axial(l.dir, l.val2))
-            }) || f
-                .loads_point
-                .iter()
-                .any(|l| active(&l.load_pat) && l.my_type == 1 && axial(l.dir, l.val))
-                || loads.iter().any(|(p, sf)| {
-                    *sf != 0.
-                        && ((model
-                            .load_patterns
-                            .get(p)
-                            .is_some_and(|pat| pat.self_wt_multiplier != 0.)
-                            && axes[0][2].abs() > 1e-14)
-                            || f.loads_gravity.get(p).is_some_and(|g| {
-                                (0..3).map(|i| axes[0][i] * g[i]).sum::<f64>().abs() > 1e-14
-                            }))
-                })
-            {
-                return Err(unsupported(format!(
-                    "frame '{}' member limits with axial span loads are not implemented",
-                    f.name
-                )));
             }
         }
     }

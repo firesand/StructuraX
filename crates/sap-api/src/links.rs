@@ -17,7 +17,9 @@ pub fn set_link_property(model: &mut SapModel, mut property: LinkProp) -> Result
         property.link_type,
         LinkPropType::Linear | LinkPropType::Damper | LinkPropType::Gap | LinkPropType::Hook
     ) {
-        return Err("This editor supports linear, damper, gap and hook link properties only.".into());
+        return Err(
+            "This editor supports linear, damper, gap and hook link properties only.".into(),
+        );
     }
     let valid_param2 = if property.link_type == LinkPropType::Damper {
         property

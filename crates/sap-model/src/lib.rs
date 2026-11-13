@@ -1,5 +1,5 @@
-pub mod templates;
 pub mod editing;
+pub mod templates;
 pub use editing::{EditError, EditSummary};
 
 use indexmap::IndexMap;
@@ -533,7 +533,9 @@ pub struct LinkProp {
     pub weight: f64,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 impl Default for LinkProp {
     fn default() -> Self {
@@ -1127,7 +1129,7 @@ pub struct NonlinearLinkForceState {
     pub force: f64,
 }
 
-/// Persisted terminal state of a direct-integration time-history case for exact continuation.
+/// Persisted terminal state of a direct-integration or modal time-history case for exact continuation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TransientTerminalState {
     pub point_order: Vec<String>,
@@ -1136,6 +1138,12 @@ pub struct TransientTerminalState {
     pub a: Vec<f64>,
     pub previous_force: Vec<f64>,
     pub nonlinear_link_forces: Vec<NonlinearLinkForceState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_q: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_v: Option<Vec<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_a: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -1190,7 +1198,7 @@ pub struct SteelDesignResult {
     pub phi_vn2: f64,
     #[serde(default)]
     pub phi_vn3: f64,
-    pub status: String, // "OK", "OVERSTRESSED", "SLENDER"
+    pub status: String,  // "OK", "OVERSTRESSED", "SLENDER"
     pub eq_name: String, // e.g. "H1-1a", "H1-1b", "EC3-6.2"
 }
 
@@ -1205,6 +1213,9 @@ pub struct ConcreteDesignResult {
     pub as_top: f64,
     /// Bottom longitudinal rebar area required $A_{s,\text{bot}}$
     pub as_bot: f64,
+    /// Side-face longitudinal rebar area required $A_{s,\text{side}}$ (for minor-axis flexure $M_2$ and/or torsion)
+    #[serde(default)]
+    pub as_side: f64,
     /// Shear stirrup area per unit spacing $A_v / s$
     pub av_over_s: f64,
     /// Column PMM interaction capacity ratio (if column)
@@ -1519,7 +1530,11 @@ impl SapModel {
                 if is_gap_or_hook {
                     lp.param1[i] *= fl;
                 } else if is_damper {
-                    let exp_t = if lp.param2[i] > 0.0 { lp.param2[i] } else { 1.0 };
+                    let exp_t = if lp.param2[i] > 0.0 {
+                        lp.param2[i]
+                    } else {
+                        1.0
+                    };
                     lp.param1[i] *= ff / fl.powf(exp_t);
                     lp.param1[i + 3] *= fm;
                 } else {
@@ -1680,7 +1695,9 @@ mod tests {
     fn changing_units_invalidates_outputs_instead_of_relabeling_them() {
         let mut model = SapModel::new(Units::KipInF);
         model.add_point("1", 12.0, 0.0, 0.0);
-        model.case_results.insert("DEAD".into(), CaseResults::default());
+        model
+            .case_results
+            .insert("DEAD".into(), CaseResults::default());
         model.is_locked = true;
         model.convert_units_in_place(Units::KipInF);
         assert!(!model.case_results.is_empty());
@@ -1693,10 +1710,17 @@ mod tests {
     #[test]
     fn new_template_drops_links_to_previous_geometry() {
         let mut model = SapModel::new(Units::KipInF);
-        model.links.insert("old".into(), LinkObj {
-            name: "old".into(), point_i: "deleted".into(), point_j: None,
-            prop: "old".into(), angle_deg: 0.0, selected: false,
-        });
+        model.links.insert(
+            "old".into(),
+            LinkObj {
+                name: "old".into(),
+                point_i: "deleted".into(),
+                point_j: None,
+                prop: "old".into(),
+                angle_deg: 0.0,
+                selected: false,
+            },
+        );
         model.generate_beam(1, 120.0, true, "FSEC1");
         assert!(model.links.is_empty());
         assert_eq!(model.frames.len(), 1);
@@ -1780,7 +1804,10 @@ mod tests {
         model.link_props.insert("L1".into(), lp.clone());
 
         model.convert_units_in_place(Units::KipInF);
-        let rb = model.frame_sections["FSEC1"].concrete_rebar.as_ref().unwrap();
+        let rb = model.frame_sections["FSEC1"]
+            .concrete_rebar
+            .as_ref()
+            .unwrap();
         assert!((rb.cover_top - 3.0).abs() < 1e-9);
         assert!((rb.total_rebar_area - 7.2).abs() < 1e-9);
 
@@ -1799,7 +1826,7 @@ mod tests {
         let mut sc = [0.0; 21];
         sc[0] = 120.0; // 120 kip/ft -> 10 kip/in
         sc[3] = 240.0; // 240 kip/ft -> 20 kip/in
-        sc[6] = 50.0;  // 50 kip/rad -> 50 kip/rad
+        sc[6] = 50.0; // 50 kip/rad -> 50 kip/rad
         sc[9] = 100.0; // 100 kip-ft/rad -> 1200 kip-in/rad
         sc[20] = 30.0; // 30 kip-ft/rad -> 360 kip-in/rad
         model.points.get_mut("1").unwrap().spring_coupled = Some(sc);
@@ -1857,10 +1884,19 @@ mod tests {
                 dof: 0,
                 force: -5.5,
             }],
+            modal_q: Some(vec![1.5]),
+            modal_v: Some(vec![2.5]),
+            modal_a: Some(vec![3.5]),
         });
         let json = serde_json::to_string(&cr).unwrap();
         let back: CaseResults = serde_json::from_str(&json).unwrap();
         assert_eq!(back, cr);
+
+        // Verify backward compatibility: deserializing JSON without modal fields defaults to None
+        let legacy_json = r#"{"point_order":["1"],"u":[1.0,1.0,1.0,1.0,1.0,1.0],"v":[2.0,2.0,2.0,2.0,2.0,2.0],"a":[3.0,3.0,3.0,3.0,3.0,3.0],"previous_force":[4.0,4.0,4.0,4.0,4.0,4.0],"nonlinear_link_forces":[]}"#;
+        let legacy_ts: TransientTerminalState = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_ts.modal_q, None);
+        assert_eq!(legacy_ts.modal_v, None);
+        assert_eq!(legacy_ts.modal_a, None);
     }
 }
-

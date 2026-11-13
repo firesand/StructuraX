@@ -226,7 +226,8 @@ impl SapModel {
                         }
                     }
                     FrameType2D::EccentricBraced => {
-                        let e_half = (eccentricity.abs().max(0.1 * bay_width)).min(0.4 * bay_width) * 0.5;
+                        let e_half =
+                            (eccentricity.abs().max(0.1 * bay_width)).min(0.4 * bay_width) * 0.5;
                         let mid_x = start_x + ((ix as f64) + 0.5) * bay_width;
                         let z = (iz as f64) * story_height;
                         let p_left = format!("{pt_id}");
@@ -547,10 +548,7 @@ impl SapModel {
             }
         }
 
-        self.model_name = format!(
-            "3D {:?} ({nz} Stories, {nx}x{ny} Bays)",
-            frame_type
-        );
+        self.model_name = format!("3D {:?} ({nz} Stories, {nx}x{ny} Bays)", frame_type);
     }
 
     /// Generates a 2D Meshed Shear Wall in the XZ plane (`cFile.NewWall`).
@@ -723,4 +721,3 @@ impl SapModel {
         self.model_name = format!("Spherical Dome Shell (R={radius})");
     }
 }
-

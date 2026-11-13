@@ -367,11 +367,13 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
             return Err(unsupported(format!("link_props.{name}.nonlinear_data_complete"),"incomplete source law data cannot be certified by synthesizing a parameter vector; use a private snapshot"));
         }
     }
-    if !model.project_info.is_empty() {
-        return Err(unsupported(
-            "project_info",
-            "native project metadata serialization has not been verified",
-        ));
+    for (k, v) in &model.project_info {
+        if k.is_empty() || v.is_empty() {
+            return Err(unsupported(
+                format!("project_info.{k}"),
+                "empty project_info key or value is not representable in native SDB",
+            ));
+        }
     }
     for (name, p) in &model.points {
         if let Some(coupled) = &p.spring_coupled {
@@ -393,20 +395,16 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                 ));
             }
         }
-        if p.local_axes_matrix.is_some() {
-            return Err(unsupported(
-                format!("points.{name}.local_axes_matrix"),
-                "explicit joint axis-matrix serialization is not implemented",
-            ));
+        if let Some(mat) = p.local_axes_matrix {
+            if mat.iter().flatten().any(|v| !v.is_finite()) {
+                return Err(unsupported(
+                    format!("points.{name}.local_axes_matrix"),
+                    "nonfinite numeric data is not exportable",
+                ));
+            }
         }
     }
     for (name, m) in &model.materials {
-        if m.fys != m.fy {
-            return Err(unsupported(
-                format!("materials.{name}.fys"),
-                "independent shear-rebar yield has no verified native representation; this importer uses the material Fy as a reconstruction fallback",
-            ));
-        }
         if m.e_ortho.is_some() || m.u_ortho.is_some() || m.g_ortho.is_some() || m.a_ortho.is_some()
         {
             let (Some(eo), Some(uo), Some(go), Some(ao)) =
@@ -432,11 +430,32 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         }
     }
     for (name, c) in &model.coord_systems {
-        if !c.grids.is_empty() {
-            return Err(unsupported(
-                format!("coord_systems.{name}.grids"),
-                "native grid serialization is not implemented",
-            ));
+        let mut prev_axis_order = 0;
+        for g in &c.grids {
+            let axis_order = match g.axis.to_ascii_uppercase().as_str() {
+                "X" => 1,
+                "Y" => 2,
+                "Z" => 3,
+                _ => {
+                    return Err(unsupported(
+                        format!("coord_systems.{name}.grids.{}.axis", g.id),
+                        "grid axis must be 'X', 'Y', or 'Z'",
+                    ));
+                }
+            };
+            if axis_order < prev_axis_order {
+                return Err(unsupported(
+                    format!("coord_systems.{name}.grids"),
+                    "grid lines must be grouped by axis in X, Y, Z order for native export",
+                ));
+            }
+            prev_axis_order = axis_order;
+            if !g.coordinate.is_finite() {
+                return Err(unsupported(
+                    format!("coord_systems.{name}.grids.{}.coordinate", g.id),
+                    "grid coordinate must be a finite number",
+                ));
+            }
         }
     }
     validate_finite_json(&semantic_value(model)?, &mut Vec::new())?;

@@ -388,4 +388,3 @@ mod tests {
         assert_eq!(parsed, Units::KipFtF);
     }
 }
-

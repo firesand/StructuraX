@@ -1,8 +1,9 @@
 pub mod concrete;
 mod error;
-mod shear;
+pub mod shear;
 pub use shear::{
-    compute_aisc_minor_shear, compute_ec3_minor_shear, compute_ec3_rectangular_minor_shear,
+    compute_aisc_minor_shear, compute_ec3_major_shear, compute_ec3_minor_shear,
+    compute_ec3_rectangular_minor_shear,
 };
 pub mod steel;
 
@@ -198,18 +199,13 @@ mod tests {
         assert!((result.total_ratio - 2.0).abs() < 1e-12);
         assert_eq!(result.status, "OVERSTRESSED");
 
-        // EC3 local-3 on an I section has no verified direction-specific Av here.
+        // EC3 local-3 shear on an I-section is now supported per EN 1993-1-1 6.2.6(3).
         model.steel_design_code = "Eurocode 3-2005".into();
-        assert!(matches!(
-            try_run_steel_design(&mut model),
-            Err(DesignError::UnsupportedEc3MinorShearSection { .. })
-        ));
-        model.frame_sections.get_mut("TEST_W").unwrap().prop_type = FramePropType::Rectangular;
         try_run_steel_design(&mut model).unwrap();
-        assert_eq!(
-            model.steel_design_results["STEEL"].eq_name,
-            "EC3-6.2.6+6.2.8(3)"
-        );
+        let result = &model.steel_design_results["STEEL"];
+        assert!((result.phi_vn3 - 500.0 / 3.0_f64.sqrt()).abs() < 1e-10);
+        assert_eq!(result.eq_name, "EC3-6.2.6 (V3)");
+        assert_eq!(result.status, "OVERSTRESSED");
 
         model.frame_sections.get_mut("TEST_W").unwrap().prop_type = FramePropType::Auto;
         assert!(matches!(
@@ -276,17 +272,19 @@ mod tests {
             }],
         );
         model.case_results.insert("DEAD".into(), cr);
-        // EC3 6.2.6(3) does not define this local-3 orientation for an I section.
-        assert!(matches!(
-            try_run_steel_design(&mut model),
-            Err(DesignError::UnsupportedEc3MinorShearSection { .. })
-        ));
+        // EC3 6.2.6(3) now supports I sections for local-3 shear:
+        try_run_steel_design(&mut model).unwrap();
+        let res = &model.steel_design_results["STEEL"];
+        assert!((res.phi_vn3 - 500.0 / 3.0_f64.sqrt()).abs() < 1e-10);
+
+        // Truly unsupported shapes still fail closed:
         model.frame_sections.get_mut("TEST_W").unwrap().prop_type = FramePropType::General;
         assert!(matches!(
             try_run_steel_design(&mut model),
             Err(DesignError::UnsupportedEc3MinorShearSection { .. })
         ));
 
+        // Combined multi-axis forces (P and V3) are now supported per EN 1993-1-1 6.2:
         let rect = make_rectangular("RECT", "A992Fy50", 8.0, 4.0);
         model.frame_sections.insert(rect.name.clone(), rect);
         model.frames.get_mut("STEEL").unwrap().section = "RECT".into();
@@ -298,11 +296,10 @@ mod tests {
             .get_mut("STEEL")
             .unwrap()[0]
             .p = 1.0;
-        assert!(matches!(
-            try_run_steel_design(&mut model),
-            Err(DesignError::UnsupportedEc3ShearInteraction { .. })
-        ));
-        assert!(model.steel_design_results.is_empty());
+        try_run_steel_design(&mut model).unwrap();
+        let res_rect = &model.steel_design_results["STEEL"];
+        assert_eq!(res_rect.status, "OK");
+        assert!(res_rect.total_ratio > 0.0);
     }
 
     #[test]
@@ -941,22 +938,36 @@ mod tests {
                 < 1e-10
         );
 
-        // 4. EC3 V3 uses only section orientations with an explicit code shear area.
+        // 4. EC3 V3 now supports all standard shapes per EN 1993-1-1 6.2.6(3).
         let mut w_sec = make_i_section("W_EC3", "A992Fy50", 12.0, 8.0, 0.5, 0.3, 8.0, 0.5);
         w_sec.as3 = f64::NAN; // Analysis shear area must not be used as EC3 Av.
-        for kind in [
-            FramePropType::I,
-            FramePropType::Channel,
-            FramePropType::DbChannel,
-            FramePropType::T,
-        ] {
-            let mut unsupported = w_sec.clone();
-            unsupported.prop_type = kind;
-            assert!(matches!(
-                compute_ec3_minor_shear(&unsupported, mat),
-                Err(DesignError::UnsupportedEc3MinorShearSection { .. })
-            ));
-        }
+                              // For I: Av3 = 8.0 * 0.5 + 8.0 * 0.5 = 8.0 in^2 -> Vpl,Rd = 400 / sqrt(3)
+        assert!(
+            (compute_ec3_minor_shear(&w_sec, mat).unwrap() - 400.0 / 3.0_f64.sqrt()).abs() < 1e-10
+        );
+
+        let mut chan_sec = w_sec.clone();
+        chan_sec.prop_type = FramePropType::Channel;
+        // For Channel: Av3 = 2 * 8.0 * 0.5 = 8.0 in^2 -> Vpl,Rd = 400 / sqrt(3)
+        assert!(
+            (compute_ec3_minor_shear(&chan_sec, mat).unwrap() - 400.0 / 3.0_f64.sqrt()).abs()
+                < 1e-10
+        );
+
+        let mut dbchan_sec = w_sec.clone();
+        dbchan_sec.prop_type = FramePropType::DbChannel;
+        // For DbChannel: Av3 = 4 * 8.0 * 0.5 = 16.0 in^2 -> Vpl,Rd = 800 / sqrt(3)
+        assert!(
+            (compute_ec3_minor_shear(&dbchan_sec, mat).unwrap() - 800.0 / 3.0_f64.sqrt()).abs()
+                < 1e-10
+        );
+
+        let mut t_sec = w_sec.clone();
+        t_sec.prop_type = FramePropType::T;
+        // For T: Av3 = 8.0 * 0.5 = 4.0 in^2 -> Vpl,Rd = 200 / sqrt(3)
+        assert!(
+            (compute_ec3_minor_shear(&t_sec, mat).unwrap() - 200.0 / 3.0_f64.sqrt()).abs() < 1e-10
+        );
 
         let mut box_sec = make_box_tube("BOX_EC3", "A992Fy50", 10.0, 6.0, 0.5, 0.5);
         box_sec.as3 = 1000.0; // Deliberately unlike the section's EC3 local-3 shear area.
@@ -965,10 +976,12 @@ mod tests {
         assert!((compute_ec3_minor_shear(&box_sec, mat).unwrap() - expected_ec3_box).abs() < 1e-10);
         let mut unequal_box = box_sec.clone();
         unequal_box.tw = 0.25;
-        assert!(matches!(
-            compute_ec3_minor_shear(&unequal_box, mat),
-            Err(DesignError::UnsupportedEc3MinorShearSection { .. })
-        ));
+        // Unequal walls box: 2 * b * tf = 2 * 6.0 * 0.5 = 6.0 in^2 -> Vpl,Rd = 300 / sqrt(3)
+        let expected_unequal_box = 6.0 * 50.0 / 3.0_f64.sqrt();
+        assert!(
+            (compute_ec3_minor_shear(&unequal_box, mat).unwrap() - expected_unequal_box).abs()
+                < 1e-10
+        );
 
         let mut pipe_sec = make_pipe("PIPE_EC3", "A992Fy50", 10.0, 0.5);
         pipe_sec.as3 = 777.0; // Must not override EC3 6.2.6(3)(g) Av = (2/pi) * A.
@@ -979,8 +992,16 @@ mod tests {
         );
         let mut circle_sec = sap_section::make_circle("CIRCLE_EC3", "A992Fy50", 10.0);
         circle_sec.as3 = 321.0;
+        let expected_ec3_circle = 0.75 * circle_sec.area * 50.0 / 3.0_f64.sqrt();
+        assert!(
+            (compute_ec3_minor_shear(&circle_sec, mat).unwrap() - expected_ec3_circle).abs()
+                < 1e-10
+        );
+
+        let mut unsupported = w_sec.clone();
+        unsupported.prop_type = FramePropType::Auto;
         assert!(matches!(
-            compute_ec3_minor_shear(&circle_sec, mat),
+            compute_ec3_minor_shear(&unsupported, mat),
             Err(DesignError::UnsupportedEc3MinorShearSection { .. })
         ));
     }
@@ -1243,8 +1264,7 @@ mod tests {
         assert!((bm_ec2.av_over_s - expected_ec2_av_s2.max(expected_ec2_av_s3)).abs() < 1e-10);
         assert_eq!(bm_ec2.status, "OK");
 
-        // M2 on beams must not be folded into as_top/as_bot, which only report
-        // top/bottom reinforcement and cannot represent the side faces.
+        // M2 on beams produces side-face reinforcement as_side per DSGN-01.
         for design_code in ["ACI 318-14", "Eurocode 2-2004"] {
             model.concrete_design_code = design_code.into();
             model
@@ -1255,11 +1275,26 @@ mod tests {
                 .get_mut("BM_3D")
                 .unwrap()[0]
                 .m2 = 1800.0;
-            assert!(matches!(
-                try_run_concrete_design(&mut model),
-                Err(DesignError::UnsupportedBeamMinorAxisFlexure { ref frame, .. }) if frame == "BM_3D"
-            ));
-            assert!(model.concrete_design_results.is_empty());
+            try_run_concrete_design(&mut model).unwrap();
+            let res = &model.concrete_design_results["BM_3D"];
+            assert!(res.as_side > 0.0);
+            if design_code == "ACI 318-14" {
+                let (expected_as_side, _, _) = design_aci_beam_flexure(
+                    1800.0,
+                    24.0,
+                    11.5,
+                    2.5,
+                    4.0,
+                    60.0,
+                    29000.0,
+                    Units::KipInF,
+                );
+                assert!((res.as_side - expected_as_side).abs() < 1e-10);
+            } else {
+                let (expected_as_side, _, _, _) =
+                    design_ec2_beam(1800.0, 0.0, 24.0, 11.5, 2.5, 4.0, 60.0, 60.0, Units::KipInF);
+                assert!((res.as_side - expected_as_side).abs() < 1e-10);
+            }
             model
                 .case_results
                 .get_mut("ULT")
@@ -1270,9 +1305,7 @@ mod tests {
                 .m2 = 0.0;
         }
 
-        // Ignore only roundoff-scale M2 relative to the same-frame flexural
-        // demand. The dimensionless boundary must be invariant under unit
-        // conversion, and a small M2 with no M3 reference demand remains real.
+        // Verify minor flexure design across unit systems
         for (design_code, units) in [
             ("ACI 318-14", Units::KipInF),
             ("Eurocode 2-2004", Units::KnMmC),
@@ -1309,9 +1342,9 @@ mod tests {
                 .frame_forces
                 .get_mut("BM_3D")
                 .unwrap()[0];
-            station.m2 = station.m3 * 0.5e-9;
+            station.m2 = 0.0;
             try_run_concrete_design(&mut relative_model).unwrap();
-            assert!(relative_model.concrete_design_results.contains_key("BM_3D"));
+            assert_eq!(relative_model.concrete_design_results["BM_3D"].as_side, 0.0);
 
             let station = &mut relative_model
                 .case_results
@@ -1320,31 +1353,9 @@ mod tests {
                 .frame_forces
                 .get_mut("BM_3D")
                 .unwrap()[0];
-            station.m2 = station.m3 * 2.0e-9;
-            relative_model.concrete_design_results.insert(
-                "STALE".into(),
-                relative_model.concrete_design_results["BM_3D"].clone(),
-            );
-            assert!(matches!(
-                try_run_concrete_design(&mut relative_model),
-                Err(DesignError::UnsupportedBeamMinorAxisFlexure { ref frame, .. }) if frame == "BM_3D"
-            ));
-            assert!(relative_model.concrete_design_results.is_empty());
-
-            let station = &mut relative_model
-                .case_results
-                .get_mut("ULT")
-                .unwrap()
-                .frame_forces
-                .get_mut("BM_3D")
-                .unwrap()[0];
-            station.m3 = 0.0;
-            station.m2 = 1.0e-6;
-            assert!(matches!(
-                try_run_concrete_design(&mut relative_model),
-                Err(DesignError::UnsupportedBeamMinorAxisFlexure { ref frame, .. }) if frame == "BM_3D"
-            ));
-            assert!(relative_model.concrete_design_results.is_empty());
+            station.m2 = 1800.0 * moment_factor;
+            try_run_concrete_design(&mut relative_model).unwrap();
+            assert!(relative_model.concrete_design_results["BM_3D"].as_side > 0.0);
         }
 
         // Verify biaxial shear overstress when V3 exceeds phi * Vn3,max under ACI 318-14:

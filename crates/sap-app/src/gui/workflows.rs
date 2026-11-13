@@ -120,7 +120,10 @@ impl Workflows {
             self.link_prop.ke[d] *= ff / fl;
             self.link_prop.ce[d] *= ff / fl;
             self.link_prop.k_nl[d] *= ff / fl;
-            if matches!(self.link_prop.link_type, LinkPropType::Gap | LinkPropType::Hook) {
+            if matches!(
+                self.link_prop.link_type,
+                LinkPropType::Gap | LinkPropType::Hook
+            ) {
                 self.link_prop.param1[d] *= fl;
             } else if self.link_prop.link_type == LinkPropType::Damper {
                 self.link_prop.param1[d] *= ff / fl;
@@ -132,7 +135,10 @@ impl Workflows {
             self.link_prop.ke[d] *= ff * fl;
             self.link_prop.ce[d] *= ff * fl;
             self.link_prop.k_nl[d] *= ff * fl;
-            if !matches!(self.link_prop.link_type, LinkPropType::Gap | LinkPropType::Hook) {
+            if !matches!(
+                self.link_prop.link_type,
+                LinkPropType::Gap | LinkPropType::Hook
+            ) {
                 self.link_prop.param1[d] *= ff * fl;
             }
         }
@@ -459,10 +465,14 @@ fn assign_tc_limits(
             return Err("Tension and compression limits must be finite.".into());
         }
         if has_c && comp > 0.0 {
-            return Err("Compression limit must be <= 0 (e.g. 0.0 for tension-only bracing).".into());
+            return Err(
+                "Compression limit must be <= 0 (e.g. 0.0 for tension-only bracing).".into(),
+            );
         }
         if has_t && tens < 0.0 {
-            return Err("Tension limit must be >= 0 (e.g. 0.0 for compression-only struts).".into());
+            return Err(
+                "Tension limit must be >= 0 (e.g. 0.0 for compression-only struts).".into(),
+            );
         }
         if model
             .frames

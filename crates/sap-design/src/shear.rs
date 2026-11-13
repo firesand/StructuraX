@@ -28,34 +28,171 @@ pub fn compute_ec3_rectangular_minor_shear(
     )
 }
 
-/// EC3 6.2.6(3) local-3 plastic shear resistance $V_{\text{pl},3,\text{Rd}} = A_{v3} (f_y / \sqrt{3}) / \gamma_{M0}$
-/// for solid `Rectangular`, circular hollow `Pipe`, and uniform-wall `Box` sections.
-/// The model's `as3` is an analysis shear-deformation area; it is never used as the
-/// Eurocode shear area here. Other local-3 shape/orientation formulas fail closed.
-pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64, DesignError> {
+/// EC3 6.2.6(3) local-2 plastic shear resistance $V_{\text{pl},2,\text{Rd}} = A_{v2} (f_y / \sqrt{3}) / \gamma_{M0}$
+pub fn compute_ec3_major_shear(sec: &FrameSection, mat: &Material) -> Result<f64, DesignError> {
     let fy = positive(sec, "Fy", mat.fy)?;
-    let av3 = match sec.prop_type {
-        FramePropType::Rectangular => positive(sec, "area", sec.area)?,
-        FramePropType::Box => {
+    let av2 = match sec.prop_type {
+        FramePropType::I => {
+            let h = positive(sec, "depth", sec.t3)?;
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            let tw = positive(sec, "web thickness", sec.tw)?;
+            let bfb = if sec.t2b > 0.0 { sec.t2b } else { bf };
+            let tfb = if sec.tfb > 0.0 { sec.tfb } else { tf };
+            let hw = (h - tf - tfb).max(0.0);
+            let area = if sec.area > 0.0 {
+                sec.area
+            } else {
+                bf * tf + bfb * tfb + hw * tw
+            };
+            // EN 1993-1-1 6.2.6(3)(a) with eta = 1.0
+            (area - (bf * tf + bfb * tfb) + tw * 0.5 * (tf + tfb)).max(hw * tw)
+        }
+        FramePropType::Channel => {
+            let h = positive(sec, "depth", sec.t3)?;
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            let tw = positive(sec, "web thickness", sec.tw)?;
+            let hw = (h - 2.0 * tf).max(0.0);
+            let area = if sec.area > 0.0 {
+                sec.area
+            } else {
+                2.0 * bf * tf + hw * tw
+            };
+            (area - 2.0 * bf * tf + tw * tf).max(hw * tw)
+        }
+        FramePropType::DbChannel => {
+            let h = positive(sec, "depth", sec.t3)?;
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            let tw = positive(sec, "web thickness", sec.tw)?;
+            let hw = (h - 2.0 * tf).max(0.0);
+            let area_single = if sec.area > 0.0 {
+                0.5 * sec.area
+            } else {
+                2.0 * bf * tf + hw * tw
+            };
+            2.0 * ((area_single - 2.0 * bf * tf + tw * tf).max(hw * tw))
+        }
+        FramePropType::T => {
+            let h = positive(sec, "depth", sec.t3)?;
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            let tw = positive(sec, "web thickness", sec.tw)?;
+            let hw = (h - tf).max(0.0);
+            let area = if sec.area > 0.0 {
+                sec.area
+            } else {
+                bf * tf + hw * tw
+            };
+            (area - bf * tf + 0.5 * tw * tf).max(hw * tw)
+        }
+        FramePropType::Angle => {
+            let h = positive(sec, "leg 1 length", sec.t3)?;
+            let t_raw = if sec.tf > 0.0 { sec.tf } else { sec.tw };
+            let t = positive(sec, "thickness", t_raw)?;
+            h * t
+        }
+        FramePropType::DblAngle => {
+            let h = positive(sec, "leg 1 length", sec.t3)?;
+            let t_raw = if sec.tf > 0.0 { sec.tf } else { sec.tw };
+            let t = positive(sec, "thickness", t_raw)?;
+            2.0 * h * t
+        }
+        FramePropType::Box | FramePropType::ColdBox => {
             let b = positive(sec, "section width", sec.t2)?;
             let h = positive(sec, "section depth", sec.t3)?;
             let tf = positive(sec, "flange thickness", sec.tf)?;
             let tw = positive(sec, "web thickness", sec.tw)?;
             let tolerance = 1e-9 * tf.max(tw);
-            if (tf - tw).abs() > tolerance {
-                return Err(DesignError::UnsupportedEc3MinorShearSection {
-                    section: sec.name.clone(),
-                    kind: format!("{:?} with unequal wall thicknesses", sec.prop_type),
-                });
+            if (tf - tw).abs() <= tolerance {
+                let area = positive(sec, "area", sec.area)?;
+                area * h / (b + h)
+            } else {
+                let hw = (h - 2.0 * tf).max(0.0);
+                2.0 * hw * tw
             }
-            // EN 1993-1-1 6.2.6(3)(f), rolled RHS loaded parallel to width.
-            let area = positive(sec, "area", sec.area)?;
-            area * b / (b + h)
         }
-        FramePropType::Pipe => {
+        FramePropType::Pipe | FramePropType::ColdPipe => {
             let area = positive(sec, "area", sec.area)?;
             (2.0 / std::f64::consts::PI) * area
         }
+        FramePropType::Circle => {
+            let area = positive(sec, "area", sec.area)?;
+            0.75 * area
+        }
+        FramePropType::Rectangular => positive(sec, "area", sec.area)?,
+        _ => {
+            return Err(DesignError::UnsupportedEc3MinorShearSection {
+                section: sec.name.clone(),
+                kind: format!("{:?}", sec.prop_type),
+            });
+        }
+    };
+    positive(sec, "EC3 major shear resistance", av2 * fy / 3.0_f64.sqrt())
+}
+
+/// EC3 6.2.6(3) local-3 plastic shear resistance $V_{\text{pl},3,\text{Rd}} = A_{v3} (f_y / \sqrt{3}) / \gamma_{M0}$
+/// across standard structural shapes.
+pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64, DesignError> {
+    let fy = positive(sec, "Fy", mat.fy)?;
+    let av3 = match sec.prop_type {
+        FramePropType::I => {
+            let bf = positive(sec, "top flange width", sec.t2)?;
+            let tf = positive(sec, "top flange thickness", sec.tf)?;
+            let bfb = if sec.t2b > 0.0 { sec.t2b } else { bf };
+            let tfb = if sec.tfb > 0.0 { sec.tfb } else { tf };
+            bf * tf + bfb * tfb
+        }
+        FramePropType::Channel => {
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            2.0 * bf * tf
+        }
+        FramePropType::DbChannel => {
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            4.0 * bf * tf
+        }
+        FramePropType::T => {
+            let bf = positive(sec, "flange width", sec.t2)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            bf * tf
+        }
+        FramePropType::Angle => {
+            let b = positive(sec, "leg 2 length", sec.t2)?;
+            let t_raw = if sec.tf > 0.0 { sec.tf } else { sec.tw };
+            let t = positive(sec, "thickness", t_raw)?;
+            b * t
+        }
+        FramePropType::DblAngle => {
+            let b = positive(sec, "leg 2 length", sec.t2)?;
+            let t_raw = if sec.tf > 0.0 { sec.tf } else { sec.tw };
+            let t = positive(sec, "thickness", t_raw)?;
+            2.0 * b * t
+        }
+        FramePropType::Box | FramePropType::ColdBox => {
+            let b = positive(sec, "section width", sec.t2)?;
+            let h = positive(sec, "section depth", sec.t3)?;
+            let tf = positive(sec, "flange thickness", sec.tf)?;
+            let tw = positive(sec, "web thickness", sec.tw)?;
+            let tolerance = 1e-9 * tf.max(tw);
+            if (tf - tw).abs() <= tolerance {
+                let area = positive(sec, "area", sec.area)?;
+                area * b / (b + h)
+            } else {
+                2.0 * b * tf
+            }
+        }
+        FramePropType::Pipe | FramePropType::ColdPipe => {
+            let area = positive(sec, "area", sec.area)?;
+            (2.0 / std::f64::consts::PI) * area
+        }
+        FramePropType::Circle => {
+            let area = positive(sec, "area", sec.area)?;
+            0.75 * area
+        }
+        FramePropType::Rectangular => positive(sec, "area", sec.area)?,
         _ => {
             return Err(DesignError::UnsupportedEc3MinorShearSection {
                 section: sec.name.clone(),
@@ -251,5 +388,125 @@ mod tests {
         sec.prop_type = FramePropType::General;
         sec.as3 = 0.0;
         assert!(compute_aisc_minor_shear(&sec, mat, false).is_err());
+    }
+
+    #[test]
+    fn test_ec3_major_and_minor_shear_across_all_standard_shapes() {
+        let model = SapModel::new(Units::KipInF);
+        let mat = &model.materials["A992Fy50"]; // Fy = 50 ksi
+        let sqrt3 = 3.0_f64.sqrt();
+
+        // 1. I section: h=14, bf=10, tf=0.5, tw=0.3
+        let mut i_sec = make_i_section("W14", "A992Fy50", 14.0, 10.0, 0.5, 0.3, 10.0, 0.5);
+        let hw_i = 14.0 - 2.0 * 0.5; // 13.0
+        let area_i = 2.0 * 10.0 * 0.5 + hw_i * 0.3; // 10.0 + 3.9 = 13.9
+        i_sec.area = area_i;
+        // Av2 = max(A - 2*bf*tf + tw*tf, hw*tw) = max(13.9 - 10 + 0.15, 3.9) = max(4.05, 3.9) = 4.05
+        let v2_i = compute_ec3_major_shear(&i_sec, mat).unwrap();
+        assert!((v2_i - 4.05 * 50.0 / sqrt3).abs() < 1e-10);
+        // Av3 = 2 * bf * tf = 10.0
+        let v3_i = compute_ec3_minor_shear(&i_sec, mat).unwrap();
+        assert!((v3_i - 10.0 * 50.0 / sqrt3).abs() < 1e-10);
+
+        // 2. Channel section
+        let mut chan_sec = i_sec.clone();
+        chan_sec.prop_type = FramePropType::Channel;
+        // Av2 = max(A - 2*bf*tf + tw*tf, hw*tw) = 4.05
+        let v2_chan = compute_ec3_major_shear(&chan_sec, mat).unwrap();
+        assert!((v2_chan - 4.05 * 50.0 / sqrt3).abs() < 1e-10);
+        // Av3 = 2 * bf * tf = 10.0
+        let v3_chan = compute_ec3_minor_shear(&chan_sec, mat).unwrap();
+        assert!((v3_chan - 10.0 * 50.0 / sqrt3).abs() < 1e-10);
+
+        // 3. Double Channel section
+        let mut dbchan_sec = i_sec.clone();
+        dbchan_sec.prop_type = FramePropType::DbChannel;
+        dbchan_sec.area = 2.0 * area_i;
+        let v2_dbchan = compute_ec3_major_shear(&dbchan_sec, mat).unwrap();
+        assert!((v2_dbchan - 2.0 * 4.05 * 50.0 / sqrt3).abs() < 1e-10);
+        let v3_dbchan = compute_ec3_minor_shear(&dbchan_sec, mat).unwrap();
+        assert!((v3_dbchan - 20.0 * 50.0 / sqrt3).abs() < 1e-10);
+
+        // 4. Tee section: h=7, bf=10, tf=0.5, tw=0.3
+        let mut t_sec = make_i_section("T7", "A992Fy50", 7.0, 10.0, 0.5, 0.3, 0.0, 0.0);
+        t_sec.prop_type = FramePropType::T;
+        let hw_t = 7.0 - 0.5; // 6.5
+        let area_t = 10.0 * 0.5 + hw_t * 0.3; // 5.0 + 1.95 = 6.95
+        t_sec.area = area_t;
+        // Av2 = max(A - bf*tf + 0.5*tw*tf, hw*tw) = max(6.95 - 5.0 + 0.075, 1.95) = max(2.025, 1.95) = 2.025
+        let v2_t = compute_ec3_major_shear(&t_sec, mat).unwrap();
+        assert!((v2_t - 2.025 * 50.0 / sqrt3).abs() < 1e-10);
+        // Av3 = bf * tf = 5.0
+        let v3_t = compute_ec3_minor_shear(&t_sec, mat).unwrap();
+        assert!((v3_t - 5.0 * 50.0 / sqrt3).abs() < 1e-10);
+
+        // 5. Angle section: h=6, b=4, t=0.5
+        let mut angle_sec = make_i_section("L6x4", "A992Fy50", 6.0, 4.0, 0.5, 0.5, 0.0, 0.0);
+        angle_sec.prop_type = FramePropType::Angle;
+        let v2_angle = compute_ec3_major_shear(&angle_sec, mat).unwrap();
+        assert!((v2_angle - 6.0 * 0.5 * 50.0 / sqrt3).abs() < 1e-10);
+        let v3_angle = compute_ec3_minor_shear(&angle_sec, mat).unwrap();
+        assert!((v3_angle - 4.0 * 0.5 * 50.0 / sqrt3).abs() < 1e-10);
+
+        // 6. Double Angle section
+        let mut dbl_angle_sec = angle_sec.clone();
+        dbl_angle_sec.prop_type = FramePropType::DblAngle;
+        let v2_dbl_angle = compute_ec3_major_shear(&dbl_angle_sec, mat).unwrap();
+        assert!((v2_dbl_angle - 2.0 * 3.0 * 50.0 / sqrt3).abs() < 1e-10);
+        let v3_dbl_angle = compute_ec3_minor_shear(&dbl_angle_sec, mat).unwrap();
+        assert!((v3_dbl_angle - 2.0 * 2.0 * 50.0 / sqrt3).abs() < 1e-10);
+
+        // 7. Box uniform and unequal
+        let box_uni = sap_section::make_box_tube("BOX_UNI", "A992Fy50", 12.0, 8.0, 0.5, 0.5);
+        let expected_v2_box_uni = box_uni.area * 12.0 / (12.0 + 8.0) * 50.0 / sqrt3;
+        let expected_v3_box_uni = box_uni.area * 8.0 / (12.0 + 8.0) * 50.0 / sqrt3;
+        assert!(
+            (compute_ec3_major_shear(&box_uni, mat).unwrap() - expected_v2_box_uni).abs() < 1e-10
+        );
+        assert!(
+            (compute_ec3_minor_shear(&box_uni, mat).unwrap() - expected_v3_box_uni).abs() < 1e-10
+        );
+
+        let mut box_uneq = box_uni.clone();
+        box_uneq.tw = 0.25; // tf = 0.5, tw = 0.25
+        let hw_box = 12.0 - 2.0 * 0.5; // 11.0
+        let expected_v2_box_uneq = 2.0 * hw_box * 0.25 * 50.0 / sqrt3;
+        let expected_v3_box_uneq = 2.0 * 8.0 * 0.5 * 50.0 / sqrt3;
+        assert!(
+            (compute_ec3_major_shear(&box_uneq, mat).unwrap() - expected_v2_box_uneq).abs() < 1e-10
+        );
+        assert!(
+            (compute_ec3_minor_shear(&box_uneq, mat).unwrap() - expected_v3_box_uneq).abs() < 1e-10
+        );
+
+        // 8. Pipe
+        let pipe = sap_section::make_pipe("PIPE", "A992Fy50", 10.0, 0.5);
+        let expected_v_pipe = (2.0 / std::f64::consts::PI) * pipe.area * 50.0 / sqrt3;
+        assert!((compute_ec3_major_shear(&pipe, mat).unwrap() - expected_v_pipe).abs() < 1e-10);
+        assert!((compute_ec3_minor_shear(&pipe, mat).unwrap() - expected_v_pipe).abs() < 1e-10);
+
+        // 9. Circle
+        let circle = sap_section::make_circle("CIRCLE", "A992Fy50", 10.0);
+        let expected_v_circle = 0.75 * circle.area * 50.0 / sqrt3;
+        assert!((compute_ec3_major_shear(&circle, mat).unwrap() - expected_v_circle).abs() < 1e-10);
+        assert!((compute_ec3_minor_shear(&circle, mat).unwrap() - expected_v_circle).abs() < 1e-10);
+
+        // 10. Rectangular
+        let rect = sap_section::make_rectangular("RECT", "A992Fy50", 12.0, 6.0);
+        let expected_v_rect = rect.area * 50.0 / sqrt3;
+        assert!((compute_ec3_major_shear(&rect, mat).unwrap() - expected_v_rect).abs() < 1e-10);
+        assert!((compute_ec3_minor_shear(&rect, mat).unwrap() - expected_v_rect).abs() < 1e-10);
+
+        // 11. Unsupported shapes fail closed
+        let mut auto_sec = i_sec.clone();
+        auto_sec.prop_type = FramePropType::Auto;
+        assert!(matches!(
+            compute_ec3_major_shear(&auto_sec, mat),
+            Err(DesignError::UnsupportedEc3MinorShearSection { .. })
+        ));
+        assert!(matches!(
+            compute_ec3_minor_shear(&auto_sec, mat),
+            Err(DesignError::UnsupportedEc3MinorShearSection { .. })
+        ));
     }
 }
