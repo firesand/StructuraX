@@ -550,58 +550,7 @@ pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> 
                 .is_some_and(|material| material.mat_type == MatType::Concrete)
         },
     )?;
-    reject_unreportable_beam_m2(model, &combo_forces)?;
     run_concrete_design_validated(model, code, combo_forces);
-    Ok(())
-}
-
-/// The current result schema reports only top/bottom longitudinal steel. It cannot
-/// distinguish reinforcement required on the two side faces by beam-axis M2.
-/// Reject M2 on beams rather than folding those areas into the top/bottom outputs.
-fn reject_unreportable_beam_m2(
-    model: &SapModel,
-    combo_forces: &[(String, Vec<(String, Vec<sap_model::FrameStationResult>)>)],
-) -> Result<(), DesignError> {
-    // M2 and M3 have identical dimensions. Use a dimensionless comparison so
-    // roundoff-sized local-2 moments on an otherwise major-axis beam do not
-    // depend on the model's current force/length units. If M2 is the only
-    // flexural demand, it sets the scale and is therefore still rejected.
-    const RELATIVE_ZERO_TOLERANCE: f64 = 1.0e-9;
-
-    for (frame_name, frame) in &model.frames {
-        let Some(section) = model.frame_sections.get(&frame.section) else {
-            continue;
-        };
-        let is_concrete = model
-            .materials
-            .get(&section.material)
-            .is_some_and(|material| material.mat_type == MatType::Concrete);
-        if !is_concrete || is_concrete_column(model, frame, section) {
-            continue;
-        }
-
-        let moment_scale = combo_forces
-            .iter()
-            .flat_map(|(_, frames)| frames.iter())
-            .filter(|(name, _)| name == frame_name)
-            .flat_map(|(_, stations)| stations.iter())
-            .map(|station| station.m2.abs().max(station.m3.abs()))
-            .fold(0.0_f64, f64::max);
-
-        for (_, frames) in combo_forces {
-            for (_, stations) in frames.iter().filter(|(name, _)| name == frame_name) {
-                if let Some(station) = stations
-                    .iter()
-                    .find(|station| station.m2.abs() > RELATIVE_ZERO_TOLERANCE * moment_scale)
-                {
-                    return Err(DesignError::UnsupportedBeamMinorAxisFlexure {
-                        frame: frame_name.clone(),
-                        m2: station.m2.to_string(),
-                    });
-                }
-            }
-        }
-    }
     Ok(())
 }
 
@@ -832,6 +781,7 @@ fn run_concrete_design_validated(
                     is_column: true,
                     as_top: 0.5 * ast,
                     as_bot: 0.5 * ast,
+                    as_side: 0.0,
                     av_over_s: max_av_s,
                     pmm_ratio: max_pmm_ratio,
                     min_rebar_area,
@@ -842,6 +792,7 @@ fn run_concrete_design_validated(
             // Concrete Beam Design
             let mut max_as_top = 0.0_f64;
             let mut max_as_bot = 0.0_f64;
+            let mut max_as_side = 0.0_f64;
             let mut max_av_s = 0.0_f64;
             let mut any_overstressed = false;
             let mut gov_combo = "NONE".to_string();
@@ -898,6 +849,38 @@ fn run_concrete_design_validated(
                         }
                     };
 
+                    // Minor-axis flexure M2 produces tension on side faces across width b with depth b and effective width h
+                    let (as_side, as_min_s, over_s) = if st.m2.abs() > 1e-12 {
+                        match code {
+                            ConcreteCode::Aci318 => design_aci_beam_flexure(
+                                st.m2.abs(),
+                                h,
+                                d3_minor,
+                                cover_minor,
+                                fc,
+                                fy,
+                                es,
+                                units,
+                            ),
+                            ConcreteCode::Eurocode2 => {
+                                let (as_val, amin, _, ov) = design_ec2_beam(
+                                    st.m2.abs(),
+                                    0.0,
+                                    h,
+                                    d3_minor,
+                                    cover_minor,
+                                    fc,
+                                    fy,
+                                    fyt,
+                                    units,
+                                );
+                                (as_val, amin, ov)
+                            }
+                        }
+                    } else {
+                        (0.0, 0.0, false)
+                    };
+
                     let (av_s_3, over_v3) = if vu3 > 1e-9 {
                         match code {
                             ConcreteCode::Aci318 => {
@@ -927,11 +910,12 @@ fn run_concrete_design_validated(
 
                     max_as_bot = max_as_bot.max(as_bot);
                     max_as_top = max_as_top.max(as_top);
+                    max_as_side = max_as_side.max(as_side);
                     max_av_s = max_av_s.max(av_s);
-                    min_rebar = min_rebar.max(as_min_b).max(as_min_t);
-                    any_overstressed = any_overstressed || over_b || over_t || over_v;
+                    min_rebar = min_rebar.max(as_min_b).max(as_min_t).max(as_min_s);
+                    any_overstressed = any_overstressed || over_b || over_t || over_s || over_v;
 
-                    let metric = as_bot.max(as_top) + av_s * d_bot;
+                    let metric = as_bot.max(as_top).max(as_side) + av_s * d_bot;
                     if metric > max_demand_metric {
                         max_demand_metric = metric;
                         gov_combo = combo_name.clone();
@@ -955,6 +939,7 @@ fn run_concrete_design_validated(
                     is_column: false,
                     as_top: max_as_top,
                     as_bot: max_as_bot,
+                    as_side: max_as_side,
                     av_over_s: max_av_s,
                     pmm_ratio: 0.0,
                     min_rebar_area: min_rebar,

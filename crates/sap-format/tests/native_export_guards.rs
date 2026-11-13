@@ -214,7 +214,7 @@ fn individually_opaque_tables_columns_and_unprojected_rows_still_reject() {
 #[test]
 fn original_physical_assignment_losses_are_rejected_before_write() {
     let mut m = supported_model();
-    m.project_info.insert("Owner".into(), "keep".into());
+    m.project_info.insert("".into(), "keep".into());
     assert_rejected_unchanged(&m, "project_info");
     let mut m = supported_model();
     m.points["B"].spring = [10., 0., 0., 0., 0., 0.];
@@ -226,7 +226,8 @@ fn original_physical_assignment_losses_are_rejected_before_write() {
     m.points["B"].spring_coupled = Some(diag_only);
     assert_rejected_unchanged(&m, "spring_coupled");
     let mut m = supported_model();
-    m.points["B"].local_axes_matrix = Some([[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]]);
+    m.points.get_mut("B").unwrap().local_axes_matrix =
+        Some([[f64::INFINITY, 0., 0.], [0., 1., 0.], [0., 0., 1.]]);
     assert_rejected_unchanged(&m, "local_axes_matrix");
     let mut m = supported_model();
     m.materials["A992Fy50"].e_ortho = Some([29000., 22000., 13000.]);
@@ -317,8 +318,41 @@ fn semantic_backstop_rejects_other_unimplemented_fields_and_late_failure_keeps_f
     m.materials["A992Fy50"].color = "VendorPurple".into();
     assert_rejected_unchanged(&m, "color");
     let mut m = supported_model();
-    m.materials["4000Psi"].fys = 72.;
-    assert_rejected_unchanged(&m, "fys");
+    m.coord_systems.get_mut("GLOBAL").unwrap().grids = vec![sap_model::GridLine {
+        axis: "X".into(),
+        id: "1".into(),
+        coordinate: f64::INFINITY,
+        visible: true,
+        bubble_loc: "End".into(),
+    }];
+    assert_rejected_unchanged(&m, "coordinate");
+    let mut m = supported_model();
+    m.coord_systems.get_mut("GLOBAL").unwrap().grids = vec![sap_model::GridLine {
+        axis: "INVALID".into(),
+        id: "1".into(),
+        coordinate: 0.0,
+        visible: true,
+        bubble_loc: "End".into(),
+    }];
+    assert_rejected_unchanged(&m, "axis");
+    let mut m = supported_model();
+    m.coord_systems.get_mut("GLOBAL").unwrap().grids = vec![
+        sap_model::GridLine {
+            axis: "Y".into(),
+            id: "1".into(),
+            coordinate: 0.0,
+            visible: true,
+            bubble_loc: "End".into(),
+        },
+        sap_model::GridLine {
+            axis: "X".into(),
+            id: "2".into(),
+            coordinate: 10.0,
+            visible: true,
+            bubble_loc: "End".into(),
+        },
+    ];
+    assert_rejected_unchanged(&m, "grids");
 }
 #[test]
 fn nonfinite_numeric_values_and_index_truncation_are_rejected() {
@@ -391,6 +425,8 @@ fn generated_class_versions_match_independently_observed_v19_tags() {
     for (class, expected) in [
         ("RUNARRAY", 2),
         ("S_MaterialPropertiesSteel", 2),
+        ("S_MaterialPropertiesRebar", 2),
+        ("S_ProjectInfo", 1),
         ("NLLINKPROPARRAY", 3),
         ("LOADPATTERNARRAY", 3),
         ("SOLUTIONCONTROLARRAY", 3),
@@ -992,4 +1028,305 @@ fn frame_joint_offsets_roundtrip_natively_in_the_verified_form_only() {
     global.frames["F"].joint_offset_is_global = true;
     assert_rejected_unchanged(&global, "frames.F.joint_offset_is_global");
     assert_eq!(parse_s2k(&write_s2k(&global)).unwrap().frames["F"], global.frames["F"]);
+}
+
+#[test]
+fn joint_local_axes_matrix_roundtrips_through_native_sdb() {
+    let mut m = supported_model();
+    let mat = [[0., -1., 0.], [1., 0., 0.], [0., 0., 1.]];
+    m.points.get_mut("B").unwrap().local_axes_matrix = Some(mat);
+
+    let native =
+        pack_model_to_native_sdb(&m).expect("native export with local_axes_matrix must succeed");
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+    let pt_records: Vec<_> = doc
+        .records()
+        .iter()
+        .filter(|r| r.class_id == "S_POINTOBJECTS")
+        .collect();
+    assert_eq!(pt_records.len(), 2);
+
+    let restored = extract_sdb_to_model(&native).unwrap();
+    assert_eq!(restored.points["B"].local_axes_matrix, Some(mat));
+    assert_eq!(restored, m);
+    assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
+}
+
+#[test]
+fn independent_shear_rebar_fys_roundtrips_through_native_sdb() {
+    let mut m = supported_model();
+    // Concrete material with distinct fys != fy
+    m.materials.get_mut("4000Psi").unwrap().fys = 72.0;
+
+    // Explicit Rebar material (MatType::Rebar) with distinct fys != fy
+    let rebar = Material {
+        name: "A615Gr60".into(),
+        mat_type: MatType::Rebar,
+        e: 29000.0,
+        e_ortho: None,
+        u: 0.3,
+        u_ortho: None,
+        g: 11153.8,
+        g_ortho: None,
+        a: 6.5e-6,
+        a_ortho: None,
+        unit_weight: 0.49 / 1728.0,
+        unit_mass: (0.49 / 1728.0) / 386.088,
+        fy: 60.0,
+        fu: 90.0,
+        fc: 0.0,
+        fys: 40.0,
+        color: "Yellow".into(),
+    };
+    m.materials.insert("A615Gr60".into(), rebar);
+
+    let native =
+        pack_model_to_native_sdb(&m).expect("native export of independent fys must succeed");
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+    let restored =
+        extract_sdb_to_model(&native).expect("native import of independent fys must succeed");
+    // Assert Concrete properties preserved
+    assert_eq!(restored.materials["4000Psi"].mat_type, MatType::Concrete);
+    assert_eq!(restored.materials["4000Psi"].fy, 60.0);
+    assert_eq!(restored.materials["4000Psi"].fys, 72.0);
+
+    // Assert Rebar properties preserved without clobbering fy
+    assert_eq!(restored.materials["A615Gr60"].mat_type, MatType::Rebar);
+    assert_eq!(restored.materials["A615Gr60"].fy, 60.0);
+    assert_eq!(restored.materials["A615Gr60"].fys, 40.0);
+
+    assert_eq!(restored, m);
+    assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
+}
+
+#[test]
+fn rebar_materials_with_independent_fy_and_fys_multi_regime_roundtrip() {
+    let mut m = supported_model();
+
+    // Regime 1: Standard rebar where fys < fy (longitudinal 60 ksi, stirrups 40 ksi)
+    let rebar_low_shear = Material {
+        name: "Rebar60_40".into(),
+        mat_type: MatType::Rebar,
+        e: 29000.0,
+        e_ortho: None,
+        u: 0.3,
+        u_ortho: None,
+        g: 11153.8,
+        g_ortho: None,
+        a: 6.5e-6,
+        a_ortho: None,
+        unit_weight: 0.49 / 1728.0,
+        unit_mass: (0.49 / 1728.0) / 386.088,
+        fy: 60.0,
+        fu: 90.0,
+        fc: 0.0,
+        fys: 40.0,
+        color: "Yellow".into(),
+    };
+    m.materials.insert("Rebar60_40".into(), rebar_low_shear);
+
+    // Regime 2: High-strength shear rebar where fys > fy (longitudinal 60 ksi, stirrups 80 ksi)
+    let rebar_high_shear = Material {
+        name: "Rebar60_80".into(),
+        mat_type: MatType::Rebar,
+        e: 29000.0,
+        e_ortho: None,
+        u: 0.3,
+        u_ortho: None,
+        g: 11153.8,
+        g_ortho: None,
+        a: 6.5e-6,
+        a_ortho: None,
+        unit_weight: 0.49 / 1728.0,
+        unit_mass: (0.49 / 1728.0) / 386.088,
+        fy: 60.0,
+        fu: 100.0,
+        fc: 0.0,
+        fys: 80.0,
+        color: "Red".into(),
+    };
+    m.materials.insert("Rebar60_80".into(), rebar_high_shear);
+
+    // Regime 3: Equal yield rebar where fys == fy (60 ksi / 60 ksi)
+    let rebar_equal = Material {
+        name: "Rebar60_60".into(),
+        mat_type: MatType::Rebar,
+        e: 29000.0,
+        e_ortho: None,
+        u: 0.3,
+        u_ortho: None,
+        g: 11153.8,
+        g_ortho: None,
+        a: 6.5e-6,
+        a_ortho: None,
+        unit_weight: 0.49 / 1728.0,
+        unit_mass: (0.49 / 1728.0) / 386.088,
+        fy: 60.0,
+        fu: 90.0,
+        fc: 0.0,
+        fys: 60.0,
+        color: "Blue".into(),
+    };
+    m.materials.insert("Rebar60_60".into(), rebar_equal);
+
+    let native = pack_model_to_native_sdb(&m)
+        .expect("native export with multi-regime rebar materials must succeed");
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+    let restored = extract_sdb_to_model(&native)
+        .expect("native import with multi-regime rebar materials must succeed");
+
+    assert_eq!(restored.materials["Rebar60_40"].fy, 60.0);
+    assert_eq!(restored.materials["Rebar60_40"].fys, 40.0);
+
+    assert_eq!(restored.materials["Rebar60_80"].fy, 60.0);
+    assert_eq!(restored.materials["Rebar60_80"].fys, 80.0);
+
+    assert_eq!(restored.materials["Rebar60_60"].fy, 60.0);
+    assert_eq!(restored.materials["Rebar60_60"].fys, 60.0);
+
+    assert_eq!(restored, m);
+    assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
+}
+
+#[test]
+fn project_info_roundtrips_through_native_sdb() {
+    let mut m = supported_model();
+    m.project_info
+        .insert("Company Name".into(), "StructuraX Engineering".into());
+    m.project_info
+        .insert("Engineer".into(), "Chief Structural Engineer".into());
+    m.project_info
+        .insert("Project Name".into(), "Superstructure Tower Parity".into());
+    m.project_info
+        .insert("Client Name".into(), "Global Infrastructure".into());
+    m.project_info
+        .insert("CustomReviewTag".into(), "Verified Parity M1".into());
+
+    let native = pack_model_to_native_sdb(&m).expect("native export of project_info must succeed");
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+    let proj_rec = doc
+        .records()
+        .iter()
+        .find(|r| r.class_id == "S_ProjectInfo")
+        .unwrap();
+    let ver_field = proj_rec
+        .fields
+        .iter()
+        .find(|f| f.name.as_deref() == Some("ClassVersion"))
+        .unwrap();
+    let ver = i32::from_le_bytes(
+        native.decompressed_stream[ver_field.offset..ver_field.offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(ver, 1);
+
+    let restored =
+        extract_sdb_to_model(&native).expect("native import of project_info must succeed");
+    assert_eq!(
+        restored.project_info["Company Name"],
+        "StructuraX Engineering"
+    );
+    assert_eq!(
+        restored.project_info["Engineer"],
+        "Chief Structural Engineer"
+    );
+    assert_eq!(
+        restored.project_info["CustomReviewTag"],
+        "Verified Parity M1"
+    );
+    assert_eq!(restored, m);
+    assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
+}
+
+#[test]
+fn coord_system_grids_roundtrip_through_native_sdb() {
+    let mut m = supported_model();
+    let cs = m.coord_systems.get_mut("GLOBAL").unwrap();
+    cs.grids = vec![
+        sap_model::GridLine {
+            axis: "X".into(),
+            id: "A".into(),
+            coordinate: 0.0,
+            visible: true,
+            bubble_loc: "Start".into(),
+        },
+        sap_model::GridLine {
+            axis: "X".into(),
+            id: "B".into(),
+            coordinate: 6.0,
+            visible: true,
+            bubble_loc: "End".into(),
+        },
+        sap_model::GridLine {
+            axis: "Y".into(),
+            id: "1".into(),
+            coordinate: 0.0,
+            visible: true,
+            bubble_loc: "End".into(),
+        },
+        sap_model::GridLine {
+            axis: "Y".into(),
+            id: "2".into(),
+            coordinate: 8.5,
+            visible: false,
+            bubble_loc: "Start".into(),
+        },
+        sap_model::GridLine {
+            axis: "Z".into(),
+            id: "L1".into(),
+            coordinate: 3.5,
+            visible: true,
+            bubble_loc: "End".into(),
+        },
+    ];
+
+    let native = pack_model_to_native_sdb(&m).expect("native export of grid lines must succeed");
+    let doc = inspect_native_sdb(&native).unwrap();
+    assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
+
+    let cs_rec = doc
+        .records()
+        .iter()
+        .find(|r| r.class_id == "COORDSYSTEMARRAY")
+        .unwrap();
+    let ver_field = cs_rec
+        .fields
+        .iter()
+        .find(|f| f.name.as_deref() == Some("ClassVersion"))
+        .unwrap();
+    let ver = i32::from_le_bytes(
+        native.decompressed_stream[ver_field.offset..ver_field.offset + 4]
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(ver, 1);
+
+    let restored = extract_sdb_to_model(&native).expect("native import of grid lines must succeed");
+    let r_grids = &restored.coord_systems["GLOBAL"].grids;
+    assert_eq!(r_grids.len(), 5);
+    assert_eq!(r_grids[0].id, "A");
+    assert_eq!(r_grids[0].axis, "X");
+    assert_eq!(r_grids[0].coordinate, 0.0);
+    assert_eq!(r_grids[0].bubble_loc, "Start");
+    assert_eq!(r_grids[1].id, "B");
+    assert_eq!(r_grids[1].coordinate, 6.0);
+    assert_eq!(r_grids[1].bubble_loc, "End");
+    assert_eq!(r_grids[3].id, "2");
+    assert_eq!(r_grids[3].axis, "Y");
+    assert!(!r_grids[3].visible);
+    assert_eq!(r_grids[3].bubble_loc, "Start");
+    assert_eq!(r_grids[4].id, "L1");
+    assert_eq!(r_grids[4].axis, "Z");
+    assert_eq!(r_grids[4].coordinate, 3.5);
+    assert_eq!(restored, m);
+    assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
 }

@@ -642,7 +642,10 @@ mod tests {
 
     #[test]
     fn test_aisc14_pro_database_parsing() {
-        let pro_path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../extracted/files/aisc14.pro"));
+        let pro_path = Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../extracted/files/aisc14.pro"
+        ));
         if pro_path.exists() {
             let db = ProDatabase::from_file(pro_path).expect("Failed to parse aisc14.pro");
             assert_eq!(db.length_unit, LengthUnit::In);

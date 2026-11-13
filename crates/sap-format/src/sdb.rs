@@ -1020,7 +1020,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
 
     // z (0x06001dcb)
     let proj_startup = r.read_struct(true)?;
-    let _proj_info = r.read_struct(false)?;
+    let proj_info = r.read_struct(true)?;
     let _standards = r.read_struct_array(false)?;
     let _am_timestamp = r.read_struct(false)?;
     let run_params = r.read_struct(true)?;
@@ -1034,6 +1034,44 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
     let units = Units::from_code(units_code)?;
     let mut model = SapModel::new(units);
     model.program_version = prog_ver;
+    if let Some(pi) = proj_info {
+        let std_keys = [
+            ("m_CompanyName", "Company Name"),
+            ("m_ClientName", "Client Name"),
+            ("m_ProjectName", "Project Name"),
+            ("m_ProjectNumber", "Project Number"),
+            ("m_ModelName", "Model Name"),
+            ("m_ModelDescription", "Model Description"),
+            ("m_RevisionNumber", "Revision Number"),
+            ("m_FrameType", "Frame Type"),
+            ("m_EngineerName", "Engineer"),
+            ("m_CheckerName", "Checker"),
+            ("m_SupervisorName", "Supervisor"),
+            ("m_IssueCode", "Issue Code"),
+            ("m_designcode", "Design Code"),
+        ];
+        for (field, key) in std_keys {
+            if let Some(val) = pi.get(field).and_then(SdbVal::as_str) {
+                if !val.is_empty() {
+                    model.project_info.insert(key.to_string(), val.to_string());
+                }
+            }
+        }
+        if let Some(user_infos) = pi.get("m_UserInfo").and_then(SdbVal::as_arr_obj) {
+            for ui in user_infos {
+                if let (Some(item), Some(data)) = (
+                    ui.get("m_Item").and_then(SdbVal::as_str),
+                    ui.get("m_data").and_then(SdbVal::as_str),
+                ) {
+                    if !item.is_empty() {
+                        model
+                            .project_info
+                            .insert(item.to_string(), data.to_string());
+                    }
+                }
+            }
+        }
+    }
     if let Some(dofs) = run_params
         .as_ref()
         .and_then(|o| o.get("m_dof"))
@@ -1067,6 +1105,45 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
         {
             continue;
         }
+        let mut grids = Vec::new();
+        let coord_type = coord
+            .get("m_CoordType")
+            .and_then(SdbVal::as_i32)
+            .unwrap_or(1);
+        if coord_type == 1 {
+            let mut parse_guides = |guides: Option<&SdbVal>, axis: &str| {
+                if let Some(arr) = guides.and_then(SdbVal::as_arr_obj) {
+                    for g in arr {
+                        if !g.get("m_alive").and_then(SdbVal::as_bool).unwrap_or(true) {
+                            continue;
+                        }
+                        let id = g
+                            .get("m_id")
+                            .and_then(SdbVal::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let coordinate =
+                            g.get("m_Ordinate").and_then(SdbVal::as_f64).unwrap_or(0.0);
+                        let visible = g.get("m_Visible").and_then(SdbVal::as_bool).unwrap_or(true);
+                        let bubble_switch = g
+                            .get("m_BubbleSwitch")
+                            .and_then(SdbVal::as_bool)
+                            .unwrap_or(false);
+                        let bubble_loc = if bubble_switch { "Start" } else { "End" }.to_string();
+                        grids.push(sap_model::GridLine {
+                            axis: axis.to_string(),
+                            id,
+                            coordinate,
+                            visible,
+                            bubble_loc,
+                        });
+                    }
+                }
+            };
+            parse_guides(coord.get("m_GuideX"), "X");
+            parse_guides(coord.get("m_GuideY"), "Y");
+            parse_guides(coord.get("m_GuideZ"), "Z");
+        }
         model.coord_systems.insert(
             name.clone(),
             sap_model::CoordSystem {
@@ -1075,7 +1152,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     .map(|key| coord.get(key).and_then(SdbVal::as_f64).unwrap_or(0.0)),
                 angles_deg: ["m_RZ", "m_Ry", "m_RX"]
                     .map(|key| coord.get(key).and_then(SdbVal::as_f64).unwrap_or(0.0)),
-                grids: Vec::new(),
+                grids,
             },
         );
     }
@@ -1294,9 +1371,11 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     }
                 }
             }
+            let mut steel_fy_present = false;
             if let Some(sp) = mt0.get("m_SteelProps").and_then(|v| v.as_obj()) {
                 if let Some(fy) = sp.get("m_fy").and_then(|v| v.as_f64()) {
                     mat.fy = fy;
+                    steel_fy_present = true;
                 }
                 if let Some(fu) = sp.get("m_Fu").and_then(|v| v.as_f64()) {
                     mat.fu = fu;
@@ -1307,11 +1386,30 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     mat.fc = fc;
                 }
             }
+            if let Some(rp) = mt0.get("m_RebarProps").and_then(|v| v.as_obj()) {
+                if let Some(rfy) = rp.get("m_fy").and_then(|v| v.as_f64()) {
+                    if mat.mat_type == MatType::Rebar && rfy > 0.0 {
+                        if !steel_fy_present || mat.fy == 0.0 {
+                            mat.fy = rfy;
+                        }
+                        mat.fys = rfy;
+                    } else if rfy > 0.0 {
+                        mat.fys = rfy;
+                    } else {
+                        mat.fys = mat.fy;
+                    }
+                } else {
+                    mat.fys = mat.fy;
+                }
+                if let Some(rfu) = rp.get("m_Fu").and_then(|v| v.as_f64()) {
+                    if mat.mat_type == MatType::Rebar && rfu > 0.0 {
+                        mat.fu = rfu;
+                    }
+                }
+            } else {
+                mat.fys = mat.fy;
+            }
         }
-        // SapModel's independent shear-rebar Fys has no observed native scalar.
-        // Use the material yield as a reconstruction fallback; native synthesis
-        // rejects an independent Fys which this projection cannot preserve.
-        mat.fys = mat.fy;
         model.materials.insert(name, mat);
     }
 
@@ -1547,9 +1645,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
         if !native_alive(prop) {
             continue;
         }
-        let link_type = native_link_type(
-            prop.get("m_type").and_then(SdbVal::as_i32).unwrap_or(1),
-        )?;
+        let link_type = native_link_type(prop.get("m_type").and_then(SdbVal::as_i32).unwrap_or(1))?;
         let dof_nonlinear = native_flags(prop, "m_Nonlinear");
         let raw_param = prop
             .get("m_param")
@@ -1713,6 +1809,23 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             .get("m_Selected")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let user_axes = p.get("m_UserAxes").and_then(|v| v.as_i32()).unwrap_or(0);
+        if user_axes != 0 {
+            if let Some(t_arr) = p
+                .get("m_T")
+                .or_else(|| p.get("m_tg"))
+                .and_then(|v| match v {
+                    SdbVal::ArrF64(arr) if arr.len() == 9 => Some(arr),
+                    _ => None,
+                })
+            {
+                pt.local_axes_matrix = Some([
+                    [t_arr[0], t_arr[1], t_arr[2]],
+                    [t_arr[3], t_arr[4], t_arr[5]],
+                    [t_arr[6], t_arr[7], t_arr[8]],
+                ]);
+            }
+        }
         model.points.insert(name, pt);
     }
 
@@ -2366,19 +2479,34 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 .get("m_fname")
                 .and_then(SdbVal::as_str)
                 .unwrap_or("");
-            let sine_p = function.get("m_SineP").and_then(SdbVal::as_f64).unwrap_or(0.0);
-            let sine_steps = function.get("m_SineSteps").and_then(SdbVal::as_i32).unwrap_or(0);
-            let sine_cycles = function.get("m_SineCycles").and_then(SdbVal::as_i32).unwrap_or(0);
-            let sine_amp = function.get("m_SineAmp").and_then(SdbVal::as_f64).unwrap_or(0.0);
-            if fname.is_empty() && sine_p > 0.0 && sine_steps > 0 && sine_cycles > 0 && sine_amp != 0.0
+            let sine_p = function
+                .get("m_SineP")
+                .and_then(SdbVal::as_f64)
+                .unwrap_or(0.0);
+            let sine_steps = function
+                .get("m_SineSteps")
+                .and_then(SdbVal::as_i32)
+                .unwrap_or(0);
+            let sine_cycles = function
+                .get("m_SineCycles")
+                .and_then(SdbVal::as_i32)
+                .unwrap_or(0);
+            let sine_amp = function
+                .get("m_SineAmp")
+                .and_then(SdbVal::as_f64)
+                .unwrap_or(0.0);
+            if fname.is_empty()
+                && sine_p > 0.0
+                && sine_steps > 0
+                && sine_cycles > 0
+                && sine_amp != 0.0
             {
                 let steps_per_cycle = (sine_steps as usize).max(64);
                 let total_steps = (sine_cycles as usize) * steps_per_cycle;
                 let dt = sine_p / (steps_per_cycle as f64);
                 for k in 0..=total_steps {
                     let t = (k as f64) * dt;
-                    let phase =
-                        2.0 * std::f64::consts::PI * (k as f64) / (steps_per_cycle as f64);
+                    let phase = 2.0 * std::f64::consts::PI * (k as f64) / (steps_per_cycle as f64);
                     points.push((t, sine_amp * phase.sin()));
                 }
             }
@@ -2568,7 +2696,11 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             if let Some(nb) = sc.get("m_NumBucklingModes").and_then(|v| v.as_i32()) {
                 lc.num_buckling_modes = nb.max(1) as usize;
             }
-            if let Some(itmax) = sc.get("m_itmax").and_then(SdbVal::as_i32).filter(|&v| v > 0) {
+            if let Some(itmax) = sc
+                .get("m_itmax")
+                .and_then(SdbVal::as_i32)
+                .filter(|&v| v > 0)
+            {
                 lc.max_iterations = itmax as usize;
             }
             if let Some(ittol) = sc
@@ -2602,10 +2734,18 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     _ => NLGeomType::None,
                 };
             }
-            if let Some(itmax) = nl.get("m_itmax").and_then(SdbVal::as_i32).filter(|&v| v > 0) {
+            if let Some(itmax) = nl
+                .get("m_itmax")
+                .and_then(SdbVal::as_i32)
+                .filter(|&v| v > 0)
+            {
                 lc.max_iterations = itmax as usize;
             }
-            if let Some(ittol) = nl.get("m_ittol").and_then(SdbVal::as_f64).filter(|&v| v > 0.0) {
+            if let Some(ittol) = nl
+                .get("m_ittol")
+                .and_then(SdbVal::as_f64)
+                .filter(|&v| v > 0.0)
+            {
                 lc.convergence_tol = ittol;
             }
         }

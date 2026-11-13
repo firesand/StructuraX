@@ -2111,11 +2111,15 @@ pub fn verify_example_7_003() -> Vec<BenchmarkVerificationRow> {
         net.points.get_mut(sname).unwrap().restraint = [true; 6];
     }
     for j in ["1", "2", "3", "4"] {
-        net.points.get_mut(j).unwrap().loads_force.push(PointLoadForce {
-            load_pat: "POINT".into(),
-            csys: "GLOBAL".into(),
-            force: [0.0, 0.0, -8.0, 0.0, 0.0, 0.0],
-        });
+        net.points
+            .get_mut(j)
+            .unwrap()
+            .loads_force
+            .push(PointLoadForce {
+                load_pat: "POINT".into(),
+                csys: "GLOBAL".into(),
+                force: [0.0, 0.0, -8.0, 0.0, 0.0, 0.0],
+            });
     }
     for (cname, pi, pj) in [
         ("1", "7", "1"),

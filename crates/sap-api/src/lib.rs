@@ -6,8 +6,12 @@
 
 #![allow(non_camel_case_types)]
 
+mod cables;
+mod database_tables;
 mod definitions;
 mod links;
+pub use cables::cCableObj;
+pub use database_tables::{cDatabaseTables, StagedTable, TableCatalogEntry};
 pub use definitions::{
     cFunctions, discard_unmodeled_source, set_case_definition, set_function_definition,
     validate_case_definition, DefinitionError,
@@ -45,7 +49,7 @@ pub(crate) fn is_valid_optional_user_name(s: &str) -> bool {
     s.is_empty() || is_valid_name(s)
 }
 
-fn is_valid_csys(model: &SapModel, csys: &str) -> bool {
+pub(crate) fn is_valid_csys(model: &SapModel, csys: &str) -> bool {
     csys == csys.trim()
         && (csys.eq_ignore_ascii_case("GLOBAL")
             || csys.eq_ignore_ascii_case("LOCAL")
@@ -126,6 +130,7 @@ pub struct cSapModel {
     pub import_warnings: Vec<String>,
     pub export_warnings: Vec<String>,
     pub last_file_error: Option<String>,
+    pub staged_tables: std::collections::BTreeMap<String, StagedTable>,
 }
 
 impl Default for cSapModel {
@@ -147,6 +152,7 @@ impl cSapModel {
             import_warnings: Vec::new(),
             export_warnings: Vec::new(),
             last_file_error: None,
+            staged_tables: std::collections::BTreeMap::new(),
         }
     }
 
@@ -158,6 +164,7 @@ impl cSapModel {
         self.import_warnings.clear();
         self.export_warnings.clear();
         self.last_file_error = None;
+        self.staged_tables.clear();
         OAPI_OK
     }
 
@@ -219,6 +226,14 @@ impl cSapModel {
 
     pub fn frame_obj(&mut self) -> cFrameObj<'_> {
         cFrameObj { api: self }
+    }
+
+    pub fn cable_obj(&mut self) -> cCableObj<'_> {
+        cCableObj::new(self)
+    }
+
+    pub fn database_tables(&mut self) -> cDatabaseTables<'_> {
+        cDatabaseTables::new(self)
     }
 
     pub fn area_obj(&mut self) -> cAreaObj<'_> {
@@ -362,8 +377,9 @@ impl cFile<'_> {
             match &self.api.last_file_path {
                 Some(p) => p.clone(),
                 None => {
-                    self.api.last_file_error =
-                        Some("No active file path for Save; specify a destination path".to_string());
+                    self.api.last_file_error = Some(
+                        "No active file path for Save; specify a destination path".to_string(),
+                    );
                     return OAPI_ERR;
                 }
             }
@@ -778,6 +794,9 @@ impl cFrameObj<'_> {
         let Some(frame) = self.api.inner.frames.get_mut(name) else {
             return OAPI_ERR;
         };
+        if frame.cable_params.is_some() {
+            return OAPI_ERR;
+        }
         edit(frame);
         self.api.inner.invalidate_results();
         OAPI_OK
@@ -997,6 +1016,9 @@ impl cFrameObj<'_> {
         let Some(frame) = self.api.inner.frames.get(name) else {
             return OAPI_ERR;
         };
+        if frame.cable_params.is_some() {
+            return OAPI_ERR;
+        }
         if !self.api.inner.load_patterns.contains_key(load_pat)
             || !val.is_finite()
             || !(1..=3).contains(&my_type)
@@ -1036,6 +1058,9 @@ impl cFrameObj<'_> {
         let Some(frame) = self.api.inner.frames.get(name) else {
             return OAPI_ERR;
         };
+        if frame.cable_params.is_some() {
+            return OAPI_ERR;
+        }
         let Some(i) = self.api.inner.points.get(&frame.point_i) else {
             return OAPI_ERR;
         };
@@ -1206,14 +1231,80 @@ impl cFrameObj<'_> {
             });
         })
     }
+    pub fn get_points(&self, name: &str) -> (i32, String, String) {
+        if let Some(f) = self.api.inner.frames.get(name) {
+            if f.cable_params.is_none() {
+                return (OAPI_OK, f.point_i.clone(), f.point_j.clone());
+            }
+        }
+        (OAPI_ERR, String::new(), String::new())
+    }
+    pub fn get_section(&self, name: &str) -> (i32, String) {
+        if let Some(f) = self.api.inner.frames.get(name) {
+            if f.cable_params.is_none() {
+                return (OAPI_OK, f.section.clone());
+            }
+        }
+        (OAPI_ERR, String::new())
+    }
+    pub fn get_tension_compression_limits(&self, name: &str) -> (i32, bool, f64, bool, f64) {
+        if let Some(f) = self.api.inner.frames.get(name) {
+            if f.cable_params.is_none() {
+                if let Some((c_exists, c, t_exists, t)) = f.tc_limits {
+                    return (OAPI_OK, c_exists, c, t_exists, t);
+                }
+                return (OAPI_OK, false, 0.0, false, 0.0);
+            }
+        }
+        (OAPI_ERR, false, 0.0, false, 0.0)
+    }
+    pub fn get_tc_limits(&self, name: &str) -> (i32, bool, f64, bool, f64) {
+        self.get_tension_compression_limits(name)
+    }
+    pub fn set_tension_compression_limits(
+        &mut self,
+        name: &str,
+        limit_compression_exists: bool,
+        limit_compression: f64,
+        limit_tension_exists: bool,
+        limit_tension: f64,
+    ) -> i32 {
+        self.set_tc_limits(
+            name,
+            limit_compression_exists,
+            limit_compression,
+            limit_tension_exists,
+            limit_tension,
+        )
+    }
     pub fn count(&self) -> usize {
-        self.api.inner.frames.len()
+        self.api
+            .inner
+            .frames
+            .values()
+            .filter(|f| f.cable_params.is_none())
+            .count()
     }
     pub fn get_name_list(&self) -> (i32, Vec<String>) {
-        (OAPI_OK, self.api.inner.frames.keys().cloned().collect())
+        (
+            OAPI_OK,
+            self.api
+                .inner
+                .frames
+                .iter()
+                .filter(|(_, f)| f.cable_params.is_none())
+                .map(|(k, _)| k.clone())
+                .collect(),
+        )
     }
     pub fn delete(&mut self, name: &str) -> i32 {
-        if self.api.inner.is_locked || !self.api.inner.frames.contains_key(name) {
+        if self.api.inner.is_locked {
+            return OAPI_ERR;
+        }
+        let Some(f) = self.api.inner.frames.get(name) else {
+            return OAPI_ERR;
+        };
+        if f.cable_params.is_some() {
             return OAPI_ERR;
         }
         self.api.inner.frames.shift_remove(name);
@@ -2319,6 +2410,17 @@ impl cAnalysisResults<'_> {
         out
     }
 
+    /// Queries internal cable station forces across selected output cases (`cAnalysisResults.CableForce`).
+    pub fn cable_force(&self, name: &str) -> Vec<(String, Vec<FrameStationResult>)> {
+        let Some(f) = self.api.inner.frames.get(name) else {
+            return Vec::new();
+        };
+        if f.cable_params.is_none() {
+            return Vec::new();
+        }
+        self.frame_force(name)
+    }
+
     /// Queries modal periods and frequencies across selected modal cases (`cAnalysisResults.ModalPeriod`).
     pub fn modal_period(&self) -> Vec<(String, Vec<ModalModeResult>)> {
         let mut out = Vec::new();
@@ -2660,6 +2762,7 @@ mod tests {
                 is_column: false,
                 as_top: 0.0,
                 as_bot: 0.0,
+                as_side: 0.0,
                 av_over_s: 0.0,
                 pmm_ratio: 0.0,
                 min_rebar_area: 0.0,
@@ -2802,9 +2905,16 @@ mod tests {
         assert!(solid_res[0].1.center_stress.s33 < 0.0);
 
         let out = std::env::temp_dir().join(format!("sap-api-native-{}.sdb", std::process::id()));
-        assert_eq!(api.file().save_native_sdb(out.to_str().unwrap()), OAPI_OK,
-            "{:?}", api.last_file_error);
-        assert!(api.export_warnings.iter().any(|w| w.contains("Experimental")));
+        assert_eq!(
+            api.file().save_native_sdb(out.to_str().unwrap()),
+            OAPI_OK,
+            "{:?}",
+            api.last_file_error
+        );
+        assert!(api
+            .export_warnings
+            .iter()
+            .any(|w| w.contains("Experimental")));
         let doc = sap_format::inspect_native_sdb_file(&out).unwrap();
         assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
         std::fs::remove_file(out).unwrap();

@@ -313,6 +313,7 @@ enum SpringLaw {
     FrameTc {
         ea_over_l: f64,
         p0_axial: f64,
+        w_axial: f64,
         limits: crate::cable::FrameTcLimits,
     },
 }
@@ -342,10 +343,12 @@ impl Spring {
             SpringLaw::FrameTc {
                 ea_over_l,
                 p0_axial,
+                w_axial,
                 limits,
             } => {
-                let (p_clamped, k_ax, _) =
-                    crate::cable::eval_frame_tc_axial(*ea_over_l, d, *p0_axial, *limits, 0.0);
+                let (p_clamped, k_ax, _) = crate::cable::eval_frame_tc_axial(
+                    *ea_over_l, d, *p0_axial, *w_axial, *limits, 0.0,
+                );
                 // Subtract p0_axial because -f_fef already contributes p0_axial to the RHS
                 (p_clamped - *p0_axial, k_ax)
             }
@@ -383,7 +386,7 @@ pub(crate) struct System {
 }
 
 impl System {
-    #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code, clippy::too_many_arguments)]
     pub fn new_with_frame_p0(
         model: &SapModel,
         points: &IndexMap<String, PointObj>,
@@ -391,6 +394,33 @@ impl System {
         rotations: &[[[f64; 3]; 3]],
         k: &[f64],
         frame_p0: &IndexMap<String, f64>,
+        hysteresis: &[sap_model::LinkHysteresisState],
+        n: usize,
+    ) -> Result<Self, SolverError> {
+        let frame_axial_loads: IndexMap<String, (f64, f64)> = frame_p0
+            .iter()
+            .map(|(k, &v)| (k.clone(), (v, 0.0)))
+            .collect();
+        Self::new_with_frame_axial_loads(
+            model,
+            points,
+            indices,
+            rotations,
+            k,
+            &frame_axial_loads,
+            hysteresis,
+            n,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_frame_axial_loads(
+        model: &SapModel,
+        points: &IndexMap<String, PointObj>,
+        indices: &IndexMap<String, usize>,
+        rotations: &[[[f64; 3]; 3]],
+        k: &[f64],
+        frame_axial_loads: &IndexMap<String, (f64, f64)>,
         hysteresis: &[sap_model::LinkHysteresisState],
         n: usize,
     ) -> Result<Self, SolverError> {
@@ -470,13 +500,15 @@ impl System {
                     let b = vec![
                         -ti[0][0], -ti[0][1], -ti[0][2], tj[0][0], tj[0][1], tj[0][2],
                     ];
-                    let p0_axial = frame_p0.get(fname).copied().unwrap_or(0.0);
+                    let (p0_axial, w_axial) =
+                        frame_axial_loads.get(fname).copied().unwrap_or((0.0, 0.0));
                     let spring = Spring {
                         dofs,
                         b,
                         law: SpringLaw::FrameTc {
                             ea_over_l,
                             p0_axial,
+                            w_axial,
                             limits: crate::cable::FrameTcLimits {
                                 tension_limit: has_tens.then_some(tens_lim),
                                 compression_limit: has_comp.then_some(comp_lim),

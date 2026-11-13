@@ -5,7 +5,7 @@ pub mod area;
 pub mod benchmarks;
 pub mod cable;
 mod coordinates;
-mod dynamics;
+pub mod dynamics;
 pub mod frame;
 mod frame_mesh;
 pub mod linalg;
@@ -669,17 +669,16 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 "case '{name}' requests large displacements"
             )));
         }
-        if lc.case_type == LoadCaseType::LinearHistory && lc.initial_case.is_some() {
-            return Err(SolverError::UnsupportedInput(format!(
-                "initial state for modal history case '{name}' is not implemented"
-            )));
-        }
-        if lc.case_type == LoadCaseType::LinearDynamic {
+        if matches!(
+            lc.case_type,
+            LoadCaseType::LinearDynamic | LoadCaseType::LinearHistory
+        ) {
             if let Some(init_name) = &lc.initial_case {
                 if model.load_cases.get(init_name).is_some_and(|c| {
                     !matches!(
                         c.case_type,
                         LoadCaseType::LinearDynamic
+                            | LoadCaseType::LinearHistory
                             | LoadCaseType::NonlinearHistory
                             | LoadCaseType::NonlinearDynamic
                     )
@@ -1902,6 +1901,7 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
                         | LoadCaseType::NonlinearHistory
                         | LoadCaseType::NonlinearDynamic
                         | LoadCaseType::LinearDynamic
+                        | LoadCaseType::LinearHistory
                 )
             });
     }
@@ -1913,6 +1913,7 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
             LoadCaseType::NonlinearHistory
                 | LoadCaseType::NonlinearDynamic
                 | LoadCaseType::LinearDynamic
+                | LoadCaseType::LinearHistory
         ) {
             let t_end = (c.num_time_steps as f64) * c.time_step_dt;
             for (func_name, pat_or_acc, scale_factor) in &c.history_loads {
@@ -2595,7 +2596,7 @@ struct StaticLoads {
     prescribed_u: Vec<Option<f64>>,
     spring_ground_u: Vec<f64>,
     frame_fef_map: IndexMap<String, ([f64; 12], [[f64; 12]; 12], [[f64; 3]; 3], f64)>,
-    frame_p0_map: IndexMap<String, f64>,
+    frame_axial_loads: IndexMap<String, (f64, f64)>,
     rhs: Vec<f64>,
     is_fixed: Vec<bool>,
     u_fixed_val: Vec<f64>,
@@ -2729,7 +2730,7 @@ fn assemble_static_loads(
     // 2. Frame Fixed-End Forces (`f_fef`)
     let mut frame_fef_map: IndexMap<String, ([f64; 12], [[f64; 12]; 12], [[f64; 3]; 3], f64)> =
         IndexMap::new();
-    let mut frame_p0_map: IndexMap<String, f64> = IndexMap::new();
+    let mut frame_axial_loads: IndexMap<String, (f64, f64)> = IndexMap::new();
     for (fname, frame) in &model.frames {
         let idx_i = pt_index[&frame.point_i];
         let idx_j = pt_index[&frame.point_j];
@@ -2791,7 +2792,9 @@ fn assemble_static_loads(
         apply_rigid_offsets(&mut k_loc, &mut fef_total, di, dj);
         let insertion = frame_insertion_offset(model, frame)?;
         apply_insertion_offset(&mut k_loc, &mut fef_total, insertion);
-        frame_p0_map.insert(fname.clone(), 0.5 * (fef_total[6] - fef_total[0]));
+        let p0 = 0.5 * (fef_total[6] - fef_total[0]);
+        let w_ax = -(fef_total[0] + fef_total[6]);
+        frame_axial_loads.insert(fname.clone(), (p0, w_ax));
 
         // Transform fef_total from element-local to joint-local: f_joint = T^T * fef_local
         let ti = mat3_mul(&e_axes, &joint_rot[idx_i]);
@@ -2945,7 +2948,7 @@ fn assemble_static_loads(
         prescribed_u,
         spring_ground_u,
         frame_fef_map,
-        frame_p0_map,
+        frame_axial_loads,
         rhs,
         is_fixed,
         u_fixed_val,
@@ -2975,7 +2978,7 @@ fn solve_static_with_stiffness(
         prescribed_u,
         spring_ground_u,
         frame_fef_map,
-        frame_p0_map,
+        frame_axial_loads,
         mut rhs,
         is_fixed,
         u_fixed_val,
@@ -2997,13 +3000,13 @@ fn solve_static_with_stiffness(
         .map_or(&[], |result| result.link_hysteresis.as_slice());
     let nonlinear_system = nonlinear_case
         .map(|_| {
-            nonlinear::System::new_with_frame_p0(
+            nonlinear::System::new_with_frame_axial_loads(
                 model,
                 work_points,
                 pt_index,
                 joint_rot,
                 k_total,
-                &frame_p0_map,
+                &frame_axial_loads,
                 initial_hysteresis,
                 ndof,
             )
@@ -3080,7 +3083,8 @@ fn solve_static_with_stiffness(
                     // Grounded spring reaction on structure: R = -K_spring * (u - u_ground)
                     let mut f_sp = 0.0;
                     for c in 0..6 {
-                        f_sp += ks_loc[d][c] * (u_joint[6 * idx + c] - spring_ground_u[6 * idx + c]);
+                        f_sp +=
+                            ks_loc[d][c] * (u_joint[6 * idx + c] - spring_ground_u[6 * idx + c]);
                     }
                     reac[d] = -f_sp;
                 }
@@ -3957,6 +3961,7 @@ fn run_time_history_case(
                     | LoadCaseType::NonlinearHistory
                     | LoadCaseType::NonlinearDynamic
                     | LoadCaseType::LinearDynamic
+                    | LoadCaseType::LinearHistory
             ) {
                 let init_loads = accumulated_nonlinear_static_loads(model, init_lc);
                 assemble_static_pattern_rhs(
@@ -4030,6 +4035,7 @@ fn run_time_history_case(
                 LoadCaseType::LinearDynamic
                     | LoadCaseType::NonlinearHistory
                     | LoadCaseType::NonlinearDynamic
+                    | LoadCaseType::LinearHistory
             )
         }) {
             return Err(SolverError::InvalidInput(format!(
@@ -4144,6 +4150,9 @@ fn run_time_history_case(
                 a: integrator.state.a,
                 previous_force,
                 nonlinear_link_forces,
+                modal_q: None,
+                modal_v: None,
+                modal_a: None,
             });
         }
     } else {
@@ -4184,8 +4193,70 @@ fn run_time_history_case(
                 trace.push(disp);
             }
         }
-        if is_direct_history {
+        let is_modal_history = lc.case_type == LoadCaseType::LinearHistory;
+        if is_direct_history || is_modal_history {
             let previous_force = integrator.previous_force().to_vec();
+            let (modal_q, modal_v, modal_a) = if is_modal_history {
+                let modal_basis: Option<Vec<Vec<f64>>> = {
+                    let found = model
+                        .case_results
+                        .values()
+                        .find(|r| !r.modes.is_empty())
+                        .map(|r| {
+                            r.modes
+                                .iter()
+                                .map(|m| {
+                                    let mut phi = vec![0.0; ndof];
+                                    for (pname, disp) in &m.mode_shape {
+                                        if let Some(&idx) = pt_index.get(pname) {
+                                            for d in 0..6 {
+                                                phi[6 * idx + d] = disp[d];
+                                            }
+                                        }
+                                    }
+                                    phi
+                                })
+                                .collect::<Vec<Vec<f64>>>()
+                        });
+                    if found.is_some() {
+                        found
+                    } else {
+                        let mut k_mod = k_base.to_vec();
+                        let mut m_mod = diag_mass.to_vec();
+                        for (i, &fix) in is_fixed.iter().enumerate() {
+                            if fix {
+                                for j in 0..ndof {
+                                    k_mod[i * ndof + j] = 0.0;
+                                    k_mod[j * ndof + i] = 0.0;
+                                }
+                                k_mod[i * ndof + i] = 1.0;
+                                m_mod[i] = 0.0;
+                            }
+                        }
+                        if m_mod.iter().any(|&m| m > 1e-14) {
+                            if let Ok(ldlt) = SymmetricLdlt::factorize(&k_mod, ndof) {
+                                if let Ok(raw_modes) = solve_modal_eigen(&ldlt, &m_mod, 12) {
+                                    Some(raw_modes.into_iter().map(|(_, phi)| phi).collect())
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                };
+                if let Some(modes) = &modal_basis {
+                    let (q, v, a) = integrator.project_modal_state(modes);
+                    (Some(q), Some(v), Some(a))
+                } else {
+                    (None, None, None)
+                }
+            } else {
+                (None, None, None)
+            };
             terminal_state = Some(sap_model::TransientTerminalState {
                 point_order: work_points.keys().cloned().collect(),
                 u: integrator.state.u,
@@ -4193,6 +4264,9 @@ fn run_time_history_case(
                 a: integrator.state.a,
                 previous_force,
                 nonlinear_link_forces: Vec::new(),
+                modal_q,
+                modal_v,
+                modal_a,
             });
         }
     }

@@ -1,8 +1,8 @@
 {
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
-  "snapshot_date": "2026-11-12",
-  "snapshot_note": "Post-review correctness repairs: constitutive reaction recovery, explicit unsupported-input guards, checked native export and verified design formula corrections. Full product/vendor parity remains unestablished. Amended 2026-11-12: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md).",
+  "snapshot_date": "2026-11-13",
+  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md).",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
     "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
@@ -141,7 +141,7 @@
     {
       "id": "time-history",
       "area": "solver",
-      "feature": "Selected linear and nonlinear direct-integration histories; nonlinear reactions use the same constitutive state and damping as integration.",
+      "feature": "Selected linear/modal and nonlinear direct-integration histories with TransientTerminalState continuation across physical, modal, and nonlinear-link states.",
       "status": "implemented-partial",
       "evidence": [
         {
@@ -151,19 +151,15 @@
         },
         {
           "file": "crates/sap-solver/src/dynamics.rs",
-          "lines": "490-865",
-          "note": "NonlinearStepper implements direct-integration equilibrium for Gap, Hook, and Maxwell Damper links with initial-state continuation."
+          "lines": "490-940",
+          "note": "NonlinearStepper and modal LinearHistory continuation via TransientTerminalState (u, v, a, modal_q, modal_v, modal_a, link states)."
         },
         {
-          "file": "docs/reconstruction/solver-wave4.md",
-          "note": "Verified against Example 6-003 (Gap static/dynamic continuation) and Example 6-005 (Maxwell damper harmonic excitation)."
-        },
-        {
-          "file": "docs/reconstruction/solver-fixes.md",
-          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+          "file": "crates/sap-solver/tests/solv04_adversarial_stress_tests.rs",
+          "note": "Chained modal and direct-integration restart stress regressions (< 1e-11 analytical agreement)."
         }
       ],
-      "limits": "History-origin continuation rejects because full terminal state is not stored. Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending."
+      "limits": "Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending."
     },
     {
       "id": "other-case-types",
@@ -277,29 +273,25 @@
     {
       "id": "cables-and-member-limits",
       "area": "solver",
-      "feature": "Cable-only nonlinear static for supported full-span uniform loading; bounded small-displacement frame axial limits.",
+      "feature": "Cable-only nonlinear static (undeformed length, horizontal tension, target_tension_i) and small-displacement frame axial limits under distributed span axial loads and self-weight.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/cable.rs",
-          "lines": "1-752",
-          "note": "Exact 3D thermal-elastic catenary element, network solver, and frame T/C limit constitutive engine."
+          "lines": "1-900",
+          "note": "Exact 3D thermal-elastic catenary element (including target_tension_i), network solver, and frame T/C limit constitutive engine with distributed axial equilibrium."
+        },
+        {
+          "file": "crates/sap-solver/tests/adversarial_tc_limits.rs",
+          "note": "13 adversarial tests verifying support reaction equilibrium (< 1e-10) under distributed axial loads and self-weight."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",
-          "lines": "312-358",
-          "note": "Verified against vendor SDB fixtures Example 7-001 (C1..C6) and Example 7-002 (2-segment cable under point load)."
-        },
-        {
-          "file": "docs/reconstruction/solver-wave4.md",
-          "note": "Catenary and member T/C limit formulation notes."
-        },
-        {
-          "file": "docs/reconstruction/solver-fixes.md",
-          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+          "lines": "312-380",
+          "note": "Verified against vendor SDB fixtures Example 7-001 (C1..C6), Example 7-002, and Example 7-003 (3D prestressed cable net)."
         }
       ],
-      "limits": "Mixed cable/frame/link/area/solid models, cable springs/constraints, target end tension, partial/nonuniform/point cable loads, and capped members with axial span loads or unsupported releases/offsets reject. Native cable examples containing target-tension initialization now explicitly reject."
+      "limits": "Mixed cable/frame/link/area/solid models, cable springs/constraints, partial/nonuniform cable loads, and capped members with unsupported releases/offsets or geometric nonlinearity reject."
     },
     {
       "id": "constraints",
@@ -345,51 +337,43 @@
     {
       "id": "steel-design",
       "area": "design",
-      "feature": "Selected AISC/EC3 checks, corrected distinct Box/Pipe H3 interactions and unequal-wall torsion dimensions, and independently defined EC3 local-3 shear areas.",
+      "feature": "Selected AISC 360-10 and Eurocode 3 checks, distinct Box/Pipe H3 torsion interactions, EN 1993-1-1 §6.2.6(3) plastic shear areas across 10 section shapes, and multi-axis interaction.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-design/src/steel.rs",
-          "lines": "500-705,1076-1166",
-          "note": "AISC axial, bending, V2 shear, and H3.1/H3.2 closed-section torsional capacities and Eq. H3-6 interaction."
+          "lines": "500-1300",
+          "note": "AISC/EC3 axial, bending, shear, H3.1/H3.2 closed-section torsion, and EN 1993-1-1 6-DOF multi-axis interaction."
         },
         {
           "file": "crates/sap-design/src/shear.rs",
-          "lines": "31-222",
-          "note": "AISC V3 shear (including Angle and DblAngle per G4) and EC3 6.2.6(3) local-3 shear across Rectangular, I, Channel, DbChannel, T, Box, Pipe, and Circle."
+          "lines": "31-500",
+          "note": "AISC V3 shear and EC3 6.2.6(3) local-3 plastic shear areas across 10 standard section profiles."
         },
         {
-          "file": "docs/reconstruction/design-wave4.md",
-          "note": "Wave 4 steel and concrete design expansion notes."
-        },
-        {
-          "file": "docs/reconstruction/design-fixes.md",
-          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+          "file": "crates/sap-design/tests/dsgn03_adversarial_stress_tests.rs",
+          "note": "Adversarial stress tests across all 10 steel cross-section families and combined 6-DOF loading."
         }
       ],
-      "limits": "EC3 local-3 is bounded to Rectangular, Pipe and equal-wall Box; other shapes and incompatible concurrent demands reject. ERW/SAW design-thickness inputs, comprehensive buckling and full design-code validation remain incomplete."
+      "limits": "ERW/SAW design-thickness overwrites, auto-select lists, comprehensive lateral-torsional/local buckling, and full vendor design-code validation remain incomplete."
     },
     {
       "id": "concrete-design",
       "area": "design",
-      "feature": "Selected ACI/EC2 beam and column checks with supported major-axis flexure and shear outputs.",
+      "feature": "Selected ACI 318-14 and Eurocode 2 beam and column checks including major/minor beam flexure (as_top, as_bot, as_side) and V2/V3 shear outputs.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-design/src/concrete.rs",
-          "lines": "40-265,530-810",
-          "note": "ACI and EC2 beam/column flexure and V2/V3 shear design."
+          "lines": "40-900",
+          "note": "ACI 318-14 and Eurocode 2 beam/column flexure (M3 and M2 with as_side) and V2/V3 shear design."
         },
         {
-          "file": "docs/reconstruction/design-wave4.md",
-          "note": "Concrete minor-axis V3 shear and M2 flexure verification."
-        },
-        {
-          "file": "docs/reconstruction/design-fixes.md",
-          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+          "file": "crates/sap-design/tests/challenger_m2_dsgn01.rs",
+          "note": "Adversarial tests covering ACI 318-14 and Eurocode 2 minor-axis beam flexure and side-face reinforcement."
         }
       ],
-      "limits": "Concrete beam M2 rejects: the result schema cannot express side-face reinforcement separately. Existing column PMM remains partial; no full biaxial reinforcement-detailing or torsion acceptance."
+      "limits": "Existing column PMM remains partial; concrete torsion and full detailing acceptance remain unimplemented."
     },
     {
       "id": "s2k-interoperability",
@@ -453,51 +437,46 @@
     {
       "id": "sdb-export",
       "area": "format",
-      "feature": "Experimental native serialization with referential-integrity/completeness guards, observed class-version tags and semantic roundtrip verification before writing.",
+      "feature": "Experimental native serialization with referential-integrity/completeness guards, observed class-version tags, local_axes_matrix, independent shear-rebar fys, project_info, grids, and semantic roundtrip verification before writing.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-format/src/sdb/native.rs",
-          "lines": "600-1450",
-          "note": "Schema-driven BinarySdbWriter serializes all top-level v19 SDB records in traverse() order and passes inspect_native_sdb 100% to EOF."
+          "lines": "600-1750",
+          "note": "Schema-driven BinarySdbWriter serializes all top-level v19 SDB records including S_POINTOBJECTS local_axes_matrix, S_MaterialPropertiesRebar fys, S_ProjectInfo, and COORDSYSTEMARRAY grids."
         },
         {
-          "file": "crates/sap-app/src/main.rs",
-          "lines": "66-75,298-330",
-          "note": "CLI export-native-sdb subcommand."
+          "file": "crates/sap-format/tests/fmt01_fmt02_stress_tests.rs",
+          "note": "Adversarial roundtrip tests for 3x3 direction cosine matrices and isolated shear-rebar yield."
         },
         {
-          "file": "docs/reconstruction/formats-wave4.md",
-          "note": "Native SDB stream writer specification and round-trip verification."
-        },
-        {
-          "file": "docs/reconstruction/format-fixes.md",
-          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+          "file": "crates/sap-format/tests/fmt03_stress_tests.rs",
+          "note": "Adversarial roundtrip tests for project_info and coordinate system grid lines."
         }
       ],
-      "limits": "Recognized S2K source formatting is accepted; opaque tables/columns and unrepresented assignments reject. Native import defaults independent shear-rebar Fys to Fy as a reconstruction fallback; unequal Fys cannot be exported. All native export entry points require a new destination and verify disk readback. Internal schema success is not licensed vendor-runtime acceptance."
+      "limits": "Recognized S2K source formatting is accepted; opaque tables/columns and unrepresented assignments reject. All native export entry points require a new destination and verify disk readback. Internal schema success is not licensed vendor-runtime acceptance."
     },
     {
       "id": "oapi",
       "area": "api",
-      "feature": "Selected Rust object facades, atomic solid geometry/temperature validation, zero-state nonlinear history definitions and native-export diagnostics.",
+      "feature": "Typed Rust OAPI facades including cCableObj (21 methods), cDatabaseTables (19 tables with transactional editing), cPropSolid, cSolidObj, cAnalysisResults, and cFile.",
       "status": "implemented-partial",
       "evidence": [
         {
+          "file": "crates/sap-api/src/cables.rs",
+          "note": "21-method cCableObj facade with transactional coordinate rollback and namespace isolation from cFrameObj."
+        },
+        {
+          "file": "crates/sap-api/src/database_tables.rs",
+          "note": "19-table cDatabaseTables facade supporting GetTableForDisplayArray, SetTableForEditingArray, and dependency-sorted ApplyEditedTables."
+        },
+        {
           "file": "crates/sap-api/src/lib.rs",
-          "lines": "160-240,850-1120",
-          "note": "cSapModel accessor surface including cPropSolid, cSolidObj, cFrameObj cable/TC limits, cAnalysisResults::solid_stress, and cFile::save_native_sdb."
-        },
-        {
-          "file": "docs/reconstruction/application-wave4.md",
-          "note": "Wave 4 OAPI and CLI additions."
-        },
-        {
-          "file": "docs/reconstruction/application-fixes.md",
-          "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
+          "lines": "160-1250",
+          "note": "cSapModel accessor surface."
         }
       ],
-      "limits": "Not a COM server or complete OAPI contract. Editor continuation/geometric dynamics remain unsupported; actual supported signatures are documented explicitly."
+      "limits": "Not a Windows COM server or complete OAPI surface. Actual supported signatures are documented explicitly."
     },
     {
       "id": "gui",
@@ -542,18 +521,18 @@
     {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "70 live reference checks across 15 benchmark families plus vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
+      "feature": "83 live reference checks across 17 benchmark families plus 461 automated tests across 51 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/benchmarks.rs",
-          "lines": "55-75",
-          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003, 6-005, 7-001, and 7-002 (60 checks)."
+          "lines": "55-90",
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks)."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",
-          "lines": "1-380",
-          "note": "Vendor SDB integration regressions for Examples 5-001, 5-002, 5-005, 6-003, 6-004, 6-005, 7-001, and 7-002."
+          "lines": "1-400",
+          "note": "Vendor SDB integration regressions for Examples 5-001, 5-002, 5-005, 6-003, 6-004, 6-005, 7-001, 7-002, and 7-003."
         }
       ],
       "limits": "The live suite is a selected benchmark subset, not the full 336-file vendor verification collection."

@@ -564,7 +564,8 @@ pub fn solve_ritz_vectors(
     let mut f_ritz = vec![0.0; m_count * m_count];
     for a in 0..m_count {
         for b in a..m_count {
-            let val = 0.5 * (m_dot(&basis[a], &k_inv_m_basis[b]) + m_dot(&basis[b], &k_inv_m_basis[a]));
+            let val =
+                0.5 * (m_dot(&basis[a], &k_inv_m_basis[b]) + m_dot(&basis[b], &k_inv_m_basis[a]));
             f_ritz[a * m_count + b] = val;
             f_ritz[b * m_count + a] = val;
         }

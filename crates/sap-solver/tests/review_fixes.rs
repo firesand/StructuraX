@@ -174,19 +174,31 @@ fn history_origin_continuation_fails_without_stale_results() {
     // Modal history types are integrated directly; they take no modal damping.
     m.load_cases["H1"].modal_damping = 0.;
     analyze_model(&mut m).unwrap();
+    assert!(m.case_results["H1"].transient_state.is_some());
+
     history(&mut m, "H2", 10);
     m.load_cases["H2"].history_loads.clear();
     m.load_cases["H2"].initial_case = Some("H1".into());
-    rejected(&mut m, "modal history continuation");
-    m.load_cases["H2"].case_type = LoadCaseType::NonlinearStatic;
-    rejected(&mut m, "modal history continuation");
+    m.load_cases["H2"].case_type = LoadCaseType::LinearHistory;
+    m.load_cases["H2"].modal_damping = 0.;
+    analyze_model(&mut m).unwrap();
+    assert!(m.case_results["H2"].transient_state.is_some());
 
-    // Direct-integration into modal LinearHistory must also remain rejected.
+    // Continuity from H1 terminal displacement to H2 initial step
+    let u_h1_end = m.case_results["H1"].time_history_disp["J"].last().unwrap()[0];
+    let u_h2_start = m.case_results["H2"].time_history_disp["J"].first().unwrap()[0];
+    close(u_h1_end, u_h2_start);
+
+    // Modal LinearHistory continuation into NonlinearStatic
+    m.load_cases["H2"].case_type = LoadCaseType::NonlinearStatic;
+    analyze_model(&mut m).unwrap();
+    assert!(m.case_results.contains_key("H2"));
+
+    // Direct-integration into modal LinearHistory continuation succeeds
     m.load_cases["H1"].case_type = LoadCaseType::LinearDynamic;
     m.load_cases["H2"].case_type = LoadCaseType::LinearHistory;
-    // Modal history types are integrated directly; they take no modal damping.
-    m.load_cases["H2"].modal_damping = 0.;
-    rejected(&mut m, "modal history");
+    analyze_model(&mut m).unwrap();
+    assert!(m.case_results["H2"].transient_state.is_some());
 }
 
 #[test]
@@ -274,7 +286,14 @@ fn member_limits_accept_nodal_axial_loading_but_reject_unrepresented_span_loads(
         val1: 1.,
         val2: 1.,
     });
-    rejected(&mut m, "axial span loads");
+    analyze_model(&mut m).unwrap();
+    let res = &m.case_results["NL"];
+    let r_i = res.joint_reactions["I"][0];
+    let r_j = res.joint_reactions["J"][0];
+    assert!((r_i + r_j).abs() < 1e-10, "Equilibrium: {r_i} + {r_j} = 0");
+    for sta in &res.frame_forces["B"] {
+        assert!(sta.p >= -1e-9, "Compression limit satisfied: p = {}", sta.p);
+    }
     m.frames["B"].loads_dist.clear();
     m.frames["B"].release_i[0] = true;
     rejected(&mut m, "releases");
@@ -804,10 +823,14 @@ fn topological_nested_load_combinations_and_skipped_first_envelope_case() {
     let mut unrun = LoadCase::linear_static("UNRUN", "DEAD", 999.0);
     unrun.run_flag = false;
     m.load_cases.insert("UNRUN".into(), unrun);
-    m.load_cases
-        .insert("CASE_A".into(), LoadCase::linear_static("CASE_A", "DEAD", 1.0));
-    m.load_cases
-        .insert("CASE_B".into(), LoadCase::linear_static("CASE_B", "LIVE", 1.0));
+    m.load_cases.insert(
+        "CASE_A".into(),
+        LoadCase::linear_static("CASE_A", "DEAD", 1.0),
+    );
+    m.load_cases.insert(
+        "CASE_B".into(),
+        LoadCase::linear_static("CASE_B", "LIVE", 1.0),
+    );
 
     // Define C1 (outer) BEFORE C2 (inner) in IndexMap!
     m.load_combos.insert(
@@ -877,7 +900,10 @@ fn topological_nested_load_combinations_and_skipped_first_envelope_case() {
     close(m.case_results["C1"].base_reactions[0], 100.0);
 
     // ENV_SKIP: first contributed case is 0.2 * CASE_B (-0.10), which beats 0.3 * CASE_A (+0.06)
-    close(m.case_results["ENV_SKIP"].joint_displacements["J"][0], -0.10);
+    close(
+        m.case_results["ENV_SKIP"].joint_displacements["J"][0],
+        -0.10,
+    );
     close(m.case_results["ENV_SKIP"].frame_forces["B"][0].p, -10.0);
 
     assert!(!m.case_results.contains_key("EMPTY_COMBO"));
@@ -1013,11 +1039,9 @@ fn coupled_21_term_joint_spring_column_major_and_rotated_axes_equilibrium() {
             let mut r_glob = [0.0; 6];
             for g in 0..3 {
                 u_glob[g] = r_p[g][0] * u_loc[0] + r_p[g][1] * u_loc[1] + r_p[g][2] * u_loc[2];
-                u_glob[g + 3] =
-                    r_p[g][0] * u_loc[3] + r_p[g][1] * u_loc[4] + r_p[g][2] * u_loc[5];
+                u_glob[g + 3] = r_p[g][0] * u_loc[3] + r_p[g][1] * u_loc[4] + r_p[g][2] * u_loc[5];
                 r_glob[g] = r_p[g][0] * r_loc[0] + r_p[g][1] * r_loc[1] + r_p[g][2] * r_loc[2];
-                r_glob[g + 3] =
-                    r_p[g][0] * r_loc[3] + r_p[g][1] * r_loc[4] + r_p[g][2] * r_loc[5];
+                r_glob[g + 3] = r_p[g][0] * r_loc[3] + r_p[g][1] * r_loc[4] + r_p[g][2] * r_loc[5];
             }
             for d in 0..6 {
                 assert!(
@@ -1165,11 +1189,15 @@ fn cable_from_target_tension_i_closed_form_and_catenary_inversion() {
         net.points.get_mut(sname).unwrap().restraint = [true; 6];
     }
     for j in ["1", "2", "3", "4"] {
-        net.points.get_mut(j).unwrap().loads_force.push(PointLoadForce {
-            load_pat: "POINT".into(),
-            csys: "GLOBAL".into(),
-            force: [0.0, 0.0, -8.0, 0.0, 0.0, 0.0],
-        });
+        net.points
+            .get_mut(j)
+            .unwrap()
+            .loads_force
+            .push(PointLoadForce {
+                load_pat: "POINT".into(),
+                csys: "GLOBAL".into(),
+                force: [0.0, 0.0, -8.0, 0.0, 0.0, 0.0],
+            });
     }
     let inclined = [
         ("1", "7", "1"),
@@ -1233,7 +1261,10 @@ fn cable_from_target_tension_i_closed_form_and_catenary_inversion() {
         .unwrap()
         .undeformed_length = Some(100.0);
     let err_dup = analyze_model(&mut bad_net).unwrap_err();
-    assert!(err_dup.to_string().contains("target end tension"), "{err_dup}");
+    assert!(
+        err_dup.to_string().contains("target end tension"),
+        "{err_dup}"
+    );
 
     analyze_model(&mut net).unwrap();
     let u1 = net.case_results["POINT"].joint_displacements["1"];

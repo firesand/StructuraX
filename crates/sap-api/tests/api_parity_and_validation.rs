@@ -4,7 +4,10 @@ use sap_units::Units;
 
 fn populated_model_with_results() -> cSapModel {
     let mut api = cSapModel::new(Units::KipInF);
-    assert_eq!(api.point_obj().add_cartesian(0.0, 0.0, 0.0, "P1").0, OAPI_OK);
+    assert_eq!(
+        api.point_obj().add_cartesian(0.0, 0.0, 0.0, "P1").0,
+        OAPI_OK
+    );
     assert_eq!(
         api.point_obj().add_cartesian(120.0, 0.0, 0.0, "P2").0,
         OAPI_OK
@@ -31,7 +34,10 @@ fn populated_model_with_results() -> cSapModel {
             .0,
         OAPI_OK
     );
-    assert_eq!(api.resp_combo().add("COMB_EXISTING", ComboType::LinearAdd), OAPI_OK);
+    assert_eq!(
+        api.resp_combo().add("COMB_EXISTING", ComboType::LinearAdd),
+        OAPI_OK
+    );
 
     api.inner
         .case_results
@@ -70,6 +76,7 @@ fn populated_model_with_results() -> cSapModel {
             is_column: false,
             as_top: 1.2,
             as_bot: 1.5,
+            as_side: 0.0,
             av_over_s: 0.05,
             pmm_ratio: 0.0,
             min_rebar_area: 0.8,
@@ -82,24 +89,21 @@ fn populated_model_with_results() -> cSapModel {
 #[test]
 fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() {
     let mut api = populated_model_with_results();
-    assert_eq!(api.point_obj().add_cartesian(60.0, 0.0, 0.0, "PMID").0, OAPI_OK);
+    assert_eq!(
+        api.point_obj().add_cartesian(60.0, 0.0, 0.0, "PMID").0,
+        OAPI_OK
+    );
     // Re-seed results after adding collinear helper joint PMID
     api.inner
         .case_results
         .insert("SOLVED".into(), CaseResults::default());
     api.inner.steel_design_results.insert(
         "F1".into(),
-        populated_model_with_results()
-            .inner
-            .steel_design_results["F1"]
-            .clone(),
+        populated_model_with_results().inner.steel_design_results["F1"].clone(),
     );
     api.inner.concrete_design_results.insert(
         "F1".into(),
-        populated_model_with_results()
-            .inner
-            .concrete_design_results["F1"]
-            .clone(),
+        populated_model_with_results().inner.concrete_design_results["F1"].clone(),
     );
 
     let before = api.inner.clone();
@@ -165,11 +169,7 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
     // Collinear triangle (P1 - PMID - P2 along X-axis)
     assert_eq!(
         api.area_obj()
-            .add_by_point(
-                vec!["P1".into(), "PMID".into(), "P2".into()],
-                "ASEC1",
-                "A2"
-            )
+            .add_by_point(vec!["P1".into(), "PMID".into(), "P2".into()], "ASEC1", "A2")
             .0,
         OAPI_ERR
     );
@@ -219,7 +219,8 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
 
     // 3. cPropFrame invalid cases across all 7 setters
     assert_eq!(
-        api.prop_frame().set_rectangle(" BAD ", "A992Fy50", 12.0, 6.0),
+        api.prop_frame()
+            .set_rectangle(" BAD ", "A992Fy50", 12.0, 6.0),
         OAPI_ERR
     );
     assert_eq!(
@@ -288,8 +289,7 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
     );
 
     // Also verify missing section inside a valid .pro database rejects before prepare_edit()
-    let pro_path =
-        std::env::temp_dir().join(format!("sap-api-synth-{}.pro", std::process::id()));
+    let pro_path = std::env::temp_dir().join(format!("sap-api-synth-{}.pro", std::process::id()));
     {
         let mut bytes = vec![0u8; 240];
         bytes[0x28..0x2c].copy_from_slice(&7.0f32.to_le_bytes()); // version 7.0
@@ -376,15 +376,17 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
         OAPI_ERR
     );
     assert_eq!(
-        api.load_patterns()
-            .set_self_wt_multiplier("DEAD", f64::NAN),
+        api.load_patterns().set_self_wt_multiplier("DEAD", f64::NAN),
         OAPI_ERR
     );
 
     // 6. cRespCombo::add & set_case_list invalid cases (excluding cycles tested next)
     assert_eq!(api.resp_combo().add(" C1 ", ComboType::LinearAdd), OAPI_ERR);
     assert_eq!(api.resp_combo().add("DEAD", ComboType::LinearAdd), OAPI_ERR);
-    assert_eq!(api.resp_combo().add("MODAL", ComboType::LinearAdd), OAPI_ERR);
+    assert_eq!(
+        api.resp_combo().add("MODAL", ComboType::LinearAdd),
+        OAPI_ERR
+    );
     assert_eq!(
         api.resp_combo().set_case_list("NO_COMBO", "DEAD", 1.0),
         OAPI_ERR
@@ -438,16 +440,13 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
         OAPI_ERR
     );
     assert_eq!(
-        api.prop_frame().set_rectangle("R_OK", "A992Fy50", 12.0, 6.0),
+        api.prop_frame()
+            .set_rectangle("R_OK", "A992Fy50", 12.0, 6.0),
         OAPI_ERR
     );
     assert_eq!(
-        api.prop_frame().import_prop(
-            "IMP_OK",
-            "A992Fy50",
-            pro_path.to_str().unwrap(),
-            "W14X90"
-        ),
+        api.prop_frame()
+            .import_prop("IMP_OK", "A992Fy50", pro_path.to_str().unwrap(), "W14X90"),
         OAPI_ERR
     );
     assert_eq!(
@@ -473,12 +472,8 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
     // Unlock and verify valid import_prop succeeds and invalidates results cleanly.
     assert_eq!(api.set_model_is_locked(false), OAPI_OK);
     assert_eq!(
-        api.prop_frame().import_prop(
-            "IMP_OK",
-            "A992Fy50",
-            pro_path.to_str().unwrap(),
-            "W14X90"
-        ),
+        api.prop_frame()
+            .import_prop("IMP_OK", "A992Fy50", pro_path.to_str().unwrap(), "W14X90"),
         OAPI_OK
     );
     assert!(api.inner.frame_sections.contains_key("IMP_OK"));
@@ -488,7 +483,8 @@ fn legacy_mutators_validate_before_prepare_edit_and_preserve_results_and_lock() 
 
 #[test]
 fn file_templates_after_open_clear_path_and_preservation_and_validate_inputs() {
-    let dir = std::env::temp_dir().join(format!("sap-api-template-lifecycle-{}", std::process::id()));
+    let dir =
+        std::env::temp_dir().join(format!("sap-api-template-lifecycle-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let orig_path = dir.join("opened_vendor.s2k");
     let orig_s2k = "TABLE: \"PROGRAM CONTROL\"\n CurrUnits=\"Kip, in, F\"\nTABLE: \"JOINT COORDINATES\"\n Joint=J1 XorR=0 Y=0 Z=0\nTABLE: \"OPAQUE VENDOR\"\n Key=42\nEND TABLE DATA\n";
@@ -503,8 +499,14 @@ fn file_templates_after_open_clear_path_and_preservation_and_validate_inputs() {
     assert!(app.sap_model.inner.s2k_preservation.is_some());
 
     // Invalid template parameters must reject BEFORE resetting the opened model or path!
-    assert_eq!(app.sap_model.file().new_beam(0, 120.0, true, "FSEC1"), OAPI_ERR);
-    assert_eq!(app.sap_model.file().new_beam(2, -50.0, true, "FSEC1"), OAPI_ERR);
+    assert_eq!(
+        app.sap_model.file().new_beam(0, 120.0, true, "FSEC1"),
+        OAPI_ERR
+    );
+    assert_eq!(
+        app.sap_model.file().new_beam(2, -50.0, true, "FSEC1"),
+        OAPI_ERR
+    );
     assert_eq!(
         app.sap_model.file().new_2d_frame(
             FrameType2D::PortalFrame,
@@ -564,7 +566,10 @@ fn file_templates_after_open_clear_path_and_preservation_and_validate_inputs() {
     assert!(app.sap_model.inner.points.contains_key("J1"));
 
     // Valid new_beam resets path, s2k_preservation, warnings, and errors
-    assert_eq!(app.sap_model.file().new_beam(2, 120.0, true, "FSEC1"), OAPI_OK);
+    assert_eq!(
+        app.sap_model.file().new_beam(2, 120.0, true, "FSEC1"),
+        OAPI_OK
+    );
     assert!(app.sap_model.last_file_path.is_none());
     assert!(app.current_file().is_none());
     assert!(app.sap_model.inner.s2k_preservation.is_none());
@@ -612,7 +617,8 @@ fn locked_model_rejects_set_run_case_flag_and_unit_conversion() {
     // Unlock and verify missing case rejection + result invalidation on mutation
     assert_eq!(api.analyze().delete_results(), OAPI_OK);
     assert_eq!(
-        api.analyze().set_run_case_flag("NO_SUCH_CASE", false, false),
+        api.analyze()
+            .set_run_case_flag("NO_SUCH_CASE", false, false),
         OAPI_ERR
     );
     api.inner
@@ -641,7 +647,10 @@ fn damper_link_spectrum_directions_and_expanded_results_queries() {
     api.inner.load_patterns["DEAD"].self_wt_multiplier = 0.0;
 
     assert_eq!(api.point_obj().add_cartesian(0.0, 0.0, 0.0, "I").0, OAPI_OK);
-    assert_eq!(api.point_obj().add_cartesian(10.0, 0.0, 0.0, "J").0, OAPI_OK);
+    assert_eq!(
+        api.point_obj().add_cartesian(10.0, 0.0, 0.0, "J").0,
+        OAPI_OK
+    );
     assert_eq!(api.point_obj().set_restraint("I", [true; 6]), OAPI_OK);
     assert_eq!(
         api.point_obj()
@@ -692,11 +701,16 @@ fn damper_link_spectrum_directions_and_expanded_results_queries() {
     damper.k_nl[0] = 200.0;
     damper.param1[0] = 25.0;
     assert_eq!(api.prop_link().set_definition(damper), OAPI_OK);
-    assert_eq!(api.prop_link().get_definition("DAMP").unwrap().param2[0], 1.0);
+    assert_eq!(
+        api.prop_link().get_definition("DAMP").unwrap().param2[0],
+        1.0
+    );
 
     // Reject untrimmed user_name on cLinkObj
     assert_eq!(
-        api.link_obj().add_by_point("I", Some("J"), "DAMP", " L1 ").0,
+        api.link_obj()
+            .add_by_point("I", Some("J"), "DAMP", " L1 ")
+            .0,
         OAPI_ERR
     );
     assert_eq!(
@@ -760,9 +774,12 @@ fn damper_link_spectrum_directions_and_expanded_results_queries() {
 
     assert_eq!(api.analyze().run_analysis(), OAPI_OK);
 
-    api.results().setup_deselect_all_cases_and_combos_for_output();
-    api.results().setup_set_case_selected_for_output("NLH", true);
-    api.results().setup_set_case_selected_for_output("MOD", true);
+    api.results()
+        .setup_deselect_all_cases_and_combos_for_output();
+    api.results()
+        .setup_set_case_selected_for_output("NLH", true);
+    api.results()
+        .setup_set_case_selected_for_output("MOD", true);
     api.results().setup_set_case_selected_for_output("RS", true);
 
     let (code, lf) = api.results().link_force("L1");
@@ -875,9 +892,7 @@ fn object_management_get_name_list_and_validated_delete() {
         OAPI_OK
     );
     assert_eq!(
-        api.solid_obj()
-            .add_by_point(pts.clone(), "BRICK", "S1")
-            .0,
+        api.solid_obj().add_by_point(pts.clone(), "BRICK", "S1").0,
         OAPI_OK
     );
     assert_eq!(api.prop_link().set_definition(LinkProp::default()), OAPI_OK);

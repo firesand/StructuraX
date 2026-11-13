@@ -612,22 +612,31 @@ mod tests {
         let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
         // Simulate a steel-only model carrying an unimplemented concrete code string
         model.concrete_design_code = "LEGACY-CONCRETE-99".to_string();
-        let sec = sap_section::make_i_section("W14_TEST", "A992Fy50", 14.0, 10.0, 0.5, 0.35, 10.0, 0.5);
+        let sec =
+            sap_section::make_i_section("W14_TEST", "A992Fy50", 14.0, 10.0, 0.5, 0.35, 10.0, 0.5);
         model.frame_sections.insert(sec.name.clone(), sec);
         model.add_point("1", 0.0, 0.0, 0.0);
         model.points.get_mut("1").unwrap().restraint = [true; 6];
         model.add_point("2", 120.0, 0.0, 0.0);
-        model.points.get_mut("2").unwrap().loads_force.push(sap_model::PointLoadForce {
-            load_pat: "DEAD".to_string(),
-            csys: "GLOBAL".to_string(),
-            force: [0.0, 0.0, -5.0, 0.0, 0.0, 0.0],
-        });
+        model
+            .points
+            .get_mut("2")
+            .unwrap()
+            .loads_force
+            .push(sap_model::PointLoadForce {
+                load_pat: "DEAD".to_string(),
+                csys: "GLOBAL".to_string(),
+                force: [0.0, 0.0, -5.0, 0.0, 0.0, 0.0],
+            });
         model.add_frame("1", "1", "2", "W14_TEST");
         save_s2k_file_with_report(&model, &input).unwrap();
 
         // Refuses overwriting input file
-        let same_err = run_cli_analyze(&input, Some(&input), AnalyzeDesignOptions::default()).unwrap_err();
-        assert!(same_err.to_string().contains("Refusing to overwrite input file"));
+        let same_err =
+            run_cli_analyze(&input, Some(&input), AnalyzeDesignOptions::default()).unwrap_err();
+        assert!(same_err
+            .to_string()
+            .contains("Refusing to overwrite input file"));
 
         // `--design` evaluates steel and cleanly skips absent concrete discipline
         run_cli_analyze(
@@ -656,7 +665,10 @@ mod tests {
             },
         )
         .unwrap_err();
-        assert!(conc_err.to_string().contains("LEGACY-CONCRETE-99"), "{conc_err}");
+        assert!(
+            conc_err.to_string().contains("LEGACY-CONCRETE-99"),
+            "{conc_err}"
+        );
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(json_out);
