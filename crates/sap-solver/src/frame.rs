@@ -210,7 +210,7 @@ pub fn eval_section_props_at(
     }
 }
 
-fn resolve_non_prismatic_segments(
+pub(crate) fn resolve_non_prismatic_segments(
     segments: &[sap_model::NonPrismaticSegment],
     lf: f64,
 ) -> Vec<(&sap_model::NonPrismaticSegment, f64)> {
@@ -585,6 +585,181 @@ pub fn apply_rigid_offsets(k: &mut [[f64; 12]; 12], fef: &mut [f64; 12], di: f64
     }
 }
 
+/// Offset of the section centroid from the line between the joints, in element
+/// local axes, for a frame whose insertion point (cardinal point plus joint
+/// offsets) has stiffness transformation on. `Ok([0.0; 3])` means the frame
+/// is analyzed between its joints. `Err` names what is not implemented.
+///
+/// Cardinal points follow the CSI Analysis Reference figure "Frame Cardinal
+/// Points": bottom/top are the negative/positive local 2 side and left/right
+/// the negative/positive local 3 side, at half the section depth and width.
+/// The centroid is at the joint plus the joint offset, minus the position of
+/// the cardinal point relative to the centroid.
+pub fn insertion_offset_local(model: &SapModel, frame: &FrameObj) -> Result<[f64; 3], String> {
+    let no_offsets = frame.joint_offset_i == [0.0; 3] && frame.joint_offset_j == [0.0; 3];
+    if !frame.stiff_transform || (frame.cardinal_point == 10 && no_offsets) {
+        return Ok([0.0; 3]);
+    }
+    let (Some(pi), Some(pj)) = (
+        model.points.get(&frame.point_i),
+        model.points.get(&frame.point_j),
+    ) else {
+        return Ok([0.0; 3]);
+    };
+    let (length, e_axes) =
+        frame_local_axes([pi.x, pi.y, pi.z], [pj.x, pj.y, pj.z], frame.angle_deg);
+
+    // Position of the cardinal point relative to the centroid, in half depths
+    // (local 2) and half widths (local 3).
+    let (c2, c3) = match frame.cardinal_point {
+        1 => (-1.0, -1.0),
+        2 => (-1.0, 0.0),
+        3 => (-1.0, 1.0),
+        4 => (0.0, -1.0),
+        5 | 10 | 11 => (0.0, 0.0),
+        6 => (0.0, 1.0),
+        7 => (1.0, -1.0),
+        8 => (1.0, 0.0),
+        9 => (1.0, 1.0),
+        other => return Err(format!("cardinal point {other} is not one of 1 to 11")),
+    };
+    // A cable object has no frame section and no bending element to offset.
+    if frame.cable_params.is_some() {
+        return Err("it is a cable".to_string());
+    }
+    let mut centroid = [0.0f64; 2];
+    if frame.cardinal_point != 10 {
+        let Some(sec) = model.frame_sections.get(&frame.section) else {
+            return Ok([0.0; 3]);
+        };
+        // Cardinal points 5 and 11 are the centroid, and the others are half
+        // the outside dimensions away from it, only for a doubly symmetric
+        // shape of known dimensions.
+        let (depth, width) = match sec.prop_type {
+            FramePropType::Rectangular | FramePropType::Box => (sec.t3, sec.t2),
+            FramePropType::I if sec.t2 == sec.t2b && sec.tf == sec.tfb => (sec.t3, sec.t2),
+            FramePropType::Circle | FramePropType::Pipe => (sec.t3, sec.t3),
+            _ => {
+                return Err(format!(
+                    "cardinal point {} on section '{}', whose shape is not a doubly symmetric one with known outside dimensions",
+                    frame.cardinal_point, sec.name
+                ))
+            }
+        };
+        if !(depth > 0.0 && width > 0.0) {
+            return Err(format!(
+                "cardinal point {} on section '{}', which has no outside dimensions",
+                frame.cardinal_point, sec.name
+            ));
+        }
+        centroid = [-c2 * depth / 2.0, -c3 * width / 2.0];
+    }
+
+    let local = |offset: [f64; 3]| {
+        if frame.joint_offset_is_global {
+            global_vec_to_local(offset, &e_axes)
+        } else {
+            offset
+        }
+    };
+    let (at_i, at_j) = (local(frame.joint_offset_i), local(frame.joint_offset_j));
+    let tolerance = 1e-9 * length.max(1e-12);
+    if (0..3).any(|c| (at_i[c] - at_j[c]).abs() > tolerance) {
+        return Err(
+            "joint offsets that differ between its ends, which turn the member axis".to_string(),
+        );
+    }
+    if at_i[0].abs() > tolerance {
+        return Err("a joint offset along its own axis".to_string());
+    }
+    let offset = [0.0, at_i[1] + centroid[0], at_i[2] + centroid[1]];
+    if offset == [0.0; 3] {
+        return Ok(offset);
+    }
+    // What the transformation below does not cover.
+    if frame.end_offset_i != 0.0 || frame.end_offset_j != 0.0 {
+        return Err("end length offsets".to_string());
+    }
+    if frame.pdelta_force != 0.0 {
+        return Err("an assigned P-Delta force".to_string());
+    }
+    if frame.auto_mesh_at_joints {
+        return Err("automatic subdivision at joints".to_string());
+    }
+    if model
+        .frame_sections
+        .get(&frame.section)
+        .is_some_and(|sec| sec.prop_type == FramePropType::Variable)
+    {
+        return Err("a non-prismatic section".to_string());
+    }
+    Ok(offset)
+}
+
+/// Rigid arm from each joint to the element end at `offset` (element local):
+/// `u_end = u_joint + theta_joint x offset`. Returns the 3x3 block that
+/// multiplies the joint rotation.
+fn insertion_arm(offset: [f64; 3]) -> [[f64; 3]; 3] {
+    [
+        [0.0, offset[2], -offset[1]],
+        [-offset[2], 0.0, offset[0]],
+        [offset[1], -offset[0], 0.0],
+    ]
+}
+
+/// Carries element stiffness and fixed-end forces from the element ends to
+/// the joints through the rigid arms of an insertion point: `k = T^T k T`,
+/// `f = T^T f`. The arms are exact rigid links, not penalty constraints.
+pub fn apply_insertion_offset(k: &mut [[f64; 12]; 12], fef: &mut [f64; 12], offset: [f64; 3]) {
+    if offset == [0.0; 3] {
+        return;
+    }
+    let arm = insertion_arm(offset);
+    let mut t = [[0.0f64; 12]; 12];
+    for (i, row) in t.iter_mut().enumerate() {
+        row[i] = 1.0;
+    }
+    for end in [0, 6] {
+        for i in 0..3 {
+            for j in 0..3 {
+                t[end + i][end + 3 + j] = arm[i][j];
+            }
+        }
+    }
+    let old_fef = *fef;
+    for i in 0..12 {
+        fef[i] = (0..12).map(|m| t[m][i] * old_fef[m]).sum();
+    }
+    let mut kt = [[0.0f64; 12]; 12];
+    for i in 0..12 {
+        for j in 0..12 {
+            kt[i][j] = (0..12).map(|m| k[i][m] * t[m][j]).sum();
+        }
+    }
+    for i in 0..12 {
+        for j in 0..12 {
+            k[i][j] = (0..12).map(|m| t[m][i] * kt[m][j]).sum();
+        }
+    }
+}
+
+/// The inverse view for result recovery: joint displacements and joint-level
+/// end forces (element local) become those of the element ends.
+pub fn insertion_to_element_ends(u: &mut [f64; 12], f: &mut [f64; 12], offset: [f64; 3]) {
+    if offset == [0.0; 3] {
+        return;
+    }
+    let arm = insertion_arm(offset);
+    for end in [0, 6] {
+        for i in 0..3 {
+            // u_end = u_joint + arm * theta
+            u[end + i] += (0..3).map(|j| arm[i][j] * u[end + 3 + j]).sum::<f64>();
+            // m_joint = m_end + arm^T * F, so m_end = m_joint - arm^T * F
+            f[end + 3 + i] -= (0..3).map(|j| arm[j][i] * f[end + j]).sum::<f64>();
+        }
+    }
+}
+
 /// Computes the consistent cubic-Hermite geometric stiffness matrix $\mathbf{K}_G(P)$ ($12 \times 12$)
 /// in local coordinates for axial force $P$ (`+` = tension, `-` = compression).
 pub fn compute_local_geometric_stiffness(p_axial: f64, lf: f64) -> [[f64; 12]; 12] {
@@ -783,6 +958,92 @@ pub fn add_point_load_fef(
     }
 }
 
+/// Adds the fixed-end forces of a concentrated force or moment at relative
+/// position $s$ on a member whose section varies along its length.
+///
+/// The member is released at J: the load is carried to I by statics, the free
+/// motion of J follows from the unit-load integrals of the varying section
+/// (the same flexibilities the stiffness is built from), and the stiffness
+/// then restrains that motion. The prismatic closed forms do not apply here.
+#[allow(clippy::too_many_arguments)]
+fn add_point_load_fef_non_prismatic(
+    fef: &mut [f64; 12],
+    model: &SapModel,
+    frame: &FrameObj,
+    sec: &FrameSection,
+    mat: &Material,
+    stiffness: &[[f64; 12]; 12],
+    my_type: i32,
+    local_vec: [f64; 3],
+    s: f64,
+    lf: f64,
+) {
+    let a = s.clamp(0.0, 1.0) * lf;
+    let (force, moment) = match my_type {
+        1 => (local_vec, [0.0; 3]),
+        2 => ([0.0; 3], local_vec),
+        _ => return,
+    };
+    let e = mat.e;
+    let g = if mat.g > 1e-12 { mat.g } else { mat.e / (2.0 * (1.0 + mat.u)) };
+
+    // Free motion of J: [u1, u2, u3, r1, r2, r3].
+    let mut free = [0.0f64; 6];
+    let mut start = 0.0;
+    for (_, segment_length) in resolve_non_prismatic_segments(&sec.non_prismatic, lf) {
+        let (lo, hi) = (start, (start + segment_length).min(a));
+        start += segment_length;
+        if hi <= lo {
+            continue;
+        }
+        for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+            let x = lo + node * (hi - lo);
+            let dx = weight * (hi - lo);
+            let props = eval_section_props_at(model, frame, sec, mat, x / lf, lf);
+            // Section resultants of the load beyond x, about the section.
+            let m3 = (a - x) * force[1] + moment[2];
+            let m2 = -(a - x) * force[2] + moment[1];
+            let arm = lf - x;
+            if e * props.area > 1e-18 {
+                free[0] += force[0] / (e * props.area) * dx;
+            }
+            if g * props.j > 1e-18 {
+                free[3] += moment[0] / (g * props.j) * dx;
+            }
+            if e * props.i33 > 1e-18 {
+                free[1] += m3 * arm / (e * props.i33) * dx;
+                free[5] += m3 / (e * props.i33) * dx;
+                if g * props.as2 > 1e-14 {
+                    free[1] += force[1] / (g * props.as2) * dx;
+                }
+            }
+            if e * props.i22 > 1e-18 {
+                free[2] -= m2 * arm / (e * props.i22) * dx;
+                free[4] += m2 / (e * props.i22) * dx;
+                if g * props.as3 > 1e-14 {
+                    free[2] += force[2] / (g * props.as3) * dx;
+                }
+            }
+        }
+    }
+
+    // Force of joint I on the member with J free: minus the load carried to I.
+    let at_i = [
+        -force[0],
+        -force[1],
+        -force[2],
+        -moment[0],
+        -(moment[1] - a * force[2]),
+        -(moment[2] + a * force[1]),
+    ];
+    for row in 0..6 {
+        fef[row] += at_i[row];
+    }
+    for row in 0..12 {
+        fef[row] -= (0..6).map(|c| stiffness[row][6 + c] * free[c]).sum::<f64>();
+    }
+}
+
 /// Computes the uncondensed flexible fixed-end force vector $\mathbf{f}_{\text{FEF}}$ ($12 \times 1$)
 /// for a given `LoadPattern` and scale factor `sf`.
 pub fn compute_flexible_fef_for_pattern(
@@ -821,6 +1082,21 @@ pub fn compute_flexible_fef_for_pattern(
         0.0
     };
 
+    // A varying section needs its own fixed-end forces; the prismatic closed
+    // forms would give the right load resultant with the wrong end moments.
+    let non_prismatic = sec.prop_type == FramePropType::Variable && !sec.non_prismatic.is_empty();
+    let varying_stiffness =
+        non_prismatic.then(|| compute_flexible_local_stiffness(model, frame, sec, mat, lf));
+    let add_point_load_fef =
+        |fef: &mut [f64; 12], my_type: i32, local_vec: [f64; 3], s: f64, lf: f64, phi2: f64, phi3: f64| {
+            match &varying_stiffness {
+                Some(stiffness) => add_point_load_fef_non_prismatic(
+                    fef, model, frame, sec, mat, stiffness, my_type, local_vec, s, lf,
+                ),
+                None => add_point_load_fef(fef, my_type, local_vec, s, lf, phi2, phi3),
+            }
+        };
+
     // 1. Self-weight (downward -Z) and Gravity multipliers
     let mut grav_mult = [0.0, 0.0, -self_wt_mult];
     if let Some(gm) = frame.loads_gravity.get(pat_name) {
@@ -830,7 +1106,7 @@ pub fn compute_flexible_fef_for_pattern(
     }
     if grav_mult[0].abs() > 1e-15 || grav_mult[1].abs() > 1e-15 || grav_mult[2].abs() > 1e-15 {
         let local_g_unit = global_vec_to_local(grav_mult, e_axes);
-        if sec.prop_type == FramePropType::Variable && !sec.non_prismatic.is_empty() {
+        if non_prismatic {
             // Exact non-prismatic self-weight integration
             let segs = resolve_non_prismatic_segments(&sec.non_prismatic, lf);
             let mut x_start = 0.0;
@@ -1078,9 +1354,12 @@ pub fn recover_frame_stations(
                         int_m3 += (x - x_eval) * dq[1];
                         int_m2 -= (x - x_eval) * dq[2];
                     } else if ld.my_type == 2 {
+                        // An applied moment about local 2 or 3 lowers the
+                        // section moment beyond it (moment equilibrium of the
+                        // part of the member before the section).
                         int_m1 += dq[0];
-                        int_m2 += dq[1];
-                        int_m3 += dq[2];
+                        int_m2 -= dq[1];
+                        int_m3 -= dq[2];
                     }
                 }
             }
@@ -1101,8 +1380,8 @@ pub fn recover_frame_stations(
                         int_m2 -= (x - x_p) * dp[2];
                     } else if lp.my_type == 2 {
                         int_m1 += dp[0];
-                        int_m2 += dp[1];
-                        int_m3 += dp[2];
+                        int_m2 -= dp[1];
+                        int_m3 -= dp[2];
                     }
                 }
             }
@@ -1151,8 +1430,8 @@ pub fn recover_frame_stations(
                                     m3_l += (1.0 - se) * length * dq[1];
                                     m2_l -= (1.0 - se) * length * dq[2];
                                 } else if ld.my_type == 2 {
-                                    m2_l += dq[1];
-                                    m3_l += dq[2];
+                                    m2_l -= dq[1];
+                                    m3_l -= dq[2];
                                 }
                             }
                         }
@@ -1165,8 +1444,8 @@ pub fn recover_frame_stations(
                             m3_l += (1.0 - lp.rel_dist) * length * dp[1];
                             m2_l -= (1.0 - lp.rel_dist) * length * dp[2];
                         } else if lp.my_type == 2 {
-                            m2_l += dp[1];
-                            m3_l += dp[2];
+                            m2_l -= dp[1];
+                            m3_l -= dp[2];
                         }
                     }
                 }
@@ -1303,7 +1582,12 @@ pub fn recover_frame_stations(
             v2,
             v3,
             t,
-            m2,
+            // Reported in the SAP2000 convention: a positive bending moment
+            // compresses the positive 3 face (CSI Analysis Reference,
+            // "Internal Force Output"). The moment vector about local 2 that
+            // the element works with internally has the opposite sense; for
+            // M3 the two agree.
+            m2: -m2,
             m3,
             local_disp: if integrate_deflection {
                 let partial = integrate(s);

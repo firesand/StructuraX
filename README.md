@@ -50,7 +50,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo run --locked --bin structurax -- verify
 ```
 
-The built-in comparisons are selected synthetic/reference examples, not the complete vendor verification suite. Several legacy tests use locally supplied vendor fixtures and skip when absent. The seven newer solver fixture tests require explicit opt-in: `cargo test -p sap-solver --features vendor-fixtures --test wave4_vendor_regressions`. Set `STRUCTURAX_VENDOR_FIXTURES` to the fixture directory, or use the local `extracted/files/` directory. CI runs without vendor assets. Historical reports under `docs/reconstruction/` describe their own checkpoints and may refer to local-only evidence under `target/`.
+The built-in comparisons are selected synthetic/reference examples, not the complete vendor verification suite. Several legacy tests use locally supplied vendor fixtures and skip when absent. The fourteen newer solver fixture tests (one of them slow and ignored by default) require explicit opt-in: `cargo test -p sap-solver --features vendor-fixtures --test wave4_vendor_regressions`. Set `STRUCTURAX_VENDOR_FIXTURES` to the fixture directory, or use the local `extracted/files/` directory. CI runs without vendor assets. Historical reports under `docs/reconstruction/` describe their own checkpoints and may refer to local-only evidence under `target/`.
 
 ## Packages
 

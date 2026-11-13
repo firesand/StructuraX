@@ -123,6 +123,12 @@ pub fn load_model_with_report(path: impl AsRef<Path>) -> Result<ImportReport, Fo
         {
             warnings.push(format!("Native link '{}' has verified activation flags but unmapped constitutive/opening data; nonlinear analysis is blocked", prop.name));
         }
+        for entry in &model.unmodeled_source {
+            warnings.push(format!(
+                "Not modeled: {}. Analysis of the affected cases is refused until this entry is removed from the model's unmodeled source data.",
+                entry.description
+            ));
+        }
         return Ok(ImportReport { model, warnings });
     }
     let text = std::str::from_utf8(&bytes)

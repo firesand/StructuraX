@@ -13,8 +13,8 @@ mod links;
 pub use cables::cCableObj;
 pub use database_tables::{cDatabaseTables, StagedTable, TableCatalogEntry};
 pub use definitions::{
-    cFunctions, set_case_definition, set_function_definition, validate_case_definition,
-    DefinitionError,
+    cFunctions, discard_unmodeled_source, set_case_definition, set_function_definition,
+    validate_case_definition, DefinitionError,
 };
 pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 
@@ -1095,6 +1095,89 @@ impl cFrameObj<'_> {
             return OAPI_ERR;
         }
         self.edit_frame(name, |f| f.modifiers = modifiers)
+    }
+    /// Insertion point of a frame object (`FrameObj.SetInsertionPoint`): the
+    /// cardinal point `1..=11` (10 is the centroid) and the joint offsets at
+    /// the two ends, in the element local or the global system. With
+    /// `stiff_transform` on, the element is set off from its joints on rigid
+    /// arms; analysis implements that for equal offsets across the member
+    /// axis, doubly symmetric shapes and linear static cases, and refuses the
+    /// rest. With it off the frame is analyzed at its centroid. Mirroring
+    /// about local 2 is not represented and is refused here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_insertion_point(
+        &mut self,
+        name: &str,
+        cardinal_point: i32,
+        mirror2: bool,
+        stiff_transform: bool,
+        offset1: [f64; 3],
+        offset2: [f64; 3],
+        csys: &str,
+    ) -> i32 {
+        let is_global = if csys.eq_ignore_ascii_case("Global") {
+            true
+        } else if csys.eq_ignore_ascii_case("Local") {
+            false
+        } else {
+            return OAPI_ERR;
+        };
+        if !(1..=11).contains(&cardinal_point)
+            || mirror2
+            || offset1.iter().chain(&offset2).any(|v| !v.is_finite())
+        {
+            return OAPI_ERR;
+        }
+        self.edit_frame(name, |f| {
+            f.cardinal_point = cardinal_point;
+            f.stiff_transform = stiff_transform;
+            f.joint_offset_i = offset1;
+            f.joint_offset_j = offset2;
+            f.joint_offset_is_global = is_global;
+        })
+    }
+    /// Automatic subdivision of a frame object for analysis
+    /// (`FrameObj.SetAutoMesh`). Subdivision at joints lying on the object and
+    /// into a number of segments are analyzed. Subdivision at intersections
+    /// with other objects and a maximum segment length are not, and are
+    /// refused here rather than stored and ignored.
+    pub fn set_auto_mesh(
+        &mut self,
+        name: &str,
+        auto_mesh: bool,
+        auto_mesh_at_points: bool,
+        auto_mesh_at_lines: bool,
+        num_segs: i32,
+        auto_mesh_max_length: f64,
+    ) -> i32 {
+        if !(0..=10_000).contains(&num_segs)
+            || auto_mesh_max_length != 0.0
+            || (auto_mesh && auto_mesh_at_lines)
+        {
+            return OAPI_ERR;
+        }
+        if self
+            .api
+            .inner
+            .frames
+            .get(name)
+            .is_some_and(|f| f.cable_params.is_some() && auto_mesh && num_segs > 1)
+        {
+            return OAPI_ERR;
+        }
+        self.edit_frame(name, |f| {
+            f.auto_mesh_segments = if auto_mesh { num_segs as usize } else { 0 };
+            f.auto_mesh_at_joints = auto_mesh && auto_mesh_at_points;
+        })
+    }
+    /// `(auto_mesh, auto_mesh_at_points, num_segs)` of a frame object.
+    pub fn get_auto_mesh(&self, name: &str) -> Option<(bool, bool, i32)> {
+        let frame = self.api.inner.frames.get(name)?;
+        Some((
+            frame.auto_mesh_segments > 0 || frame.auto_mesh_at_joints,
+            frame.auto_mesh_at_joints,
+            i32::try_from(frame.auto_mesh_segments).ok()?,
+        ))
     }
     pub fn set_tc_limits(
         &mut self,
@@ -2505,6 +2588,34 @@ pub struct cDesignSteel<'a> {
 }
 
 impl cDesignSteel<'_> {
+    /// Sets (`Some`) or clears (`None`) the steel design overwrites of a frame:
+    /// unbraced length ratios, effective length factors, Cb and the sway flag.
+    /// Items left `None` stay program determined. Design overwrites do not
+    /// change the analysis, so the model may be locked; steel design results
+    /// are cleared.
+    pub fn set_overwrite(
+        &mut self,
+        name: &str,
+        overwrite: Option<sap_model::SteelDesignOverwrite>,
+    ) -> i32 {
+        if let Some(o) = &overwrite {
+            let items = [o.l_ratio_major, o.l_ratio_minor, o.l_ratio_ltb, o.k_major, o.k_minor, o.cb];
+            if items.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
+                return OAPI_ERR;
+            }
+        }
+        let Some(frame) = self.api.inner.frames.get_mut(name) else {
+            return OAPI_ERR;
+        };
+        frame.steel_overwrite = overwrite;
+        self.api.inner.steel_design_results.clear();
+        OAPI_OK
+    }
+
+    pub fn get_overwrite(&self, name: &str) -> Option<&sap_model::SteelDesignOverwrite> {
+        self.api.inner.frames.get(name)?.steel_overwrite.as_ref()
+    }
+
     pub fn set_code(&mut self, code_name: &str) -> i32 {
         if SteelCode::try_from_code_str(code_name).is_err() {
             return OAPI_ERR;
@@ -2536,6 +2647,24 @@ pub struct cDesignConcrete<'a> {
 }
 
 impl cDesignConcrete<'_> {
+    /// Sets the framing type of a frame (the "Framing Type" overwrite). For
+    /// ACI beam design, Sway Special and Sway Intermediate apply the end and
+    /// span moment-strength rules; their capacity-based shear, column and
+    /// joint provisions are not implemented. Concrete design results are
+    /// cleared; the model may be locked.
+    pub fn set_framing_type(&mut self, name: &str, framing: sap_model::ConcreteFramingType) -> i32 {
+        let Some(frame) = self.api.inner.frames.get_mut(name) else {
+            return OAPI_ERR;
+        };
+        frame.concrete_framing = framing;
+        self.api.inner.concrete_design_results.clear();
+        OAPI_OK
+    }
+
+    pub fn get_framing_type(&self, name: &str) -> Option<sap_model::ConcreteFramingType> {
+        Some(self.api.inner.frames.get(name)?.concrete_framing)
+    }
+
     pub fn set_code(&mut self, code_name: &str) -> i32 {
         if ConcreteCode::try_from_code_str(code_name).is_err() {
             return OAPI_ERR;

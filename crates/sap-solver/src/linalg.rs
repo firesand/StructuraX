@@ -35,6 +35,31 @@ pub struct SymmetricLdlt {
 impl SymmetricLdlt {
     /// Factorizes an $n \times n$ symmetric matrix `k` (stored as flattened row-major `n * n`).
     pub fn factorize(k: &[f64], n: usize) -> Result<Self, LinalgError> {
+        Self::factorize_with_reference(k, n, None)
+    }
+
+    /// As [`Self::factorize`], with a reference diagonal for the singularity
+    /// test. A pivot is normally compared with the original diagonal of its
+    /// DOF. A penalty constraint inflates that diagonal by many orders of
+    /// magnitude, and the DOF of a constrained pair that is eliminated second
+    /// legitimately keeps only the structural stiffness, so the comparison
+    /// would report a sound but flexible structure as singular. Where
+    /// `reference[j]` is positive (the structural diagonal without penalties)
+    /// the pivot is compared with the smaller of the two, and where it is zero
+    /// with nothing; in both cases never with less than the roundoff of the
+    /// arithmetic actually performed on the inflated diagonal, so a true
+    /// mechanism at a constrained DOF is still detected.
+    pub fn factorize_with_reference(
+        k: &[f64],
+        n: usize,
+        reference: Option<&[f64]>,
+    ) -> Result<Self, LinalgError> {
+        if reference.is_some_and(|r| r.len() != n) {
+            return Err(LinalgError::DimensionMismatch {
+                expected: n,
+                actual: reference.map_or(0, <[f64]>::len),
+            });
+        }
         if k.len() != n * n {
             return Err(LinalgError::DimensionMismatch {
                 expected: n * n,
@@ -84,7 +109,20 @@ impl SymmetricLdlt {
             if !dj.is_finite() {
                 return Err(LinalgError::NonFinite("stiffness factorization"));
             }
-            let rel_pivot_tol = orig_diag[j].abs() * 1e-11;
+            let scale = match reference.map(|r| r[j]) {
+                Some(structural) if structural > 0.0 => orig_diag[j].abs().min(structural),
+                // A DOF whose whole diagonal is penalty (for example the
+                // rotation of a solid joint tied into a body constraint) has no
+                // structural scale; only the roundoff floor applies to it.
+                Some(_) => 0.0,
+                None => orig_diag[j].abs(),
+            };
+            let roundoff_floor = 64.0 * f64::EPSILON * orig_diag[j].abs();
+            let rel_pivot_tol = (scale * 1e-11).max(if reference.is_some() {
+                roundoff_floor
+            } else {
+                0.0
+            });
             if dj <= rel_pivot_tol {
                 return Err(LinalgError::SingularMatrix(j));
             }
@@ -672,4 +710,55 @@ pub fn solve_buckling_eigen(
     }
 
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bar (1e6) from DOF 0 to DOF 1, a ground spring at DOF 0, and DOF 2
+    /// tied to DOF 1 by a 1e12 penalty. DOF 2 has no stiffness of its own, so
+    /// its diagonal is all penalty while its pivot is the true stiffness seen
+    /// there. Returns the matrix and the structural (penalty-free) diagonal.
+    fn penalty_tied(ground_spring: f64) -> (Vec<f64>, Vec<f64>) {
+        let (bar, penalty) = (1.0e6, 1.0e12);
+        let k = vec![
+            bar + ground_spring,
+            -bar,
+            0.0,
+            -bar,
+            bar + penalty,
+            -penalty,
+            0.0,
+            -penalty,
+            penalty,
+        ];
+        (k, vec![bar + ground_spring, bar, 0.0])
+    }
+
+    #[test]
+    fn penalty_inflated_diagonals_do_not_hide_or_invent_mechanisms() {
+        // Grounded by a spring of 2: the true stiffness at DOF 2 is about 2.
+        let (k, structural) = penalty_tied(2.0);
+        // Relative to its penalty diagonal that pivot looks like lost stiffness.
+        assert!(matches!(
+            SymmetricLdlt::factorize(&k, 3),
+            Err(LinalgError::SingularMatrix(2))
+        ));
+        let factor = SymmetricLdlt::factorize_with_reference(&k, 3, Some(&structural)).unwrap();
+        let u = factor.solve(&[0.0, 0.0, 1.0]).unwrap();
+        // Springs in series: 1/2 + 1/1e6 + 1/1e12.
+        let expected = 0.5 + 1.0e-6 + 1.0e-12;
+        assert!((u[2] - expected).abs() < 1e-4 * expected, "{}", u[2]);
+
+        // With no path to ground the structure is a mechanism and is still
+        // reported: the pivot falls below the roundoff floor of the penalty.
+        let (k, structural) = penalty_tied(0.0);
+        assert!(matches!(
+            SymmetricLdlt::factorize_with_reference(&k, 3, Some(&structural)),
+            Err(LinalgError::SingularMatrix(_))
+        ));
+        // A reference of the wrong length is an error, not a silent fallback.
+        assert!(SymmetricLdlt::factorize_with_reference(&k, 3, Some(&structural[..2])).is_err());
+    }
 }

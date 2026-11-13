@@ -34,6 +34,8 @@ fn history(m: &mut SapModel, name: &str, steps: usize) {
     let mut c = LoadCase::linear_static(name, "DEAD", 1.);
     c.loads.clear();
     c.case_type = LoadCaseType::NonlinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    c.modal_damping = 0.;
     c.history_loads = vec![("RAMP".into(), "DEAD".into(), 1.)];
     c.time_step_dt = 0.01;
     c.num_time_steps = steps;
@@ -169,6 +171,8 @@ fn history_origin_continuation_fails_without_stale_results() {
     m.points["J"].spring[0] = 100.;
     history(&mut m, "H1", 10);
     m.load_cases["H1"].case_type = LoadCaseType::LinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    m.load_cases["H1"].modal_damping = 0.;
     analyze_model(&mut m).unwrap();
     assert!(m.case_results["H1"].transient_state.is_some());
 
@@ -176,6 +180,7 @@ fn history_origin_continuation_fails_without_stale_results() {
     m.load_cases["H2"].history_loads.clear();
     m.load_cases["H2"].initial_case = Some("H1".into());
     m.load_cases["H2"].case_type = LoadCaseType::LinearHistory;
+    m.load_cases["H2"].modal_damping = 0.;
     analyze_model(&mut m).unwrap();
     assert!(m.case_results["H2"].transient_state.is_some());
 
@@ -712,6 +717,8 @@ fn nonlinear_gap_hook_maxwell_split_history_and_terminal_static_continuation() {
     let mut h_full = LoadCase::linear_static("H_FULL", "DEAD", 1.);
     h_full.loads.clear();
     h_full.case_type = LoadCaseType::NonlinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    h_full.modal_damping = 0.;
     h_full.time_integration = TimeIntegrationMethod::HilberHughesTaylor;
     h_full.hht_alpha = -0.1;
     h_full.rayleigh_damping = (2.5, 0.02);

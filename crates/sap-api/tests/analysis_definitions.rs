@@ -33,6 +33,8 @@ fn function(name: &str, history: bool) -> DynamicFunction {
 fn history() -> LoadCase {
     let mut h = LoadCase::linear_static("H", "DEAD", 1.);
     h.case_type = LoadCaseType::LinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    h.modal_damping = 0.;
     h.loads.clear();
     h.num_time_steps = 200;
     h.time_step_dt = 0.005;
@@ -148,4 +150,48 @@ fn history_editor_rejects_unsupported_pattern_sources_and_parameter_ranges() {
     let before = a.inner.clone();
     assert!(set_case_definition(&mut a.inner, history()).is_err());
     assert_eq!(a.inner, before);
+}
+
+#[test]
+fn modal_history_damping_and_unmodeled_source_need_explicit_decisions() {
+    use sap_api::{discard_unmodeled_source, validate_case_definition};
+    let mut api = oscillator();
+    assert_eq!(api.functions().set_definition(function("STEP", true)), OAPI_OK);
+    // The general 0.05 default is a spectrum setting; a modal history type
+    // cannot honor it and the definition is refused, not silently accepted.
+    let mut h = history();
+    h.modal_damping = 0.05;
+    assert!(validate_case_definition(&api.inner, &h)
+        .unwrap_err()
+        .to_string()
+        .contains("modal damping"));
+    assert_eq!(api.load_cases().set_definition(h.clone()), OAPI_ERR);
+    h.modal_damping = 0.;
+    assert_eq!(api.load_cases().set_definition(h.clone()), OAPI_OK);
+    // The direct-integration type does not use the ratio.
+    h.name = "D".into();
+    h.case_type = LoadCaseType::LinearDynamic;
+    h.modal_damping = 0.05;
+    assert_eq!(api.load_cases().set_definition(h), OAPI_OK);
+
+    api.inner.unmodeled_source.push(UnmodeledSourceData {
+        scope: UnmodeledScope::NonlinearCases,
+        description: "2 frame hinge assignment(s)".into(),
+    });
+    api.inner
+        .case_results
+        .insert("OLD".into(), Default::default());
+    let before = api.inner.clone();
+    assert!(discard_unmodeled_source(&mut api.inner, 1).is_err());
+    api.inner.is_locked = true;
+    let locked = api.inner.clone();
+    assert!(discard_unmodeled_source(&mut api.inner, 0).is_err());
+    assert_eq!(api.inner, locked);
+    api.inner.is_locked = false;
+    assert_eq!(api.inner, before);
+    let entry = discard_unmodeled_source(&mut api.inner, 0).unwrap();
+    assert_eq!(entry.description, "2 frame hinge assignment(s)");
+    assert!(api.inner.unmodeled_source.is_empty());
+    // The model changed in a way that affects results.
+    assert!(api.inner.case_results.is_empty());
 }

@@ -1,5 +1,5 @@
 use sap_api::{cSapModel, OAPI_ERR, OAPI_OK};
-use sap_model::{CaseResults, PointLoadForce};
+use sap_model::{CaseResults, ConcreteFramingType, PointLoadForce, SteelDesignOverwrite};
 use sap_units::Units;
 
 fn api() -> cSapModel {
@@ -340,4 +340,105 @@ fn ambiguous_coincident_joint_identity_rejects_coordinate_creation_atomically() 
         OAPI_OK
     );
     assert_eq!(a.inner.frames["explicit"].point_i, "coincident_A");
+}
+
+#[test]
+fn frame_auto_mesh_stores_what_is_analyzed_and_refuses_the_rest() {
+    let mut a = api();
+    assert_eq!(a.frame_obj().get_auto_mesh("F"), Some((false, false, 0)));
+    assert_eq!(a.frame_obj().set_auto_mesh("F", true, true, false, 8, 0.0), OAPI_OK);
+    assert_eq!(a.frame_obj().get_auto_mesh("F"), Some((true, true, 8)));
+    assert!(a.inner.case_results.is_empty());
+
+    // Refused without changing the stored assignment: intersections with
+    // other objects, a maximum segment length, a negative or huge count, an
+    // unknown frame.
+    let before = a.inner.clone();
+    for (at_lines, segments, max_length) in
+        [(true, 2, 0.0), (false, 2, 12.0), (false, -1, 0.0), (false, 10_001, 0.0), (false, 2, f64::NAN)]
+    {
+        assert_eq!(
+            a.frame_obj().set_auto_mesh("F", true, false, at_lines, segments, max_length),
+            OAPI_ERR
+        );
+    }
+    assert_eq!(a.frame_obj().set_auto_mesh("MISSING", true, true, false, 2, 0.0), OAPI_ERR);
+    assert_eq!(a.frame_obj().get_auto_mesh("MISSING"), None);
+    assert_eq!(a.inner, before);
+
+    // Turning it off clears both settings whatever else is passed.
+    assert_eq!(a.frame_obj().set_auto_mesh("F", false, true, false, 5, 0.0), OAPI_OK);
+    assert_eq!(a.frame_obj().get_auto_mesh("F"), Some((false, false, 0)));
+}
+
+#[test]
+fn frame_insertion_point_is_validated_and_stored() {
+    let mut a = api();
+    let before = a.inner.clone();
+    for (cardinal, mirror, offset, csys) in [
+        (0, false, [0.0; 3], "Local"),
+        (12, false, [0.0; 3], "Local"),
+        (8, true, [0.0; 3], "Local"),
+        (8, false, [0.0, f64::NAN, 0.0], "Local"),
+        (8, false, [0.0; 3], "CSYS1"),
+    ] {
+        assert_eq!(
+            a.frame_obj()
+                .set_insertion_point("F", cardinal, mirror, true, offset, [0.0; 3], csys),
+            OAPI_ERR
+        );
+    }
+    assert_eq!(
+        a.frame_obj()
+            .set_insertion_point("MISSING", 8, false, true, [0.0; 3], [0.0; 3], "Local"),
+        OAPI_ERR
+    );
+    assert_eq!(a.inner, before);
+
+    assert_eq!(
+        a.frame_obj().set_insertion_point(
+            "F",
+            8,
+            false,
+            false,
+            [0.0, 0.0, 12.0],
+            [0.0, 1.0, 12.0],
+            "global"
+        ),
+        OAPI_OK
+    );
+    let frame = &a.inner.frames["F"];
+    assert_eq!((frame.cardinal_point, frame.stiff_transform), (8, false));
+    assert_eq!(frame.joint_offset_i, [0.0, 0.0, 12.0]);
+    assert_eq!(frame.joint_offset_j, [0.0, 1.0, 12.0]);
+    assert!(frame.joint_offset_is_global);
+    assert!(a.inner.case_results.is_empty());
+}
+
+#[test]
+fn design_overwrites_are_validated_and_clear_only_design_results() {
+    let mut a = api();
+    a.inner.is_locked = true;
+    assert_eq!(a.design_concrete().get_framing_type("F"), Some(ConcreteFramingType::SwaySpecial));
+    assert_eq!(a.design_concrete().set_framing_type("F", ConcreteFramingType::SwayOrdinary), OAPI_OK);
+    assert_eq!(a.design_concrete().get_framing_type("F"), Some(ConcreteFramingType::SwayOrdinary));
+    assert_eq!(a.design_concrete().set_framing_type("MISSING", ConcreteFramingType::NonSway), OAPI_ERR);
+
+    let braced = SteelDesignOverwrite { l_ratio_ltb: Some(0.25), ..Default::default() };
+    assert_eq!(a.design_steel().set_overwrite("F", Some(braced.clone())), OAPI_OK);
+    assert_eq!(a.design_steel().get_overwrite("F"), Some(&braced));
+    // Refused without changing the stored overwrite.
+    for bad in [
+        SteelDesignOverwrite { l_ratio_ltb: Some(0.0), ..Default::default() },
+        SteelDesignOverwrite { k_major: Some(-1.0), ..Default::default() },
+        SteelDesignOverwrite { cb: Some(f64::NAN), ..Default::default() },
+    ] {
+        assert_eq!(a.design_steel().set_overwrite("F", Some(bad)), OAPI_ERR);
+    }
+    assert_eq!(a.design_steel().set_overwrite("MISSING", None), OAPI_ERR);
+    assert_eq!(a.design_steel().get_overwrite("F"), Some(&braced));
+    // Analysis results and the lock are untouched.
+    assert!(a.inner.is_locked && a.inner.case_results.contains_key("OLD"));
+    assert_eq!(a.design_steel().set_overwrite("F", None), OAPI_OK);
+    assert_eq!(a.design_steel().get_overwrite("F"), None);
 }

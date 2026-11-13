@@ -578,6 +578,10 @@ fn test_fmt02_tendon_material_independent_fys() {
 fn test_fmt01_vendor_fixture_modification_with_local_axes() {
     let sdb_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../extracted/files/example_1_001.sdb");
+    // The vendor corpus is not part of the repository; CI runs without it.
+    if !sdb_path.exists() {
+        return;
+    }
     let sdb = sap_format::read_sdb_file(&sdb_path).expect("read vendor fixture must succeed");
     let mut model = extract_sdb_to_model(&sdb).expect("extract vendor fixture must succeed");
 

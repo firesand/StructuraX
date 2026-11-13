@@ -526,6 +526,11 @@ pub struct LinkProp {
     pub param1: [f64; 6],
     /// Post-yield stiffness ratio `[r1..6]`
     pub param2: [f64; 6],
+    /// Third nonlinear parameter row. For `PlasticWen` this is the yield exponent
+    /// `[exp1..6]` (CSI Analysis Reference, "Wen Plasticity Property"); unused by
+    /// Gap/Hook/Damper.
+    #[serde(default)]
+    pub param3: [f64; 6],
     /// Shear distance from J-end `[dj2, dj3]`
     pub dj2: f64,
     pub dj3: f64,
@@ -551,6 +556,7 @@ impl Default for LinkProp {
             k_nl: [0.0; 6],
             param1: [0.0; 6],
             param2: [0.0; 6],
+            param3: [0.0; 6],
             dj2: 0.0,
             dj3: 0.0,
             mass: 0.0,
@@ -711,6 +717,60 @@ pub struct FrameObj {
     /// Gravity load multiplier `[gx, gy, gz]` per load pattern (`load_pat -> [gx, gy, gz]`)
     pub loads_gravity: BTreeMap<String, [f64; 3]>,
     pub selected: bool,
+    /// Automatic subdivision for analysis into this many equal-length frame
+    /// elements (`0` or `1` = one element). Results are reported for the
+    /// object, not for the elements.
+    #[serde(default)]
+    pub auto_mesh_segments: usize,
+    /// Automatic subdivision for analysis at every joint that lies on the
+    /// object between its ends.
+    #[serde(default)]
+    pub auto_mesh_at_joints: bool,
+    /// Concrete frame design framing type (ACI ductility class).
+    #[serde(default)]
+    pub concrete_framing: ConcreteFramingType,
+    /// Steel frame design overwrites; `None` uses the program defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steel_overwrite: Option<SteelDesignOverwrite>,
+}
+
+/// Concrete frame design framing type, as in the SAP2000 concrete design
+/// overwrites. The default is Sway Special, which SAP2000 derives from its
+/// default seismic design category D.
+///
+/// For ACI beam design, Sway Special requires the positive moment strength at
+/// each end to be at least one half of the negative strength there, and both
+/// strengths at every section to be at least one quarter of the largest end
+/// strength (ACI 318-14 18.6.3.2). Sway Intermediate uses one third and one
+/// fifth (18.4.2.2). Capacity-based shear, column and joint provisions of
+/// these framing types are not implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ConcreteFramingType {
+    #[default]
+    SwaySpecial,
+    SwayIntermediate,
+    SwayOrdinary,
+    NonSway,
+}
+
+/// Steel frame design overwrites of one member, after `cDesignSteel.SetOverwrite`.
+/// `None` in a field keeps the program-determined value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SteelDesignOverwrite {
+    /// Unbraced length ratio for major-axis buckling ($L_{33} / L$)
+    pub l_ratio_major: Option<f64>,
+    /// Unbraced length ratio for minor-axis buckling ($L_{22} / L$)
+    pub l_ratio_minor: Option<f64>,
+    /// Unbraced length ratio for lateral-torsional buckling ($L_{ltb} / L$)
+    pub l_ratio_ltb: Option<f64>,
+    /// Effective length factor $K_{33}$ (major axis)
+    pub k_major: Option<f64>,
+    /// Effective length factor $K_{22}$ (minor axis)
+    pub k_minor: Option<f64>,
+    /// Moment gradient factor $C_b$ (`None` = computed from the moment diagram)
+    pub cb: Option<f64>,
+    /// Sway frame flag for automatic alignment-chart $K$-factor calculation
+    pub is_sway: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -756,6 +816,10 @@ impl FrameObj {
             loads_temp: Vec::new(),
             loads_gravity: BTreeMap::new(),
             selected: false,
+            auto_mesh_segments: 0,
+            auto_mesh_at_joints: false,
+            concrete_framing: ConcreteFramingType::default(),
+            steel_overwrite: None,
         }
     }
 }
@@ -798,6 +862,11 @@ pub struct AreaObj {
     /// Auto-mesh divisions `(n1, n2)` (`(1, 1)` = unmeshed single element)
     pub auto_mesh: (usize, usize),
     pub edge_constraint: bool,
+    /// Added mass per unit area (the vendor "area mass" assignment). It is
+    /// lumped to the translations of the element joints and is not scaled by
+    /// the mass property modifier, which applies to the section's own mass.
+    #[serde(default)]
+    pub mass_per_area: f64,
     pub loads_uniform: Vec<AreaLoadUniform>,
     pub loads_pressure: Vec<AreaLoadSurfacePressure>,
     pub loads_temp: Vec<AreaLoadTemperature>,
@@ -814,6 +883,7 @@ impl AreaObj {
             modifiers: [1.0; 10],
             auto_mesh: (1, 1),
             edge_constraint: false,
+            mass_per_area: 0.0,
             loads_uniform: Vec::new(),
             loads_pressure: Vec::new(),
             loads_temp: Vec::new(),
@@ -937,6 +1007,26 @@ pub struct LoadCase {
     /// Buckling parameters
     pub num_buckling_modes: usize,
     pub run_flag: bool,
+    /// Nonlinear-static load application control. `None` is full-load control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_control: Option<DisplacementControl>,
+}
+
+/// Displacement-controlled nonlinear static load application (CSI Analysis
+/// Reference, "Load Application Control"). The case load pattern is scaled until
+/// the monitored displacement has moved by `target` (a positive magnitude)
+/// from its value at the start of the case, in the direction the load moves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplacementControl {
+    pub target: f64,
+    /// Monitored joint and joint-local DOF `0..6`; `None` records an imported
+    /// control whose monitored quantity is not representable (for example a
+    /// generalized displacement). Such a case cannot be analyzed.
+    pub monitored: Option<(String, usize)>,
+    /// Vendor "use conjugate displacement" option. It selects the internal
+    /// stepping measure only; the monitored displacement still sets the target.
+    #[serde(default)]
+    pub conjugate: bool,
 }
 
 impl LoadCase {
@@ -970,6 +1060,7 @@ impl LoadCase {
             rayleigh_damping: (0.0, 0.0),
             num_buckling_modes: 6,
             run_flag: true,
+            displacement_control: None,
         }
     }
 
@@ -998,6 +1089,7 @@ impl LoadCase {
             rayleigh_damping: (0.0, 0.0),
             num_buckling_modes: 6,
             run_flag: true,
+            displacement_control: None,
         }
     }
 }
@@ -1051,7 +1143,8 @@ pub struct FrameStationResult {
     pub v3: f64,
     /// Torsional moment $T$ about local 1-axis
     pub t: f64,
-    /// Minor bending moment $M_2$ about local 2-axis (in 1-3 plane)
+    /// Minor bending moment $M_2$ about local 2-axis (in 1-3 plane); positive
+    /// compresses the positive 3 face, as in SAP2000
     pub m2: f64,
     /// Major bending moment $M_3$ about local 3-axis (in 1-2 plane)
     pub m3: f64,
@@ -1173,6 +1266,113 @@ pub struct CaseResults {
     /// Terminal dynamic state for chained `initial_case` continuation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient_state: Option<TransientTerminalState>,
+    /// Terminal hysteretic state of path-dependent nonlinear link DOFs, used by
+    /// a following case that names this one as its `initial_case`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_hysteresis: Vec<LinkHysteresisState>,
+    /// Load factor reached by a displacement-controlled nonlinear static case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_control_factor: Option<f64>,
+}
+
+/// One piece of imported source data that the importer recognized, could not
+/// represent, and that would change analysis results if ignored (for example
+/// frame hinges or a link gravity load). It is recorded so analysis fails
+/// closed instead of silently solving a different model. Removing the entry is
+/// the explicit decision to analyze without that data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnmodeledSourceData {
+    pub scope: UnmodeledScope,
+    pub description: String,
+}
+
+/// Which analysis cases an [`UnmodeledSourceData`] entry affects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnmodeledScope {
+    /// Stiffness, mass or geometry data: every case.
+    AllCases,
+    /// Nonlinear element behavior: nonlinear cases and cases continuing from them.
+    NonlinearCases,
+    /// Mass data: modal, response-spectrum and history cases, and cases
+    /// continuing from them.
+    DynamicCases,
+    /// Data that leaves a linear static solution from zero unchanged but
+    /// affects everything else (for example how finely a frame is subdivided):
+    /// every case except linear static cases with no initial case.
+    AllButLinearStatic,
+    /// A load in this load pattern: cases that apply or inherit the pattern.
+    LoadPattern(String),
+    /// A setting of this case: the case and cases continuing from it.
+    Case(String),
+}
+
+impl SapModel {
+    /// Entries of `unmodeled_source` that affect the named analysis case,
+    /// following its `initial_case` chain.
+    pub fn unmodeled_source_for_case(&self, case_name: &str) -> Vec<&UnmodeledSourceData> {
+        let mut chain = Vec::new();
+        let mut current = self.load_cases.get(case_name);
+        while let Some(case) = current {
+            if chain.iter().any(|c: &&LoadCase| c.name == case.name) {
+                break;
+            }
+            chain.push(case);
+            current = case
+                .initial_case
+                .as_ref()
+                .and_then(|name| self.load_cases.get(name));
+        }
+        self.unmodeled_source
+            .iter()
+            .filter(|entry| match &entry.scope {
+                UnmodeledScope::AllCases => true,
+                UnmodeledScope::NonlinearCases => chain.iter().any(|c| {
+                    matches!(
+                        c.case_type,
+                        LoadCaseType::NonlinearStatic
+                            | LoadCaseType::NonlinearHistory
+                            | LoadCaseType::NonlinearDynamic
+                    )
+                }),
+                UnmodeledScope::AllButLinearStatic => {
+                    chain.len() != 1
+                        || !matches!(
+                            chain[0].case_type,
+                            LoadCaseType::LinearStatic | LoadCaseType::LinearStaticMultiStep
+                        )
+                }
+                UnmodeledScope::DynamicCases => chain.iter().any(|c| {
+                    !matches!(
+                        c.case_type,
+                        LoadCaseType::LinearStatic
+                            | LoadCaseType::NonlinearStatic
+                            | LoadCaseType::LinearStaticMultiStep
+                            | LoadCaseType::Buckling
+                    )
+                }),
+                UnmodeledScope::LoadPattern(pattern) => chain.iter().any(|c| {
+                    c.loads
+                        .iter()
+                        .any(|l| &l.load_name == pattern && l.scale_factor != 0.0)
+                        || c.history_loads
+                            .iter()
+                            .any(|(_, p, scale)| p == pattern && *scale != 0.0)
+                }),
+                UnmodeledScope::Case(name) => chain.iter().any(|c| &c.name == name),
+            })
+            .collect()
+    }
+}
+
+/// Internal state of one path-dependent link DOF at the end of a case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LinkHysteresisState {
+    pub link: String,
+    pub dof: usize,
+    /// Internal deformation at which `z` was reached.
+    pub deformation: f64,
+    /// Wen hysteretic variable, `|z| <= 1`.
+    pub z: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1237,6 +1437,11 @@ pub struct S2kPreservation {
 pub struct SapModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s2k_preservation: Option<S2kPreservation>,
+    /// Imported source data that changes analysis results but has no model
+    /// representation. Analysis of every case in an entry's scope is refused
+    /// until the entry is removed. See [`UnmodeledSourceData`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmodeled_source: Vec<UnmodeledSourceData>,
     pub model_name: String,
     pub program_version: String,
     pub present_units: Units,
@@ -1353,6 +1558,7 @@ impl SapModel {
 
         Self {
             s2k_preservation: None,
+            unmodeled_source: Vec::new(),
             model_name: "Untitled".to_string(),
             program_version: "19.0.0".to_string(),
             present_units: units,
@@ -1544,6 +1750,17 @@ impl SapModel {
             }
         }
 
+        for case in self.load_cases.values_mut() {
+            // A monitored translation target is a length; a rotation target is
+            // in radians. An unrepresented monitored quantity has no known unit
+            // and is left unchanged (such a case cannot be analyzed).
+            if let Some(control) = &mut case.displacement_control {
+                if control.monitored.as_ref().is_some_and(|(_, dof)| *dof < 3) {
+                    control.target *= fl;
+                }
+            }
+        }
+
         for p in self.points.values_mut() {
             p.x *= fl;
             p.y *= fl;
@@ -1631,6 +1848,7 @@ impl SapModel {
         }
 
         for ar in self.areas.values_mut() {
+            ar.mass_per_area *= f_mass / (fl * fl);
             for lu in &mut ar.loads_uniform {
                 lu.val *= f_stress;
             }
@@ -1796,6 +2014,7 @@ mod tests {
             k_nl: [240.0, 0.0, 0.0, 50.0, 0.0, 0.0],
             param1: [0.1; 6],
             param2: [0.0; 6],
+            param3: [0.0; 6],
             dj2: 0.5,
             dj3: 0.5,
             mass: 1.0,
@@ -1869,8 +2088,14 @@ mod tests {
             source_text: "TABLE: \"OPAQUE\"".into(),
             canonical_baseline: String::new(),
         });
+        model.unmodeled_source.push(UnmodeledSourceData {
+            scope: UnmodeledScope::AllCases,
+            description: "advanced local axes of link '1'".into(),
+        });
         model.generate_beam(2, 120.0, true, "FSEC1");
         assert!(model.s2k_preservation.is_none());
+        // Records about a previously imported file do not describe the new model.
+        assert!(model.unmodeled_source.is_empty());
 
         let mut cr = CaseResults::default();
         cr.transient_state = Some(TransientTerminalState {

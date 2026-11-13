@@ -77,6 +77,7 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "CASE - RESPONSE SPECTRUM 2 - LOAD ASSIGNMENTS"
             | "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS"
             | "COMBINATION DEFINITIONS"
+            | "RUST UNMODELED SOURCE DATA"
     )
 }
 

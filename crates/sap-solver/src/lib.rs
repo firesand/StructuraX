@@ -7,6 +7,7 @@ pub mod cable;
 mod coordinates;
 pub mod dynamics;
 pub mod frame;
+mod frame_mesh;
 pub mod linalg;
 mod link;
 mod nonlinear;
@@ -26,7 +27,8 @@ use crate::area::{
     area_local_system, compute_area_local_loads, compute_area_local_stiffness, recover_area_result,
 };
 use crate::frame::{
-    apply_rigid_offsets, compute_flexible_fef_for_pattern, compute_flexible_local_stiffness,
+    apply_insertion_offset, apply_rigid_offsets, compute_flexible_fef_for_pattern,
+    compute_flexible_local_stiffness, insertion_offset_local, insertion_to_element_ends,
     compute_local_geometric_stiffness, condense_releases_and_springs, eval_section_props_at,
     frame_local_axes, joint_local_to_global_matrix, mat3_mul, mat3_transpose,
     recover_frame_stations, resolve_load_dir_to_local,
@@ -90,8 +92,28 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     if model.points.is_empty() {
         return Err(SolverError::EmptyModel);
     }
+    refuse_unmodeled_source(model)?;
     validate_analysis_inputs(model)?;
     let ordered_cases = analysis_case_order(model)?;
+
+    // Replace automatically subdivided frame objects by their elements. The
+    // results are folded back onto the objects before returning.
+    let area_mesh_joints: Vec<(String, [f64; 3])> =
+        if model
+            .frames
+            .values()
+            .any(|f| f.auto_mesh_at_joints || f.auto_mesh_segments > 1)
+        {
+            expand_auto_meshed_areas(model)
+                .0
+                .into_iter()
+                .filter(|(name, _)| !model.points.contains_key(name))
+                .map(|(name, p)| (name, [p.x, p.y, p.z]))
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let frame_mesh = frame_mesh::expand(model, &area_mesh_joints)?;
 
     // Expand any auto-meshed AreaObjs (`auto_mesh.0 > 1 || auto_mesh.1 > 1`) into a working point/area list
     let (work_points, work_areas, orig_area_map) = expand_auto_meshed_areas(model);
@@ -168,8 +190,11 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
                 model,
                 &lc,
                 &work_points,
+                &work_areas,
+                &orig_area_map,
                 &pt_index,
                 &joint_rot,
+                &k_struct,
                 &k_base,
                 ndof,
             )?,
@@ -214,9 +239,25 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
 
     // Evaluate all LoadCombos
     evaluate_load_combos(model);
+    frame_mesh::collapse(&mut model.case_results, &frame_mesh);
 
     model.is_locked = true;
     Ok(())
+}
+
+/// The insertion offset of a frame, with the reason as a solver error if the
+/// assignment is one the element does not implement. Validation refuses those
+/// first; this keeps every later use from falling back to a centroidal frame.
+fn frame_insertion_offset(
+    model: &SapModel,
+    frame: &sap_model::FrameObj,
+) -> Result<[f64; 3], SolverError> {
+    insertion_offset_local(model, frame).map_err(|reason| {
+        SolverError::UnsupportedInput(format!(
+            "frame '{}' has an insertion point with stiffness transformation and {reason}",
+            frame.name
+        ))
+    })
 }
 
 /// Reject requests that the implemented algorithms cannot represent. Returning an
@@ -287,9 +328,73 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
             }
         }
         validate_area_geometry(model, area)?;
+        // An axisymmetric-solid section would otherwise be assembled as a
+        // plane-stress membrane, which is a different problem.
+        if model
+            .area_sections
+            .get(&area.section)
+            .is_some_and(|section| section.prop_type == sap_model::AreaPropType::ASolid)
+        {
+            return Err(SolverError::UnsupportedInput(format!(
+                "area '{}' uses an axisymmetric-solid section, which is not implemented",
+                area.name
+            )));
+        }
+        // The area element has no incompatible bending modes. A plane section
+        // that asks for them (the vendor default) would be solved without.
+        if model.area_sections.get(&area.section).is_some_and(|section| {
+            section.prop_type == sap_model::AreaPropType::Plane && section.incompatible_modes
+        }) {
+            return Err(SolverError::UnsupportedInput(format!(
+                "area '{}' uses a plane section with incompatible bending modes, which are not implemented for area elements",
+                area.name
+            )));
+        }
+        if !area.mass_per_area.is_finite() || area.mass_per_area < 0.0 {
+            return Err(SolverError::InvalidInput(format!(
+                "area '{}' added mass per area must be finite and nonnegative",
+                area.name
+            )));
+        }
     }
     let has_cables = model.frames.values().any(|f| f.cable_params.is_some());
     for frame in model.frames.values() {
+        // An insertion point (cardinal point plus joint offsets) with
+        // stiffness transformation sets the element off from its joints on
+        // rigid arms. That is implemented for a parallel offset in linear
+        // static cases; everything else is refused, not solved as if the
+        // frame were centroidal.
+        match insertion_offset_local(model, frame) {
+            Ok(offset) if offset != [0.0; 3] => {
+                if let Some(case) = model.load_cases.values().find(|lc| {
+                    lc.run_flag
+                        && !(matches!(
+                            lc.case_type,
+                            LoadCaseType::LinearStatic | LoadCaseType::LinearStaticMultiStep
+                        ) && lc.initial_case.is_none())
+                }) {
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "frame '{}' has an insertion point with stiffness transformation, which is implemented for linear static cases with no initial case only; case '{}' is not one (mass and geometric stiffness of the offset are not modeled). Turn the case off, or use cardinal point 10 with zero joint offsets, or turn the transformation off to analyze the frame at its centroid (S2K table \"FRAME INSERTION POINT ASSIGNMENTS\")",
+                        frame.name, case.name
+                    )));
+                }
+            }
+            Ok(_) => {}
+            Err(reason) => {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "frame '{}' has an insertion point with stiffness transformation and {reason}, a combination that is not implemented; use cardinal point 10 with zero joint offsets, or turn the transformation off to analyze the frame at its centroid (S2K table \"FRAME INSERTION POINT ASSIGNMENTS\", columns CardinalPt, StiffTrans and the offset columns)",
+                    frame.name
+                )));
+            }
+        }
+        if frame.auto_mesh_segments > frame_mesh::MAX_SEGMENTS {
+            return Err(SolverError::InvalidInput(format!(
+                "frame '{}' asks for {} automatic segments; at most {} are accepted",
+                frame.name,
+                frame.auto_mesh_segments,
+                frame_mesh::MAX_SEGMENTS
+            )));
+        }
         if let Some(cp) = &frame.cable_params {
             if cp
                 .undeformed_length
@@ -382,6 +487,7 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                         | sap_model::LinkPropType::Gap
                         | sap_model::LinkPropType::Hook
                         | sap_model::LinkPropType::Damper
+                        | sap_model::LinkPropType::PlasticWen
                 ) {
                     return Err(SolverError::UnsupportedInput(format!(
                         "nonlinear link constitutive iteration for '{}' is not implemented",
@@ -395,11 +501,25 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                             sap_model::LinkPropType::Gap
                                 | sap_model::LinkPropType::Hook
                                 | sap_model::LinkPropType::Damper
+                                | sap_model::LinkPropType::PlasticWen
                         ) {
                             return Err(SolverError::InvalidInput(format!(
                                 "link '{}' nonlinear flags require a supported nonlinear property",
                                 object.name
                             )));
+                        }
+                        if prop.link_type == sap_model::LinkPropType::PlasticWen {
+                            nonlinear::wen_law_for(prop, d, &object.name)?;
+                            if model
+                                .frames
+                                .values()
+                                .any(|f| f.tc_limits.is_some_and(|(c, _, t, _)| c || t))
+                            {
+                                return Err(SolverError::UnsupportedInput(format!(
+                                    "link '{}' combines plastic Wen behavior with frame tension/compression limits, which is not implemented",
+                                    object.name
+                                )));
+                            }
                         }
                         if matches!(
                             prop.link_type,
@@ -456,6 +576,94 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
         {
             return Err(SolverError::UnsupportedInput(format!("case '{name}' requires continuation from a nonlinear link tangent, which is not stored")));
         }
+        // Geometric stiffness is assembled from frame axial forces only. With
+        // area or solid elements present, their membrane and continuum forces
+        // would be left out of a buckling or P-Delta solution.
+        // The cases that assemble it: buckling; nonlinear static with
+        // geometric nonlinearity; and linear static and modal cases with an
+        // initial case, which take geometric stiffness from that case's frame
+        // forces whatever its type.
+        let uses_geometric_stiffness = lc.case_type == LoadCaseType::Buckling
+            || lc.nl_geom != NLGeomType::None
+            || (lc.initial_case.is_some()
+                && matches!(
+                    lc.case_type,
+                    LoadCaseType::LinearStatic
+                        | LoadCaseType::LinearStaticMultiStep
+                        | LoadCaseType::Modal
+                ));
+        if uses_geometric_stiffness && (!model.areas.is_empty() || !model.solids.is_empty()) {
+            return Err(SolverError::UnsupportedInput(format!(
+                "case '{name}' needs geometric stiffness, which is implemented for frame elements only; the model has area or solid elements"
+            )));
+        }
+        // A static case applies load patterns by name. A name that is not a
+        // load pattern would contribute nothing, so it must not pass silently:
+        // imported acceleration loads (U1..R3) arrive here as such names.
+        if matches!(
+            lc.case_type,
+            LoadCaseType::LinearStatic
+                | LoadCaseType::NonlinearStatic
+                | LoadCaseType::LinearStaticMultiStep
+                | LoadCaseType::Buckling
+        ) {
+            for load in &lc.loads {
+                if model.load_patterns.contains_key(&load.load_name) {
+                    continue;
+                }
+                let upper = load.load_name.trim().to_ascii_uppercase();
+                return Err(
+                    if matches!(
+                        upper.as_str(),
+                        "U1" | "U2" | "U3" | "R1" | "R2" | "R3" | "U4" | "U5" | "U6" | "UX"
+                            | "UY" | "UZ" | "RX" | "RY" | "RZ"
+                    ) {
+                        SolverError::UnsupportedInput(format!(
+                            "case '{name}' applies acceleration load '{}'; acceleration loads in static cases are not implemented",
+                            load.load_name
+                        ))
+                    } else {
+                        SolverError::InvalidInput(format!(
+                            "case '{name}' references missing load pattern '{}'",
+                            load.load_name
+                        ))
+                    },
+                );
+            }
+        }
+        if let Some(control) = &lc.displacement_control {
+            if lc.case_type != LoadCaseType::NonlinearStatic {
+                return Err(SolverError::InvalidInput(format!(
+                    "case '{name}' uses displacement control, which applies only to nonlinear static cases"
+                )));
+            }
+            if !control.target.is_finite() || control.target <= 0. {
+                return Err(SolverError::InvalidInput(format!(
+                    "case '{name}' displacement-control target must be finite and positive"
+                )));
+            }
+            let Some((point, dof)) = &control.monitored else {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "case '{name}' uses displacement control without a representable monitored joint displacement"
+                )));
+            };
+            if !model.points.contains_key(point) || *dof >= 6 {
+                return Err(SolverError::InvalidInput(format!(
+                    "case '{name}' monitors a missing joint or invalid degree of freedom"
+                )));
+            }
+            if lc.nl_geom != NLGeomType::None
+                || has_cables
+                || model
+                    .frames
+                    .values()
+                    .any(|f| f.tc_limits.is_some_and(|(c, _, t, _)| c || t))
+            {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "case '{name}' combines displacement control with geometric nonlinearity, cables or frame tension/compression limits, which is not implemented"
+                )));
+            }
+        }
         if lc.nl_geom == NLGeomType::LargeDisplacements && !has_cables {
             return Err(SolverError::UnsupportedInput(format!(
                 "case '{name}' requests large displacements"
@@ -488,6 +696,20 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 | LoadCaseType::LinearDynamic
                 | LoadCaseType::NonlinearDynamic
         ) {
+            // LinearHistory and NonlinearHistory are the vendor's modal-superposition
+            // history types. They are integrated here directly over all degrees of
+            // freedom with Rayleigh and link damping only, so a modal damping ratio
+            // cannot be honored and must not be dropped.
+            if matches!(
+                lc.case_type,
+                LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+            ) && lc.modal_damping != 0.0
+            {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "case '{name}' is a modal history type with modal damping ratio {}; modal damping is not implemented for history cases. Set it to zero and use Rayleigh damping, or use a direct-integration case type",
+                    lc.modal_damping
+                )));
+            }
             dynamics::validate_parameters(lc)?;
             for (_, pattern, scale) in &lc.history_loads {
                 if !scale.is_finite() {
@@ -651,6 +873,25 @@ fn validate_area_geometry(model: &SapModel, area: &AreaObj) -> Result<(), Solver
             orientation = cross.signum();
         } else if cross.signum() != orientation {
             return Err(invalid());
+        }
+    }
+    Ok(())
+}
+
+/// Imported data that changes results but is not modeled must stop analysis of
+/// the cases it affects, before any other check reports a secondary symptom.
+fn refuse_unmodeled_source(model: &SapModel) -> Result<(), SolverError> {
+    for (name, case) in &model.load_cases {
+        if !case.run_flag {
+            continue;
+        }
+        let entries = model.unmodeled_source_for_case(name);
+        if !entries.is_empty() {
+            let descriptions: Vec<&str> = entries.iter().map(|e| e.description.as_str()).collect();
+            return Err(SolverError::UnsupportedInput(format!(
+                "case '{name}' depends on imported source data that is not modeled: {}. Remove the entry from the model's unmodeled source data to analyze without it",
+                descriptions.join("; ")
+            )));
         }
     }
     Ok(())
@@ -875,6 +1116,8 @@ fn assemble_elastic_stiffness_and_mass(
         let mut dummy_fef = [0.0; 12];
         condense_releases_and_springs(&mut k_loc, &mut dummy_fef, frame);
         apply_rigid_offsets(&mut k_loc, &mut dummy_fef, di, dj);
+        let insertion = frame_insertion_offset(model, frame)?;
+        apply_insertion_offset(&mut k_loc, &mut dummy_fef, insertion);
 
         // Transform from element-local to joint-local at I and J:
         // u_elem = T_elem_joint * u_joint where T_p = e_axes * R_p
@@ -931,8 +1174,9 @@ fn assemble_elastic_stiffness_and_mass(
         );
 
         let mod_mass = sec.modifiers[8] * area.modifiers[8];
-        let m_node =
-            (sec.thickness_membrane * mat.unit_mass * mod_mass * elem_area) / (n_nodes as f64);
+        let m_node = ((sec.thickness_membrane * mat.unit_mass * mod_mass + area.mass_per_area)
+            * elem_area)
+            / (n_nodes as f64);
         for &idx in &node_indices {
             for d in 0..3 {
                 diag_mass[6 * idx + d] += m_node;
@@ -1686,12 +1930,121 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
                 }
             }
         } else {
+            // A completed displacement-controlled case applied its pattern at
+            // the load factor it reached, not at the nominal scale factor.
+            let factor = c
+                .displacement_control
+                .as_ref()
+                .and_then(|_| model.case_results.get(&c.name))
+                .and_then(|result| result.displacement_control_factor)
+                .unwrap_or(1.0);
             for a in &c.loads {
-                loads.push((a.load_name.clone(), a.scale_factor));
+                loads.push((a.load_name.clone(), factor * a.scale_factor));
             }
         }
     }
     loads
+}
+
+/// Loads already on the structure when a nonlinear static case starts.
+fn initial_chain_loads(model: &SapModel, lc: &LoadCase) -> Vec<(String, f64)> {
+    lc.initial_case
+        .as_ref()
+        .and_then(|name| model.load_cases.get(name))
+        .filter(|prev| {
+            matches!(
+                prev.case_type,
+                LoadCaseType::NonlinearStatic
+                    | LoadCaseType::NonlinearHistory
+                    | LoadCaseType::NonlinearDynamic
+                    | LoadCaseType::LinearDynamic
+            )
+        })
+        .map_or_else(Vec::new, |prev| accumulated_nonlinear_static_loads(model, prev))
+}
+
+/// Final load factor of a path-dependent or displacement-controlled nonlinear
+/// static case; see `nonlinear::System::load_path_factor`.
+#[allow(clippy::too_many_arguments)]
+fn nonlinear_static_load_factor(
+    model: &SapModel,
+    lc: &LoadCase,
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    k_total: &[f64],
+    ndof: usize,
+) -> Result<f64, SolverError> {
+    let own_loads: Vec<(String, f64)> = lc
+        .loads
+        .iter()
+        .map(|a| (a.load_name.clone(), a.scale_factor))
+        .collect();
+    let no_axial = IndexMap::new();
+    let assemble = |loads: &[(String, f64)]| {
+        assemble_static_loads(
+            model,
+            loads,
+            work_points,
+            work_areas,
+            pt_index,
+            joint_rot,
+            &no_axial,
+            ndof,
+        )
+    };
+    let prev = assemble(&initial_chain_loads(model, lc))?;
+    let own = assemble(&own_loads)?;
+    let fixed: Vec<bool> = prev
+        .is_fixed
+        .iter()
+        .zip(&own.is_fixed)
+        .map(|(a, b)| *a || *b)
+        .collect();
+    let initial_hysteresis: &[sap_model::LinkHysteresisState] = lc
+        .initial_case
+        .as_ref()
+        .and_then(|name| model.case_results.get(name))
+        .map_or(&[], |result| result.link_hysteresis.as_slice());
+    let system = nonlinear::System::new_with_frame_p0(
+        model,
+        work_points,
+        pt_index,
+        joint_rot,
+        k_total,
+        &IndexMap::new(),
+        initial_hysteresis,
+        ndof,
+    )?;
+    let monitor = match &lc.displacement_control {
+        Some(control) => {
+            let (point, dof) = control.monitored.as_ref().ok_or_else(|| {
+                SolverError::UnsupportedInput(format!(
+                    "case '{}' uses displacement control without a representable monitored joint displacement",
+                    lc.name
+                ))
+            })?;
+            let index = *pt_index
+                .get(point)
+                .ok_or_else(|| SolverError::PointNotFound(point.clone()))?;
+            Some((6 * index + dof, control.target))
+        }
+        None => None,
+    };
+    let u_init = initial_displacement_vector(model, lc, work_points, ndof);
+    system.load_path_factor(
+        &nonlinear::StageLoads {
+            rhs_prev: &prev.rhs,
+            rhs_own: &own.rhs,
+            u_prev: &prev.u_fixed_val,
+            u_own: &own.u_fixed_val,
+            fixed: &fixed,
+        },
+        u_init.as_deref(),
+        lc,
+        monitor,
+    )
 }
 
 fn initial_displacement_vector(
@@ -2046,7 +2399,13 @@ fn run_nonlinear_static_case(
         .values()
         .any(|f| f.tc_limits.is_some_and(|(c, _, t, _)| c || t));
 
-    if has_nl_links || has_tc_frames {
+    let has_hysteretic_links = model.links.values().any(|object| {
+        let prop = &model.link_props[&object.prop];
+        prop.link_type == sap_model::LinkPropType::PlasticWen
+            && (0..6).any(|d| prop.dof_nonlinear[d] && prop.dof_active[d] && !prop.dof_fixed[d])
+    });
+
+    if has_nl_links || has_tc_frames || lc.displacement_control.is_some() {
         // Assemble the linear part without nonlinear effective springs from the
         // outset. Subtracting a large ke afterward can lose small true stiffness
         // terms through cancellation; ke must not influence nonlinear response.
@@ -2074,7 +2433,30 @@ fn run_nonlinear_static_case(
             &linear_struct,
             ndof,
         );
-        return solve_static_with_stiffness(
+        let mut case_loads = case_loads;
+        let mut reached_factor = None;
+        if has_hysteretic_links || lc.displacement_control.is_some() {
+            let factor = nonlinear_static_load_factor(
+                &constitutive_model,
+                lc,
+                work_points,
+                work_areas,
+                pt_index,
+                joint_rot,
+                &linear_base,
+                ndof,
+            )?;
+            if lc.displacement_control.is_some() {
+                case_loads = initial_chain_loads(model, lc);
+                case_loads.extend(
+                    lc.loads
+                        .iter()
+                        .map(|a| (a.load_name.clone(), factor * a.scale_factor)),
+                );
+                reached_factor = Some(factor);
+            }
+        }
+        let mut result = solve_static_with_stiffness(
             &constitutive_model,
             &lc.name,
             &case_loads,
@@ -2088,7 +2470,9 @@ fn run_nonlinear_static_case(
             &IndexMap::new(),
             Some(lc),
             ndof,
-        );
+        )?;
+        result.displacement_control_factor = reached_factor;
+        return Ok(result);
     }
 
     let mut current_axial: IndexMap<String, f64> = IndexMap::new();
@@ -2203,23 +2587,32 @@ fn add_reaction_contributions(
     }
 }
 
-/// Core static solver given assembled stiffness matrices `k_struct` and `k_total`.
+/// Nodal loads, fixed-end forces and prescribed displacements of a scaled set
+/// of load patterns. Every quantity is linear in the pattern scale factors.
+#[allow(clippy::type_complexity)]
+struct StaticLoads {
+    f_ext_joint: Vec<f64>,
+    f_fef_joint: Vec<f64>,
+    prescribed_u: Vec<Option<f64>>,
+    spring_ground_u: Vec<f64>,
+    frame_fef_map: IndexMap<String, ([f64; 12], [[f64; 12]; 12], [[f64; 3]; 3], f64)>,
+    frame_axial_loads: IndexMap<String, (f64, f64)>,
+    rhs: Vec<f64>,
+    is_fixed: Vec<bool>,
+    u_fixed_val: Vec<f64>,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn solve_static_with_stiffness(
+fn assemble_static_loads(
     model: &SapModel,
-    case_name: &str,
     case_loads: &[(String, f64)],
     work_points: &IndexMap<String, PointObj>,
     work_areas: &IndexMap<String, AreaObj>,
-    orig_area_map: &IndexMap<String, Vec<String>>,
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
-    k_struct: &[f64],
-    k_total: &[f64],
     frame_axial: &IndexMap<String, f64>,
-    nonlinear_case: Option<&LoadCase>,
     ndof: usize,
-) -> Result<CaseResults, SolverError> {
+) -> Result<StaticLoads, SolverError> {
     let mut f_ext_joint = vec![0.0f64; ndof];
     let mut f_fef_joint = vec![0.0f64; ndof];
     let mut prescribed_u: Vec<Option<f64>> = vec![None; ndof];
@@ -2397,6 +2790,8 @@ fn solve_static_with_stiffness(
 
         condense_releases_and_springs(&mut k_loc, &mut fef_total, frame);
         apply_rigid_offsets(&mut k_loc, &mut fef_total, di, dj);
+        let insertion = frame_insertion_offset(model, frame)?;
+        apply_insertion_offset(&mut k_loc, &mut fef_total, insertion);
         let p0 = 0.5 * (fef_total[6] - fef_total[0]);
         let w_ax = -(fef_total[0] + fef_total[6]);
         frame_axial_loads.insert(fname.clone(), (p0, w_ax));
@@ -2547,17 +2942,76 @@ fn solve_static_with_stiffness(
         }
     }
 
-    let nonlinear_system = nonlinear_case.map(|_| {
-        nonlinear::System::new_with_frame_axial_loads(
-            model,
-            work_points,
-            pt_index,
-            joint_rot,
-            k_total,
-            &frame_axial_loads,
-            ndof,
-        )
-    });
+    Ok(StaticLoads {
+        f_ext_joint,
+        f_fef_joint,
+        prescribed_u,
+        spring_ground_u,
+        frame_fef_map,
+        frame_axial_loads,
+        rhs,
+        is_fixed,
+        u_fixed_val,
+    })
+}
+
+/// Core static solver given assembled stiffness matrices `k_struct` and `k_total`.
+#[allow(clippy::too_many_arguments)]
+fn solve_static_with_stiffness(
+    model: &SapModel,
+    case_name: &str,
+    case_loads: &[(String, f64)],
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    orig_area_map: &IndexMap<String, Vec<String>>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
+    k_total: &[f64],
+    frame_axial: &IndexMap<String, f64>,
+    nonlinear_case: Option<&LoadCase>,
+    ndof: usize,
+) -> Result<CaseResults, SolverError> {
+    let StaticLoads {
+        f_ext_joint,
+        f_fef_joint,
+        prescribed_u,
+        spring_ground_u,
+        frame_fef_map,
+        frame_axial_loads,
+        mut rhs,
+        is_fixed,
+        u_fixed_val,
+    } = assemble_static_loads(
+        model,
+        case_loads,
+        work_points,
+        work_areas,
+        pt_index,
+        joint_rot,
+        frame_axial,
+        ndof,
+    )?;
+
+    // Path-dependent link state inherited from the initial case, if any.
+    let initial_hysteresis: &[sap_model::LinkHysteresisState] = nonlinear_case
+        .and_then(|case| case.initial_case.as_ref())
+        .and_then(|name| model.case_results.get(name))
+        .map_or(&[], |result| result.link_hysteresis.as_slice());
+    let nonlinear_system = nonlinear_case
+        .map(|_| {
+            nonlinear::System::new_with_frame_axial_loads(
+                model,
+                work_points,
+                pt_index,
+                joint_rot,
+                k_total,
+                &frame_axial_loads,
+                initial_hysteresis,
+                ndof,
+            )
+        })
+        .transpose()?;
     let u_joint = if let (Some(system), Some(case)) = (&nonlinear_system, nonlinear_case) {
         let u_init = initial_displacement_vector(model, case, work_points, ndof);
         system.solve_from(&rhs, &is_fixed, &u_fixed_val, u_init.as_deref(), case)?
@@ -2582,12 +3036,24 @@ fn solve_static_with_stiffness(
             }
         }
 
-        let ldlt = SymmetricLdlt::factorize(&k_mod, ndof)?;
+        // Constraint penalties sit on the diagonal of `k_total` but not of
+        // `k_struct`; the singularity test must not be relative to them.
+        let structural_diagonal: Vec<f64> = (0..ndof).map(|i| k_struct[i * ndof + i]).collect();
+        let ldlt =
+            SymmetricLdlt::factorize_with_reference(&k_mod, ndof, Some(&structural_diagonal))?;
         ldlt.solve(&rhs)?
     };
     let nonlinear_correction = nonlinear_system
         .as_ref()
         .map_or_else(|| vec![0.; ndof], |system| system.correction(&u_joint));
+    let hysteretic_forces = nonlinear_system
+        .as_ref()
+        .map(|system| system.hysteretic_forces(&u_joint))
+        .unwrap_or_default();
+    let link_hysteresis = nonlinear_system
+        .as_ref()
+        .map(|system| system.hysteretic_states(&u_joint))
+        .unwrap_or_default();
 
     // 6. Recover Joint Displacements and Support/Spring Reactions
     let mut joint_displacements = IndexMap::new();
@@ -2650,6 +3116,7 @@ fn solve_static_with_stiffness(
             &u_joint,
             None,
             nonlinear_case.is_some(),
+            &hysteretic_forces,
         ),
         work_points,
         pt_index,
@@ -2686,6 +3153,13 @@ fn solve_static_with_stiffness(
                 f_end_loc[r] += k_loc[r][c] * u_loc[c];
             }
         }
+        // Station forces and deflections are those of the element, whose
+        // ends an insertion point sets off from the joints.
+        insertion_to_element_ends(
+            &mut u_loc,
+            &mut f_end_loc,
+            frame_insertion_offset(model, frame)?,
+        );
         if nonlinear_case.is_some() {
             if let Some((has_c, c_lim, has_t, t_lim)) = frame.tc_limits {
                 if has_c || has_t {
@@ -2808,7 +3282,13 @@ fn solve_static_with_stiffness(
         let op = link::operator(link, prop, work_points, pt_index, joint_rot);
         link_forces.insert(
             lname.clone(),
-            link::forces_for_case(prop, &op, &u_joint, nonlinear_case.is_some()),
+            link::forces_for_case(
+                prop,
+                &op,
+                &u_joint,
+                nonlinear_case.is_some(),
+                &link::hysteretic_overrides(&hysteretic_forces, lname),
+            ),
         );
     }
 
@@ -2826,6 +3306,8 @@ fn solve_static_with_stiffness(
         time_history_disp: IndexMap::new(),
         base_reactions,
         transient_state: None,
+        link_hysteresis,
+        displacement_control_factor: None,
     })
 }
 
@@ -2966,31 +3448,51 @@ fn run_modal_case(
 }
 
 /// Runs a Linear Buckling eigenvalue case (`LoadCaseType::Buckling`).
+#[allow(clippy::too_many_arguments)]
 fn run_buckling_case(
     model: &SapModel,
     lc: &LoadCase,
     work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    orig_area_map: &IndexMap<String, Vec<String>>,
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
     k_base: &[f64],
     ndof: usize,
 ) -> Result<CaseResults, SolverError> {
-    // Obtain reference axial forces from initial_case, or first load pattern in lc.loads, or frame.pdelta_force
+    // Reference axial forces. A case with no initial case buckles under its
+    // own loads: every assigned pattern at its scale factor, solved here as a
+    // linear static state. With an initial case, that case's forces are the
+    // reference; with neither, the assigned frame P-Delta forces are.
     let mut ref_axial: IndexMap<String, f64> = IndexMap::new();
-    let ref_case_name = lc
-        .initial_case
-        .clone()
-        .or_else(|| lc.loads.first().map(|a| a.load_name.clone()));
-
-    if let Some(rc_name) = ref_case_name {
-        if let Some(rc_res) = model.case_results.get(&rc_name) {
-            for (fname, stations) in &rc_res.frame_forces {
-                if !stations.is_empty() {
-                    let p_avg = 0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
-                    ref_axial.insert(fname.clone(), p_avg);
-                }
+    let mut take_axial = |results: &CaseResults| {
+        for (fname, stations) in &results.frame_forces {
+            if let (Some(first), Some(last)) = (stations.first(), stations.last()) {
+                ref_axial.insert(fname.clone(), 0.5 * (first.p + last.p));
             }
         }
+    };
+    if let Some(initial) = &lc.initial_case {
+        if let Some(results) = model.case_results.get(initial) {
+            take_axial(results);
+        }
+    } else if !lc.loads.is_empty() {
+        let mut reference = LoadCase::linear_static(lc.name.clone(), "", 1.0);
+        reference.loads = lc.loads.clone();
+        let results = run_linear_static_case(
+            model,
+            &reference,
+            work_points,
+            work_areas,
+            orig_area_map,
+            pt_index,
+            joint_rot,
+            k_struct,
+            k_base,
+            ndof,
+        )?;
+        take_axial(&results);
     }
 
     if ref_axial.is_empty() {
@@ -3368,6 +3870,8 @@ fn assemble_static_pattern_rhs(
         }
         condense_releases_and_springs(&mut k_loc, &mut fef_total, frame);
         apply_rigid_offsets(&mut k_loc, &mut fef_total, di, dj);
+        let insertion = frame_insertion_offset(model, frame)?;
+        apply_insertion_offset(&mut k_loc, &mut fef_total, insertion);
         let ti = mat3_mul(&e_axes, &joint_rot[idx_i]);
         let tj = mat3_mul(&e_axes, &joint_rot[idx_j]);
         for c in 0..3 {
@@ -3552,6 +4056,7 @@ fn run_time_history_case(
     let mut peak_norm = 0.0f64;
     let mut nl_link_peak: IndexMap<(String, usize), f64> = IndexMap::new();
     let mut terminal_state: Option<sap_model::TransientTerminalState> = None;
+    let mut terminal_hysteresis: Vec<sap_model::LinkHysteresisState> = Vec::new();
     // Linear history borrows the assembled matrices. Only nonlinear history
     // owns a separately assembled constitutive base for reaction recovery.
     let mut reaction_base = std::borrow::Cow::Borrowed(k_base);
@@ -3604,6 +4109,10 @@ fn run_time_history_case(
             &f0,
             &element_damping,
             u_init.as_deref(),
+            lc.initial_case
+                .as_ref()
+                .and_then(|name| model.case_results.get(name))
+                .map_or(&[], |result| result.link_hysteresis.as_slice()),
         )?;
         if let Some(ts) = seed_ts {
             integrator.seed_transient_state(ts, &f0)?;
@@ -3630,6 +4139,7 @@ fn run_time_history_case(
                 trace.push(disp);
             }
         }
+        terminal_hysteresis = integrator.terminal_hysteresis();
         if is_direct_history {
             let previous_force = integrator.previous_force().to_vec();
             let nonlinear_link_forces = integrator.terminal_link_force_states();
@@ -3834,6 +4344,7 @@ fn run_time_history_case(
     res.time_steps = time_steps;
     res.time_history_disp = time_history_disp;
     res.transient_state = terminal_state;
+    res.link_hysteresis = terminal_hysteresis;
     let mut grounded = IndexMap::<String, [f64; 6]>::new();
     for (name, object) in &model.links {
         let prop = &model.link_props[&object.prop];
@@ -3942,6 +4453,11 @@ fn recover_results_from_displacement_vector(
         let mut dummy_fef = [0.0; 12];
         condense_releases_and_springs(&mut k_loc, &mut dummy_fef, frame);
         apply_rigid_offsets(&mut k_loc, &mut dummy_fef, di, dj);
+        // This path serves history and spectrum cases, which validation
+        // refuses for a frame with an offset insertion point, so the offset
+        // is zero here.
+        let insertion = insertion_offset_local(model, frame).unwrap_or([0.0; 3]);
+        apply_insertion_offset(&mut k_loc, &mut dummy_fef, insertion);
 
         let ti = mat3_mul(&e_axes, &joint_rot[idx_i]);
         let tj = mat3_mul(&e_axes, &joint_rot[idx_j]);
@@ -3962,6 +4478,7 @@ fn recover_results_from_displacement_vector(
                 f_end_loc[r] += k_loc[r][c] * u_loc[c];
             }
         }
+        insertion_to_element_ends(&mut u_loc, &mut f_end_loc, insertion);
 
         let stations = recover_frame_stations(
             model,

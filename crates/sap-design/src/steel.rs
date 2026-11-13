@@ -68,23 +68,9 @@ impl SteelCode {
 }
 
 /// Optional per-member steel design overwrites matching `cDesignSteel.GetOverwrite` / `SetOverwrite`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct SteelMemberOverwrite {
-    /// Unbraced length ratio for major-axis bending ($L_{33} / L$)
-    pub l_ratio_major: Option<f64>,
-    /// Unbraced length ratio for minor-axis bending ($L_{22} / L$)
-    pub l_ratio_minor: Option<f64>,
-    /// Unbraced length ratio for lateral-torsional buckling ($L_{ltb} / L$)
-    pub l_ratio_ltb: Option<f64>,
-    /// Effective length factor $K_{33}$ (major axis)
-    pub k_major: Option<f64>,
-    /// Effective length factor $K_{22}$ (minor axis)
-    pub k_minor: Option<f64>,
-    /// Moment gradient factor $C_b$ (`None` = compute automatically from station moments)
-    pub cb: Option<f64>,
-    /// Sway frame flag for automatic alignment-chart $K$-factor calculation
-    pub is_sway: bool,
-}
+/// The model stores one per frame (`FrameObj::steel_overwrite`); an entry
+/// passed to [`try_run_steel_design_with_overwrites`] takes precedence.
+pub use sap_model::SteelDesignOverwrite as SteelMemberOverwrite;
 
 /// Evaluates flange and web compactness for axial compression and flexure per AISC 360-10 Table B4.1a & B4.1b.
 pub fn check_compactness_aisc(sec: &FrameSection, e: f64, fy: f64) -> SectionCompactness {
@@ -450,6 +436,55 @@ pub fn frame_clear_length(model: &SapModel, frame: &FrameObj) -> f64 {
         clear
     } else {
         total_len
+    }
+}
+
+/// Moment gradient factor for a member braced at equal spacings of `ratio`
+/// times its length: $C_b$ is computed within each unbraced segment and the
+/// smallest value is used for the member. With `ratio >= 1` the member is one
+/// segment. (SAP2000 likewise bases $C_b$ on the moments of each unbraced
+/// segment, not of the whole member.)
+pub fn compute_cb_for_unbraced_ratio(stations: &[FrameStationResult], ratio: f64) -> f64 {
+    if !(ratio > 0.0 && ratio < 1.0) || stations.len() < 2 {
+        return compute_cb_from_stations(stations);
+    }
+    let moment_at = |rel: f64| -> f64 {
+        for w in stations.windows(2) {
+            let (s0, s1) = (w[0].rel_dist, w[1].rel_dist);
+            if rel >= s0 - 1e-12 && rel <= s1 + 1e-12 {
+                let t = ((rel - s0) / (s1 - s0).max(1e-12)).clamp(0.0, 1.0);
+                return w[0].m3 + t * (w[1].m3 - w[0].m3);
+            }
+        }
+        stations.last().map_or(0.0, |s| s.m3)
+    };
+    // Bracing closer than a thousandth of the length is continuous bracing;
+    // the moment gradient within such a segment is flat.
+    if ratio < 1e-3 {
+        return 1.0;
+    }
+    let segments = (1.0 / ratio - 1e-9).ceil().max(1.0) as usize;
+    let mut smallest = f64::INFINITY;
+    for k in 0..segments {
+        let (a, b) = (k as f64 * ratio, ((k + 1) as f64 * ratio).min(1.0));
+        if b <= a {
+            continue;
+        }
+        let mut m_max = moment_at(a).abs().max(moment_at(b).abs());
+        for s in stations.iter().filter(|s| s.rel_dist > a && s.rel_dist < b) {
+            m_max = m_max.max(s.m3.abs());
+        }
+        if m_max <= 1e-12 {
+            continue;
+        }
+        let quarter = |t: f64| moment_at(a + t * (b - a)).abs();
+        let cb = 12.5 * m_max / (2.5 * m_max + 3.0 * quarter(0.25) + 4.0 * quarter(0.5) + 3.0 * quarter(0.75));
+        smallest = smallest.min(cb.clamp(1.0, 3.0));
+    }
+    if smallest.is_finite() {
+        smallest
+    } else {
+        1.0
     }
 }
 
@@ -1206,7 +1241,27 @@ fn run_steel_design_validated(
                     name == frame_name && stations.iter().any(|st| st.v3.abs() > 1e-9)
                 })
             });
-        let ow = overwrites.get(frame_name);
+        let ow = overwrites.get(frame_name).or(frame.steel_overwrite.as_ref());
+        // A stored overwrite can come from a file; a zero or negative length
+        // ratio or factor must not reach the capacity formulas.
+        if let Some(o) = ow {
+            for (item, value) in [
+                ("L33 ratio", o.l_ratio_major),
+                ("L22 ratio", o.l_ratio_minor),
+                ("LTB ratio", o.l_ratio_ltb),
+                ("K33", o.k_major),
+                ("K22", o.k_minor),
+                ("Cb", o.cb),
+            ] {
+                if let Some(value) = value.filter(|v| !v.is_finite() || *v <= 0.0) {
+                    return Err(DesignError::InvalidSteelOverwrite {
+                        frame: frame_name.clone(),
+                        item,
+                        value: value.to_string(),
+                    });
+                }
+            }
+        }
         let l_clear = frame_clear_length(model, frame).max(1e-6);
         let l33 = ow.and_then(|o| o.l_ratio_major).unwrap_or(1.0) * l_clear;
         let l22 = ow.and_then(|o| o.l_ratio_minor).unwrap_or(1.0) * l_clear;
@@ -1261,7 +1316,17 @@ fn run_steel_design_validated(
 
             let cb = ow
                 .and_then(|o| o.cb)
-                .unwrap_or_else(|| compute_cb_from_stations(stations));
+                .unwrap_or_else(|| {
+                    let ratio = ow.and_then(|o| o.l_ratio_ltb).unwrap_or(1.0);
+                    let minor = ow.and_then(|o| o.l_ratio_minor).unwrap_or(1.0);
+                    // As in SAP2000, Cb is 1.0 when the unbraced length is
+                    // set longer than the member.
+                    if ratio > 1.0 || minor > 1.0 {
+                        1.0
+                    } else {
+                        compute_cb_for_unbraced_ratio(stations, ratio)
+                    }
+                });
 
             let (phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness) = match code {
                 SteelCode::Aisc360Lrfd | SteelCode::Aisc360Asd => {

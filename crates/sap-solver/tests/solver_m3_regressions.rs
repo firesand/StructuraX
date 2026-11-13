@@ -587,6 +587,7 @@ fn solv_04_a_modal_trajectory_overlay_split_vs_full() {
     let mut full_case = LoadCase::linear_static("FULL", "DEAD", 1.0);
     full_case.loads.clear();
     full_case.case_type = LoadCaseType::LinearHistory;
+    full_case.modal_damping = 0.0;
     full_case.history_loads = vec![("STEP".into(), "DEAD".into(), 1.0)];
     full_case.time_step_dt = 0.01;
     full_case.num_time_steps = 200;
@@ -596,6 +597,7 @@ fn solv_04_a_modal_trajectory_overlay_split_vs_full() {
     let mut hist1 = LoadCase::linear_static("HIST1", "DEAD", 1.0);
     hist1.loads.clear();
     hist1.case_type = LoadCaseType::LinearHistory;
+    hist1.modal_damping = 0.0;
     hist1.history_loads = vec![("STEP".into(), "DEAD".into(), 1.0)];
     hist1.time_step_dt = 0.01;
     hist1.num_time_steps = 100;
@@ -606,6 +608,7 @@ fn solv_04_a_modal_trajectory_overlay_split_vs_full() {
     let mut hist2 = LoadCase::linear_static("HIST2", "DEAD", 1.0);
     hist2.loads.clear();
     hist2.case_type = LoadCaseType::LinearHistory;
+    hist2.modal_damping = 0.0;
     hist2.initial_case = Some("HIST1".into());
     hist2.time_step_dt = 0.01;
     hist2.num_time_steps = 100;
@@ -732,6 +735,7 @@ fn solv_04_b_modal_to_direct_integration_continuation() {
     let mut c1 = LoadCase::linear_static("MODAL_HIST", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("PULSE".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = 0.01;
     c1.num_time_steps = 100;
@@ -819,6 +823,7 @@ fn solv_04_c_modal_to_nonlinear_static_continuation() {
     let mut c1 = LoadCase::linear_static("H1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("RAMP".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = 0.01;
     c1.num_time_steps = 100;

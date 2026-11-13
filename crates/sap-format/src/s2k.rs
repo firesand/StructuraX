@@ -15,6 +15,7 @@ use sap_model::{
 use sap_units::Units;
 
 use crate::{FormatError, ImportReport};
+use sap_model::{UnmodeledScope, UnmodeledSourceData};
 
 thread_local! {
     static COLUMN_READS: std::cell::RefCell<(String, BTreeMap<String, std::collections::BTreeSet<String>>)> = const { std::cell::RefCell::new((String::new(), BTreeMap::new())) };
@@ -1237,6 +1238,9 @@ pub(super) fn parse_s2k_internal(
                             if let Some(p2) = get_f64(&row, "Param2") {
                                 lp.param2[i] = p2;
                             }
+                            if let Some(p3) = get_f64(&row, "Param3") {
+                                lp.param3[i] = p3;
+                            }
                         }
                     }
                 }
@@ -1497,6 +1501,36 @@ pub(super) fn parse_s2k_internal(
                     }
                     if let Some(ms) = get_i32(&row, "MinSta") {
                         fr.min_stations = ms.max(1) as usize;
+                    }
+                    if let Some(segments) = get_i32(&row, "MeshSegments") {
+                        fr.auto_mesh_segments = segments.max(0) as usize;
+                    }
+                    if let Some(at_joints) = get_bool(&row, "MeshAtJoints") {
+                        fr.auto_mesh_at_joints = at_joints;
+                    }
+                    if let Some(framing) = get_str(&row, "ConcFraming") {
+                        fr.concrete_framing = match framing.to_ascii_uppercase().as_str() {
+                            "SPECIAL" => sap_model::ConcreteFramingType::SwaySpecial,
+                            "INTERMEDIATE" => sap_model::ConcreteFramingType::SwayIntermediate,
+                            "ORDINARY" => sap_model::ConcreteFramingType::SwayOrdinary,
+                            "NONSWAY" => sap_model::ConcreteFramingType::NonSway,
+                            other => {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "frame '{fname}' has an unknown ConcFraming value '{other}'"
+                                )))
+                            }
+                        };
+                    }
+                    if get_bool(&row, "SteelOverwrite") == Some(true) {
+                        fr.steel_overwrite = Some(sap_model::SteelDesignOverwrite {
+                            l_ratio_major: get_f64(&row, "SteelL33"),
+                            l_ratio_minor: get_f64(&row, "SteelL22"),
+                            l_ratio_ltb: get_f64(&row, "SteelLtb"),
+                            k_major: get_f64(&row, "SteelK33"),
+                            k_minor: get_f64(&row, "SteelK22"),
+                            cb: get_f64(&row, "SteelCb"),
+                            is_sway: get_bool(&row, "SteelSway") == Some(true),
+                        });
                     }
                 }
             }
@@ -1821,6 +1855,9 @@ pub(super) fn parse_s2k_internal(
                     if let Some(ec) = get_bool(&row, "EdgeConstraint") {
                         ar.edge_constraint = ec;
                     }
+                    if let Some(mass) = get_f64(&row, "MassPerArea") {
+                        ar.mass_per_area = mass;
+                    }
                 }
             }
             "AREA SECTION ASSIGNMENTS" => {
@@ -2055,6 +2092,36 @@ pub(super) fn parse_s2k_internal(
                     }
                 }
             }
+            "RUST UNMODELED SOURCE DATA" => {
+                let target = get_str(&row, "Target").unwrap_or("").to_string();
+                let scope = match get_str(&row, "Scope")
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "ALL" => UnmodeledScope::AllCases,
+                    "NONLINEAR" => UnmodeledScope::NonlinearCases,
+                    "DYNAMIC" => UnmodeledScope::DynamicCases,
+                    "NOTLINEARSTATIC" => UnmodeledScope::AllButLinearStatic,
+                    "PATTERN" if !target.is_empty() => UnmodeledScope::LoadPattern(target),
+                    "CASE" if !target.is_empty() => UnmodeledScope::Case(target),
+                    // An unreadable entry must not turn into "nothing is missing".
+                    _ => {
+                        return Err(FormatError::ParseS2k(
+                            "Invalid RUST UNMODELED SOURCE DATA row: Scope must be All, Nonlinear, Dynamic, NotLinearStatic, Pattern or Case, with a Target for Pattern and Case".into(),
+                        ));
+                    }
+                };
+                let description = get_str(&row, "Description").unwrap_or("").to_string();
+                if description.is_empty() {
+                    return Err(FormatError::ParseS2k(
+                        "RUST UNMODELED SOURCE DATA row needs a Description".into(),
+                    ));
+                }
+                model
+                    .unmodeled_source
+                    .push(UnmodeledSourceData { scope, description });
+            }
             "LOAD PATTERN DEFINITIONS" => {
                 if !cleared_lpats {
                     model.load_patterns.clear();
@@ -2101,6 +2168,14 @@ pub(super) fn parse_s2k_internal(
                     };
                     let mut lc = LoadCase::linear_static(name, name, 1.0);
                     lc.case_type = ctype;
+                    // Modal history types carry no modal damping unless the row
+                    // states one; the general 0.05 default is for spectra.
+                    if matches!(
+                        ctype,
+                        LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+                    ) {
+                        lc.modal_damping = 0.0;
+                    }
                     lc.loads.clear();
                     lc.run_flag = get_bool(&row, "RunCase").unwrap_or(true);
                     if let Some(ic) = get_str(&row, "InitialCond") {
@@ -2179,6 +2254,32 @@ pub(super) fn parse_s2k_internal(
                     }
                     if let Some(nbm) = get_i32(&row, "NumBucklingModes") {
                         lc.num_buckling_modes = nbm.max(0) as usize;
+                    }
+                    if let Some(target) = get_f64(&row, "RustDisplTarget") {
+                        let dof = match get_str(&row, "RustDisplDOF")
+                            .map(|v| v.to_ascii_uppercase())
+                            .as_deref()
+                        {
+                            Some("U1") => Some(0),
+                            Some("U2") => Some(1),
+                            Some("U3") => Some(2),
+                            Some("R1") => Some(3),
+                            Some("R2") => Some(4),
+                            Some("R3") => Some(5),
+                            Some(_) => {
+                                return Err(FormatError::ParseS2k(
+                                    "Invalid RustDisplDOF; expected U1..U3 or R1..R3".into(),
+                                ));
+                            }
+                            None => None,
+                        };
+                        lc.displacement_control = Some(sap_model::DisplacementControl {
+                            target,
+                            monitored: get_str(&row, "RustDisplJoint")
+                                .map(str::to_owned)
+                                .zip(dof),
+                            conjugate: get_bool(&row, "RustDisplConjugate").unwrap_or(false),
+                        });
                     }
                     model.load_cases.insert(name.to_string(), lc);
                 }
@@ -2709,6 +2810,13 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             ShellType::Membrane => "Membrane",
             ShellType::ShellLayered => "Shell-Layered",
         };
+        // A plane section's type is stress or strain; the reader takes the
+        // plane type from this column, so the shell wording would lose "strain".
+        let stype = match (a.prop_type, a.plane_type) {
+            (AreaPropType::Plane, PlaneType::PlaneStrain) => "Plane-Strain",
+            (AreaPropType::Plane, PlaneType::PlaneStress) => "Plane-Stress",
+            _ => stype,
+        };
         out.push_str(&format!(
             "   Section={}   Material={}   MatAngle={}   AreaType={}   Type={}   DrillDOF={} _\n     Thickness={}   BendThick={}   InComp={}   F11Mod={}   F22Mod={}   F12Mod={} _\n     M11Mod={}   M22Mod={}   M12Mod={}   V13Mod={}   V23Mod={}   MMod={}   WMod={}\n",
             format_val(&a.name),
@@ -2795,7 +2903,7 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
         for lp in model.link_props.values() {
             for i in 0..6 {
                 out.push_str(&format!(
-                    "   Link={}   DOF={}   Active={}   Fixed={}   RustNonlinear={}   Ke={}   Ce={}   Knl={}   Param1={}   Param2={}\n",
+                    "   Link={}   DOF={}   Active={}   Fixed={}   RustNonlinear={}   Ke={}   Ce={}   Knl={}   Param1={}   Param2={}",
                     format_val(&lp.name),
                     dof_names[i],
                     format_bool(lp.dof_active[i]),
@@ -2807,6 +2915,12 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                     lp.param1[i],
                     lp.param2[i],
                 ));
+                // Third parameter row (Wen yield exponent); a reconstruction
+                // extension like Knl/Param1/Param2, written only where used.
+                if lp.link_type == LinkPropType::PlasticWen || lp.param3[i] != 0.0 {
+                    out.push_str(&format!("   Param3={}", lp.param3[i]));
+                }
+                out.push('\n');
             }
         }
         out.push('\n');
@@ -3079,13 +3193,48 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
         out.push_str("TABLE:  \"CONNECTIVITY - FRAME\"\n");
         for f in model.frames.values() {
             out.push_str(&format!(
-                "   Frame={}   JointI={}   JointJ={}   IsCurved=No   Selected={}   MinSta={}\n",
+                "   Frame={}   JointI={}   JointJ={}   IsCurved=No   Selected={}   MinSta={}",
                 format_val(&f.name),
                 format_val(&f.point_i),
                 format_val(&f.point_j),
                 format_bool(f.selected),
                 f.min_stations,
             ));
+            // Automatic subdivision for analysis, written only where assigned
+            // (reconstruction extension columns, like MeshN1/MeshN2 on areas).
+            if f.auto_mesh_segments > 0 {
+                out.push_str(&format!("   MeshSegments={}", f.auto_mesh_segments));
+            }
+            if f.auto_mesh_at_joints {
+                out.push_str("   MeshAtJoints=Yes");
+            }
+            // Design overwrites, written only where they differ from the
+            // defaults (reconstruction extension columns).
+            match f.concrete_framing {
+                sap_model::ConcreteFramingType::SwaySpecial => {}
+                sap_model::ConcreteFramingType::SwayIntermediate => out.push_str("   ConcFraming=Intermediate"),
+                sap_model::ConcreteFramingType::SwayOrdinary => out.push_str("   ConcFraming=Ordinary"),
+                sap_model::ConcreteFramingType::NonSway => out.push_str("   ConcFraming=NonSway"),
+            }
+            if let Some(o) = &f.steel_overwrite {
+                out.push_str("   SteelOverwrite=Yes");
+                for (column, value) in [
+                    ("SteelL33", o.l_ratio_major),
+                    ("SteelL22", o.l_ratio_minor),
+                    ("SteelLtb", o.l_ratio_ltb),
+                    ("SteelK33", o.k_major),
+                    ("SteelK22", o.k_minor),
+                    ("SteelCb", o.cb),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!("   {column}={value}"));
+                    }
+                }
+                if o.is_sway {
+                    out.push_str("   SteelSway=Yes");
+                }
+            }
+            out.push('\n');
         }
         out.push('\n');
 
@@ -3443,13 +3592,19 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                 line.push_str(&format!("   Joint{}={}", idx + 1, format_val(pt)));
             }
             line.push_str(&format!(
-                "   Selected={}   Angle={}   MeshN1={}   MeshN2={}   EdgeConstraint={}\n",
+                "   Selected={}   Angle={}   MeshN1={}   MeshN2={}   EdgeConstraint={}",
                 format_bool(a.selected),
                 a.angle_deg,
                 a.auto_mesh.0,
                 a.auto_mesh.1,
                 format_bool(a.edge_constraint),
             ));
+            // Added mass per area, written only where assigned (a reconstruction
+            // extension column, like MeshN1/MeshN2 on this row).
+            if a.mass_per_area != 0.0 {
+                line.push_str(&format!("   MassPerArea={}", a.mass_per_area));
+            }
+            line.push('\n');
             out.push_str(&line);
         }
         out.push('\n');
@@ -3736,8 +3891,25 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             TimeIntegrationMethod::WilsonTheta => "WilsonTheta",
         };
         let ic = lc.initial_case.as_deref().unwrap_or("Zero");
+        // Displacement control is a reconstruction extension of this table,
+        // written only for cases that use it.
+        let control = lc.displacement_control.as_ref().map_or_else(String::new, |c| {
+            let mut text = format!(
+                "   RustDisplTarget={}   RustDisplConjugate={}",
+                c.target,
+                format_bool(c.conjugate)
+            );
+            if let Some((joint, dof)) = &c.monitored {
+                text.push_str(&format!(
+                    "   RustDisplJoint={}   RustDisplDOF={}",
+                    format_val(joint),
+                    ["U1", "U2", "U3", "R1", "R2", "R3"].get(*dof).copied().unwrap_or("?")
+                ));
+            }
+            text
+        });
         out.push_str(&format!(
-            "   Case={}   Type={}   InitialCond={}   RunCase={}   ModeType={}   MaxNumModes={}   MinNumModes={}   EigenShift={} _\n     GeomNonLin={}   MaxIter={}   ConvTol={}   ModalCombo={}   ConstDamp={}   NumSteps={}   StepSize={} _\n     TimeInteg={}   HHTAlpha={}   WilsonTheta={}   RayleighMass={}   RayleighStiff={}   NumBucklingModes={}\n",
+            "   Case={}   Type={}   InitialCond={}   RunCase={}   ModeType={}   MaxNumModes={}   MinNumModes={}   EigenShift={} _\n     GeomNonLin={}   MaxIter={}   ConvTol={}   ModalCombo={}   ConstDamp={}   NumSteps={}   StepSize={} _\n     TimeInteg={}   HHTAlpha={}   WilsonTheta={}   RayleighMass={}   RayleighStiff={}   NumBucklingModes={}{}\n",
             format_val(&lc.name),
             ctype,
             format_val(ic),
@@ -3759,6 +3931,7 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             lc.rayleigh_damping.0,
             lc.rayleigh_damping.1,
             lc.num_buckling_modes,
+            control,
         ));
     }
     out.push('\n');
@@ -3867,6 +4040,30 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                     ));
                 }
             }
+        }
+        out.push('\n');
+    }
+
+    // Reconstruction extension: imported data that is not modeled. Keeping it
+    // in the text model keeps analysis refused after a save and reopen.
+    if !model.unmodeled_source.is_empty() {
+        out.push_str("TABLE:  \"RUST UNMODELED SOURCE DATA\"\n");
+        for (index, entry) in model.unmodeled_source.iter().enumerate() {
+            let (scope, target) = match &entry.scope {
+                UnmodeledScope::AllCases => ("All", ""),
+                UnmodeledScope::NonlinearCases => ("Nonlinear", ""),
+                UnmodeledScope::DynamicCases => ("Dynamic", ""),
+                UnmodeledScope::AllButLinearStatic => ("NotLinearStatic", ""),
+                UnmodeledScope::LoadPattern(name) => ("Pattern", name.as_str()),
+                UnmodeledScope::Case(name) => ("Case", name.as_str()),
+            };
+            out.push_str(&format!(
+                "   Item={}   Scope={}   Target={}   Description={}\n",
+                index + 1,
+                scope,
+                format_val(target),
+                format_val(&entry.description),
+            ));
         }
         out.push('\n');
     }
