@@ -78,6 +78,10 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS"
             | "COMBINATION DEFINITIONS"
             | "RUST UNMODELED SOURCE DATA"
+            | "RUST CASE - MODAL RITZ CONTROLS"
+            | "RUST MASS SOURCE"
+            | "RUST AUTO SEISMIC - ASCE 7-10"
+            | "RUST STEEL DESIGN PREFERENCES"
     )
 }
 

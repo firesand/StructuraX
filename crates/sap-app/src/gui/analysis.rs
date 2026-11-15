@@ -71,7 +71,11 @@ fn delete_case(model: &mut SapModel, name: &str) -> Result<String, String> {
     if model
         .load_cases
         .values()
-        .any(|c| c.name != name && c.initial_case.as_deref() == Some(name))
+        .any(|c| {
+            c.name != name
+                && (c.initial_case.as_deref() == Some(name)
+                    || c.modal_case.as_deref() == Some(name))
+        })
     {
         return Err(format!(
             "Case '{name}' is referenced as initial/modal source by another case."
@@ -126,7 +130,9 @@ fn new_case(kind: LoadCaseType, name: &str) -> LoadCase {
     if kind == LoadCaseType::Modal {
         case = LoadCase::modal_eigen(name, 12);
     }
-    // Modal history types are integrated directly and take no modal damping.
+    // Without a modal case (direct integration, the default of a new case) a
+    // history case takes no modal damping; `case_controls` sets a damping
+    // ratio when a Modal case is chosen for superposition.
     if matches!(
         kind,
         LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
@@ -230,6 +236,46 @@ fn dynamic_loads(
         ));
     }
 }
+/// How a linear history case is solved: direct integration or superposition of
+/// the modes of a Modal case. Choosing a Modal case clears the settings that
+/// modal superposition refuses (Rayleigh damping, initial case) and gives a
+/// zero damping ratio the usual 5 %; going back to direct integration resets
+/// the damping ratio that direct integration refuses.
+fn history_solution_choice(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
+    let before = case.modal_case.clone();
+    let mut source = before.clone().unwrap_or_default();
+    ui.horizontal(|ui| {
+        ui.label("Solution:");
+        egui::ComboBox::from_id_salt("analysis_history_solution")
+            .selected_text(if source.is_empty() {
+                "Direct integration".to_string()
+            } else {
+                format!("Modal superposition of {source}")
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut source, String::new(), "Direct integration");
+                for (name, modal) in &model.load_cases {
+                    if modal.case_type == LoadCaseType::Modal && name != &case.name {
+                        ui.selectable_value(&mut source, name.clone(), format!("Modal: {name}"));
+                    }
+                }
+            });
+    });
+    let chosen = (!source.is_empty()).then_some(source);
+    if chosen != before {
+        match &chosen {
+            Some(_) => {
+                case.rayleigh_damping = (0.0, 0.0);
+                case.initial_case = None;
+                if case.modal_damping == 0.0 {
+                    case.modal_damping = 0.05;
+                }
+            }
+            None => case.modal_damping = 0.0,
+        }
+        case.modal_case = chosen;
+    }
+}
 fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
     ui.horizontal(|ui| {
         ui.label("Name:");
@@ -325,11 +371,9 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
             });
             if old_subtype != case.modal_sub_type && case.modal_sub_type == ModalSubType::Eigen {
                 case.loads.clear();
+                case.ritz_controls.clear();
             }
-            if case.modal_sub_type == ModalSubType::Ritz {
-                ui.label("Starting load patterns:");
-                static_loads(ui, model, case);
-            }
+            super::modal_tables::ritz_load_controls(ui, model, case);
         }
         LoadCaseType::ResponseSpectrum => {
             let mut source = case.initial_case.clone().unwrap_or_default();
@@ -371,14 +415,27 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
         | LoadCaseType::LinearDynamic
         | LoadCaseType::NonlinearHistory
         | LoadCaseType::NonlinearDynamic => {
-            if matches!(
+            if case.case_type == LoadCaseType::LinearHistory {
+                history_solution_choice(ui, model, case);
+            }
+            let superposed = case.modal_case.is_some();
+            if superposed {
+                ui.horizontal(|ui| {
+                    ui.label("Modal damping ratio (constant for all modes, 0 <= ratio < 1):");
+                    ui.add(
+                        egui::DragValue::new(&mut case.modal_damping)
+                            .speed(0.005)
+                            .range(0.0..=0.99),
+                    );
+                });
+            } else if matches!(
                 case.case_type,
                 LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
             ) {
                 // An imported modal history may carry a modal damping ratio. It is
                 // shown because analysis refuses the case until it is zero.
                 ui.horizontal(|ui| {
-                    ui.label("Modal damping ratio (not implemented for history cases; must be 0, use Rayleigh damping):");
+                    ui.label("Modal damping ratio (direct integration takes none; must be 0, use Rayleigh damping):");
                     ui.add(egui::DragValue::new(&mut case.modal_damping).speed(0.005));
                 });
             }
@@ -408,6 +465,9 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                         .max_decimals(10),
                 );
             });
+            if superposed {
+                ui.label("Each mode is integrated exactly for loads that vary linearly between the output steps and the function points; integrator and Rayleigh settings do not apply.");
+            } else {
             egui::ComboBox::from_id_salt("analysis_integrator")
                 .selected_text(format!("{:?}", case.time_integration))
                 .show_ui(ui, |ui| {
@@ -442,6 +502,7 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                 ui.label("Stiffness beta:");
                 ui.add(egui::DragValue::new(&mut case.rayleigh_damping.1).speed(0.001));
             });
+            }
             dynamic_loads(ui, model, &mut case.history_loads, true);
             ui.label("U1/U2/U3 are global base acceleration. Other targets are joint-force patterns. Ordinate × scale multiplies the selected excitation.");
             ui.label(
@@ -571,6 +632,94 @@ mod tests {
         assert!(history.loads.is_empty());
         assert!(history.spectrum_loads.is_empty());
     }
+    #[test]
+    fn a_modal_case_named_by_a_modal_history_cannot_be_deleted() {
+        let mut model = SapModel::new(Units::KipInF);
+        model
+            .load_cases
+            .insert("MODES".into(), LoadCase::modal_eigen("MODES", 3));
+        let mut history = new_case(LoadCaseType::LinearHistory, "H");
+        history.modal_case = Some("MODES".into());
+        model.load_cases.insert("H".into(), history);
+        let error = delete_case(&mut model, "MODES").unwrap_err();
+        assert!(error.contains("referenced"), "{error}");
+        assert!(model.load_cases.contains_key("MODES"));
+        // The dependent case itself can go, and then the modal case can too.
+        delete_case(&mut model, "H").unwrap();
+        delete_case(&mut model, "MODES").unwrap();
+    }
+    #[test]
+    fn modal_history_case_renders_with_a_modal_source() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/modal-history.s2k")));
+        app.model = SapModel::new(Units::KipInF);
+        app.analysis_editor.open = true;
+        let mut case = new_case(LoadCaseType::LinearHistory, "H");
+        case.modal_case = Some("MODAL".into());
+        case.modal_damping = 0.05;
+        app.analysis_editor.case = case;
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for time in [1., 2., 3.] {
+            out = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400., 1200.))),
+                    time: Some(time),
+                    ..Default::default()
+                },
+                |ctx| app.render_analysis_editor(ctx),
+            ));
+        }
+        let out = out.unwrap();
+        let texts: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(texts.iter().any(|t| t.contains("Modal damping ratio (constant")));
+        assert!(texts.iter().any(|t| t.contains("Modal superposition of MODAL")));
+        assert_eq!(
+            app.analysis_editor.case.modal_case.as_deref(),
+            Some("MODAL")
+        );
+    }
+    #[test]
+    fn modal_cases_as_the_editor_creates_them_save_and_analyze() {
+        // A spring-supported mass: one mode, omega^2 = k / m.
+        let mut model = SapModel::new(Units::KipInF);
+        model.active_dofs = [true, false, false, false, false, false];
+        model.add_point("1", 0.0, 0.0, 0.0);
+        model.points["1"].spring[0] = 40.0;
+        model.points["1"].mass[0] = 0.1;
+        let period = 2.0 * std::f64::consts::PI * (0.1f64 / 40.0).sqrt();
+
+        // The Eigen case a new Modal case starts as.
+        let eigen = new_case(LoadCaseType::Modal, "EIG");
+        assert!(eigen.loads.is_empty() && eigen.modal_sub_type == ModalSubType::Eigen);
+        sap_api::set_case_definition(&mut model, eigen).unwrap();
+
+        // Switching it to Ritz without a starting load is refused at save,
+        // with the reason, and nothing is stored.
+        let mut ritz = new_case(LoadCaseType::Modal, "RITZ");
+        ritz.modal_sub_type = ModalSubType::Ritz;
+        let error = sap_api::set_case_definition(&mut model, ritz.clone()).unwrap_err();
+        assert!(error.to_string().contains("starting load"), "{error}");
+        assert!(!model.load_cases.contains_key("RITZ"));
+
+        // With the X acceleration as its starting load it saves.
+        ritz.loads.push(LoadCaseAssignment { load_name: "UX".into(), scale_factor: 1.0 });
+        sap_api::set_case_definition(&mut model, ritz).unwrap();
+
+        sap_solver::analyze_model(&mut model).unwrap();
+        for case in ["MODAL", "EIG", "RITZ"] {
+            let modes = &model.case_results[case].modes;
+            assert_eq!(modes.len(), 1, "{case}");
+            assert!((modes[0].period_sec - period).abs() < 1e-12 * period, "{case}");
+        }
+    }
+
     #[test]
     fn editor_renders_case_types_and_pointer_click_saves_function() {
         let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/analysis-editor.s2k")));

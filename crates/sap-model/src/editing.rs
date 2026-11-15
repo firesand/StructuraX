@@ -27,20 +27,20 @@ pub enum EditError {
     JointConflict(String),
 }
 
-fn invalid(message: impl Into<String>) -> EditError {
+pub(crate) fn invalid(message: impl Into<String>) -> EditError {
     EditError::Invalid(message.into())
 }
-fn finite(values: impl IntoIterator<Item = f64>) -> Result<(), EditError> {
+pub(crate) fn finite(values: impl IntoIterator<Item = f64>) -> Result<(), EditError> {
     if values.into_iter().all(f64::is_finite) {
         Ok(())
     } else {
         Err(invalid("non-finite value"))
     }
 }
-fn coords(p: &PointObj) -> [f64; 3] {
+pub(crate) fn coords(p: &PointObj) -> [f64; 3] {
     [p.x, p.y, p.z]
 }
-fn validate_point(p: &PointObj) -> Result<(), EditError> {
+pub(crate) fn validate_point(p: &PointObj) -> Result<(), EditError> {
     finite(coords(p))?;
     finite(p.spring)?;
     finite(p.mass)?;
@@ -60,7 +60,7 @@ fn validate_point(p: &PointObj) -> Result<(), EditError> {
     }
     Ok(())
 }
-fn validate_frame(f: &FrameObj) -> Result<(), EditError> {
+pub(crate) fn validate_frame(f: &FrameObj) -> Result<(), EditError> {
     finite([
         f.angle_deg,
         f.end_offset_i,
@@ -113,7 +113,7 @@ fn validate_frame(f: &FrameObj) -> Result<(), EditError> {
     }
     Ok(())
 }
-fn same_assignments(a: &PointObj, b: &PointObj) -> bool {
+pub(crate) fn same_assignments(a: &PointObj, b: &PointObj) -> bool {
     let mut normalized = a.clone();
     normalized.name.clone_from(&b.name);
     normalized.x = b.x;
@@ -131,14 +131,14 @@ impl SapModel {
         self.concrete_design_results.clear();
     }
 
-    fn check_edit(&self) -> Result<(), EditError> {
+    pub(crate) fn check_edit(&self) -> Result<(), EditError> {
         if self.is_locked {
             return Err(EditError::Locked);
         }
         Ok(())
     }
 
-    fn selected_joints(&self) -> Result<BTreeSet<String>, EditError> {
+    pub(crate) fn selected_joints(&self) -> Result<BTreeSet<String>, EditError> {
         self.check_edit()?;
         if self.links.values().any(|v| v.selected) || self.solids.values().any(|v| v.selected) {
             return Err(EditError::Unsupported("selected links or solids".into()));

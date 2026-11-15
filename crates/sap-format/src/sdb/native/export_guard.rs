@@ -333,6 +333,20 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                 target,
             )?;
         }
+        // Reconstruction data with no native record written here; a
+        // synthesized file would drop it and the case would change meaning.
+        if case.modal_case.is_some() {
+            return Err(unsupported(
+                format!("load_cases.{name}.modal_case"),
+                "mode superposition for a history case is not written natively; use S2K",
+            ));
+        }
+        if !case.ritz_controls.is_empty() {
+            return Err(unsupported(
+                format!("load_cases.{name}.ritz_controls"),
+                "Ritz generation cycles and participation targets are not written natively; use S2K",
+            ));
+        }
         for l in &case.loads {
             reference(
                 model.load_patterns.contains_key(&l.load_name) || acceleration(&l.load_name),
@@ -379,6 +393,24 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         if !p.nonlinear_data_complete {
             return Err(unsupported(format!("link_props.{name}.nonlinear_data_complete"),"incomplete source law data cannot be certified by synthesizing a parameter vector; use a private snapshot"));
         }
+    }
+    if !model.mass_source.is_default() {
+        return Err(unsupported(
+            "mass_source",
+            "a mass source other than element and additional mass is not written natively; use S2K",
+        ));
+    }
+    if let Some(pattern) = model.auto_seismic.keys().next() {
+        return Err(unsupported(
+            format!("auto_seismic.{pattern}"),
+            "automatic seismic loads are not written natively; use S2K",
+        ));
+    }
+    if !model.steel_design_prefs.is_default() {
+        return Err(unsupported(
+            "steel_design_prefs",
+            "steel design preferences are not written natively; use S2K",
+        ));
     }
     if let Some(entry) = model.unmodeled_source.first() {
         return Err(unsupported(
@@ -469,6 +501,12 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
             return Err(unsupported(
                 format!("frames.{name}.steel_overwrite"),
                 "steel design overwrites are not written natively; use S2K",
+            ));
+        }
+        if frame.auto_select.is_some() {
+            return Err(unsupported(
+                format!("frames.{name}.auto_select"),
+                "the Auto Select design and analysis sections are not written natively; use S2K",
             ));
         }
         // Joint offsets are written in the one form the corpus shows: element

@@ -1,8 +1,8 @@
 {
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
-  "snapshot_date": "2026-11-13",
-  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md).",
+  "snapshot_date": "2026-11-15",
+  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md). 2026-11-15: first wave of tutorial-video features (docs/reconstruction/tutorial-video-wave1.md): profile LDLT and subspace eigen solver, mass source, ASCE 7-10 automatic seismic load with entered coefficients, Ritz loads and load participation, modal time history, functions from file, Auto Select design and default design combinations, grid/quick-draw/radial geometry commands. Pushover, AISC 360-16 and ASCE 7-16 remain absent.",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
     "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
@@ -159,7 +159,7 @@
           "note": "Chained modal and direct-integration restart stress regressions (< 1e-11 analytical agreement)."
         }
       ],
-      "limits": "Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending."
+      "limits": "Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending. Since 2026-11-15 a LinearHistory case may name a modal case and is then solved by mode superposition (see modal-time-history)."
     },
     {
       "id": "other-case-types",
@@ -355,7 +355,7 @@
           "note": "Adversarial stress tests across all 10 steel cross-section families and combined 6-DOF loading."
         }
       ],
-      "limits": "ERW/SAW design-thickness overwrites, auto-select lists, comprehensive lateral-torsional/local buckling, and full vendor design-code validation remain incomplete."
+      "limits": "ERW/SAW design-thickness overwrites, auto-select lists, comprehensive lateral-torsional/local buckling, and full vendor design-code validation remain incomplete. Auto Select lists and default combinations: see steel-design-workflow."
     },
     {
       "id": "concrete-design",
@@ -519,15 +519,164 @@
       "limits": "Six generators are present; generated default properties need reference comparisons."
     },
     {
+      "id": "solver-capacity",
+      "area": "solver",
+      "feature": "Profile LDLT factorization (bitwise equal to the dense loops) and subspace iteration with a Sturm sequence check for Eigen cases above 400 mass degrees of freedom, falling back to exact condensation.",
+      "status": "implemented-tested",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/linalg.rs",
+          "lines": "1-1000",
+          "note": "factorize_with_reference, solve_modal_eigen_checked, solve_modal_eigen_subspace."
+        },
+        {
+          "file": "crates/sap-solver/tests/eigen_capacity_regressions.rs",
+          "lines": "1-1280",
+          "note": "Bitwise oracle, CSI Example 1-021 eigenvalues, closed-form chain, missed-mode detection."
+        }
+      ],
+      "limits": "Matrices are stored dense (8 n^2 bytes per copy); models beyond a few thousand joints are out of reach. Buckling and history paths are unchanged apart from the faster factorization."
+    },
+    {
+      "id": "mass-source-auto-seismic",
+      "area": "solver",
+      "feature": "Mass source from element mass, additional mass and load patterns; ASCE 7-10 automatic seismic load (equivalent lateral force) per Quake pattern with a per-case report.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/mass_source.rs",
+          "lines": "1-170",
+          "note": "Pattern mass and refusals."
+        },
+        {
+          "file": "crates/sap-solver/src/auto_seismic.rs",
+          "lines": "1-336",
+          "note": "Eqns. 12.8-1 to 12.8-7, 12.8-11/12 of ASCE 7-10 as printed in the CSI Lateral Loads Manual."
+        },
+        {
+          "file": "crates/sap-solver/tests/mass_source_auto_seismic.rs",
+          "lines": "1-1070",
+          "note": "Closed-form periods, statics, each Cs branch recomputed in the test, refusals."
+        }
+      ],
+      "limits": "Fa, Fv and Ie are entered (code tables absent from the vendor material). Program-calculated period and eccentricity on diaphragms are refused. One code edition; no wind. The vendor's rule for the weight W is not printed; W is the mass-source weight above the base elevation. One mass source per model."
+    },
+    {
+      "id": "ritz-and-participation",
+      "area": "solver",
+      "feature": "Ritz vectors from listed load patterns and accelerations with generation cycles and dynamic participation targets; static and dynamic load participation ratios for every modal case.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/ritz_modal.rs",
+          "lines": "1-443",
+          "note": "Starting loads, generation, targets, participation."
+        },
+        {
+          "file": "crates/sap-solver/tests/ritz_participation.rs",
+          "lines": "1-679",
+          "note": "Closed-form two- and three-mass cantilevers; refusals."
+        }
+      ],
+      "limits": "A Ritz case with an empty load list keeps the previous UX/UY/UZ start. Rotational accelerations, loads without a mass component and min_modes above 1 with starting loads are refused. Native import does not read participation targets."
+    },
+    {
+      "id": "modal-time-history",
+      "area": "solver",
+      "feature": "Linear time history by mode superposition with a constant modal damping ratio, exact for piecewise-linear loads; relative acceleration traces; time functions read from text files.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/modal_history.rs",
+          "lines": "1-644",
+          "note": "Validation, exact recurrence, recovery."
+        },
+        {
+          "file": "crates/sap-solver/tests/modal_history_regressions.rs",
+          "lines": "1-817",
+          "note": "Closed forms; opt-in vendor Example 1-022 (published 5.486 in)."
+        },
+        {
+          "file": "crates/sap-format/src/function_file.rs",
+          "lines": "1-269",
+          "note": "Reader following the vendor help topic."
+        }
+      ],
+      "limits": "Constant damping only; no initial case, no link damping, no nonlinear modal history, no ramp/arrival-time options. Reactions omit the modal damping force. Without a modal case a history case is integrated directly as before."
+    },
+    {
+      "id": "steel-design-workflow",
+      "area": "design",
+      "feature": "Auto Select section lists in analysis and design, demand/capacity ratio limit, Verify Analysis vs Design Section, Verify All Members Passed, default LRFD/ASD design combinations.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-model/src/auto_select.rs",
+          "lines": "1-320",
+          "note": "Analysis section resolution and refusals."
+        },
+        {
+          "file": "crates/sap-design/src/auto_select.rs",
+          "lines": "1-175",
+          "note": "Selection and verify commands."
+        },
+        {
+          "file": "crates/sap-design/src/default_combos.rs",
+          "lines": "1-535",
+          "note": "Rows of the AISC 360-10 design manual section 3.2."
+        },
+        {
+          "file": "crates/sap-design/tests/auto_select_and_default_combos.rs",
+          "lines": "1-920",
+          "note": "Manual factor lists, closed-form beam selection, refusals."
+        }
+      ],
+      "limits": "AISC 360-10 and Eurocode 3 only. Median for an even list and rows for absent load types are this project's choices. Overstrength combinations, notional loads, seismic framing types and second-order preferences are not implemented."
+    },
+    {
+      "id": "geometry-generation",
+      "area": "application",
+      "feature": "Quick grid, quick draw by grid region (beams, columns, braces, secondary beams, areas), select by section, diaphragm assignment, radial replicate, radial extrusion of lines to areas, reverse area local 3, curved frames.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-model/src/generate.rs",
+          "lines": "1-922",
+          "note": "Grid, quick draw, selection, diaphragms."
+        },
+        {
+          "file": "crates/sap-model/src/radial.rs",
+          "lines": "1-861",
+          "note": "Radial commands, reversal, curves, local-axis rules."
+        },
+        {
+          "file": "crates/sap-model/tests/generate_radial.rs",
+          "lines": "1-2502",
+          "note": "Closed-form coordinates and counts; refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/p6_geometry_local_axes.rs",
+          "lines": "1-673",
+          "note": "Copies respond as the rotated original; braces, secondary beams and diaphragms analyze."
+        },
+        {
+          "file": "crates/sap-app/tests/video_tutorial_workflows.rs",
+          "lines": "1-420",
+          "note": "The video's building, ten-storey frame and tower end to end."
+        }
+      ],
+      "limits": "Typed inputs only: no mouse drawing on grids or plane views. Vertical rotation axis only. Assignments a radial copy cannot reproduce exactly are refused. GUI windows tested headless, not by hand."
+    },
+    {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "83 live reference checks across 17 benchmark families plus 461 automated tests across 51 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
+      "feature": "86 live reference checks across 18 benchmark families plus 656 automated tests across 63 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/benchmarks.rs",
           "lines": "55-90",
-          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks)."
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks)."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",

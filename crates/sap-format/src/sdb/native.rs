@@ -1510,6 +1510,12 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
         for i in 0..6 {
             ir[i] = i32::from(fr.release_i[i]) | (i32::from(fr.release_j[i]) << 1);
         }
+        let object_length = match (model.points.get(&fr.point_i), model.points.get(&fr.point_j)) {
+            (Some(i), Some(j)) => {
+                ((j.x - i.x).powi(2) + (j.y - i.y).powi(2) + (j.z - i.z).powi(2)).sqrt()
+            }
+            _ => 0.0,
+        };
         let mut l_map = HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(fr.name.clone())),
@@ -1517,8 +1523,8 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_LineType".into(), SdbVal::I32(line_type)),
             ("m_sanalysis".into(), SdbVal::I32(san)),
             ("m_ang".into(), SdbVal::F64(fr.angle_deg)),
-            ("m_ai".into(), SdbVal::F64(fr.end_offset_i)),
-            ("m_aj".into(), SdbVal::F64(fr.end_offset_j)),
+            ("m_ai".into(), SdbVal::F64(offset_fraction(fr.end_offset_i, object_length))),
+            ("m_aj".into(), SdbVal::F64(offset_fraction(fr.end_offset_j, object_length))),
             ("m_RZ".into(), SdbVal::F64(fr.rigid_zone_factor)),
             ("m_CardinalPoint".into(), SdbVal::I32(fr.cardinal_point)),
             ("m_StiffTransform".into(), SdbVal::Bool(fr.stiff_transform)),
@@ -2498,6 +2504,32 @@ pub fn save_native_sdb_file(model: &SapModel, path: impl AsRef<Path>) -> Result<
     let sdb = pack_model_to_native_sdb(model)?;
     let bytes = write_sdb_bytes(&sdb)?;
     verified_file::write_new(path.as_ref(), &bytes)
+}
+
+/// An end length offset as the fraction of the object length that the native
+/// record stores. The fraction is chosen so that reading it back, as
+/// `fraction * length`, gives the same offset bit for bit where one of the
+/// three nearest fractions does; the projection check refuses the rest.
+fn offset_fraction(offset: f64, length: f64) -> f64 {
+    if offset == 0.0 || length <= 0.0 {
+        return 0.0;
+    }
+    let fraction = offset / length;
+    // The neighbouring doubles: one step in the bit pattern of a finite,
+    // nonzero value (written out because the project's minimum Rust version
+    // predates `f64::next_up`).
+    let neighbours = if fraction.is_finite() && fraction != 0.0 {
+        [
+            f64::from_bits(fraction.to_bits() + 1),
+            f64::from_bits(fraction.to_bits() - 1),
+        ]
+    } else {
+        [fraction; 2]
+    };
+    [fraction, neighbours[0], neighbours[1]]
+        .into_iter()
+        .find(|candidate| candidate * length == offset)
+        .unwrap_or(fraction)
 }
 
 #[cfg(test)]

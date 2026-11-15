@@ -64,6 +64,7 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_example_1_016());
     rows.extend(verify_frame_auto_subdivision());
     rows.extend(verify_example_1_011());
+    rows.extend(verify_example_1_021());
     rows.extend(verify_example_5_001());
     rows.extend(verify_example_6_003());
     rows.extend(verify_example_6_005());
@@ -1356,6 +1357,71 @@ pub fn verify_example_1_011() -> Vec<BenchmarkVerificationRow> {
         BenchmarkVerificationRow::new("Ex 1-011", "2 (load on frame)", "My (fixed end) [k-in]", 210.0, support[4], 0.001),
         BenchmarkVerificationRow::new("Ex 1-011", "2 (load on frame)", "Mz (fixed end) [k-in]", 60.0, support[5], 0.001),
     ]
+}
+
+/// Example 1-021: eigenvalues of the Bathe and Wilson plane frame, ten 20 ft
+/// bays and nine 10 ft storeys with a fixed base (E = 432000 k/ft2, A = 3 ft2,
+/// I = 1 ft4, mass 3 k-s2/ft per unit length, no shear deformation). The
+/// reference values are the independent ones the problem prints (Peterson
+/// 1981). The numbers are in feet whatever the model's unit label, which no
+/// part of an eigenvalue analysis reads.
+pub fn verify_example_1_021() -> Vec<BenchmarkVerificationRow> {
+    let (bays, storeys) = (10usize, 9usize);
+    let mut model = SapModel::new(Units::KipFtF);
+    model.load_cases.clear();
+    model.active_dofs = [true, false, true, false, true, false];
+    let mut material = Material::default_steel_kip_in();
+    material.name = "BW".into();
+    material.e = 432_000.0;
+    material.unit_weight = 0.0;
+    material.unit_mass = 1.0;
+    model.materials.insert("BW".into(), material);
+    let mut section = make_rectangular("BW", "BW", 1.0, 3.0);
+    section.area = 3.0;
+    section.i33 = 1.0;
+    section.i22 = 1.0;
+    section.torsional_j = 1.0;
+    section.as2 = 0.0;
+    section.as3 = 0.0;
+    model.frame_sections.insert("BW".into(), section);
+    for j in 0..=storeys {
+        for i in 0..=bays {
+            let name = format!("{i}_{j}");
+            model.add_point(name.clone(), 20.0 * i as f64, 0.0, 10.0 * j as f64);
+            if j == 0 {
+                model.points[&name].restraint = [true; 6];
+            }
+        }
+    }
+    for j in 1..=storeys {
+        for i in 0..bays {
+            model.add_frame(format!("B{i}_{j}"), format!("{i}_{j}"), format!("{}_{j}", i + 1), "BW");
+        }
+    }
+    for j in 0..storeys {
+        for i in 0..=bays {
+            model.add_frame(format!("C{i}_{j}"), format!("{i}_{j}"), format!("{i}_{}", j + 1), "BW");
+        }
+    }
+    model
+        .load_cases
+        .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 3));
+    analyze_model(&mut model).expect("Example 1-021 analysis failed");
+    let modes = &model.case_results["MODAL"].modes;
+    [0.589541, 5.52696, 16.5879]
+        .into_iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            BenchmarkVerificationRow::new(
+                "Ex 1-021",
+                "MODAL (Eigen)",
+                &format!("Eigenvalue {} [rad2/s2]", index + 1),
+                reference,
+                modes[index].eigenvalue,
+                0.001,
+            )
+        })
+        .collect()
 }
 
 /// Example 5-001: Solid Element Patch Test (MacNeal & Harder 1985, 7-Element Irregular Unit Cube).

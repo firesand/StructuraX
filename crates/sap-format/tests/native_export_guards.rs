@@ -1368,3 +1368,50 @@ fn design_overwrites_roundtrip_through_s2k_and_block_native_synthesis() {
     }
     assert_rejected_unchanged(&m, "frames.G.steel_overwrite");
 }
+
+/// The native line record holds the end length offsets as fractions of the
+/// object length (vendor Example 1-010: 0.041667 for 6 in on 144 in). The
+/// model holds lengths; they must come back bit for bit.
+#[test]
+fn end_length_offsets_are_written_as_fractions_and_read_back_as_lengths() {
+    let mut m = supported_model();
+    m.add_point("C", 0.0, 0.0, 144.0);
+    m.add_point("D", 37.5, -11.25, 100.5);
+    m.add_frame("COL", "A", "C", "FSEC1");
+    m.add_frame("SKEW", "B", "D", "FSEC1");
+    m.frames["COL"].end_offset_i = 6.0;
+    m.frames["COL"].rigid_zone_factor = 0.5;
+    m.frames["SKEW"].end_offset_i = 20.0;
+    m.frames["SKEW"].end_offset_j = 10.0;
+    m.frames["SKEW"].rigid_zone_factor = 1.0;
+
+    let native = pack_model_to_native_sdb(&m).unwrap();
+    let doc = inspect_native_sdb(&native).unwrap();
+    let stored: Vec<f64> = doc
+        .records()
+        .iter()
+        .filter(|r| r.class_id == "S_LINEOBJECTS" || r.class_id == "TYLINEOBJECT")
+        .flat_map(|r| r.fields.iter())
+        .filter(|f| f.name.as_deref() == Some("m_ai"))
+        .map(|f| {
+            f64::from_le_bytes(
+                native.decompressed_stream[f.offset..f.offset + 8]
+                    .try_into()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    // Frames F (no offset), COL and SKEW, in model order.
+    let skew_length = (25.5f64.powi(2) + 11.25f64.powi(2) + 100.5f64.powi(2)).sqrt();
+    assert_eq!(stored.len(), 3, "{stored:?}");
+    assert_eq!(stored[0], 0.0);
+    assert!((stored[1] - 6.0 / 144.0).abs() < 1e-15, "{}", stored[1]);
+    assert!((stored[2] - 20.0 / skew_length).abs() < 1e-15, "{}", stored[2]);
+
+    let back = extract_sdb_to_model(&native).unwrap();
+    for name in ["F", "COL", "SKEW"] {
+        assert_eq!(back.frames[name].end_offset_i.to_bits(), m.frames[name].end_offset_i.to_bits());
+        assert_eq!(back.frames[name].end_offset_j.to_bits(), m.frames[name].end_offset_j.to_bits());
+        assert_eq!(back.frames[name].rigid_zone_factor, m.frames[name].rigid_zone_factor);
+    }
+}

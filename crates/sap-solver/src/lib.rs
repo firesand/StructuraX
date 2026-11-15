@@ -2,6 +2,7 @@
 //! formulations of `CsiGo2.dll`, `csigo2_a.dll`, and `CSI.SAPFire.dll`.
 
 pub mod area;
+mod auto_seismic;
 pub mod benchmarks;
 pub mod cable;
 mod coordinates;
@@ -10,7 +11,10 @@ pub mod frame;
 mod frame_mesh;
 pub mod linalg;
 mod link;
+mod mass_source;
+mod modal_history;
 mod nonlinear;
+mod ritz_modal;
 pub mod solid;
 mod supported_subset;
 
@@ -34,7 +38,8 @@ use crate::frame::{
     recover_frame_stations, resolve_load_dir_to_local,
 };
 use crate::linalg::{
-    solve_buckling_eigen, solve_modal_eigen, solve_ritz_vectors, LinalgError, SymmetricLdlt,
+    solve_buckling_eigen, solve_modal_eigen, solve_modal_eigen_checked, solve_ritz_vectors,
+    LinalgError, SymmetricLdlt,
 };
 use crate::solid::{
     compute_solid_nodal_loads, compute_solid_stiffness_and_mass, recover_solid_result,
@@ -76,11 +81,14 @@ pub fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
     model.concrete_design_results.clear();
     // Analyze a working copy so coordinate normalization never rewrites assignments.
     let mut working = model.clone();
-    let result =
-        coordinates::normalize_loads(&mut working).and_then(|()| analyze_model_inner(&mut working));
+    let result = sap_model::auto_select::resolve_analysis_sections(&mut working)
+        .map_err(SolverError::UnsupportedInput)
+        .and_then(|()| coordinates::normalize_loads(&mut working))
+        .and_then(|()| analyze_model_inner(&mut working));
     if result.is_ok() {
         model.case_results = working.case_results;
         model.is_locked = working.is_locked;
+        sap_model::auto_select::record_analysis_sections(model);
     }
     if result.is_err() {
         model.case_results.clear();
@@ -94,6 +102,8 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     }
     refuse_unmodeled_source(model)?;
     validate_analysis_inputs(model)?;
+    mass_source::validate(model)?;
+    auto_seismic::validate(model)?;
     let ordered_cases = analysis_case_order(model)?;
 
     // Replace automatically subdivided frame objects by their elements. The
@@ -116,7 +126,7 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     let frame_mesh = frame_mesh::expand(model, &area_mesh_joints)?;
 
     // Expand any auto-meshed AreaObjs (`auto_mesh.0 > 1 || auto_mesh.1 > 1`) into a working point/area list
-    let (work_points, work_areas, orig_area_map) = expand_auto_meshed_areas(model);
+    let (mut work_points, work_areas, orig_area_map) = expand_auto_meshed_areas(model);
 
     let num_pts = work_points.len();
     let ndof = num_pts * 6;
@@ -134,7 +144,7 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
 
     // Assemble base elastic structural stiffness K_struct (without grounded springs or restraints)
     // and lumped diagonal mass vector diag_mass (in joint-local coordinates).
-    let (k_struct, diag_mass) = assemble_elastic_stiffness_and_mass(
+    let (k_struct, mut diag_mass) = assemble_elastic_stiffness_and_mass(
         model,
         &work_points,
         &work_areas,
@@ -142,6 +152,18 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
         &joint_rot,
         ndof,
     )?;
+    mass_source::add_pattern_mass(
+        model,
+        &work_points,
+        &work_areas,
+        &pt_index,
+        &joint_rot,
+        ndof,
+        &mut diag_mass,
+    )?;
+    // Automatic lateral loads use the final mass and join the joint loads of
+    // their patterns, which every case reads from `work_points`.
+    let auto_lateral = auto_seismic::apply(model, &mut work_points, &joint_rot, &diag_mass)?;
 
     // Build K_base = K_struct + grounded springs + multipoint constraints
     let k_base =
@@ -180,8 +202,10 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
                 model,
                 &lc,
                 &work_points,
+                &work_areas,
                 &pt_index,
                 &joint_rot,
+                &k_struct,
                 &k_base,
                 &diag_mass,
                 ndof,
@@ -199,6 +223,19 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
                 ndof,
             )?,
             LoadCaseType::ResponseSpectrum => run_response_spectrum_case(
+                model,
+                &lc,
+                &work_points,
+                &work_areas,
+                &orig_area_map,
+                &pt_index,
+                &joint_rot,
+                &k_struct,
+                &k_base,
+                &diag_mass,
+                ndof,
+            )?,
+            LoadCaseType::LinearHistory if lc.modal_case.is_some() => modal_history::run_case(
                 model,
                 &lc,
                 &work_points,
@@ -236,6 +273,8 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
         };
         model.case_results.insert(case_name, res);
     }
+
+    auto_seismic::attach(model, &auto_lateral);
 
     // Evaluate all LoadCombos
     evaluate_load_combos(model);
@@ -437,6 +476,9 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
         }
     }
     for (name, lc) in model.load_cases.iter().filter(|(_, lc)| lc.run_flag) {
+        // A LinearHistory case that names a modal case superposes its modes
+        // with a constant damping ratio; any other case type is refused.
+        modal_history::validate_case(model, name, lc)?;
         if lc.loads.iter().any(|load| !load.scale_factor.is_finite()) {
             return Err(SolverError::InvalidInput(format!(
                 "case '{name}' has nonfinite load scale"
@@ -704,6 +746,7 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 lc.case_type,
                 LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
             ) && lc.modal_damping != 0.0
+                && lc.modal_case.is_none()
             {
                 return Err(SolverError::UnsupportedInput(format!(
                     "case '{name}' is a modal history type with modal damping ratio {}; modal damping is not implemented for history cases. Set it to zero and use Rayleigh damping, or use a direct-integration case type",
@@ -912,6 +955,14 @@ fn analysis_case_order(model: &SapModel) -> Result<Vec<String>, SolverError> {
         _ => 2,
     });
     for name in &pending {
+        // Modes superposed by a history case must be computed first.
+        if let Some(dep) = &model.load_cases[name].modal_case {
+            if !model.load_cases.get(dep).is_some_and(|lc| lc.run_flag) {
+                return Err(SolverError::InvalidInput(format!(
+                    "case '{name}' requires missing or disabled modal case '{dep}'"
+                )));
+            }
+        }
         if let Some(dep) = &model.load_cases[name].initial_case {
             if !model.load_cases.get(dep).is_some_and(|lc| lc.run_flag) {
                 return Err(SolverError::InvalidInput(format!(
@@ -930,14 +981,18 @@ fn analysis_case_order(model: &SapModel) -> Result<Vec<String>, SolverError> {
     let mut ordered = Vec::with_capacity(pending.len());
     while !pending.is_empty() {
         let ready = pending.iter().position(|name| {
-            model.load_cases[name]
-                .initial_case
+            let case = &model.load_cases[name];
+            case.initial_case
                 .as_ref()
                 .is_none_or(|dep| ordered.contains(dep))
+                && case
+                    .modal_case
+                    .as_ref()
+                    .is_none_or(|dep| ordered.contains(dep))
         });
         let Some(index) = ready else {
             return Err(SolverError::InvalidInput(format!(
-                "cyclic initial-case dependencies: {}",
+                "cyclic initial-case or modal-case dependencies: {}",
                 pending.join(", ")
             )));
         };
@@ -1068,9 +1123,12 @@ fn assemble_elastic_stiffness_and_mass(
     let mut diag_mass = vec![0.0f64; ndof];
 
     // 1. Joint lumped masses
-    for (idx, pt) in work_points.values().enumerate() {
-        for d in 0..6 {
-            diag_mass[6 * idx + d] += pt.mass[d];
+    let source = &model.mass_source;
+    if source.additional_mass {
+        for (idx, pt) in work_points.values().enumerate() {
+            for d in 0..6 {
+                diag_mass[6 * idx + d] += pt.mass[d];
+            }
         }
     }
 
@@ -1126,11 +1184,13 @@ fn assemble_elastic_stiffness_and_mass(
         assemble_12x12_into_global(&mut k_struct, ndof, idx_i, idx_j, &k_loc, &ti, &tj);
 
         // Lumped frame translational mass (50% at I, 50% at J)
-        let p_mid = eval_section_props_at(model, frame, sec, mat, 0.5, length);
-        let m_half = 0.5 * p_mid.mass_per_len * length;
-        for d in 0..3 {
-            diag_mass[6 * idx_i + d] += m_half;
-            diag_mass[6 * idx_j + d] += m_half;
+        if source.element_self_mass {
+            let p_mid = eval_section_props_at(model, frame, sec, mat, 0.5, length);
+            let m_half = 0.5 * p_mid.mass_per_len * length;
+            for d in 0..3 {
+                diag_mass[6 * idx_i + d] += m_half;
+                diag_mass[6 * idx_j + d] += m_half;
+            }
         }
     }
 
@@ -1174,8 +1234,17 @@ fn assemble_elastic_stiffness_and_mass(
         );
 
         let mod_mass = sec.modifiers[8] * area.modifiers[8];
-        let m_node = ((sec.thickness_membrane * mat.unit_mass * mod_mass + area.mass_per_area)
-            * elem_area)
+        let self_mass = if source.element_self_mass {
+            sec.thickness_membrane * mat.unit_mass * mod_mass
+        } else {
+            0.0
+        };
+        let added_mass = if source.additional_mass {
+            area.mass_per_area
+        } else {
+            0.0
+        };
+        let m_node = ((self_mass + added_mass) * elem_area)
             / (n_nodes as f64);
         for &idx in &node_indices {
             for d in 0..3 {
@@ -1189,9 +1258,11 @@ fn assemble_elastic_stiffness_and_mass(
         let prop = &model.link_props[&link.prop];
         let op = link::operator(link, prop, work_points, pt_index, joint_rot);
         link::assemble(&mut k_struct, ndof, &op, link::stiffness(prop));
-        for name in std::iter::once(&link.point_i).chain(link.point_j.iter()) {
-            for d in 0..3 {
-                diag_mass[6 * pt_index[name] + d] += 0.5 * prop.mass;
+        if source.element_self_mass {
+            for name in std::iter::once(&link.point_i).chain(link.point_j.iter()) {
+                for d in 0..3 {
+                    diag_mass[6 * pt_index[name] + d] += 0.5 * prop.mass;
+                }
             }
         }
     }
@@ -1224,9 +1295,11 @@ fn assemble_elastic_stiffness_and_mass(
             &k_solid_glob,
             joint_rot,
         );
-        for (a, &idx) in node_indices.iter().enumerate() {
-            for d in 0..3 {
-                diag_mass[6 * idx + d] += m_solid_diag[3 * a + d];
+        if source.element_self_mass {
+            for (a, &idx) in node_indices.iter().enumerate() {
+                for d in 0..3 {
+                    diag_mass[6 * idx + d] += m_solid_diag[3 * a + d];
+                }
             }
         }
     }
@@ -3308,6 +3381,7 @@ fn solve_static_with_stiffness(
         transient_state: None,
         link_hysteresis,
         displacement_control_factor: None,
+        ..Default::default()
     })
 }
 
@@ -3317,8 +3391,10 @@ fn run_modal_case(
     model: &SapModel,
     lc: &LoadCase,
     work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
     k_base: &[f64],
     diag_mass: &[f64],
     ndof: usize,
@@ -3368,9 +3444,49 @@ fn run_modal_case(
         }
     }
 
-    let ldlt = SymmetricLdlt::factorize(&k_mod, ndof)?;
-    let raw_modes = if lc.modal_sub_type == ModalSubType::Ritz {
-        // Build 3 unit-acceleration starting load vectors (UX, UY, UZ) + any explicit loads in lc.loads
+    // Constraint penalties sit on the diagonal of `k_base` but not of
+    // `k_struct`; as in the static path, the singularity test must not be
+    // relative to them, or a constrained model is reported as unstable.
+    let structural_diagonal: Vec<f64> = (0..ndof).map(|i| k_struct[i * ndof + i]).collect();
+    let ldlt = SymmetricLdlt::factorize_with_reference(&k_mod, ndof, Some(&structural_diagonal))?;
+    // Participation is reported for each starting load of a Ritz case and, for
+    // every other modal case, for the three unit accelerations UX, UY, UZ.
+    let mut participation_loads: Vec<(String, bool, Vec<f64>)> = Vec::new();
+    let mut generated: Vec<usize> = Vec::new();
+    if lc.modal_sub_type == ModalSubType::Eigen && !lc.ritz_controls.is_empty() {
+        return Err(SolverError::UnsupportedInput(format!(
+            "modal case '{}' is an Eigen case and cannot carry Ritz generation controls",
+            lc.name
+        )));
+    }
+    let raw_modes = if ritz_modal::uses_starting_loads(lc) {
+        let pattern_force = |name: &str, scale: f64| -> Result<Vec<f64>, SolverError> {
+            let loads = assemble_static_loads(
+                model,
+                &[(name.to_string(), scale)],
+                work_points,
+                work_areas,
+                pt_index,
+                joint_rot,
+                &IndexMap::new(),
+                ndof,
+            )?;
+            Ok((0..ndof)
+                .map(|i| loads.f_ext_joint[i] - loads.f_fef_joint[i])
+                .collect())
+        };
+        let starting =
+            ritz_modal::build_starting_loads(model, lc, &m_mod, &is_fixed, joint_rot, &pattern_force)?;
+        let ritz =
+            ritz_modal::generate_ritz_modes(&k_mod, &ldlt, &m_mod, &is_fixed, &starting, lc.max_modes)?;
+        generated = ritz.generated;
+        participation_loads = starting
+            .into_iter()
+            .map(|l| (l.name, l.is_acceleration, l.p))
+            .collect();
+        ritz.modes
+    } else if lc.modal_sub_type == ModalSubType::Ritz {
+        // No starting loads listed: the legacy start from unit UX, UY, UZ accelerations.
         let mut starting_loads = Vec::new();
         for dir in 0..3 {
             let mut f_acc = vec![0.0; ndof];
@@ -3388,8 +3504,31 @@ fn run_modal_case(
         }
         solve_ritz_vectors(&ldlt, &m_mod, &starting_loads, lc.max_modes)?
     } else {
-        solve_modal_eigen(&ldlt, &m_mod, lc.max_modes)?
+        if !lc.loads.is_empty() {
+            return Err(SolverError::UnsupportedInput(format!(
+                "modal case '{}' is an Eigen case and cannot carry starting load vectors; select Ritz",
+                lc.name
+            )));
+        }
+        solve_modal_eigen_checked(&k_mod, &ldlt, &m_mod, lc.max_modes)?
     };
+    if participation_loads.is_empty() {
+        for (label, dir) in sap_model::ritz::ACCELERATION_LOADS {
+            participation_loads.push((
+                label.to_string(),
+                true,
+                ritz_modal::acceleration_load(&m_mod, joint_rot, dir, 1.0),
+            ));
+        }
+    }
+    let load_participation = ritz_modal::load_participation(
+        &ldlt,
+        &m_mod,
+        &is_fixed,
+        &raw_modes,
+        &participation_loads,
+        &generated,
+    )?;
 
     // Total unrestrained mass along global X, Y, Z for modal mass ratio calculation
     let mut total_mass = [0.0f64; 6];
@@ -3443,6 +3582,7 @@ fn run_modal_case(
         case_name: lc.name.clone(),
         joint_displacements: first_disp,
         modes,
+        load_participation,
         ..Default::default()
     })
 }
@@ -3583,8 +3723,10 @@ fn run_response_spectrum_case(
                 model,
                 &temp_modal,
                 work_points,
+                work_areas,
                 pt_index,
                 joint_rot,
+                k_struct,
                 k_base,
                 diag_mass,
                 ndof,

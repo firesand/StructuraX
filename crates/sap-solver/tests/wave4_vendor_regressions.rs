@@ -1212,3 +1212,77 @@ fn vendor_sdb_per_end_assignment_records_are_written_byte_for_byte() {
         assert_eq!(synthesized, original, "{fname} {class}");
     }
 }
+
+/// End length offsets are stored in the native file as fractions of the
+/// object length. Example 1-010 publishes the tip deflection of a cantilever
+/// with a 6 in offset that is 0 %, 50 % and 100 % rigid (independent hand
+/// calculation, equal to SAP2000 to the five digits printed).
+#[test]
+fn vendor_sdb_example_1_010_end_offsets_match_the_published_deflections() {
+    let dir = vendor_dir();
+    for (fname, expected) in [
+        ("example_1_010a.sdb", -0.39951),
+        ("example_1_010b.sdb", -0.39951),
+        ("example_1_010c.sdb", -0.37523),
+        ("example_1_010d.sdb", -0.35197),
+    ] {
+        let path = dir.join(fname);
+        assert!(path.exists(), "missing vendor file {fname}");
+        let mut model = load_sdb_file(&path).expect(fname);
+        if fname != "example_1_010a.sdb" {
+            let frame = model.frames.values().next().expect("one frame");
+            assert!(
+                (frame.end_offset_i - 6.0).abs() < 1e-5 && frame.end_offset_j == 0.0,
+                "{fname}: offsets {} {}",
+                frame.end_offset_i,
+                frame.end_offset_j
+            );
+        }
+        analyze_model(&mut model).expect(fname);
+        let results = model
+            .load_cases
+            .values()
+            .find(|c| c.case_type == LoadCaseType::LinearStatic)
+            .and_then(|c| model.case_results.get(&c.name))
+            .expect("a linear static case");
+        let tip = results
+            .joint_displacements
+            .values()
+            .map(|u| u[2])
+            .fold(0.0f64, f64::min);
+        assert!((tip - expected).abs() < 6e-6, "{fname}: Uz = {tip}, published {expected}");
+    }
+}
+
+/// Examples 6-006 and 6-007 (three-storey frame with dampers, end offsets
+/// with a rigid zone factor of 0.6, a diaphragm per floor): the Ritz case of
+/// the file against the modal periods SAP2000 publishes, 0.438, 0.135 and
+/// 0.074 s. Measured on 2026-11-15: 0.4309, 0.1303 and 0.0745 s, that is
+/// -1.6 %, -3.5 % and +0.6 %. The residual is not explained; the tolerance
+/// below bounds it and is not a claim of agreement. With the offsets read as
+/// lengths instead of fractions of the member length, as before that date,
+/// the periods were 0.554, 0.169 and 0.098 s.
+#[test]
+fn vendor_sdb_example_6_006_modal_periods_with_end_offsets_and_diaphragms() {
+    let dir = vendor_dir();
+    for fname in ["example_6_006.sdb", "example_6_007.sdb"] {
+        let path = dir.join(fname);
+        assert!(path.exists(), "missing vendor file {fname}");
+        let mut model = load_sdb_file(&path).expect(fname);
+        let column = &model.frames["1"];
+        assert!((column.end_offset_i - 20.0).abs() < 1e-4 && (column.end_offset_j - 10.0).abs() < 1e-4);
+        for case in model.load_cases.values_mut() {
+            case.run_flag = case.case_type == LoadCaseType::Modal;
+        }
+        analyze_model(&mut model).expect(fname);
+        let modes = &model.case_results["MODAL"].modes;
+        for (mode, expected) in modes.iter().zip([0.438, 0.135, 0.074]) {
+            assert!(
+                (mode.period_sec - expected).abs() < 0.04 * expected,
+                "{fname}: mode {} period {}, published {expected}",
+                mode.mode_num,
+                mode.period_sec
+            );
+        }
+    }
+}

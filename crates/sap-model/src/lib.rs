@@ -1,4 +1,9 @@
+pub mod auto_select;
 pub mod editing;
+pub mod generate;
+pub mod radial;
+pub mod ritz;
+pub mod seismic;
 pub mod templates;
 pub use editing::{EditError, EditSummary};
 
@@ -732,6 +737,10 @@ pub struct FrameObj {
     /// Steel frame design overwrites; `None` uses the program defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub steel_overwrite: Option<SteelDesignOverwrite>,
+    /// Set when `section` names an Auto Select list: the member of the list
+    /// chosen by design and the one the last analysis used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_select: Option<auto_select::AutoSelectState>,
 }
 
 /// Concrete frame design framing type, as in the SAP2000 concrete design
@@ -820,6 +829,7 @@ impl FrameObj {
             auto_mesh_at_joints: false,
             concrete_framing: ConcreteFramingType::default(),
             steel_overwrite: None,
+            auto_select: None,
         }
     }
 }
@@ -1010,6 +1020,15 @@ pub struct LoadCase {
     /// Nonlinear-static load application control. `None` is full-load control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displacement_control: Option<DisplacementControl>,
+    /// Ritz modal cases: per starting load, the number of generation cycles
+    /// and the target dynamic participation. A load of `loads` without an
+    /// entry has no cycle limit and no target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ritz_controls: Vec<ritz::RitzLoadControl>,
+    /// Linear history cases: the Modal case whose modes are superposed.
+    /// `None` integrates the full equations directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_case: Option<String>,
 }
 
 /// Displacement-controlled nonlinear static load application (CSI Analysis
@@ -1061,6 +1080,8 @@ impl LoadCase {
             num_buckling_modes: 6,
             run_flag: true,
             displacement_control: None,
+            ritz_controls: Vec::new(),
+            modal_case: None,
         }
     }
 
@@ -1090,6 +1111,8 @@ impl LoadCase {
             num_buckling_modes: 6,
             run_flag: true,
             displacement_control: None,
+            ritz_controls: Vec::new(),
+            modal_case: None,
         }
     }
 }
@@ -1273,6 +1296,16 @@ pub struct CaseResults {
     /// Load factor reached by a displacement-controlled nonlinear static case.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub displacement_control_factor: Option<f64>,
+    /// Modal cases: static and dynamic participation of each starting load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_participation: Vec<ritz::LoadParticipation>,
+    /// What each automatic lateral load pattern applied in this case computed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_lateral: Vec<seismic::AutoSeismicReport>,
+    /// History cases: joint accelerations relative to the ground at each
+    /// output step, `joint_name -> Vec<[U1, U2, U3, R1, R2, R3]>`.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub time_history_accel: IndexMap<String, Vec<[f64; 6]>>,
 }
 
 /// One piece of imported source data that the importer recognized, could not
@@ -1475,6 +1508,16 @@ pub struct SapModel {
     pub case_results: IndexMap<String, CaseResults>,
     pub steel_design_results: IndexMap<String, SteelDesignResult>,
     pub concrete_design_results: IndexMap<String, ConcreteDesignResult>,
+
+    /// Where the mass of the model comes from.
+    #[serde(default, skip_serializing_if = "seismic::MassSource::is_default")]
+    pub mass_source: seismic::MassSource,
+    /// Automatic seismic load definitions, keyed by load pattern name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub auto_seismic: IndexMap<String, seismic::AutoSeismicAsce710>,
+    /// Steel frame design preferences.
+    #[serde(default, skip_serializing_if = "auto_select::SteelDesignPreferences::is_default")]
+    pub steel_design_prefs: auto_select::SteelDesignPreferences,
 }
 
 impl Default for SapModel {
@@ -1587,6 +1630,9 @@ impl SapModel {
             case_results: IndexMap::new(),
             steel_design_results: IndexMap::new(),
             concrete_design_results: IndexMap::new(),
+            mass_source: seismic::MassSource::default(),
+            auto_seismic: IndexMap::new(),
+            steel_design_prefs: auto_select::SteelDesignPreferences::default(),
         }
     }
 
@@ -1642,6 +1688,8 @@ impl SapModel {
         let f_mass = src.mass_factor_to(target_units);
         let f_temp = src.temp_delta_factor_to(target_units);
         let f_alpha = src.thermal_expansion_factor_to(target_units);
+
+        seismic::scale_units(self, src, target_units);
 
         for cs in self.coord_systems.values_mut() {
             for c in &mut cs.origin {

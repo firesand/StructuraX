@@ -838,12 +838,11 @@ fn v20_ebook_building_weight_matches_the_printed_base_shear() {
 /// Slow: about 12 s in a release build, minutes in a debug build. The
 /// document's own mesh (6 x 6 per bay, 1821 joints) is beyond the dense solver.
 #[test]
-#[ignore = "slow dense modal analysis of a 261-joint building"]
 fn v20_ebook_building_periods_approach_the_printed_values_on_a_coarser_mesh() {
     // Printed by SAP2000 on a 6 x 6 mesh: T1 = T2 = 1.165482 s (the two
     // translations), T3 = 1.062094 s (torsion), and 99.4 % of the mass in 12
     // modes. A 2 x 2 mesh is stiffer: measured here, T1 is about 7 % short
-    // (1 x 1 is 35 % short and 3 x 3 is 3.8 % short).
+    // (1 x 1 is 35 % short, 3 x 3 is 3.8 % and 4 x 4 is 2.5 % short).
     let (mut model, _) = ebook_building(2);
     analyze_model(&mut model).unwrap();
     let modes = &model.case_results["MODAL"].modes;
@@ -1039,5 +1038,30 @@ fn vendor_aci_318_14_example_001_flexural_steel_matches_for_every_framing_type()
         let phi_vc = 0.75 * 2.0 * 4000.0f64.sqrt() / 1000.0 * 10.0 * 13.5;
         close("stirrups at the support", design.av_over_s, (48.68 - phi_vc) / (0.75 * 60.0 * 13.5), 1e-4);
         close("stirrups at d from the support, by the same formula", (37.73 - phi_vc) / (0.75 * 60.0 * 13.5), 0.041, 5e-4);
+    }
+}
+
+#[test]
+#[ignore = "1821 joints: seconds in a release build, minutes in a debug build"]
+fn v20_ebook_building_periods_on_the_documents_own_mesh() {
+    // The document's 6 x 6 slab mesh per bay (1821 joints, 5415 mass degrees
+    // of freedom), which goes through subspace iteration. Printed by SAP2000:
+    // T1 = T2 = 1.165482 s, T3 = 1.062094 s, 99.405 % of the mass in 12 modes.
+    // Measured here on 2026-11-15: 1.145161, 1.144167 and 1.039122 s, 99.420 %.
+    // The mass is entered by hand in this model and the slab elements differ
+    // from the vendor's, so the comparison is a bound, not an identity.
+    let (mut model, _) = ebook_building(6);
+    assert_eq!(model.points.len(), 1821);
+    analyze_model(&mut model).unwrap();
+    let modes = &model.case_results["MODAL"].modes;
+    assert_eq!(modes.len(), 12);
+    let (t1, t2, t3) = (modes[0].period_sec, modes[1].period_sec, modes[2].period_sec);
+    close("the two translational periods are equal", t1, t2, 2e-3 * t1);
+    close("T1 against the printed value", t1, 1.165482, 0.025 * 1.165482);
+    close("T3 against the printed value", t3, 1.062094, 0.03 * 1.062094);
+    assert!(t1 < 1.165482 && t3 < 1.062094, "the displacement-based mesh is stiffer");
+    for direction in 0..2 {
+        let mass: f64 = modes.iter().map(|mode| mode.modal_mass_ratios[direction]).sum();
+        close("modal mass in 12 modes", mass, 0.99405, 0.002);
     }
 }

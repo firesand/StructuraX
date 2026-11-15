@@ -2151,8 +2151,20 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             }
         }
         fr.angle_deg = l.get("m_ang").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        fr.end_offset_i = l.get("m_ai").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        fr.end_offset_j = l.get("m_aj").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // The native record holds the end length offsets as fractions of the
+        // object length (Example 1-010: 0.041667 for a 6 in offset on a 144 in
+        // beam; Example 6-006: 0.199005 for 20 cm on 100.5 cm). The model
+        // holds lengths.
+        let object_length = match (model.points.get(&fr.point_i), model.points.get(&fr.point_j)) {
+            (Some(i), Some(j)) => {
+                ((j.x - i.x).powi(2) + (j.y - i.y).powi(2) + (j.z - i.z).powi(2)).sqrt()
+            }
+            _ => 0.0,
+        };
+        fr.end_offset_i =
+            l.get("m_ai").and_then(|v| v.as_f64()).unwrap_or(0.0) * object_length;
+        fr.end_offset_j =
+            l.get("m_aj").and_then(|v| v.as_f64()).unwrap_or(0.0) * object_length;
         fr.rigid_zone_factor = l.get("m_RZ").and_then(|v| v.as_f64()).unwrap_or(0.0);
         fr.cardinal_point = l
             .get("m_CardinalPoint")

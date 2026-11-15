@@ -4,6 +4,11 @@
 //! member diagram inspector, Database Tables viewer, and Verification Benchmark Suite runner.
 
 mod analysis;
+mod build;
+mod modal_tables;
+mod seismic;
+mod steel_design;
+mod time_history;
 mod workflows;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
@@ -248,6 +253,11 @@ pub struct SapGuiApp {
 
     workflows: workflows::Workflows,
     analysis_editor: analysis::AnalysisEditor,
+    panel_build: build::State,
+    panel_modal_tables: modal_tables::State,
+    panel_seismic: seismic::State,
+    panel_steel_design: steel_design::State,
+    panel_time_history: time_history::State,
 
     // Verification suite cache
     pub verification_rows: Vec<BenchmarkVerificationRow>,
@@ -414,6 +424,11 @@ impl SapGuiApp {
             custom_sec_rebar_area: 4.0,
             workflows: workflows::Workflows::default(),
             analysis_editor: analysis::AnalysisEditor::default(),
+            panel_build: build::State::default(),
+            panel_modal_tables: modal_tables::State::default(),
+            panel_seismic: seismic::State::default(),
+            panel_steel_design: steel_design::State::default(),
+            panel_time_history: time_history::State::default(),
             verification_rows: Vec::new(),
         };
         if app.model.present_units != Units::KipInF {
@@ -477,6 +492,11 @@ impl SapGuiApp {
                 .scale_for_units(Units::KipInF, new_u, &self.model);
         }
         self.analysis_editor = analysis::AnalysisEditor::default();
+        self.panel_build = build::State::default();
+        self.panel_modal_tables = modal_tables::State::default();
+        self.panel_seismic = seismic::State::default();
+        self.panel_steel_design = steel_design::State::default();
+        self.panel_time_history = time_history::State::default();
         self.import_warnings = import_warnings;
         self.export_warnings.clear();
         self.draw_first_point = None;
@@ -762,6 +782,13 @@ impl SapGuiApp {
                     self.open_workflow(0);
                     ui.close_menu();
                 }
+                if ui
+                    .button("Grid, Quick Draw, Radial, Extrude, Select by Property...")
+                    .clicked()
+                {
+                    self.panel_build.open = true;
+                    ui.close_menu();
+                }
                 if ui.button("Select All Objects").clicked() {
                     for p in self.model.points.values_mut() {
                         p.selected = true;
@@ -882,6 +909,14 @@ impl SapGuiApp {
                     self.show_section_modal = true;
                     ui.close_menu();
                 }
+                if ui.button("Mass Source and Auto Seismic Loads...").clicked() {
+                    self.panel_seismic.open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Functions from File and Plot Functions...").clicked() {
+                    self.panel_time_history.open = true;
+                    ui.close_menu();
+                }
                 if ui.button("Database Tables Explorer... (Ctrl+T)").clicked() {
                     self.show_tables_modal = true;
                     ui.close_menu();
@@ -965,6 +1000,14 @@ impl SapGuiApp {
             });
 
             ui.menu_button("Display", |ui| {
+                if ui.button("Modal Periods and Participation Tables...").clicked() {
+                    self.panel_modal_tables.open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Show Plot Functions...").clicked() {
+                    self.panel_time_history.open = true;
+                    ui.close_menu();
+                }
                 if ui.button("Show Undeformed Shape (F4)").clicked() {
                     self.display_mode = DisplayMode::Undeformed;
                     self.animate_deformed = false;
@@ -1034,6 +1077,14 @@ impl SapGuiApp {
             });
 
             ui.menu_button("Design", |ui| {
+                if ui
+                    .button("Steel Auto Select, Preferences, Design Combos, Verify...")
+                    .clicked()
+                {
+                    self.panel_steel_design.open = true;
+                    ui.close_menu();
+                }
+                ui.separator();
                 for code in ["AISC 360-10", "AISC 360-10 ASD", "Eurocode 3-2005"] {
                     if ui
                         .button(format!("▶ Start Steel Frame Design ({code})"))
@@ -4142,6 +4193,26 @@ impl SapGuiApp {
         }
         self.render_workflows(ctx);
         self.render_analysis_editor(ctx);
+        self.render_panels(ctx);
+    }
+
+    /// Windows of the panel modules. A panel returns the outcome of a command
+    /// the user ran in it; a panel that changes the model definition refuses
+    /// while the model is locked, so no result can outlive its model.
+    fn render_panels(&mut self, ctx: &egui::Context) {
+        let outcomes = [
+            build::render(ctx, &mut self.panel_build, &mut self.model),
+            seismic::render(ctx, &mut self.panel_seismic, &mut self.model),
+            steel_design::render(ctx, &mut self.panel_steel_design, &mut self.model),
+            time_history::render(ctx, &mut self.panel_time_history, &mut self.model),
+            modal_tables::render(ctx, &mut self.panel_modal_tables, &mut self.model),
+        ];
+        for outcome in outcomes.into_iter().flatten() {
+            self.status_msg = match outcome {
+                Ok(message) => message,
+                Err(error) => format!("Not done: {error}"),
+            };
+        }
     }
 
     pub(crate) fn render_ui(&mut self, ctx: &egui::Context) {
@@ -4624,6 +4695,59 @@ mod tests {
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             app.render_ui(ctx);
         });
+    }
+
+    #[test]
+    fn the_five_panel_windows_render_inside_the_application_before_and_after_analysis() {
+        let mut app = blank_app();
+        app.model.generate_beam(2, 120.0, true, "FSEC1");
+        let titles = |out: &egui::FullOutput| -> Vec<String> {
+            out.shapes
+                .iter()
+                .filter_map(|shape| match &shape.shape {
+                    egui::epaint::Shape::Text(text) => Some(text.galley.job.text.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let input = |time| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1800., 1400.))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let closed = ctx.run(input(0.0), |ctx| app.render_ui(ctx));
+        let before = titles(&closed).len();
+
+        app.panel_build.open = true;
+        app.panel_modal_tables.open = true;
+        app.panel_seismic.open = true;
+        app.panel_steel_design.open = true;
+        app.panel_time_history.open = true;
+        let _ = ctx.run(input(1.0), |ctx| app.render_ui(ctx));
+        let open = ctx.run(input(2.0), |ctx| app.render_ui(ctx));
+        assert!(
+            titles(&open).len() > before + 5,
+            "the open panels must draw their own content"
+        );
+
+        // With results in the model the panels that read them still render.
+        app.execute_analysis();
+        assert!(app.model.is_locked, "{}", app.status_msg);
+        let _ = ctx.run(input(3.0), |ctx| app.render_ui(ctx));
+        let locked = ctx.run(input(4.0), |ctx| app.render_ui(ctx));
+        assert!(titles(&locked).len() > before + 5);
+        assert!(app.model.is_locked, "rendering must not unlock or edit the model");
+
+        // Loading another model closes the panels.
+        app.replace_model(SapModel::new(Units::KipInF), "x".into(), Vec::new());
+        assert!(
+            !(app.panel_build.open
+                || app.panel_modal_tables.open
+                || app.panel_seismic.open
+                || app.panel_steel_design.open
+                || app.panel_time_history.open)
+        );
     }
 
     #[test]

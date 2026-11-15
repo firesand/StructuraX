@@ -18,7 +18,10 @@ The model is not changed. The solver expands a working copy before assembly and
 folds every result back afterwards, so results are reported for the object and
 only for joints the model defines: joint displacements, reactions, mode shapes,
 history traces, the stored transient state and frame forces of every case and
-combination. This follows the vendor's statement in Example 1-006 that results
+combination. (One later addition is an exception: the report of an
+automatic seismic load lists the force on every joint that has mass,
+including the joints created here; see
+[tutorial-video-wave1.md](tutorial-video-wave1.md).) This follows the vendor's statement in Example 1-006 that results
 "are combined and reported for the entire frame object, not the subdivided
 elements".
 

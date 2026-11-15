@@ -52,6 +52,10 @@ pub enum DesignError {
         m3: String,
         t: String,
     },
+    /// A refusal of the steel design workflow (Auto Select lists, default
+    /// design combinations, verification); the text names the offending item.
+    #[error("steel design workflow: {0}")]
+    Workflow(String),
     #[error("{discipline} design found nonfinite {component} demand/station data on member '{frame}' ({value})")]
     NonFiniteDemand {
         discipline: &'static str,

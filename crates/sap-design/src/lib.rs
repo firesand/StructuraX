@@ -1,4 +1,6 @@
+pub mod auto_select;
 pub mod concrete;
+pub mod default_combos;
 mod error;
 pub mod shear;
 pub use shear::{
@@ -7,6 +9,10 @@ pub use shear::{
 };
 pub mod steel;
 
+pub use auto_select::{verify_all_members_passed, verify_analysis_vs_design};
+pub use default_combos::{
+    add_default_design_combos, DefaultComboOptions, DefaultComboSummary, DesignMethod,
+};
 pub use error::DesignError;
 
 pub use concrete::{

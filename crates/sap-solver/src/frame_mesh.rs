@@ -439,6 +439,7 @@ pub(crate) fn collapse(results: &mut IndexMap<String, CaseResults>, mesh: &Frame
         case.joint_displacements.retain(|joint, _| !internal.contains(joint));
         case.joint_reactions.retain(|joint, _| !internal.contains(joint));
         case.time_history_disp.retain(|joint, _| !internal.contains(joint));
+        case.time_history_accel.retain(|joint, _| !internal.contains(joint));
         for mode in &mut case.modes {
             mode.mode_shape.retain(|joint, _| !internal.contains(joint));
         }

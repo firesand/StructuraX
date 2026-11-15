@@ -1521,6 +1521,14 @@ pub(super) fn parse_s2k_internal(
                             }
                         };
                     }
+                    let auto_design = get_str(&row, "AutoSelDesign");
+                    let auto_analysis = get_str(&row, "AutoSelAnalysis");
+                    if auto_design.is_some() || auto_analysis.is_some() {
+                        fr.auto_select = Some(sap_model::auto_select::AutoSelectState {
+                            design: auto_design.unwrap_or("").to_string(),
+                            analysis: auto_analysis.map(str::to_owned),
+                        });
+                    }
                     if get_bool(&row, "SteelOverwrite") == Some(true) {
                         fr.steel_overwrite = Some(sap_model::SteelDesignOverwrite {
                             l_ratio_major: get_f64(&row, "SteelL33"),
@@ -2281,8 +2289,116 @@ pub(super) fn parse_s2k_internal(
                             conjugate: get_bool(&row, "RustDisplConjugate").unwrap_or(false),
                         });
                     }
+                    if let Some(modal) = get_str(&row, "RustModalCase") {
+                        lc.modal_case = Some(modal.to_string());
+                    }
                     model.load_cases.insert(name.to_string(), lc);
                 }
+            }
+            "RUST CASE - MODAL RITZ CONTROLS" => {
+                let (Some(case), Some(load)) = (get_str(&row, "Case"), get_str(&row, "LoadName"))
+                else {
+                    return Err(FormatError::ParseS2k(
+                        "RUST CASE - MODAL RITZ CONTROLS row needs Case and LoadName".into(),
+                    ));
+                };
+                let max_cycles = get_i32(&row, "MaxCycles").unwrap_or(0);
+                let target = get_f64(&row, "TargetPar").unwrap_or(0.0);
+                if max_cycles < 0 || !target.is_finite() {
+                    return Err(FormatError::ParseS2k(format!(
+                        "RUST CASE - MODAL RITZ CONTROLS row of case '{case}' has an invalid MaxCycles or TargetPar"
+                    )));
+                }
+                let Some(lc) = model.load_cases.get_mut(case) else {
+                    return Err(FormatError::ParseS2k(format!(
+                        "RUST CASE - MODAL RITZ CONTROLS names unknown case '{case}'"
+                    )));
+                };
+                lc.ritz_controls.push(sap_model::ritz::RitzLoadControl {
+                    load_name: load.to_string(),
+                    max_cycles: max_cycles as usize,
+                    target_dynamic_participation: target,
+                });
+            }
+            "RUST MASS SOURCE" => {
+                let item = get_str(&row, "Item").unwrap_or("").to_ascii_uppercase();
+                match item.as_str() {
+                    "OPTIONS" => {
+                        let (Some(elements), Some(masses)) =
+                            (get_bool(&row, "Elements"), get_bool(&row, "Masses"))
+                        else {
+                            return Err(FormatError::ParseS2k(
+                                "RUST MASS SOURCE Options row needs Elements and Masses".into(),
+                            ));
+                        };
+                        model.mass_source.element_self_mass = elements;
+                        model.mass_source.additional_mass = masses;
+                    }
+                    "PATTERN" => {
+                        let (Some(pattern), Some(multiplier)) =
+                            (get_str(&row, "LoadPat"), get_f64(&row, "Multiplier"))
+                        else {
+                            return Err(FormatError::ParseS2k(
+                                "RUST MASS SOURCE Pattern row needs LoadPat and Multiplier".into(),
+                            ));
+                        };
+                        model
+                            .mass_source
+                            .load_patterns
+                            .push((pattern.to_string(), multiplier));
+                    }
+                    _ => {
+                        return Err(FormatError::ParseS2k(
+                            "RUST MASS SOURCE row: Item must be Options or Pattern".into(),
+                        ))
+                    }
+                }
+            }
+            "RUST AUTO SEISMIC - ASCE 7-10" => {
+                use sap_model::seismic::{AutoSeismicAsce710, SeismicDirection, SeismicPeriod};
+                let bad = |what: &str| {
+                    FormatError::ParseS2k(format!("RUST AUTO SEISMIC - ASCE 7-10 row: {what}"))
+                };
+                let pattern = get_str(&row, "LoadPat").ok_or_else(|| bad("LoadPat is missing"))?;
+                let need = |key: &str| get_f64(&row, key).ok_or_else(|| bad(&format!("{key} is missing or not a number")));
+                let direction = match get_str(&row, "Dir").unwrap_or("").to_ascii_uppercase().as_str() {
+                    "X" => SeismicDirection::X,
+                    "Y" => SeismicDirection::Y,
+                    _ => return Err(bad("Dir must be X or Y")),
+                };
+                let period = match get_str(&row, "PeriodType").unwrap_or("").to_ascii_uppercase().as_str() {
+                    "APPROXIMATE" => SeismicPeriod::Approximate { ct: need("Ct")?, x: need("Exponent")? },
+                    "USER" => SeismicPeriod::User { t: need("UserT")? },
+                    "PROGRAMCALC" => SeismicPeriod::ProgramCalculated,
+                    _ => return Err(bad("PeriodType must be Approximate, User or ProgramCalc")),
+                };
+                model.auto_seismic.insert(
+                    pattern.to_string(),
+                    AutoSeismicAsce710 {
+                        direction,
+                        eccentricity_ratio: need("EccRatio")?,
+                        period,
+                        r: need("R")?,
+                        omega0: need("Omega")?,
+                        cd: need("Cd")?,
+                        ie: need("I")?,
+                        ss: need("Ss")?,
+                        s1: need("S1")?,
+                        tl: need("TL")?,
+                        fa: get_f64(&row, "Fa"),
+                        fv: get_f64(&row, "Fv"),
+                        z_min: get_f64(&row, "MinZ"),
+                        z_max: get_f64(&row, "MaxZ"),
+                    },
+                );
+            }
+            "RUST STEEL DESIGN PREFERENCES" => {
+                let Some(limit) = get_f64(&row, "DCLimit") else {
+                    return Err(FormatError::ParseS2k(
+                        "RUST STEEL DESIGN PREFERENCES row needs DCLimit".into(),
+                    ));
+                };
+                model.steel_design_prefs.dc_ratio_limit = limit;
             }
             "CASE - STATIC 1 - LOAD ASSIGNMENTS" => {
                 if let (Some(cname), Some(lname)) =
@@ -3234,6 +3350,13 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                     out.push_str("   SteelSway=Yes");
                 }
             }
+            // Auto Select list state (reconstruction extension columns).
+            if let Some(state) = &f.auto_select {
+                out.push_str(&format!("   AutoSelDesign={}", format_val(&state.design)));
+                if let Some(analysis) = &state.analysis {
+                    out.push_str(&format!("   AutoSelAnalysis={}", format_val(analysis)));
+                }
+            }
             out.push('\n');
         }
         out.push('\n');
@@ -3933,6 +4056,12 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             lc.num_buckling_modes,
             control,
         ));
+        // Mode superposition is a reconstruction extension of this table.
+        if let Some(modal) = &lc.modal_case {
+            let end = out.trim_end_matches('\n').len();
+            out.truncate(end);
+            out.push_str(&format!("   RustModalCase={}\n", format_val(modal)));
+        }
     }
     out.push('\n');
 
@@ -4066,6 +4195,91 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             ));
         }
         out.push('\n');
+    }
+
+    // Reconstruction extensions written only where they differ from the
+    // defaults: Ritz generation controls, the mass source, automatic seismic
+    // loads and the steel design preferences.
+    if model.load_cases.values().any(|lc| !lc.ritz_controls.is_empty()) {
+        out.push_str("TABLE:  \"RUST CASE - MODAL RITZ CONTROLS\"\n");
+        for lc in model.load_cases.values() {
+            for control in &lc.ritz_controls {
+                out.push_str(&format!(
+                    "   Case={}   LoadName={}   MaxCycles={}   TargetPar={}\n",
+                    format_val(&lc.name),
+                    format_val(&control.load_name),
+                    control.max_cycles,
+                    control.target_dynamic_participation,
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if !model.mass_source.is_default() {
+        out.push_str("TABLE:  \"RUST MASS SOURCE\"\n");
+        out.push_str(&format!(
+            "   Item=Options   Elements={}   Masses={}\n",
+            format_bool(model.mass_source.element_self_mass),
+            format_bool(model.mass_source.additional_mass),
+        ));
+        for (pattern, multiplier) in &model.mass_source.load_patterns {
+            out.push_str(&format!(
+                "   Item=Pattern   LoadPat={}   Multiplier={}\n",
+                format_val(pattern),
+                multiplier,
+            ));
+        }
+        out.push('\n');
+    }
+    if !model.auto_seismic.is_empty() {
+        use sap_model::seismic::{SeismicDirection, SeismicPeriod};
+        out.push_str("TABLE:  \"RUST AUTO SEISMIC - ASCE 7-10\"\n");
+        for (pattern, def) in &model.auto_seismic {
+            let direction = match def.direction {
+                SeismicDirection::X => "X",
+                SeismicDirection::Y => "Y",
+            };
+            let period = match def.period {
+                SeismicPeriod::Approximate { ct, x } => {
+                    format!("PeriodType=Approximate   Ct={ct}   Exponent={x}")
+                }
+                SeismicPeriod::User { t } => format!("PeriodType=User   UserT={t}"),
+                SeismicPeriod::ProgramCalculated => "PeriodType=ProgramCalc".to_string(),
+            };
+            out.push_str(&format!(
+                "   LoadPat={}   Dir={}   EccRatio={}   {}   R={}   Omega={}   Cd={}   I={}   Ss={}   S1={}   TL={}",
+                format_val(pattern),
+                direction,
+                def.eccentricity_ratio,
+                period,
+                def.r,
+                def.omega0,
+                def.cd,
+                def.ie,
+                def.ss,
+                def.s1,
+                def.tl,
+            ));
+            for (column, value) in [
+                ("Fa", def.fa),
+                ("Fv", def.fv),
+                ("MinZ", def.z_min),
+                ("MaxZ", def.z_max),
+            ] {
+                if let Some(value) = value {
+                    out.push_str(&format!("   {column}={value}"));
+                }
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if !model.steel_design_prefs.is_default() {
+        out.push_str("TABLE:  \"RUST STEEL DESIGN PREFERENCES\"\n");
+        out.push_str(&format!(
+            "   DCLimit={}\n\n",
+            model.steel_design_prefs.dc_ratio_limit
+        ));
     }
 
     out.push_str("END TABLE DATA\n");
