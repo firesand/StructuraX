@@ -1,7 +1,7 @@
 //! Model-editing workflows with validation before mutation.
 use super::*;
 use sap_model::{
-    AreaLoadSurfacePressure, AreaSection, CableParams, ComboType, LinkObj, LinkProp, LinkPropType,
+    AreaLoadSurfacePressure, AreaLoadUniform, AreaSection, CableParams, ComboType, LinkObj, LinkProp, LinkPropType,
     LoadCombo, MatType, ShellType,
 };
 
@@ -11,6 +11,8 @@ pub(super) struct Workflows {
     delta: [f64; 3],
     copies: usize,
     segments: usize,
+    /// Ratio of the last to the first length of a divided frame.
+    length_ratio: f64,
     pattern: String,
     pattern_type: LoadPatternType,
     self_weight: f64,
@@ -32,6 +34,9 @@ pub(super) struct Workflows {
     steel_sway: bool,
     pressure: f64,
     face: i32,
+    /// Area uniform load: intensity and direction code (`AreaLoadUniform::dir`).
+    area_uniform: f64,
+    area_uniform_dir: i32,
     replace_loads: bool,
     area: AreaSection,
     mesh: [usize; 2],
@@ -65,6 +70,7 @@ impl Default for Workflows {
             delta: [0.0; 3],
             copies: 1,
             segments: 2,
+            length_ratio: 1.0,
             pattern: "DEAD".into(),
             pattern_type: LoadPatternType::Dead,
             self_weight: 0.0,
@@ -80,6 +86,8 @@ impl Default for Workflows {
             steel_sway: false,
             pressure: 0.0,
             face: -2,
+            area_uniform: 0.0,
+            area_uniform_dir: 10,
             replace_loads: true,
             area: AreaSection::default(),
             mesh: [1, 1],
@@ -127,6 +135,7 @@ impl Workflows {
         }
         self.distributed *= ff / fl;
         self.pressure *= ff / (fl * fl);
+        self.area_uniform *= ff / (fl * fl);
         self.area.thickness_membrane *= fl;
         self.area.thickness_bending *= fl;
         self.tc_comp_limit *= ff;
@@ -588,6 +597,51 @@ fn delete_combo(model: &mut SapModel, name: &str) -> Result<String, String> {
     invalidate(model);
     Ok(format!("Deleted combination {name}."))
 }
+/// Directions of an area uniform load: `AreaLoadUniform::dir` and its label.
+/// The projected directions (7 to 9 and 11) are not offered: the solver
+/// refuses them.
+const AREA_UNIFORM_DIRECTIONS: [(i32, &str); 7] = [
+    (10, "Gravity (-Z)"),
+    (4, "Global X"),
+    (5, "Global Y"),
+    (6, "Global Z"),
+    (1, "Local 1"),
+    (2, "Local 2"),
+    (3, "Local 3"),
+];
+
+/// Divide the selected frames into `segments` pieces whose last length is
+/// `ratio` times the first.
+fn divide_with_ratio(model: &mut SapModel, segments: usize, ratio: f64) -> Result<String, String> {
+    editable(model)?;
+    model
+        .divide_selected_frames_ratio(segments, ratio)
+        .map(|r| {
+            format!(
+                "Divided selected frames into {segments} segments (last/first length {ratio}); created {} additional segments and {} joints.",
+                r.frames_created.len(),
+                r.points_created.len()
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Break the selected frames at the selected joints on them and at their
+/// intersections with each other.
+fn break_at_intersections(model: &mut SapModel) -> Result<String, String> {
+    editable(model)?;
+    model
+        .break_selected_frames_at_intersections()
+        .map(|r| {
+            format!(
+                "Broke the selected frames at intersections; created {} additional frames and {} joints.",
+                r.frames_created.len(),
+                r.points_created.len()
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Clone, Copy)]
 enum LoadAssignment {
     Joint([f64; 6]),
@@ -609,6 +663,9 @@ enum LoadAssignment {
         values: [f64; 2],
     },
     Pressure(i32, f64),
+    /// A uniform load per area in Gravity (10), Global X, Y, Z (4 to 6) or
+    /// Local 1, 2, 3 (1 to 3).
+    AreaUniform(i32, f64),
 }
 
 /// Relative positions of `distances` on every selected frame, or why one of
@@ -671,6 +728,18 @@ fn assign_load(
             (
                 model.areas.values().filter(|p| p.selected).count(),
                 p.is_finite(),
+            )
+        }
+        LoadAssignment::AreaUniform(dir, w) => {
+            if !AREA_UNIFORM_DIRECTIONS.iter().any(|(code, _)| *code == dir) {
+                return Err(
+                    "Choose Gravity, a global direction or a local direction; projected directions are not available because the solver does not implement them."
+                        .into(),
+                );
+            }
+            (
+                model.areas.values().filter(|p| p.selected).count(),
+                w.is_finite(),
             )
         }
     };
@@ -751,6 +820,19 @@ fn assign_load(
                     rel_dist2,
                     val1: values[0],
                     val2: values[1],
+                });
+            }
+        }
+        LoadAssignment::AreaUniform(dir, val) => {
+            for a in model.areas.values_mut().filter(|a| a.selected) {
+                if replace {
+                    a.loads_uniform.retain(|l| l.load_pat != pattern);
+                }
+                a.loads_uniform.push(AreaLoadUniform {
+                    load_pat: pattern.into(),
+                    csys: if (1..=3).contains(&dir) { "LOCAL" } else { "GLOBAL" }.into(),
+                    dir,
+                    val,
                 });
             }
         }
@@ -873,6 +955,15 @@ impl SapGuiApp {
                     if ui.button("Replicate Selected").clicked() {outcome=Some(self.model.replicate_selected(state.delta,state.copies).map(|r|format!("Created {} joints, {} frames, {} areas.",r.points_created.len(),r.frames_created.len(),r.areas_created.len())).map_err(|e|e.to_string()));}
                     ui.separator();ui.horizontal(|ui| {ui.label("Equal frame segments:");ui.add(egui::DragValue::new(&mut state.segments).range(2..=100));});
                     if ui.button("Divide Selected Frames").clicked() {outcome=Some(self.model.divide_selected_frames(state.segments).map(|r|format!("Divided selected frames; created {} additional segments and {} joints.",r.frames_created.len(),r.points_created.len())).map_err(|e|e.to_string()));}
+                    ui.horizontal(|ui| {
+                        ui.label("Last/first length ratio:");
+                        ui.add(egui::DragValue::new(&mut state.length_ratio).speed(0.05).range(1e-6..=1e6));
+                    });
+                    ui.label("Uses the number of segments above. A ratio of 1 is the equal division; above 1 the pieces grow toward the J end.");
+                    if ui.button("Divide Selected Frames with Ratio").clicked() {outcome=Some(divide_with_ratio(&mut self.model,state.segments,state.length_ratio));}
+                    ui.separator();
+                    ui.label("Break the selected frames at the selected joints on them and where they meet each other (joints and frames only).");
+                    if ui.button("Break Selected at Intersections").clicked() {outcome=Some(break_at_intersections(&mut self.model));}
                 },
                 1=>{
                     ui.horizontal(|ui| {ui.label("Pattern:");ui.text_edit_singleline(&mut state.pattern);});
@@ -959,6 +1050,16 @@ impl SapGuiApp {
                     ui.separator();ui.horizontal(|ui| {ui.label("Area pressure:");ui.add(egui::DragValue::new(&mut state.pressure).speed(0.001));ui.selectable_value(&mut state.face,-2,"Top");ui.selectable_value(&mut state.face,-1,"Bottom");});
                     ui.label("Positive pressure pushes into the selected face: top -local 3, bottom +local 3.");
                     if ui.button("Assign to Selected Areas").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::Pressure(state.face,state.pressure),state.replace_loads));}
+                    ui.horizontal(|ui| {
+                        ui.label("Area uniform load:");
+                        ui.add(egui::DragValue::new(&mut state.area_uniform).speed(0.001));
+                        let label = AREA_UNIFORM_DIRECTIONS.iter().find(|(code, _)| *code == state.area_uniform_dir).map_or("Gravity (-Z)", |(_, l)| *l);
+                        egui::ComboBox::from_id_salt("wf_area_uniform_dir").selected_text(label).show_ui(ui,|ui| {
+                            for (code, lbl) in AREA_UNIFORM_DIRECTIONS {ui.selectable_value(&mut state.area_uniform_dir, code, lbl);}
+                        });
+                    });
+                    ui.label("Force per area in the chosen direction (gravity acts along -Z); projected directions are not offered.");
+                    if ui.button("Assign Uniform Load to Selected Areas").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::AreaUniform(state.area_uniform_dir,state.area_uniform),state.replace_loads));}
                 },
                 2=>{
                     ui.horizontal(|ui| {ui.label("Section:");ui.text_edit_singleline(&mut state.area.name);});
@@ -1559,5 +1660,290 @@ mod tests {
         assert!(assign_concrete_framing(&mut m, Framing::NonSway).is_err());
         assert!(assign_steel_overwrite(&mut m, None).is_err());
         assert_eq!(m.frames["F"].concrete_framing, Framing::SwayOrdinary);
+    }
+
+    // --- divide with ratio, break at intersections, area uniform loads -----
+
+    fn click_button(app: &mut SapGuiApp, ctx: &egui::Context, label: &str, time: f64) {
+        let input = |time| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 3000.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let find = |out: &egui::FullOutput| {
+            out.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+        };
+        // The window starts about 400 points high and scrolls: scroll it
+        // with the mouse wheel until the button is drawn.
+        let mut time = time;
+        let mut found = None;
+        for _ in 0..40 {
+            time += 0.1;
+            let _ = ctx.run(input(time), |ctx| app.render_workflows(ctx));
+            time += 0.1;
+            let out = ctx.run(input(time), |ctx| app.render_workflows(ctx));
+            if let Some(pos) = find(&out) {
+                found = Some(pos);
+                break;
+            }
+            time += 0.1;
+            let mut wheel = input(time);
+            wheel.events = vec![
+                egui::Event::PointerMoved(Pos2::new(120.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -150.0),
+                    modifiers: Default::default(),
+                },
+            ];
+            let _ = ctx.run(wheel, |ctx| app.render_workflows(ctx));
+        }
+        let pos = found.unwrap_or_else(|| panic!("button {label:?} must become visible"));
+        let time = time + 0.1;
+        let mut down = input(time + 0.2);
+        down.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ];
+        let _ = ctx.run(down, |ctx| app.render_workflows(ctx));
+        let mut up = input(time + 0.3);
+        up.events = vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }];
+        let _ = ctx.run(up, |ctx| app.render_workflows(ctx));
+    }
+
+    #[test]
+    fn divide_with_ratio_command_makes_the_geometric_series_and_refuses_cleanly() {
+        let mut m = model();
+        // L = 120, 4 segments, ratio 8: q = 2, pieces 8, 16, 32, 64 (units of
+        // L / 15 = 8), so the joints are at x = 8, 24, 56.
+        let message = divide_with_ratio(&mut m, 4, 8.0).unwrap();
+        assert!(message.contains("created 3 additional segments and 3 joints"), "{message}");
+        let mut xs: Vec<f64> = m
+            .points
+            .values()
+            .filter(|p| p.y == 0.0 && p.z == 0.0)
+            .map(|p| p.x)
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        for (got, want) in xs.iter().zip([0.0, 8.0, 24.0, 56.0, 120.0]) {
+            assert!((got - want).abs() < 1e-9, "{xs:?}");
+        }
+        let mut zero = model();
+        let before = zero.clone();
+        assert!(divide_with_ratio(&mut zero, 4, 0.0).is_err());
+        assert_eq!(zero, before);
+        let mut locked = model();
+        locked.is_locked = true;
+        let before = locked.clone();
+        assert!(divide_with_ratio(&mut locked, 4, 2.0).unwrap_err().contains("locked"));
+        assert_eq!(locked, before);
+        let mut one = model();
+        let before = one.clone();
+        assert!(divide_with_ratio(&mut one, 1, 2.0).is_err());
+        assert_eq!(one, before);
+    }
+
+    #[test]
+    fn break_command_splits_crossing_frames_and_refuses_cleanly() {
+        let mut m = model();
+        m.areas["A"].selected = false;
+        m.add_point("5", 60.0, -60.0, 0.0);
+        m.add_point("6", 60.0, 60.0, 0.0);
+        m.add_frame("G", "5", "6", "FSEC1");
+        m.frames["G"].selected = true;
+        let message = break_at_intersections(&mut m).unwrap();
+        assert!(message.contains("created 2 additional frames and 1 joints"), "{message}");
+        assert_eq!(m.frames.len(), 4);
+        // Nothing to break any more.
+        let before = m.clone();
+        assert!(break_at_intersections(&mut m).is_err());
+        assert_eq!(m, before);
+        // A selected area, and a locked model.
+        let mut with_area = model();
+        let before = with_area.clone();
+        let error = break_at_intersections(&mut with_area).unwrap_err();
+        assert!(error.contains("area or solid edges is not implemented"), "{error}");
+        assert_eq!(with_area, before);
+        let mut locked = model();
+        locked.is_locked = true;
+        let before = locked.clone();
+        assert!(break_at_intersections(&mut locked).unwrap_err().contains("locked"));
+        assert_eq!(locked, before);
+    }
+
+    #[test]
+    fn geometry_tab_buttons_divide_with_ratio_and_break() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/workflow-test.s2k")));
+        app.model = model();
+        app.model.areas["A"].selected = false;
+        app.workflows.open = true;
+        app.workflows.tab = 0;
+        app.workflows.segments = 4;
+        app.workflows.length_ratio = 8.0;
+        let ctx = egui::Context::default();
+        click_button(&mut app, &ctx, "Divide Selected Frames with Ratio", 1.0);
+        assert_eq!(app.model.frames.len(), 4, "{}", app.status_msg);
+        assert!(app.status_msg.contains("last/first length 8"), "{}", app.status_msg);
+        // Break: a selected frame crossing the first piece (x = 4 of 0..8).
+        app.model.add_point("20", 4.0, -10.0, 0.0);
+        app.model.add_point("21", 4.0, 10.0, 0.0);
+        app.model.add_frame("X", "20", "21", "FSEC1");
+        app.model.frames["X"].selected = true;
+        click_button(&mut app, &ctx, "Break Selected at Intersections", 10.0);
+        assert!(app.status_msg.starts_with("Broke the selected frames"), "{}", app.status_msg);
+        // The four pieces and X become 7 frames: X and the first piece split.
+        assert_eq!(app.model.frames.len(), 7, "{}", app.status_msg);
+    }
+
+    #[test]
+    fn area_uniform_load_command_assigns_by_direction_and_refuses_projected_ones() {
+        for (dir, csys) in [
+            (10, "GLOBAL"),
+            (4, "GLOBAL"),
+            (5, "GLOBAL"),
+            (6, "GLOBAL"),
+            (1, "LOCAL"),
+            (2, "LOCAL"),
+            (3, "LOCAL"),
+        ] {
+            let mut m = model();
+            let message =
+                assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 0.8), false).unwrap();
+            assert!(message.contains("1 objects"), "{message}");
+            assert_eq!(
+                m.areas["A"].loads_uniform,
+                vec![AreaLoadUniform {
+                    load_pat: "DEAD".into(),
+                    csys: csys.into(),
+                    dir,
+                    val: 0.8
+                }]
+            );
+            // Adding keeps the earlier load; replacing removes the pattern's.
+            assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 1.5), false).unwrap();
+            assert_eq!(m.areas["A"].loads_uniform.len(), 2);
+            assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 2.5), true).unwrap();
+            assert_eq!(m.areas["A"].loads_uniform.len(), 1);
+            assert_eq!(m.areas["A"].loads_uniform[0].val, 2.5);
+        }
+        let mut m = model();
+        let before = m.clone();
+        for dir in [0, 7, 8, 9, 11, 12, -1] {
+            let error =
+                assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 0.8), false).unwrap_err();
+            assert!(error.contains("projected directions are not available"), "{dir}: {error}");
+            assert_eq!(m, before, "{dir}");
+        }
+        assert!(assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(10, f64::NAN), false).is_err());
+        assert!(assign_load(&mut m, "NOPE", LoadAssignment::AreaUniform(10, 0.8), false).is_err());
+        assert_eq!(m, before);
+        m.areas["A"].selected = false;
+        let before = m.clone();
+        assert!(assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(10, 0.8), false).is_err());
+        assert_eq!(m, before);
+        let mut locked = model();
+        locked.is_locked = true;
+        let before = locked.clone();
+        assert!(assign_load(&mut locked, "DEAD", LoadAssignment::AreaUniform(10, 0.8), false).is_err());
+        assert_eq!(locked, before);
+    }
+
+    /// A 6 x 5 panel at z = 0, one element, every corner fixed, no weight; the
+    /// sums of the reactions are the loads, reversed.
+    fn panel_reaction_sums(dir: i32, value: f64) -> [f64; 3] {
+        let mut m = SapModel::new(Units::KnMC);
+        m.load_cases.clear();
+        m.load_patterns.clear();
+        m.add_point("1", 0.0, 0.0, 0.0);
+        m.add_point("2", 6.0, 0.0, 0.0);
+        m.add_point("3", 6.0, 5.0, 0.0);
+        m.add_point("4", 0.0, 5.0, 0.0);
+        for j in ["1", "2", "3", "4"] {
+            m.points[j].restraint = [true; 6];
+        }
+        m.add_area("A", vec!["1".into(), "2".into(), "3".into(), "4".into()], "ASEC1");
+        m.areas["A"].auto_mesh = (1, 1);
+        m.areas["A"].selected = true;
+        define_pattern(&mut m, "Q", LoadPatternType::Other, 0.0).unwrap();
+        assign_load(&mut m, "Q", LoadAssignment::AreaUniform(dir, value), false).unwrap();
+        sap_solver::analyze_model(&mut m).unwrap();
+        let mut sum = [0.0; 3];
+        for r in m.case_results["Q"].joint_reactions.values() {
+            for k in 0..3 {
+                sum[k] += r[k];
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn area_uniform_loads_give_the_resultants_of_their_direction() {
+        let tol = 1e-9 * 30.0;
+        // Gravity 0.8 kN/m2 on 30 m2: 24 kN down, so the reactions add to +24.
+        let s = panel_reaction_sums(10, 0.8);
+        assert!((s[2] - 24.0).abs() < tol && s[0].abs() < tol && s[1].abs() < tol, "{s:?}");
+        // Global X 0.5 kN/m2: 15 kN toward +X, reactions -15.
+        let s = panel_reaction_sums(4, 0.5);
+        assert!((s[0] + 15.0).abs() < tol && s[1].abs() < tol && s[2].abs() < tol, "{s:?}");
+        let s = panel_reaction_sums(5, 0.5);
+        assert!((s[1] + 15.0).abs() < tol && s[0].abs() < tol && s[2].abs() < tol, "{s:?}");
+        let s = panel_reaction_sums(6, 0.5);
+        assert!((s[2] + 15.0).abs() < tol && s[0].abs() < tol && s[1].abs() < tol, "{s:?}");
+        // Local 3 of a panel drawn counter-clockwise from above is +Z.
+        let s = panel_reaction_sums(3, 0.5);
+        assert!((s[2] + 15.0).abs() < tol && s[0].abs() < tol && s[1].abs() < tol, "{s:?}");
+        // Local 1 and 2 lie in the plane of the panel.
+        for dir in [1, 2] {
+            let s = panel_reaction_sums(dir, 0.5);
+            assert!(s[2].abs() < tol, "{s:?}");
+            assert!((s[0].hypot(s[1]) - 15.0).abs() < tol, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn loads_tab_button_assigns_the_area_uniform_load() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/workflow-test.s2k")));
+        app.model = model();
+        app.workflows.open = true;
+        app.workflows.tab = 1;
+        app.workflows.area_uniform = 0.8;
+        app.workflows.area_uniform_dir = 6;
+        let ctx = egui::Context::default();
+        click_button(&mut app, &ctx, "Assign Uniform Load to Selected Areas", 1.0);
+        assert_eq!(
+            app.model.areas["A"].loads_uniform,
+            vec![AreaLoadUniform {
+                load_pat: "DEAD".into(),
+                csys: "GLOBAL".into(),
+                dir: 6,
+                val: 0.8
+            }],
+            "{}",
+            app.status_msg
+        );
+        // The offered directions: no projected one.
+        let labels: Vec<&str> = AREA_UNIFORM_DIRECTIONS.iter().map(|(_, l)| *l).collect();
+        assert_eq!(
+            labels,
+            ["Gravity (-Z)", "Global X", "Global Y", "Global Z", "Local 1", "Local 2", "Local 3"]
+        );
+        assert!(AREA_UNIFORM_DIRECTIONS
+            .iter()
+            .all(|(d, _)| !(7..=9).contains(d) && *d != 11));
     }
 }

@@ -355,6 +355,56 @@ impl SapModel {
         Ok(summary)
     }
 
+    /// Refusals shared by every command that replaces a frame by pieces, and
+    /// the frame's end `a`, its end-to-end vector and its length.
+    fn check_divisible(&self, f: &FrameObj) -> Result<([f64; 3], [f64; 3], f64), EditError> {
+        validate_frame(f)?;
+        let section = self
+            .frame_sections
+            .get(&f.section)
+            .ok_or_else(|| invalid(format!("missing section {}", f.section)))?;
+        if section.prop_type == FramePropType::Variable
+            || !section.non_prismatic.is_empty()
+            || f.cable_params.is_some()
+            || f.tc_limits.is_some()
+            || f.end_offset_i != 0.0
+            || f.end_offset_j != 0.0
+            || f.joint_offset_i != [0.0; 3]
+            || f.joint_offset_j != [0.0; 3]
+            || f.cardinal_point != 10
+            || f.loads_temp.iter().any(|l| l.pattern_name.is_some())
+        {
+            return Err(EditError::Unsupported(format!("frame {}: nonprismatic/cable/limits/offsets/cardinal point/patterned temperature", f.name)));
+        }
+        // Every piece is a copy of the object, so its hinges would be
+        // repeated on each piece at the same relative distance.
+        if !f.hinges.is_empty() || f.hinge_overwrite.is_some() {
+            return Err(EditError::Unsupported(format!(
+                "frame {}: hinge assignments or a hinge overwrite",
+                f.name
+            )));
+        }
+        let pi = self
+            .points
+            .get(&f.point_i)
+            .ok_or_else(|| EditError::MissingPoint(f.point_i.clone()))?;
+        let pj = self
+            .points
+            .get(&f.point_j)
+            .ok_or_else(|| EditError::MissingPoint(f.point_j.clone()))?;
+        validate_point(pi)?;
+        validate_point(pj)?;
+        let a = coords(pi);
+        let b = coords(pj);
+        let distance: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
+        finite(distance)?;
+        let length = distance[0].hypot(distance[1]).hypot(distance[2]);
+        if !length.is_finite() || length <= 0.0 {
+            return Err(invalid("zero/nonfinite frame length"));
+        }
+        Ok((a, distance, length))
+    }
+
     /// Replace selected prismatic frames with equal geometric segments. Original
     /// endpoint joints/assignments survive; intermediate joints have no assignments.
     /// End releases/springs stay at the original ends. Distributed loads are clipped
@@ -365,6 +415,59 @@ impl SapModel {
         if !(2..=10_000).contains(&segments) {
             return Err(invalid("2..=10000 segments required"));
         }
+        let rels: Vec<f64> = (1..segments)
+            .map(|i| i as f64 / segments as f64)
+            .collect();
+        self.split_at(&rels)
+    }
+
+    /// Divide each selected frame into `segments` pieces whose lengths form a
+    /// geometric series with `last_to_first` the ratio of the last length to
+    /// the first (SAP2000 "Divide into specified number of frames" with a
+    /// last/first length ratio). A ratio of 1 is the equal division.
+    ///
+    /// With `q = r^(1/(n-1))` the pieces are `l1 q^k` and the interior joints
+    /// lie at the relative distances `(q^k - 1) / (q^n - 1)`, k = 1..n-1.
+    pub fn divide_selected_frames_ratio(
+        &mut self,
+        segments: usize,
+        last_to_first: f64,
+    ) -> Result<EditSummary, EditError> {
+        self.check_edit()?;
+        if !(2..=10_000).contains(&segments) {
+            return Err(invalid("2..=10000 segments required"));
+        }
+        if !last_to_first.is_finite() || last_to_first <= 0.0 {
+            return Err(invalid(
+                "the last/first length ratio must be positive and finite",
+            ));
+        }
+        if last_to_first == 1.0 {
+            return self.divide_selected_frames(segments);
+        }
+        let ln_q = last_to_first.ln() / (segments - 1) as f64;
+        let denominator = (segments as f64 * ln_q).exp_m1();
+        let rels: Vec<f64> = (1..segments)
+            .map(|k| (k as f64 * ln_q).exp_m1() / denominator)
+            .collect();
+        if rels
+            .iter()
+            .any(|r| !r.is_finite() || !(0.0..1.0).contains(r))
+            || rels.windows(2).any(|w| w[1] <= w[0])
+            || rels[0] <= 0.0
+        {
+            return Err(invalid(format!(
+                "ratio {last_to_first} over {segments} segments is not representable"
+            )));
+        }
+        self.split_at(&rels)
+    }
+
+    /// Replace each selected frame by pieces that end at the relative distances
+    /// `rels` (strictly increasing, inside 0..1) from its I end.
+    fn split_at(&mut self, rels: &[f64]) -> Result<EditSummary, EditError> {
+        self.check_edit()?;
+        let segments = rels.len() + 1;
         let selected: Vec<_> = self
             .frames
             .values()
@@ -381,56 +484,31 @@ impl SapModel {
         {
             return Err(invalid("edit exceeds one million generated frames"));
         }
+        // Equal pieces keep the arithmetic of the equal division (a product by
+        // the number of segments); other pieces divide by their own span.
+        let uniform = rels
+            .iter()
+            .enumerate()
+            .all(|(i, r)| *r == (i + 1) as f64 / segments as f64);
+        let mut bounds = vec![0.0];
+        bounds.extend_from_slice(rels);
+        bounds.push(1.0);
         let mut staged = self.clone();
         let mut summary = EditSummary::default();
         for f in &selected {
-            validate_frame(f)?;
-            let section = self
-                .frame_sections
-                .get(&f.section)
-                .ok_or_else(|| invalid(format!("missing section {}", f.section)))?;
-            if section.prop_type == FramePropType::Variable
-                || !section.non_prismatic.is_empty()
-                || f.cable_params.is_some()
-                || f.tc_limits.is_some()
-                || f.end_offset_i != 0.0
-                || f.end_offset_j != 0.0
-                || f.joint_offset_i != [0.0; 3]
-                || f.joint_offset_j != [0.0; 3]
-                || f.cardinal_point != 10
-                || f.loads_temp.iter().any(|l| l.pattern_name.is_some())
-            {
-                return Err(EditError::Unsupported(format!("frame {}: nonprismatic/cable/limits/offsets/cardinal point/patterned temperature", f.name)));
-            }
-            // Every piece is a copy of the object, so its hinges would be
-            // repeated on each piece at the same relative distance.
-            if !f.hinges.is_empty() || f.hinge_overwrite.is_some() {
-                return Err(EditError::Unsupported(format!(
-                    "frame {}: hinge assignments or a hinge overwrite",
-                    f.name
-                )));
-            }
-            let pi = self
-                .points
-                .get(&f.point_i)
-                .ok_or_else(|| EditError::MissingPoint(f.point_i.clone()))?;
-            let pj = self
-                .points
-                .get(&f.point_j)
-                .ok_or_else(|| EditError::MissingPoint(f.point_j.clone()))?;
-            validate_point(pi)?;
-            validate_point(pj)?;
-            let a = coords(pi);
-            let b = coords(pj);
-            let distance: [f64; 3] = std::array::from_fn(|k| b[k] - a[k]);
-            finite(distance)?;
-            let length = distance[0].hypot(distance[1]).hypot(distance[2]);
-            if !length.is_finite() || length <= 0.0 {
-                return Err(invalid("zero/nonfinite frame length"));
+            let (a, distance, length) = self.check_divisible(f)?;
+            if !uniform {
+                let tol = crate::generate::geometry_tolerance(self, &[]);
+                if bounds.windows(2).any(|w| (w[1] - w[0]) * length <= tol) {
+                    return Err(invalid(format!(
+                        "frame {}: a segment is shorter than the coordinate tolerance",
+                        f.name
+                    )));
+                }
             }
             let mut joints = vec![f.point_i.clone()];
-            for i in 1..segments {
-                let c = std::array::from_fn(|k| a[k] + distance[k] * (i as f64 / segments as f64));
+            for (i, rel) in rels.iter().enumerate() {
+                let c = std::array::from_fn(|k| a[k] + distance[k] * rel);
                 finite(c)?;
                 // Reuse existing geometric joints (their assignments remain unchanged).
                 let id = if let Some((id, _)) = staged.points.iter().find(|(_, p)| coords(p) == c) {
@@ -446,68 +524,354 @@ impl SapModel {
                 if joints.contains(&id) || id == f.point_j {
                     return Err(invalid("segments collapse at coordinate precision"));
                 }
+                debug_assert_eq!(joints.len(), i + 1);
                 joints.push(id);
             }
             joints.push(f.point_j.clone());
-            // Keep the original name for the first child; reserve all original names.
-            for i in 0..segments {
-                let lo = i as f64 / segments as f64;
-                let hi = (i + 1) as f64 / segments as f64;
-                let mut child = f.clone();
-                child.name = if i == 0 {
-                    f.name.clone()
-                } else {
-                    next_numeric_name(staged.frames.keys())
-                };
-                child.point_i = joints[i].clone();
-                child.point_j = joints[i + 1].clone();
-                if i != 0 {
-                    child.release_i = [false; 6];
-                    child.start_spring = [0.0; 6];
-                }
-                if i != segments - 1 {
-                    child.release_j = [false; 6];
-                    child.end_spring = [0.0; 6];
-                }
-                child.loads_dist.clear();
-                for l in &f.loads_dist {
-                    let start = lo.max(l.rel_dist1);
-                    let end = hi.min(l.rel_dist2);
-                    if end > start {
-                        let value = |s| {
-                            l.val1
-                                + (l.val2 - l.val1)
-                                    * ((s - l.rel_dist1) / (l.rel_dist2 - l.rel_dist1))
-                        };
-                        let mut load = l.clone();
-                        load.rel_dist1 = (start - lo) * segments as f64;
-                        load.rel_dist2 = (end - lo) * segments as f64;
-                        load.val1 = value(start);
-                        load.val2 = value(end);
-                        finite([load.val1, load.val2])?;
-                        child.loads_dist.push(load);
-                    }
-                }
-                child.loads_point = f
-                    .loads_point
-                    .iter()
-                    .filter(|l| l.rel_dist >= lo && (l.rel_dist < hi || i == segments - 1))
-                    .map(|l| {
-                        let mut load = l.clone();
-                        load.rel_dist = (l.rel_dist - lo) * segments as f64;
-                        load
-                    })
-                    .collect();
-                if i != 0 {
-                    summary.frames_created.push(child.name.clone());
-                }
-                staged.frames.insert(child.name.clone(), child);
-            }
+            make_children(&mut staged, f, &joints, &bounds, uniform, &mut summary)?;
         }
         staged.invalidate_results();
         *self = staged;
         Ok(summary)
     }
+
+    /// Break the selected frames where selected joints lie on them and where
+    /// they meet other selected frames (SAP2000 "Break at intersections with
+    /// selected joints, frames"). A frame splits at a selected joint that lies
+    /// within the geometry tolerance of its interior, and at the point where
+    /// another selected frame comes within the tolerance of it, also when that
+    /// frame ends there (a T-junction splits only the frame that is crossed).
+    /// Pieces share the joint at the break; the joint of an intersection is
+    /// created unless one exists there. Selected areas, solids and links are
+    /// refused, as are collinear overlapping frames and frames the divide
+    /// command refuses (checked on the frames that would split).
+    pub fn break_selected_frames_at_intersections(&mut self) -> Result<EditSummary, EditError> {
+        self.check_edit()?;
+        if self.areas.values().any(|a| a.selected) || self.solids.values().any(|s| s.selected) {
+            return Err(EditError::Unsupported(
+                "breaking at area or solid edges is not implemented".into(),
+            ));
+        }
+        if self.links.values().any(|l| l.selected) {
+            return Err(EditError::Unsupported(
+                "breaking with selected links is not implemented".into(),
+            ));
+        }
+        let selected: Vec<_> = self
+            .frames
+            .values()
+            .filter(|f| f.selected)
+            .cloned()
+            .collect();
+        if selected.is_empty() {
+            return Err(EditError::EmptySelection);
+        }
+        let joints: Vec<(String, [f64; 3])> = self
+            .points
+            .iter()
+            .filter(|(_, p)| p.selected)
+            .map(|(n, p)| (n.clone(), coords(p)))
+            .collect();
+        for (n, c) in &joints {
+            finite(*c).map_err(|_| invalid(format!("joint {n} has a nonfinite coordinate")))?;
+        }
+        let mut ends = Vec::with_capacity(selected.len());
+        for f in &selected {
+            let pi = self
+                .points
+                .get(&f.point_i)
+                .ok_or_else(|| EditError::MissingPoint(f.point_i.clone()))?;
+            let pj = self
+                .points
+                .get(&f.point_j)
+                .ok_or_else(|| EditError::MissingPoint(f.point_j.clone()))?;
+            let (a, b) = (coords(pi), coords(pj));
+            let u = sub(b, a);
+            finite(a)?;
+            finite(u)?;
+            if norm(u) <= 0.0 || !norm(u).is_finite() {
+                return Err(invalid(format!("frame {} has zero length", f.name)));
+            }
+            ends.push((a, u));
+        }
+        let tol = crate::generate::geometry_tolerance(self, &[]);
+
+        // Plan on the original geometry: per frame, the relative distance of
+        // every break and where it goes.
+        let mut plan: Vec<Vec<(f64, Split)>> = vec![Vec::new(); selected.len()];
+        for (k, f) in selected.iter().enumerate() {
+            let (a, u) = ends[k];
+            let len = norm(u);
+            let interior = |s: f64| s * len > tol && (1.0 - s) * len > tol;
+            for (name, c) in &joints {
+                if *name == f.point_i || *name == f.point_j {
+                    continue;
+                }
+                let s = dot(sub(*c, a), u) / dot(u, u);
+                let foot: [f64; 3] = std::array::from_fn(|d| a[d] + u[d] * s);
+                if interior(s) && norm(sub(*c, foot)) <= tol {
+                    plan[k].push((s, Split::Joint(name.clone())));
+                }
+            }
+            for (m, g) in selected.iter().enumerate() {
+                if m == k {
+                    continue;
+                }
+                let (c0, v) = ends[m];
+                let lv = norm(v);
+                let sin = norm(cross(u, v)) / (len * lv);
+                if sin * len.min(lv) <= tol {
+                    // Parallel: only a collinear overlap is a problem.
+                    let off = |p: [f64; 3]| {
+                        let s = dot(sub(p, a), u) / dot(u, u);
+                        let foot: [f64; 3] = std::array::from_fn(|d| a[d] + u[d] * s);
+                        (s, norm(sub(p, foot)))
+                    };
+                    let (s0, d0) = off(c0);
+                    let (s1, d1) = off(std::array::from_fn(|d| c0[d] + v[d]));
+                    if d0 <= tol && d1 <= tol {
+                        let overlap = (s0.max(s1).min(1.0) - s0.min(s1).max(0.0)) * len;
+                        if overlap > tol {
+                            return Err(invalid(format!(
+                                "frames {} and {} overlap along a common line; they cannot be broken",
+                                f.name, g.name
+                            )));
+                        }
+                    }
+                    continue;
+                }
+                let (s, _t, dist) = segment_closest(a, u, c0, v);
+                if dist <= tol && interior(s) {
+                    let p = std::array::from_fn(|d| a[d] + u[d] * s);
+                    plan[k].push((s, Split::Point(p)));
+                }
+            }
+            plan[k].sort_by(|x, y| x.0.total_cmp(&y.0));
+            // Merge breaks that fall on the same place; two different selected
+            // joints that close are a refusal.
+            let mut merged: Vec<(f64, Split)> = Vec::new();
+            for (s, split) in std::mem::take(&mut plan[k]) {
+                if let Some((s0, last)) = merged.last_mut() {
+                    if (s - *s0) * len <= tol {
+                        match (&*last, &split) {
+                            (Split::Joint(x), Split::Joint(y)) if x != y => {
+                                return Err(invalid(format!(
+                                    "frame {}: joints {x} and {y} lie within the tolerance of each other",
+                                    f.name
+                                )));
+                            }
+                            (Split::Point(_), Split::Joint(_)) => {
+                                *s0 = s;
+                                *last = split;
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+                }
+                merged.push((s, split));
+            }
+            plan[k] = merged;
+        }
+        if plan.iter().all(Vec::is_empty) {
+            return Err(invalid(
+                "no selected joint lies on a selected frame and no selected frames intersect",
+            ));
+        }
+        let count: usize = plan.iter().map(|p| p.len() + 1).sum();
+        if count > 1_000_000 {
+            return Err(invalid("edit exceeds one million generated frames"));
+        }
+
+        let mut stage = crate::generate::Stage::new(self, &[]);
+        let mut pairs: BTreeSet<(String, String)> = self
+            .frames
+            .values()
+            .map(|f| pair(&f.point_i, &f.point_j))
+            .collect();
+        for (k, f) in selected.iter().enumerate() {
+            if plan[k].is_empty() {
+                continue;
+            }
+            self.check_divisible(f)?;
+            let mut names = vec![f.point_i.clone()];
+            let mut bounds = vec![0.0];
+            for (s, split) in &plan[k] {
+                let name = match split {
+                    Split::Joint(name) => name.clone(),
+                    Split::Point(p) => {
+                        let before = stage.summary.points_created.len();
+                        let name = stage.add_joint(*p)?;
+                        if stage.summary.points_created.len() > before {
+                            stage
+                                .model
+                                .points
+                                .get_mut(&name)
+                                .expect("joint just created")
+                                .selected = true;
+                        }
+                        name
+                    }
+                };
+                if names.contains(&name) || name == f.point_j {
+                    return Err(invalid(format!(
+                        "frame {}: breaks collapse at coordinate precision",
+                        f.name
+                    )));
+                }
+                names.push(name);
+                bounds.push(*s);
+            }
+            names.push(f.point_j.clone());
+            bounds.push(1.0);
+            pairs.remove(&pair(&f.point_i, &f.point_j));
+            for w in names.windows(2) {
+                if !pairs.insert(pair(&w[0], &w[1])) {
+                    return Err(invalid(format!(
+                        "frame {}: a piece would duplicate an existing frame between joints {} and {}",
+                        f.name, w[0], w[1]
+                    )));
+                }
+            }
+            let mut summary = std::mem::take(&mut stage.summary);
+            let result = make_children(&mut stage.model, f, &names, &bounds, false, &mut summary);
+            stage.summary = summary;
+            result?;
+        }
+        Ok(stage.commit(self))
+    }
+}
+
+/// Where a frame breaks: at an existing joint, or at a point that gets a joint.
+#[derive(Debug, Clone)]
+enum Split {
+    Joint(String),
+    Point([f64; 3]),
+}
+
+fn pair(a: &str, b: &str) -> (String, String) {
+    if a <= b {
+        (a.to_string(), b.to_string())
+    } else {
+        (b.to_string(), a.to_string())
+    }
+}
+
+fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    std::array::from_fn(|k| a[k] - b[k])
+}
+fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+fn norm(a: [f64; 3]) -> f64 {
+    a[0].hypot(a[1]).hypot(a[2])
+}
+
+/// Closest points of the segments `a + s u` and `c + t v` (s, t in 0..1, neither
+/// segment degenerate and not parallel): the parameters and the distance.
+fn segment_closest(a: [f64; 3], u: [f64; 3], c: [f64; 3], v: [f64; 3]) -> (f64, f64, f64) {
+    let r = sub(a, c);
+    let (aa, e, f) = (dot(u, u), dot(v, v), dot(v, r));
+    let (cc, b) = (dot(u, r), dot(u, v));
+    let denominator = aa * e - b * b;
+    let mut s = if denominator > 0.0 {
+        ((b * f - cc * e) / denominator).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut t = (b * s + f) / e;
+    if t < 0.0 {
+        t = 0.0;
+        s = (-cc / aa).clamp(0.0, 1.0);
+    } else if t > 1.0 {
+        t = 1.0;
+        s = ((b - cc) / aa).clamp(0.0, 1.0);
+    }
+    let p: [f64; 3] = std::array::from_fn(|k| a[k] + u[k] * s);
+    let q: [f64; 3] = std::array::from_fn(|k| c[k] + v[k] * t);
+    (s, t, norm(sub(p, q)))
+}
+
+/// Replace `f` by the pieces between consecutive `joints`, which lie at the
+/// relative distances `bounds` (first 0, last 1). The first piece keeps the
+/// name. `uniform` bounds are the equal division, rescaled by a product with
+/// the number of pieces as that command always did.
+fn make_children(
+    staged: &mut SapModel,
+    f: &FrameObj,
+    joints: &[String],
+    bounds: &[f64],
+    uniform: bool,
+    summary: &mut EditSummary,
+) -> Result<(), EditError> {
+    let segments = joints.len() - 1;
+    // Keep the original name for the first child; reserve all original names.
+    for i in 0..segments {
+        let lo = bounds[i];
+        let hi = bounds[i + 1];
+        let rescale = |x: f64| {
+            if uniform {
+                (x - lo) * segments as f64
+            } else {
+                ((x - lo) / (hi - lo)).clamp(0.0, 1.0)
+            }
+        };
+        let mut child = f.clone();
+        child.name = if i == 0 {
+            f.name.clone()
+        } else {
+            next_numeric_name(staged.frames.keys())
+        };
+        child.point_i = joints[i].clone();
+        child.point_j = joints[i + 1].clone();
+        if i != 0 {
+            child.release_i = [false; 6];
+            child.start_spring = [0.0; 6];
+        }
+        if i != segments - 1 {
+            child.release_j = [false; 6];
+            child.end_spring = [0.0; 6];
+        }
+        child.loads_dist.clear();
+        for l in &f.loads_dist {
+            let start = lo.max(l.rel_dist1);
+            let end = hi.min(l.rel_dist2);
+            if end > start {
+                let value = |s| {
+                    l.val1 + (l.val2 - l.val1) * ((s - l.rel_dist1) / (l.rel_dist2 - l.rel_dist1))
+                };
+                let mut load = l.clone();
+                load.rel_dist1 = rescale(start);
+                load.rel_dist2 = rescale(end);
+                load.val1 = value(start);
+                load.val2 = value(end);
+                finite([load.val1, load.val2])?;
+                child.loads_dist.push(load);
+            }
+        }
+        child.loads_point = f
+            .loads_point
+            .iter()
+            .filter(|l| l.rel_dist >= lo && (l.rel_dist < hi || i == segments - 1))
+            .map(|l| {
+                let mut load = l.clone();
+                load.rel_dist = rescale(l.rel_dist);
+                load
+            })
+            .collect();
+        if i != 0 {
+            summary.frames_created.push(child.name.clone());
+        }
+        staged.frames.insert(child.name.clone(), child);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -262,6 +262,7 @@ fn function_tab(
     ui: &mut egui::Ui,
     state: &mut State,
     model: &mut SapModel,
+    files: &mut super::file_browser::State,
 ) -> Option<Result<String, String>> {
     let mut outcome = None;
     ui.label(
@@ -270,7 +271,21 @@ fn function_tab(
     ui.horizontal(|ui| {
         ui.label("File path:");
         ui.text_edit_singleline(&mut state.path);
+        if ui.button("Browse...").clicked() {
+            super::file_browser::open_for(
+                files,
+                super::file_browser::Purpose::FunctionFile,
+                std::path::Path::new(state.path.trim()),
+                &[],
+                false,
+            );
+        }
     });
+    if let Some(path) =
+        super::file_browser::take_choice(files, super::file_browser::Purpose::FunctionFile)
+    {
+        state.path = path.display().to_string();
+    }
     egui::Grid::new("function_file_options")
         .num_columns(2)
         .show(ui, |ui| {
@@ -428,6 +443,7 @@ pub(super) fn render(
     ctx: &egui::Context,
     state: &mut State,
     model: &mut SapModel,
+    files: &mut super::file_browser::State,
 ) -> Option<Result<String, String>> {
     if !state.open {
         return None;
@@ -445,7 +461,7 @@ pub(super) fn render(
             });
             ui.separator();
             if state.tab == 0 {
-                outcome = function_tab(ui, state, model);
+                outcome = function_tab(ui, state, model, files);
             } else {
                 plot_tab(ui, state, model);
             }
@@ -609,7 +625,7 @@ mod tests {
                 ..Default::default()
             },
             |ctx| {
-                if let Some(result) = render(ctx, state, model) {
+                if let Some(result) = render(ctx, state, model, &mut Default::default()) {
                     outcome = Some(result);
                 }
             },

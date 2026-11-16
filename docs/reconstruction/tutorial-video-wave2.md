@@ -273,3 +273,5 @@ nothing about the video's result, whose hinge data are not stated.
   results).
 - Native export of hinge data.
 - Everything listed as not done in the first wave other than pushover.
+  The third wave ([tutorial-video-wave3.md](tutorial-video-wave3.md)) added
+  drawing and editing on plane views; it did not change this list.

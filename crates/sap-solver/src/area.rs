@@ -147,16 +147,7 @@ fn compute_quad4_local_stiffness(
     let tm = sec.thickness_membrane;
     let tb = sec.thickness_bending;
 
-    let has_membrane = match sec.prop_type {
-        AreaPropType::Shell => {
-            !matches!(sec.shell_type, ShellType::PlateThin | ShellType::PlateThick)
-        }
-        AreaPropType::Plane | AreaPropType::ASolid => true,
-    };
-    let has_bending = match sec.prop_type {
-        AreaPropType::Shell => !matches!(sec.shell_type, ShellType::Membrane),
-        AreaPropType::Plane | AreaPropType::ASolid => false,
-    };
+    let (has_membrane, has_bending) = section_behaviours(sec);
     let is_thin_plate = matches!(sec.shell_type, ShellType::ShellThin | ShellType::PlateThin);
 
     // Constitutive matrices
@@ -541,12 +532,19 @@ pub fn compute_area_local_loads(
                             f_loc[6 * i + 1] += n_th * mods[1] * dndy[i] * d_omega;
                         }
                     } else if lt.my_type == 2 {
-                        // Through-thickness gradient Delta T_3 -> bending moment M_th = E * tb^3 * alpha * grad / (12 * (1 - nu))
+                        // Through-thickness gradient dT/dx3 (positive: warmer toward +local 3).
+                        // The free thermal strain is alpha * grad * x3 and the bending strain
+                        // is -x3 * kappa with kappa_xx = w,xx = -sum dndx_i * theta2_i and
+                        // kappa_yy = w,yy = sum dndy_i * theta1_i, so the free curvature is
+                        // -alpha * grad in both directions and the equivalent loads are
+                        // B^T D kappa_free, with m_th = E * tb^3 * alpha * grad / (12 * (1 - nu)).
+                        // Sign checked on CSI Example 2-014: the plate with the warmer bottom
+                        // (grad = -100) lifts its free inner edge.
                         let m_th =
                             e * sec.thickness_bending.powi(3) * mat.a * val / (12.0 * (1.0 - nu));
                         for i in 0..4 {
-                            f_loc[6 * i + 3] += m_th * mods[4] * dndy[i] * d_omega;
-                            f_loc[6 * i + 4] -= m_th * mods[3] * dndx[i] * d_omega;
+                            f_loc[6 * i + 3] -= m_th * mods[4] * dndy[i] * d_omega;
+                            f_loc[6 * i + 4] += m_th * mods[3] * dndx[i] * d_omega;
                         }
                     }
                 }
@@ -566,6 +564,91 @@ pub fn compute_area_local_loads(
     }
 
     f_loc
+}
+
+/// Whether a section has membrane stiffness and plate-bending stiffness.
+pub fn section_behaviours(sec: &AreaSection) -> (bool, bool) {
+    let has_membrane = match sec.prop_type {
+        AreaPropType::Shell => {
+            !matches!(sec.shell_type, ShellType::PlateThin | ShellType::PlateThick)
+        }
+        AreaPropType::Plane | AreaPropType::ASolid => true,
+    };
+    let has_bending = match sec.prop_type {
+        AreaPropType::Shell => !matches!(sec.shell_type, ShellType::Membrane),
+        AreaPropType::Plane | AreaPropType::ASolid => false,
+    };
+    (has_membrane, has_bending)
+}
+
+/// Internal area temperature load types: `1` uniform change, `2` gradient through the
+/// thickness (the type the native file and the OAPI number `3`).
+pub const AREA_TEMP_UNIFORM: i32 = 1;
+pub const AREA_TEMP_GRADIENT: i32 = 2;
+
+/// Total uniform temperature change and total through-thickness gradient of an area in a
+/// case with the given load patterns and scale factors.
+pub fn area_thermal_totals(area_obj: &AreaObj, case_loads: &[(String, f64)]) -> (f64, f64) {
+    let mut uniform = 0.0;
+    let mut gradient = 0.0;
+    for (pattern, sf) in case_loads {
+        for lt in &area_obj.loads_temp {
+            if &lt.load_pat != pattern {
+                continue;
+            }
+            match lt.my_type {
+                AREA_TEMP_UNIFORM => uniform += lt.val * sf,
+                AREA_TEMP_GRADIENT => gradient += lt.val * sf,
+                _ => {}
+            }
+        }
+    }
+    (uniform, gradient)
+}
+
+/// Removes the part of the recovered resultants that belongs to free thermal strain.
+///
+/// [`recover_area_result`] multiplies the total strains by the stiffness. Stress comes from
+/// the strain in excess of the free thermal strain, so for a uniform change `dT` the
+/// membrane forces lose `E tm alpha dT / (1 - nu)`, and for a gradient `g` (free curvature
+/// `-alpha g`) the moments gain `E tb^3 alpha g / (12 (1 - nu))`. References: CSI Examples
+/// 2-013 (a restrained plate at +100 has -733.33 lb/in2, a free one has none) and 2-014
+/// (edge moment -2.182 k-in/in).
+pub fn apply_area_thermal(
+    result: &mut AreaResult,
+    area_obj: &AreaObj,
+    sec: &AreaSection,
+    mat: &Material,
+    uniform: f64,
+    gradient: f64,
+) {
+    if uniform == 0.0 && gradient == 0.0 {
+        return;
+    }
+    let mods: [f64; 10] = std::array::from_fn(|i| sec.modifiers[i] * area_obj.modifiers[i]);
+    let nu = mat.u.clamp(-0.49, 0.4999);
+    let tm = sec.thickness_membrane.max(1e-12);
+    let tb = sec.thickness_bending.max(1e-12);
+    let n_th = mat.e * sec.thickness_membrane * mat.a * uniform / (1.0 - nu);
+    let m_th = mat.e * sec.thickness_bending.powi(3) * mat.a * gradient / (12.0 * (1.0 - nu));
+    result.f11 -= n_th * mods[0];
+    result.f22 -= n_th * mods[1];
+    result.m11 += m_th * mods[3];
+    result.m22 += m_th * mods[4];
+    result.s11_top = result.f11 / tm - 6.0 * result.m11 / (tb * tb);
+    result.s22_top = result.f22 / tm - 6.0 * result.m22 / (tb * tb);
+    result.s12_top = result.f12 / tm - 6.0 * result.m12 / (tb * tb);
+    result.svm_top = plane_von_mises(result.s11_top, result.s22_top, result.s12_top);
+}
+
+/// Plane-stress von Mises value of the stress components `[s11, s22, s12]`.
+///
+/// A von Mises or principal value is not linear in the components, so a result that
+/// averages or combines several stress states recomputes it from the combined components.
+pub fn plane_von_mises(s11: f64, s22: f64, s12: f64) -> f64 {
+    (s11 * s11 - s11 * s22 + s22 * s22 + 3.0 * s12 * s12)
+        .max(0.0)
+        .sqrt()
 }
 
 /// Recovers internal stresses and resultants ($F_{11}, F_{22}, F_{12}, M_{11}, M_{22}, M_{12}, V_{13}, V_{23}, S_{11}, S_{22}, S_{12}, S_{\text{VM}}$)
@@ -645,13 +728,12 @@ pub fn recover_area_result(
     let v13 = (5.0 / 6.0) * g * tb * gamma_xz * mods[6];
     let v23 = (5.0 / 6.0) * g * tb * gamma_yz * mods[7];
 
-    let s11_top = f11 / tm + 6.0 * m11 / (tb * tb);
-    let s22_top = f22 / tm + 6.0 * m22 / (tb * tb);
-    let s12_top = f12 / tm + 6.0 * m12 / (tb * tb);
-    let svm_top =
-        (s11_top * s11_top - s11_top * s22_top + s22_top * s22_top + 3.0 * s12_top * s12_top)
-            .max(0.0)
-            .sqrt();
+    // CSI Analysis Reference Eqns. 2: positive moments give positive stress at the
+    // bottom face, so at the top face (x3 = +tb/2) s = F/tm - 6 M/tb^2.
+    let s11_top = f11 / tm - 6.0 * m11 / (tb * tb);
+    let s22_top = f22 / tm - 6.0 * m22 / (tb * tb);
+    let s12_top = f12 / tm - 6.0 * m12 / (tb * tb);
+    let svm_top = plane_von_mises(s11_top, s22_top, s12_top);
 
     AreaResult {
         f11,

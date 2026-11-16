@@ -45,7 +45,7 @@ use crate::linalg::{
 };
 use crate::solid::{
     compute_solid_nodal_loads, compute_solid_stiffness_and_mass, recover_solid_result,
-    solid_constitutive_matrix, solid_face_nodes, validate_solid_geometry,
+    solid_constitutive_matrix, solid_stress_from_components, solid_face_nodes, validate_solid_geometry,
 };
 
 #[derive(Debug, Error)]
@@ -813,6 +813,21 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 }
             }
         }
+        for (_, direction, _) in &lc.spectrum_loads {
+            match direction.trim().to_ascii_uppercase().as_str() {
+                "U1" | "UX" | "X" | "1" | "U2" | "UY" | "Y" | "2" | "U3" | "UZ" | "Z" | "3" => {}
+                "R1" | "R2" | "R3" | "RX" | "RY" | "RZ" | "4" | "5" | "6" => {
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "case '{name}' has response spectrum direction '{direction}': rotational spectrum loads are not implemented"
+                    )));
+                }
+                _ => {
+                    return Err(SolverError::InvalidInput(format!(
+                        "case '{name}' has unknown response spectrum direction '{direction}'; expected U1, U2 or U3"
+                    )));
+                }
+            }
+        }
         let functions = lc
             .history_loads
             .iter()
@@ -887,6 +902,61 @@ fn validate_active_loads(model: &SapModel) -> Result<(), SolverError> {
                 && ((7..=9).contains(&load.dir) || load.dir == 11)
             {
                 return Err(SolverError::UnsupportedInput(format!("area '{name}' has projected uniform loading; surface projection is not implemented")));
+            }
+        }
+        for load in &area.loads_temp {
+            // Temperature loads are integrated for four-joint areas, as a uniform
+            // change or a through-thickness gradient, with one value per area.
+            // Anything else would be dropped without a trace.
+            if !used_patterns.contains(load.load_pat.as_str()) || load.val == 0. {
+                continue;
+            }
+            if !matches!(
+                load.my_type,
+                crate::area::AREA_TEMP_UNIFORM | crate::area::AREA_TEMP_GRADIENT
+            ) {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "area '{name}' has a temperature load of type {} in pattern '{}'; only a uniform change (1) and a through-thickness gradient (2) are implemented",
+                    load.my_type, load.load_pat
+                )));
+            }
+            if area.points.len() != 4 {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "area '{name}' has a temperature load in pattern '{}'; temperature loads are implemented for four-joint areas only",
+                    load.load_pat
+                )));
+            }
+            // The load and the stress recovery are those of a shell: a uniform change
+            // acts on the membrane stiffness, a gradient on the plate-bending
+            // stiffness. Plane and axisymmetric-solid sections (whose thermal stress
+            // has another form in plane strain) and the behaviour a section does not
+            // have are refused.
+            if let Some(sec) = model.area_sections.get(&area.section) {
+                let (has_membrane, has_bending) = crate::area::section_behaviours(sec);
+                let supported = sec.prop_type == sap_model::AreaPropType::Shell
+                    && if load.my_type == crate::area::AREA_TEMP_UNIFORM {
+                        has_membrane
+                    } else {
+                        has_bending
+                    };
+                if !supported {
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "area '{name}' has a temperature load in pattern '{}' that its section '{}' cannot carry; a uniform change needs a shell section with membrane stiffness and a gradient one with plate-bending stiffness",
+                        load.load_pat, area.section
+                    )));
+                }
+            }
+            if load.pattern_name.as_ref().is_some_and(|p| !p.is_empty()) {
+                return Err(SolverError::UnsupportedInput(format!(
+                    "area '{name}' has a temperature load scaled by a joint pattern in pattern '{}'; joint patterns on area temperature loads are not implemented",
+                    load.load_pat
+                )));
+            }
+            if !load.val.is_finite() {
+                return Err(SolverError::InvalidInput(format!(
+                    "area '{name}' has a nonfinite temperature load in pattern '{}'",
+                    load.load_pat
+                )));
             }
         }
     }
@@ -2715,6 +2785,8 @@ struct StaticLoads {
     spring_ground_u: Vec<f64>,
     frame_fef_map: IndexMap<String, ([f64; 12], [[f64; 12]; 12], [[f64; 3]; 3], f64)>,
     frame_axial_loads: IndexMap<String, (f64, f64)>,
+    /// Uniform temperature change and through-thickness gradient of each analysis area.
+    area_thermal: IndexMap<String, (f64, f64)>,
     rhs: Vec<f64>,
     is_fixed: Vec<bool>,
     u_fixed_val: Vec<f64>,
@@ -2938,9 +3010,14 @@ fn assemble_static_loads(
     }
 
     // 3. Area Nodal Loads
-    for area in work_areas.values() {
+    let mut area_thermal = IndexMap::new();
+    for (aname, area) in work_areas {
         if area.points.len() < 3 {
             continue;
+        }
+        let thermal = crate::area::area_thermal_totals(area, case_loads);
+        if thermal != (0.0, 0.0) {
+            area_thermal.insert(aname.clone(), thermal);
         }
         let sec = &model.area_sections[&area.section];
         let mat = &model.materials[&sec.material];
@@ -3067,6 +3144,7 @@ fn assemble_static_loads(
         spring_ground_u,
         frame_fef_map,
         frame_axial_loads,
+        area_thermal,
         rhs,
         is_fixed,
         u_fixed_val,
@@ -3196,6 +3274,7 @@ fn recover_static_results(
         prescribed_u,
         spring_ground_u,
         frame_fef_map,
+        area_thermal,
         ..
     } = loads;
     let nonlinear_correction = nonlinear_system
@@ -3220,7 +3299,7 @@ fn recover_static_results(
         let has_support = pt.restraint.iter().any(|&r| r)
             || ks_loc_opt.is_some()
             || (0..6).any(|d| prescribed_u[6 * idx + d].is_some());
-        if has_support && model.points.contains_key(pname) {
+        if has_support {
             let mut reac = [0.0f64; 6];
             for d in 0..6 {
                 let gdof = 6 * idx + d;
@@ -3241,7 +3320,12 @@ fn recover_static_results(
                     reac[d] = -f_sp;
                 }
             }
-            joint_reactions.insert(pname.clone(), reac);
+            // A joint created by meshing (it inherits the restraints its edge or
+            // its area's corners share) is not a joint of the model, so it has no
+            // row of its own; its reaction still belongs to the base reaction.
+            if model.points.contains_key(pname) {
+                joint_reactions.insert(pname.clone(), reac);
+            }
 
             // Transform joint reaction to global for base_reactions sum (including r x F about origin)
             let r_p = &joint_rot[idx];
@@ -3365,7 +3449,10 @@ fn recover_static_results(
             }
         }
 
-        let ares = recover_area_result(area, sec, mat, &local_xy, &u_loc, Vec::new());
+        let mut ares = recover_area_result(area, sec, mat, &local_xy, &u_loc, Vec::new());
+        if let Some(&(uniform, gradient)) = area_thermal.get(aname) {
+            crate::area::apply_area_thermal(&mut ares, area, sec, mat, uniform, gradient);
+        }
         sub_area_results.insert(aname.clone(), ares);
     }
 
@@ -3392,9 +3479,10 @@ fn recover_static_results(
                     avg.s11_top += r.s11_top / count;
                     avg.s22_top += r.s22_top / count;
                     avg.s12_top += r.s12_top / count;
-                    avg.svm_top += r.svm_top / count;
                 }
             }
+            // The von Mises value is not linear: take it from the averaged components.
+            avg.svm_top = crate::area::plane_von_mises(avg.s11_top, avg.s22_top, avg.s12_top);
             area_results.insert(orig_name.clone(), avg);
         }
     }
@@ -3837,7 +3925,13 @@ fn run_response_spectrum_case(
                 "U1" | "UX" | "X" | "1" => 0,
                 "U2" | "UY" | "Y" | "2" => 1,
                 "U3" | "UZ" | "Z" | "3" => 2,
-                _ => 0,
+                // `validate_analysis_inputs` refuses every other direction string.
+                other => {
+                    return Err(SolverError::UnsupportedInput(format!(
+                        "case '{}' has unsupported response spectrum direction '{other}'",
+                        lc.name
+                    )))
+                }
             };
             let sa = eval_dynamic_function(model, func_name, t_sec);
             q_m += mode.participation_factors[dir_idx] * sa * (*sf) / (omega * omega);
@@ -4616,7 +4710,7 @@ fn recover_results_from_displacement_vector(
 
         let ks_loc_opt = joint_spring_matrix_local(pt, &joint_rot[idx]);
         let has_support = pt.restraint.iter().any(|&r| r) || ks_loc_opt.is_some();
-        if has_support && model.points.contains_key(pname) {
+        if has_support {
             let mut reac = [0.0f64; 6];
             for d in 0..6 {
                 let gdof = 6 * idx + d;
@@ -4634,7 +4728,12 @@ fn recover_results_from_displacement_vector(
                     reac[d] = -f_sp;
                 }
             }
-            joint_reactions.insert(pname.clone(), reac);
+            // A joint created by meshing (it inherits the restraints its edge or
+            // its area's corners share) is not a joint of the model, so it has no
+            // row of its own; its reaction still belongs to the base reaction.
+            if model.points.contains_key(pname) {
+                joint_reactions.insert(pname.clone(), reac);
+            }
 
             let r_p = &joint_rot[idx];
             let mut r_glob_f = [0.0f64; 3];
@@ -4875,6 +4974,17 @@ fn evaluate_load_combos(model: &mut SapModel) {
             dst.von_mises = finalize_op(dst.von_mises);
         };
 
+        // A combination reports an area, solid or link result for an object only if
+        // every contributing case reports one; otherwise the sum would silently be
+        // that of a subset of the cases (a response-spectrum, modal or buckling case,
+        // for example, carries no area, solid or link results).
+        let contributing: Vec<&CaseResults> = combo
+            .cases
+            .iter()
+            .filter_map(|(name, _)| model.case_results.get(name))
+            .collect();
+        let in_all = |has: &dyn Fn(&CaseResults) -> bool| contributing.iter().all(|c| has(c));
+
         let mut contributed = 0usize;
         for (src_name, sf) in &combo.cases {
             let Some(src) = model.case_results.get(src_name).cloned() else {
@@ -4944,6 +5054,9 @@ fn evaluate_load_combos(model: &mut SapModel) {
             }
 
             for (aname, ar) in &src.area_results {
+                if !in_all(&|c| c.area_results.contains_key(aname)) {
+                    continue;
+                }
                 let key_first = is_first || !comb_res.area_results.contains_key(aname);
                 let entry = comb_res.area_results.entry(aname.clone()).or_default();
                 entry.f11 = combine_op(entry.f11, ar.f11, *sf, key_first);
@@ -4961,6 +5074,9 @@ fn evaluate_load_combos(model: &mut SapModel) {
             }
 
             for (sname, sr) in &src.solid_results {
+                if !in_all(&|c| c.solid_results.contains_key(sname)) {
+                    continue;
+                }
                 let key_first = is_first || !comb_res.solid_results.contains_key(sname);
                 let entry = comb_res.solid_results.entry(sname.clone()).or_default();
                 combine_stress(&mut entry.center_stress, &sr.center_stress, *sf, key_first);
@@ -4991,6 +5107,9 @@ fn evaluate_load_combos(model: &mut SapModel) {
             }
 
             for (lname, lf) in &src.link_forces {
+                if !in_all(&|c| c.link_forces.contains_key(lname)) {
+                    continue;
+                }
                 let key_first = is_first || !comb_res.link_forces.contains_key(lname);
                 let entry = comb_res
                     .link_forces
@@ -5062,6 +5181,26 @@ fn evaluate_load_combos(model: &mut SapModel) {
             for lf in comb_res.link_forces.values_mut() {
                 for v in lf {
                     *v = finalize_op(*v);
+                }
+            }
+        }
+
+        // Von Mises and principal values are not linear in the stress components.
+        // For the linear sums, take them from the combined components. The envelope
+        // keeps the largest-magnitude value of each field, and SRSS and AbsAdd combine
+        // each field by its own rule; those are left as they are.
+        if matches!(combo.combo_type, ComboType::LinearAdd | ComboType::RangeAdd) {
+            for ar in comb_res.area_results.values_mut() {
+                ar.svm_top = crate::area::plane_von_mises(ar.s11_top, ar.s22_top, ar.s12_top);
+            }
+            let rederive = |st: &mut SolidStress| {
+                *st = solid_stress_from_components([st.s11, st.s22, st.s33, st.s12, st.s13, st.s23]);
+            };
+            for sr in comb_res.solid_results.values_mut() {
+                rederive(&mut sr.center_stress);
+                for g in 0..8 {
+                    rederive(&mut sr.gauss_stresses[g]);
+                    rederive(&mut sr.nodal_stresses[g]);
                 }
             }
         }

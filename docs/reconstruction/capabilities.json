@@ -741,15 +741,147 @@
       "limits": "GUI verified through command functions and headless renders only. Legend colours are project choices. No capacity-spectrum form of the curve. Hinge definition commands are not in the typed API. S2K uses reconstruction extension tables; genuine vendor hinge tables are kept verbatim and not interpreted. Native export refuses hinge data. Native import accepts only the hinge values the two Example 1-026 files show."
     },
     {
+      "id": "plane-views-mouse-drawing",
+      "area": "application",
+      "feature": "Plan and elevation views at a coordinate with stepping through grid levels, window selection (inside / crossing) and previous selection, mouse drawing tools (quick draw of frames, areas, braces and secondary beams on the grid of a plane view; frames and areas through picked points), grid line editor, 2D frame template on a custom grid, division of frames with a length ratio, breaking frames at intersections, area uniform loads by direction.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-app/src/gui/view.rs",
+          "lines": "1-575",
+          "note": "Projection of a pane, plane views, plane members, grid segments; tests."
+        },
+        {
+          "file": "crates/sap-app/src/gui/selection.rs",
+          "lines": "1-528",
+          "note": "Window and previous selection with their tests."
+        },
+        {
+          "file": "crates/sap-app/src/gui/draw_tools.rs",
+          "lines": "1-1192",
+          "note": "The tools as pure functions of event, view and model."
+        },
+        {
+          "file": "crates/sap-app/src/gui/draw_tools/tests.rs",
+          "lines": "1-1024",
+          "note": "Fixed-view clicks and windows, identity with the index commands, refusals, a click through the viewport."
+        },
+        {
+          "file": "crates/sap-model/src/draw.rs",
+          "lines": "1-242",
+          "note": "draw_frames, draw_areas and the area criterion."
+        },
+        {
+          "file": "crates/sap-model/tests/draw_commands.rs",
+          "lines": "1-282",
+          "note": "Model command tests and refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/draw_area_criterion.rs",
+          "lines": "1-137",
+          "note": "The area criterion against the solver's validation."
+        },
+        {
+          "file": "crates/sap-model/tests/grid_divide_break.rs",
+          "lines": "1-938",
+          "note": "Grid lines, custom template, ratio division, break at intersections; refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/grid_divide_break_solver.rs",
+          "lines": "1-256",
+          "note": "Closed forms for the divided and broken beams and the area loads."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_drawing_e2e.rs",
+          "lines": "1-283",
+          "note": "Pointer drags, clicks and keys through the application."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_drawing_e2e/building.rs",
+          "lines": "1-322",
+          "note": "The video's first building drawn with the mouse against the index commands."
+        }
+      ],
+      "limits": "Verified through command functions and headless renders with synthetic pointer and key input only; never used by hand. Snapping is to joints and grid intersections; no midpoint, intersection or perpendicular snaps, no back-face views, no cylindrical grids. Areas have at most four joints. Breaking covers joints and frames, not area or solid edges. The frame-window rule, snap radius and previous-selection rule are project choices. No cSapModel facade."
+    },
+    {
+      "id": "material-library-section-import-chooser",
+      "area": "application",
+      "feature": "Materials from the vendor's CSiMaterialLibrary XML files read at run time (region, type, standard, grade), import of several section-file shapes at once with filters and an Auto Select list, and a file chooser inside the program.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-format/src/material_library.rs",
+          "lines": "1-1000",
+          "note": "Subset XML reader, unit handling, duplicate rule, conversion to a material and its refusals."
+        },
+        {
+          "file": "crates/sap-format/tests/material_library.rs",
+          "lines": "1-728",
+          "note": "Synthetic files, unit factors, parser errors, opt-in totals and values of the eight vendor files."
+        },
+        {
+          "file": "crates/sap-app/src/gui/materials.rs",
+          "lines": "1-704",
+          "note": "Window and command function with tests."
+        },
+        {
+          "file": "crates/sap-app/src/gui/section_import.rs",
+          "lines": "1-981",
+          "note": "Selection rules, filters, atomic import, tests."
+        },
+        {
+          "file": "crates/sap-app/src/gui/file_browser.rs",
+          "lines": "1-628",
+          "note": "Chooser on std::fs with tests."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_drawing_e2e/part4.rs",
+          "lines": "1-369",
+          "note": "Library material to analysis; S2K and native round trip of library names (opt-in)."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_drawing_e2e/chooser.rs",
+          "lines": "1-160",
+          "note": "Chooser to import window to a drawn frame."
+        }
+      ],
+      "limits": "No library or section file ships with the program. Lightweight concrete, shear reduction factors other than 1, aluminum and cold-formed materials are refused; expected strengths and strains are not kept. The XML reader covers the vendor files and their schema, not general XML. The chooser is not the operating-system dialog. Verified headless only."
+    },
+    {
+      "id": "shell-stress-temperature-combination-output",
+      "area": "solver",
+      "feature": "Shell top-face stresses by the CSI sign convention, shell stress resultants under uniform temperature changes and through-thickness gradients, native import of the gradient load, von Mises and principal values of linear combinations from the combined components, combination results only where every case has them, base reactions including supports created by area meshing, and refusal of unknown response-spectrum directions.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/tests/shell_stress_and_combos.rs",
+          "lines": "1-466",
+          "note": "Cantilever strip (F11, M11, top stress, displacements), combinations, missing results, spectrum directions, base reaction of a meshed panel."
+        },
+        {
+          "file": "crates/sap-solver/tests/shell_temperature.rs",
+          "lines": "1-408",
+          "note": "Free and restrained plate closed forms; refusals; opt-in CSI Examples 2-013 and 2-014 from the vendor files."
+        },
+        {
+          "file": "crates/sap-solver/tests/shell_vendor_moment_sign.rs",
+          "lines": "1-53",
+          "note": "Opt-in CSI Example 2-015: sign of the edge moment and of the top stress."
+        }
+      ],
+      "limits": "Top stresses, thermal resultants and combination von Mises values differ from versions before 2026-11-16. Temperature loads on three-joint areas, with joint patterns, and on sections without the stiffness they act on (plane and axisymmetric-solid sections included) are refused. Von Mises and principal values of SRSS and absolute combinations are still combined field by field. A combination that drops shell, solid or link results gives no message. Example 2-014 is matched to the independent solution within 4 % on the vendor's coarse mesh and 1 % on its fine mesh, not to the vendor's element."
+    },
+    {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "90 live reference checks across 19 benchmark families plus 803 automated tests across 69 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
+      "feature": "92 live reference checks plus 965 automated tests across 77 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/benchmarks.rs",
           "lines": "55-90",
-          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks)."
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks). A cantilever shell strip (top-face stress and moment sign) added 2026-11-16 (92 checks)."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",

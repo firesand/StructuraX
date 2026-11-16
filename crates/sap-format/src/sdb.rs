@@ -3084,7 +3084,15 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             let pindex = load.get("m_Pattern").and_then(SdbVal::as_i32).unwrap_or(0) as usize;
             area.loads_temp.push(AreaLoadTemperature {
                 load_pat: load_pat.clone(),
-                my_type: load.get("m_LT").and_then(SdbVal::as_i32).unwrap_or(1),
+                // The native file numbers the load types as the OAPI does
+                // (1 temperature, 3 gradient along local 3); the model numbers the
+                // gradient 2, as the S2K reader does. Other values are kept so the
+                // analysis can refuse them by name.
+                my_type: match load.get("m_LT").and_then(SdbVal::as_i32).unwrap_or(1) {
+                    3 => 2,
+                    2 => 3,
+                    other => other,
+                },
                 val: load.get("m_T").and_then(SdbVal::as_f64).unwrap_or(0.0),
                 pattern_name: pat_names
                     .get(pindex)

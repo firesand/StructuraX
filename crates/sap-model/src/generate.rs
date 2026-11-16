@@ -25,7 +25,7 @@ const MAX_GRID_LINES: usize = 1000;
 
 /// Tolerance for treating two coordinates as the same point:
 /// `1e-9 * max(1, largest |coordinate|)` over the model and `extra`.
-pub(crate) fn geometry_tolerance(model: &SapModel, extra: &[[f64; 3]]) -> f64 {
+pub fn geometry_tolerance(model: &SapModel, extra: &[[f64; 3]]) -> f64 {
     let mut scale = 1.0f64;
     for p in model.points.values() {
         scale = scale.max(p.x.abs()).max(p.y.abs()).max(p.z.abs());
@@ -318,7 +318,7 @@ pub enum SpanDirection {
 }
 
 /// Excel-style label: A..Z, AA, AB, ...
-fn column_label(mut i: usize) -> String {
+pub(crate) fn column_label(mut i: usize) -> String {
     let mut out = Vec::new();
     loop {
         out.push(b'A' + (i % 26) as u8);
@@ -395,7 +395,7 @@ impl SapModel {
     }
 
     /// Sorted (ascending) GLOBAL grid coordinates of X, Y and Z.
-    fn grid_axes(&self) -> Result<[Vec<f64>; 3], EditError> {
+    pub(crate) fn grid_axes(&self) -> Result<[Vec<f64>; 3], EditError> {
         let cs = self
             .coord_systems
             .get("GLOBAL")
@@ -420,7 +420,7 @@ impl SapModel {
         Ok(axes)
     }
 
-    fn checked_region(axes: &[Vec<f64>; 3], r: &GridRegion) -> Result<(), EditError> {
+    pub(crate) fn checked_region(axes: &[Vec<f64>; 3], r: &GridRegion) -> Result<(), EditError> {
         for (k, (lo, hi)) in [r.x, r.y, r.z].into_iter().enumerate() {
             if lo > hi || hi >= axes[k].len() {
                 return Err(invalid(format!(
@@ -433,7 +433,7 @@ impl SapModel {
         Ok(())
     }
 
-    fn require_frame_section(&self, name: &str) -> Result<(), EditError> {
+    pub(crate) fn require_frame_section(&self, name: &str) -> Result<(), EditError> {
         if self.frame_sections.contains_key(name) {
             Ok(())
         } else {
@@ -441,7 +441,7 @@ impl SapModel {
         }
     }
 
-    fn finish_draw(&mut self, stage: Stage, what: &str) -> Result<EditSummary, EditError> {
+    pub(crate) fn finish_draw(&mut self, stage: Stage, what: &str) -> Result<EditSummary, EditError> {
         if stage.summary.frames_created.is_empty() && stage.summary.areas_created.is_empty() {
             return Err(invalid(format!(
                 "{what} creates no objects (all exist already)"
@@ -918,5 +918,110 @@ impl SapModel {
         staged.invalidate_results();
         *self = staged;
         Ok(deleted)
+    }
+}
+
+/// One direction of the GLOBAL Cartesian grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridAxis {
+    X,
+    Y,
+    Z,
+}
+
+impl GridAxis {
+    pub const ALL: [Self; 3] = [Self::X, Self::Y, Self::Z];
+
+    /// The axis name stored in a grid line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::X => "X",
+            Self::Y => "Y",
+            Self::Z => "Z",
+        }
+    }
+
+    fn bubble(self) -> &'static str {
+        match self {
+            Self::X => "End",
+            Self::Y | Self::Z => "Start",
+        }
+    }
+}
+
+impl SapModel {
+    /// Replace the GLOBAL grid lines of one direction by `lines` (id and
+    /// coordinate, kept in the given order). Lines of the other directions are
+    /// untouched; a line whose id already exists in the direction keeps its
+    /// visibility and bubble location. An empty direction is allowed (2D
+    /// models). Refused: a locked model, a blank or repeated id, a nonfinite
+    /// coordinate, two coordinates within [`geometry_tolerance`] of each other
+    /// (the tolerance covers the model and the new coordinates), more than 1000
+    /// lines. A refused call leaves the model unchanged.
+    pub fn set_grid_lines(
+        &mut self,
+        axis: GridAxis,
+        lines: &[(String, f64)],
+    ) -> Result<(), EditError> {
+        self.check_edit()?;
+        if lines.len() > MAX_GRID_LINES {
+            return Err(invalid(format!(
+                "at most {MAX_GRID_LINES} grid lines per direction"
+            )));
+        }
+        let label = axis.label();
+        let mut ids = BTreeSet::new();
+        for (id, c) in lines {
+            if id.trim().is_empty() {
+                return Err(invalid(format!("a {label} grid line has no id")));
+            }
+            if !c.is_finite() {
+                return Err(invalid(format!(
+                    "{label} grid line {id} has a nonfinite coordinate"
+                )));
+            }
+            if !ids.insert(id.as_str()) {
+                return Err(invalid(format!("{label} grid id {id} is used twice")));
+            }
+        }
+        let extra: Vec<[f64; 3]> = lines.iter().map(|(_, c)| [*c, 0.0, 0.0]).collect();
+        let tol = geometry_tolerance(self, &extra);
+        let mut order: Vec<&(String, f64)> = lines.iter().collect();
+        order.sort_by(|a, b| a.1.total_cmp(&b.1));
+        if let Some(w) = order.windows(2).find(|w| w[1].1 - w[0].1 <= tol) {
+            return Err(invalid(format!(
+                "{label} grid lines {} and {} are at the same coordinate (within {tol:e})",
+                w[0].0, w[1].0
+            )));
+        }
+        let cs = self
+            .coord_systems
+            .get_mut("GLOBAL")
+            .ok_or_else(|| invalid("model has no GLOBAL coordinate system"))?;
+        let old: Vec<GridLine> = cs
+            .grids
+            .iter()
+            .filter(|g| g.axis == label)
+            .cloned()
+            .collect();
+        let new_lines: Vec<GridLine> = lines
+            .iter()
+            .map(|(id, c)| {
+                let kept = old.iter().find(|g| &g.id == id);
+                GridLine {
+                    axis: label.into(),
+                    id: id.clone(),
+                    coordinate: *c,
+                    visible: kept.is_none_or(|g| g.visible),
+                    bubble_loc: kept
+                        .map_or_else(|| axis.bubble().into(), |g| g.bubble_loc.clone()),
+                }
+            })
+            .collect();
+        let at = cs.grids.iter().position(|g| g.axis == label);
+        cs.grids.retain(|g| g.axis != label);
+        let at = at.unwrap_or(cs.grids.len()).min(cs.grids.len());
+        cs.grids.splice(at..at, new_lines);
+        Ok(())
     }
 }

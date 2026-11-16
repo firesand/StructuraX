@@ -5,12 +5,20 @@
 
 mod analysis;
 mod build;
+mod draw_tools;
+mod file_browser;
 mod hinges;
+mod materials;
 mod modal_tables;
 mod pushover;
+mod section_import;
 mod seismic;
+mod selection;
 mod steel_design;
 mod time_history;
+#[cfg(test)]
+mod video_drawing_e2e;
+mod view;
 mod workflows;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
@@ -35,6 +43,7 @@ use sap_solver::{
 use sap_units::Units;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use view::{PlaneView, ViewTransform};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolMode {
@@ -42,6 +51,39 @@ pub enum ToolMode {
     DrawPoint,
     DrawFrame,
     DrawArea,
+    /// Click or window grid segments of a plane view.
+    QuickFrame,
+    /// Frames through picked points.
+    PolyFrame,
+    /// Click or window grid cells of a plane view.
+    QuickArea,
+    /// Two opposite corners in a plane view.
+    RectArea,
+    /// An area through picked points.
+    PolyArea,
+    /// Click or window grid cells of an elevation.
+    QuickBrace,
+    /// Click or window grid cells of a plan.
+    QuickSecondary,
+}
+
+/// What a primary drag in a viewport pane does; decided when the drag starts
+/// from the modifier keys, the projection and the tool.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragKind {
+    /// Rubber band: a selection window, or a window for the active draw tool.
+    Window,
+    Pan,
+    /// Rotate the 3D view by this many radians per pixel.
+    Rotate(f32),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PaneDrag {
+    pane: usize,
+    kind: DragKind,
+    from: Pos2,
+    to: Pos2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +239,18 @@ pub struct SapGuiApp {
     pub pitch_rad: f32,
     pub zoom: f32,
     pub pan: Vec2,
+    /// Coordinate of the plane a 2D pane shows (left pane, right pane);
+    /// `None` shows the whole model in that projection.
+    pub left_plane: Option<f64>,
+    pub right_plane: Option<f64>,
+    /// Projection and plane each pane used in the last frame.
+    last_view: [Option<(ViewTransform, Option<PlaneView>)>; 2],
+    /// The pane the pointer was last in; Plane Up/Down and the keyboard act
+    /// on it.
+    active_pane: usize,
+    /// The primary drag in progress, decided when it started.
+    pane_drag: Option<PaneDrag>,
+    set_2d: view::Set2dForm,
 
     // Display options
     pub show_grids: bool,
@@ -236,6 +290,10 @@ pub struct SapGuiApp {
     pub tpl_num_bays_y: usize,
     pub tpl_bay_width_y: f64,
     pub tpl_restraint: bool,
+    /// 2D frame on typed bay widths and storey heights.
+    pub tpl_custom_grid: bool,
+    pub tpl_bays_text: String,
+    pub tpl_storeys_text: String,
 
     // Section dialog parameters
     pub pro_file_name: String,
@@ -256,6 +314,11 @@ pub struct SapGuiApp {
     workflows: workflows::Workflows,
     analysis_editor: analysis::AnalysisEditor,
     panel_build: build::State,
+    draw_tools: draw_tools::State,
+    selection: selection::State,
+    file_browser: file_browser::State,
+    panel_materials: materials::State,
+    panel_section_import: section_import::State,
     panel_hinges: hinges::State,
     panel_modal_tables: modal_tables::State,
     panel_pushover: pushover::State,
@@ -381,6 +444,12 @@ impl SapGuiApp {
             pitch_rad: 0.42,
             zoom: 1.0,
             pan: Vec2::ZERO,
+            left_plane: None,
+            right_plane: None,
+            last_view: [None; 2],
+            active_pane: 1,
+            pane_drag: None,
+            set_2d: view::Set2dForm::default(),
             show_grids: true,
             show_joint_labels: true,
             show_frame_labels: false,
@@ -412,6 +481,9 @@ impl SapGuiApp {
             tpl_num_bays_y: 2,
             tpl_bay_width_y: 240.0,
             tpl_restraint: true,
+            tpl_custom_grid: false,
+            tpl_bays_text: "240, 240, 240".to_string(),
+            tpl_storeys_text: "144, 144, 144".to_string(),
             pro_file_name: "aisc14.pro".to_string(),
             pro_filter: "W14".to_string(),
             pro_available_names: pro_names,
@@ -429,6 +501,11 @@ impl SapGuiApp {
             workflows: workflows::Workflows::default(),
             analysis_editor: analysis::AnalysisEditor::default(),
             panel_build: build::State::default(),
+            draw_tools: draw_tools::State::default(),
+            selection: selection::State::default(),
+            file_browser: file_browser::State::default(),
+            panel_materials: materials::State::default(),
+            panel_section_import: section_import::State::default(),
             panel_hinges: hinges::State::default(),
             panel_modal_tables: modal_tables::State::default(),
             panel_pushover: pushover::State::default(),
@@ -502,6 +579,19 @@ impl SapGuiApp {
         }
         self.analysis_editor = analysis::AnalysisEditor::default();
         self.panel_build = build::State::default();
+        self.draw_tools = draw_tools::State::default();
+        self.selection = selection::State::default();
+        self.file_browser = file_browser::State::default();
+        self.panel_materials = materials::State::default();
+        self.panel_section_import = section_import::State::default();
+        self.left_plane = None;
+        self.right_plane = None;
+        self.last_view = [None; 2];
+        self.pane_drag = None;
+        self.set_2d.open = false;
+        if draw_tools::is_draw_tool(self.tool_mode) {
+            self.tool_mode = ToolMode::Select;
+        }
         self.panel_hinges = hinges::State::default();
         self.panel_modal_tables = modal_tables::State::default();
         self.panel_pushover = pushover::State::default();
@@ -681,10 +771,246 @@ impl SapGuiApp {
         self.status_msg = format!("Assigned {label} restraint to {count} joints.");
     }
 
+    fn select_all_objects(&mut self) {
+        for p in self.model.points.values_mut() {
+            p.selected = true;
+        }
+        for f in self.model.frames.values_mut() {
+            f.selected = true;
+        }
+        for a in self.model.areas.values_mut() {
+            a.selected = true;
+        }
+        for s in self.model.solids.values_mut() {
+            s.selected = true;
+        }
+        for l in self.model.links.values_mut() {
+            l.selected = true;
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        for p in self.model.points.values_mut() {
+            p.selected = false;
+        }
+        for f in self.model.frames.values_mut() {
+            f.selected = false;
+        }
+        for a in self.model.areas.values_mut() {
+            a.selected = false;
+        }
+        for s in self.model.solids.values_mut() {
+            s.selected = false;
+        }
+        for l in self.model.links.values_mut() {
+            l.selected = false;
+        }
+    }
+
+    /// Send Enter or Escape to the active draw tool, in the view the pointer
+    /// was last in. Without a drawn frame there is no view to give.
+    fn route_draw_key(&mut self, event: draw_tools::PointerEvent) {
+        let Some((view, plane)) = self.last_view[self.active_pane.min(1)] else {
+            return;
+        };
+        let outcome = draw_tools::on_event(
+            &mut self.draw_tools,
+            self.tool_mode,
+            &view,
+            plane,
+            event,
+            &mut self.model,
+        );
+        self.apply_draw_outcome(outcome);
+    }
+
+    fn pane_projection(&self, pane: usize) -> ViewProjection {
+        if pane == 0 {
+            self.left_proj
+        } else {
+            self.right_proj
+        }
+    }
+
+    fn pane_plane(&self, pane: usize) -> Option<f64> {
+        if pane == 0 {
+            self.left_plane
+        } else {
+            self.right_plane
+        }
+    }
+
+    /// Show `proj` in a pane. The plane of the old projection does not carry
+    /// over (its coordinate belongs to another axis), so the pane shows the
+    /// whole model, unless the projection is unchanged.
+    fn set_pane_projection(&mut self, pane: usize, proj: ViewProjection) {
+        let pane = pane.min(1);
+        if self.pane_projection(pane) == proj {
+            return;
+        }
+        if pane == 0 {
+            self.left_proj = proj;
+            self.left_plane = None;
+        } else {
+            self.right_proj = proj;
+            self.right_plane = None;
+        }
+    }
+
+    /// Show the plane normal to `normal` at `coordinate` in a pane.
+    fn set_plane_view(&mut self, pane: usize, normal: view::PlaneAxis, coordinate: f64) {
+        if pane.min(1) == 0 {
+            self.left_proj = normal.projection();
+            self.left_plane = Some(coordinate);
+        } else {
+            self.right_proj = normal.projection();
+            self.right_plane = Some(coordinate);
+        }
+    }
+
+    /// The 2D pane Plane Up and Plane Down act on: the pane the pointer was
+    /// last in, else the other one.
+    fn plane_pane(&self) -> Option<usize> {
+        let first = self.active_pane.min(1);
+        [first, 1 - first]
+            .into_iter()
+            .filter(|p| *p == 0 || self.dual_pane)
+            .find(|p| self.pane_projection(*p) != ViewProjection::Perspective3D)
+    }
+
+    /// Plane Up / Plane Down: the next plane of the grid (or of the joint
+    /// coordinates) in the plane view. At the last plane the view stays.
+    fn step_plane(&mut self, up: bool) {
+        let Some(pane) = self.plane_pane() else {
+            self.status_msg = "Plane Up / Down needs a plan or an elevation pane.".into();
+            return;
+        };
+        let Some(normal) = PlaneView::of(self.pane_projection(pane), Some(0.0)).map(|p| p.normal)
+        else {
+            return;
+        };
+        let levels = view::plane_levels(&self.model, normal);
+        let tol = view::plane_tolerance(&self.model);
+        match view::step_level(&levels, self.pane_plane(pane), up, tol) {
+            Some(c) => {
+                self.set_plane_view(pane, normal, c);
+                if let Some(plane) = PlaneView::of(self.pane_projection(pane), Some(c)) {
+                    self.status_msg = plane.title();
+                }
+            }
+            None => {
+                self.status_msg = format!(
+                    "No {} {} plane: the view stays.",
+                    if up { "higher" } else { "lower" },
+                    normal.label()
+                );
+            }
+        }
+    }
+
+    /// Leave every plane view: both panes show the whole model again.
+    fn whole_model_view(&mut self) {
+        self.left_plane = None;
+        self.right_plane = None;
+        self.status_msg = "Showing the whole model.".into();
+    }
+
+    fn open_set_2d_view(&mut self) {
+        let pane = if self.dual_pane { self.plane_pane().unwrap_or(1) } else { 0 };
+        let proj = self.pane_projection(pane);
+        if let Some(plane) = PlaneView::of(proj, Some(0.0)) {
+            self.set_2d.normal = plane.normal;
+        }
+        self.set_2d.pane = pane;
+        if let Some(c) = self.pane_plane(pane) {
+            self.set_2d.coordinate_text = c.to_string();
+        }
+        self.set_2d.open = true;
+    }
+
+    /// The "Set 2D View" dialog: plane, coordinate and pane.
+    fn render_set_2d_view(&mut self, ctx: &egui::Context) {
+        if !self.set_2d.open {
+            return;
+        }
+        let levels = view::plane_levels(&self.model, self.set_2d.normal);
+        let mut open = true;
+        let mut apply = false;
+        let mut close = false;
+        egui::Window::new("Set 2D View")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if self.dual_pane {
+                    ui.horizontal(|ui| {
+                        ui.label("Pane:");
+                        ui.radio_value(&mut self.set_2d.pane, 0, "Left");
+                        ui.radio_value(&mut self.set_2d.pane, 1, "Right");
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Plane:");
+                    for (axis, label) in [
+                        (view::PlaneAxis::Z, "X-Y"),
+                        (view::PlaneAxis::Y, "X-Z"),
+                        (view::PlaneAxis::X, "Y-Z"),
+                    ] {
+                        ui.radio_value(&mut self.set_2d.normal, axis, label);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(format!("{} =", self.set_2d.normal.label()));
+                    ui.text_edit_singleline(&mut self.set_2d.coordinate_text);
+                    if !levels.is_empty() {
+                        egui::ComboBox::from_id_salt("set_2d_levels")
+                            .selected_text("grid")
+                            .show_ui(ui, |ui| {
+                                for l in &levels {
+                                    if ui.selectable_label(false, l.to_string()).clicked() {
+                                        self.set_2d.coordinate_text = l.to_string();
+                                    }
+                                }
+                            });
+                    }
+                });
+                ui.label("Front face of the plane only.");
+                ui.horizontal(|ui| {
+                    if ui.button("OK").clicked() {
+                        apply = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if apply {
+            match self.set_2d.coordinate_text.trim().parse::<f64>() {
+                Ok(c) if c.is_finite() => {
+                    let pane = if self.dual_pane { self.set_2d.pane } else { 0 };
+                    self.set_plane_view(pane, self.set_2d.normal, c);
+                    if let Some(plane) = PlaneView::of(self.pane_projection(pane), Some(c)) {
+                        self.status_msg = plane.title();
+                    }
+                    close = true;
+                }
+                _ => {
+                    self.status_msg = format!(
+                        "Not done: '{}' is not a coordinate.",
+                        self.set_2d.coordinate_text
+                    );
+                }
+            }
+        }
+        if close || !open {
+            self.set_2d.open = false;
+        }
+    }
+
     fn render_top_menu_and_ribbon(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         // Keyboard shortcuts (ignored while typing in text fields)
         if !ctx.wants_keyboard_input() {
-            let (f4, f5, f6, f7, del, esc, ctrl_n, ctrl_o, ctrl_t) = ctx.input(|i| {
+            let (f4, f5, f6, f7, del, esc, ctrl_n, ctrl_o, ctrl_t, enter) = ctx.input(|i| {
                 let cmd = i.modifiers.command || i.modifiers.ctrl;
                 (
                     i.key_pressed(egui::Key::F4),
@@ -696,6 +1022,7 @@ impl SapGuiApp {
                     cmd && i.key_pressed(egui::Key::N),
                     cmd && (i.key_pressed(egui::Key::O) || i.key_pressed(egui::Key::S)),
                     cmd && i.key_pressed(egui::Key::T),
+                    i.key_pressed(egui::Key::Enter),
                 )
             });
             if f5 {
@@ -723,7 +1050,14 @@ impl SapGuiApp {
                     self.status_msg = "No selected objects to delete.".to_string();
                 }
             }
+            if enter && draw_tools::is_draw_tool(self.tool_mode) {
+                self.route_draw_key(draw_tools::PointerEvent::Enter);
+            }
             if esc {
+                // The tool ends its sequence first; then the Select tool returns.
+                if draw_tools::is_draw_tool(self.tool_mode) {
+                    self.route_draw_key(draw_tools::PointerEvent::Escape);
+                }
                 self.draw_first_point = None;
                 self.draw_area_points.clear();
                 self.tool_mode = ToolMode::Select;
@@ -800,40 +1134,12 @@ impl SapGuiApp {
                     self.panel_build.open = true;
                     ui.close_menu();
                 }
-                if ui.button("Select All Objects").clicked() {
-                    for p in self.model.points.values_mut() {
-                        p.selected = true;
-                    }
-                    for f in self.model.frames.values_mut() {
-                        f.selected = true;
-                    }
-                    for a in self.model.areas.values_mut() {
-                        a.selected = true;
-                    }
-                    for s in self.model.solids.values_mut() {
-                        s.selected = true;
-                    }
-                    for l in self.model.links.values_mut() {
-                        l.selected = true;
-                    }
+                if ui.button("Edit Grid Lines...").clicked() {
+                    self.panel_build.show_tab(build::TAB_GRID);
                     ui.close_menu();
                 }
-                if ui.button("Clear Selection").clicked() {
-                    for p in self.model.points.values_mut() {
-                        p.selected = false;
-                    }
-                    for f in self.model.frames.values_mut() {
-                        f.selected = false;
-                    }
-                    for a in self.model.areas.values_mut() {
-                        a.selected = false;
-                    }
-                    for s in self.model.solids.values_mut() {
-                        s.selected = false;
-                    }
-                    for l in self.model.links.values_mut() {
-                        l.selected = false;
-                    }
+                if ui.button("Divide / Break Frames...").clicked() {
+                    self.open_workflow(0);
                     ui.close_menu();
                 }
                 if ui.button("Delete Selected Objects (Del)").clicked() {
@@ -858,23 +1164,60 @@ impl SapGuiApp {
                 }
             });
 
+            ui.menu_button("Select", |ui| {
+                if ui.button("Select All Objects").clicked() {
+                    self.select_all_objects();
+                    ui.close_menu();
+                }
+                if ui.button("Clear Selection").clicked() {
+                    self.clear_selection();
+                    ui.close_menu();
+                }
+                if ui.button("Get Previous Selection").clicked() {
+                    self.status_msg = match selection::restore_previous(
+                        &self.selection,
+                        &mut self.model,
+                    ) {
+                        Ok(message) => message,
+                        Err(error) => format!("Not done: {error}"),
+                    };
+                    ui.close_menu();
+                }
+            });
+
             ui.menu_button("View", |ui| {
                 ui.checkbox(&mut self.dual_pane, "Dual-Pane Viewport (3D + 2D)");
                 ui.separator();
-                if ui.button("Set Left View: 3D Perspective").clicked() {
-                    self.left_proj = ViewProjection::Perspective3D;
+                for (pane, name) in [(0usize, "Left"), (1, "Right")] {
+                    ui.menu_button(format!("{name} Pane"), |ui| {
+                        for (label, proj) in [
+                            ("3D Perspective", ViewProjection::Perspective3D),
+                            ("XY Plan", ViewProjection::PlanXY),
+                            ("XZ Elevation", ViewProjection::ElevationXZ),
+                            ("YZ Elevation", ViewProjection::ElevationYZ),
+                        ] {
+                            if ui.button(label).clicked() {
+                                self.set_pane_projection(pane, proj);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                }
+                ui.separator();
+                if ui.button("Set 2D View...").clicked() {
+                    self.open_set_2d_view();
                     ui.close_menu();
                 }
-                if ui.button("Set Right View: XZ Elevation").clicked() {
-                    self.right_proj = ViewProjection::ElevationXZ;
+                if ui.button("Plane Up").clicked() {
+                    self.step_plane(true);
                     ui.close_menu();
                 }
-                if ui.button("Set Right View: XY Plan").clicked() {
-                    self.right_proj = ViewProjection::PlanXY;
+                if ui.button("Plane Down").clicked() {
+                    self.step_plane(false);
                     ui.close_menu();
                 }
-                if ui.button("Set Right View: YZ Elevation").clicked() {
-                    self.right_proj = ViewProjection::ElevationYZ;
+                if ui.button("Whole Model (leave plane view)").clicked() {
+                    self.whole_model_view();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -916,8 +1259,19 @@ impl SapGuiApp {
                         ui.close_menu();
                     }
                 }
+                if ui.button("Materials from Library...").clicked() {
+                    self.panel_materials.open = true;
+                    ui.close_menu();
+                }
                 if ui.button("Frame Sections & .PRO Library...").clicked() {
                     self.show_section_modal = true;
+                    ui.close_menu();
+                }
+                if ui
+                    .button("Import Sections from .PRO (multiple)...")
+                    .clicked()
+                {
+                    self.panel_section_import.open = true;
                     ui.close_menu();
                 }
                 if ui.button("Mass Source and Auto Seismic Loads...").clicked() {
@@ -936,6 +1290,30 @@ impl SapGuiApp {
                 if ui.button("Database Tables Explorer... (Ctrl+T)").clicked() {
                     self.show_tables_modal = true;
                     ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Draw", |ui| {
+                for (label, tool) in [
+                    ("Select / Pointer", ToolMode::Select),
+                    ("Draw Special Joint", ToolMode::DrawPoint),
+                    ("Draw Frame between Two Joints", ToolMode::DrawFrame),
+                    ("Draw Frame through Points", ToolMode::PolyFrame),
+                    ("Quick Draw Frame (grid segment)", ToolMode::QuickFrame),
+                    ("Quick Draw Braces (grid cell)", ToolMode::QuickBrace),
+                    (
+                        "Quick Draw Secondary Beams (grid cell)",
+                        ToolMode::QuickSecondary,
+                    ),
+                    ("Draw Area through Four Joints", ToolMode::DrawArea),
+                    ("Draw Poly Area", ToolMode::PolyArea),
+                    ("Draw Rectangular Area", ToolMode::RectArea),
+                    ("Quick Draw Area (grid cell)", ToolMode::QuickArea),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.tool_mode = tool;
+                        ui.close_menu();
+                    }
                 }
             });
 
@@ -1576,7 +1954,14 @@ impl SapGuiApp {
         });
     }
 
-    fn render_viewport(&mut self, ui: &mut egui::Ui, proj: ViewProjection, title: &str) {
+    /// Draws pane `pane` (0: left or only pane, 1: right pane).
+    fn render_viewport(&mut self, ui: &mut egui::Ui, pane: usize, title: &str) {
+        let pane = pane.min(1);
+        let (proj, plane_coordinate) = if pane == 0 {
+            (self.left_proj, self.left_plane)
+        } else {
+            (self.right_proj, self.right_plane)
+        };
         let avail = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(avail, Sense::click_and_drag());
         let painter = ui.painter_at(rect);
@@ -1589,10 +1974,17 @@ impl SapGuiApp {
             Stroke::new(1.0_f32, Color32::from_rgb(55, 65, 85)),
         );
 
-        // Camera manipulation
+        if response.hovered() || response.dragged() {
+            self.active_pane = pane;
+        }
+
+        // Camera manipulation. A middle or right drag pans a 2D pane and
+        // rotates the 3D one. A primary drag is decided once, when it starts:
+        // in 2D it draws a window (Select tool or a draw tool) and Shift or
+        // Alt pan; in 3D it rotates (Shift pans, Alt rotates faster) and Ctrl
+        // draws a window.
         if response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle)
-            || (response.dragged_by(egui::PointerButton::Primary) && ui.input(|i| i.modifiers.alt))
         {
             let delta = response.drag_delta();
             if proj == ViewProjection::Perspective3D {
@@ -1601,15 +1993,63 @@ impl SapGuiApp {
             } else {
                 self.pan += delta;
             }
-        } else if response.dragged_by(egui::PointerButton::Primary)
-            && self.tool_mode == ToolMode::Select
-        {
-            let delta = response.drag_delta();
-            if ui.input(|i| i.modifiers.shift) || proj != ViewProjection::Perspective3D {
-                self.pan += delta;
+        }
+        if response.drag_started_by(egui::PointerButton::Primary) {
+            let (alt, shift, ctrl, press) = ui.input(|i| {
+                (
+                    i.modifiers.alt,
+                    i.modifiers.shift,
+                    i.modifiers.ctrl || i.modifiers.command,
+                    i.pointer.press_origin(),
+                )
+            });
+            let window_tool =
+                self.tool_mode == ToolMode::Select || draw_tools::is_draw_tool(self.tool_mode);
+            let kind = if proj == ViewProjection::Perspective3D {
+                if alt {
+                    Some(DragKind::Rotate(0.01))
+                } else if ctrl && window_tool {
+                    Some(DragKind::Window)
+                } else if self.tool_mode == ToolMode::Select {
+                    Some(if shift {
+                        DragKind::Pan
+                    } else {
+                        DragKind::Rotate(0.008)
+                    })
+                } else {
+                    None
+                }
+            } else if alt || shift {
+                Some(DragKind::Pan)
+            } else if window_tool {
+                Some(DragKind::Window)
             } else {
-                self.yaw_rad += delta.x * 0.008;
-                self.pitch_rad = (self.pitch_rad + delta.y * 0.008).clamp(-1.5, 1.5);
+                None
+            };
+            let from = press.or(response.interact_pointer_pos());
+            self.pane_drag = kind.zip(from).map(|(kind, from)| PaneDrag {
+                pane,
+                kind,
+                from,
+                to: from,
+            });
+        }
+        if response.dragged_by(egui::PointerButton::Primary) {
+            let delta = response.drag_delta();
+            let pos = response.interact_pointer_pos();
+            if let Some(d) = self.pane_drag.as_mut().filter(|d| d.pane == pane) {
+                match d.kind {
+                    DragKind::Pan => self.pan += delta,
+                    DragKind::Rotate(rate) => {
+                        self.yaw_rad += delta.x * rate;
+                        self.pitch_rad = (self.pitch_rad + delta.y * rate).clamp(-1.5, 1.5);
+                    }
+                    DragKind::Window => {
+                        if let Some(p) = pos {
+                            d.to = p;
+                        }
+                    }
+                }
             }
         }
 
@@ -1637,31 +2077,24 @@ impl SapGuiApp {
         let screen_center = rect.center() + self.pan;
         let is_planar_xz = dy_b.abs() < 1e-6 && self.model.points.len() >= 2;
 
-        let project = |p: [f64; 3]| -> Pos2 {
-            if !p[0].is_finite() || !p[1].is_finite() || !p[2].is_finite() {
-                return screen_center;
-            }
-            let dx =
-                ((p[0] - center_3d[0]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
-            let dy =
-                ((p[1] - center_3d[1]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
-            let dz =
-                ((p[2] - center_3d[2]) * (base_scale as f64)).clamp(-50_000.0, 50_000.0) as f32;
-            let (sx, sy) = match proj {
-                ViewProjection::Perspective3D => {
-                    let (syaw, cyaw) = self.yaw_rad.sin_cos();
-                    let (sp, cp) = self.pitch_rad.sin_cos();
-                    let x1 = dx * cyaw - dy * syaw;
-                    let y1 = dx * syaw + dy * cyaw;
-                    let z2 = dz * cp - y1 * sp;
-                    (x1, -z2)
-                }
-                ViewProjection::ElevationXZ => (dx, -dz),
-                ViewProjection::PlanXY => (dx, -dy),
-                ViewProjection::ElevationYZ => (dy, -dz),
-            };
-            Pos2::new(screen_center.x + sx, screen_center.y + sy)
+        let view = ViewTransform {
+            proj,
+            center: center_3d,
+            scale: f64::from(base_scale),
+            screen_center,
+            yaw: self.yaw_rad,
+            pitch: self.pitch_rad,
         };
+        let plane = PlaneView::of(proj, plane_coordinate);
+        self.last_view[pane] = Some((view, plane));
+        let project = |p: [f64; 3]| -> Pos2 { view.project(p) };
+        // In a plane view only the objects in the plane are drawn and picked.
+        let members = plane.map(|pl| {
+            view::plane_members(&self.model, pl, view::plane_tolerance(&self.model))
+        });
+        let in_view = |pick: fn(&view::Members) -> &std::collections::BTreeSet<String>,
+                       name: &String|
+         -> bool { members.as_ref().is_none_or(|m| pick(m).contains(name)) };
 
         // Active static load-pattern multipliers for load arrow visualization
         let mut active_pat_scales: BTreeMap<String, f64> = BTreeMap::new();
@@ -1748,7 +2181,25 @@ impl SapGuiApp {
 
         // 1. Draw Grid Lines & Bubbles (orthogonal on base planes, never diagonal in 3D)
         if self.show_grids {
-            if let Some(cs) = self.model.coord_systems.get("GLOBAL") {
+            if let Some(pl) = plane {
+                let grid_col = Color32::from_rgba_unmultiplied(70, 85, 110, 120);
+                for g in view::plane_grid_segments(&self.model, pl, (min_pt, max_pt)) {
+                    let sa = project(g.a);
+                    let sb = project(g.b);
+                    if sa.distance(sb) > 1.0 {
+                        painter.line_segment([sa, sb], Stroke::new(1.0_f32, grid_col));
+                        let bubble = if g.bubble_at_a { sa } else { sb };
+                        painter.circle_stroke(bubble, 8.0, Stroke::new(1.0_f32, grid_col));
+                        painter.text(
+                            bubble,
+                            egui::Align2::CENTER_CENTER,
+                            &g.id,
+                            FontId::proportional(10.0),
+                            Color32::from_rgb(150, 170, 200),
+                        );
+                    }
+                }
+            } else if let Some(cs) = self.model.coord_systems.get("GLOBAL") {
                 let grid_col = Color32::from_rgba_unmultiplied(70, 85, 110, 120);
                 for g in &cs.grids {
                     if !g.visible || !g.coordinate.is_finite() {
@@ -1822,7 +2273,29 @@ impl SapGuiApp {
             [2, 3, 7, 6],
             [3, 0, 4, 7],
         ];
+        if let Some(m) = &members {
+            // Solid faces in the plane are outlines; solids are not selectable.
+            for (sid, k) in &m.solid_faces {
+                let Some(solid) = self.model.solids.get(sid) else {
+                    continue;
+                };
+                let face: Vec<Pos2> = view::SOLID_FACES[*k]
+                    .iter()
+                    .filter_map(|c| self.model.points.get(&solid.points[*c]))
+                    .map(|p| project([p.x, p.y, p.z]))
+                    .collect();
+                if face.len() == 4 {
+                    painter.add(Shape::closed_line(
+                        face,
+                        Stroke::new(1.0_f32, Color32::from_rgb(130, 175, 225)),
+                    ));
+                }
+            }
+        }
         for (sid, solid) in &self.model.solids {
+            if members.is_some() {
+                continue;
+            }
             let mut corners = [[0.0_f64; 3]; 8];
             let mut valid = true;
             for (k, pid) in solid.points.iter().enumerate() {
@@ -1902,6 +2375,9 @@ impl SapGuiApp {
         // 3. Draw Area / Shell Objects (+ Deformed Mesh + Applied Area Loads)
         let mut area_screen_polys: Vec<(String, Vec<Pos2>)> = Vec::new();
         for (aid, area) in &self.model.areas {
+            if !in_view(|m| &m.areas, aid) {
+                continue;
+            }
             let mut poly_undef = Vec::with_capacity(area.points.len());
             let mut poly_def = Vec::with_capacity(area.points.len());
             let mut world_pts = Vec::with_capacity(area.points.len());
@@ -2026,6 +2502,9 @@ impl SapGuiApp {
         // 4. Draw Link / Spring-Damper Elements (1-Joint Grounded & 2-Joint Links)
         let mut link_screen_segs: Vec<(String, Pos2, Pos2)> = Vec::new();
         for (lid, link) in &self.model.links {
+            if !in_view(|m| &m.links, lid) {
+                continue;
+            }
             let Some(pi) = self.model.points.get(&link.point_i) else {
                 continue;
             };
@@ -2132,6 +2611,9 @@ impl SapGuiApp {
             Vec::new()
         };
         for (fid, frame) in &self.model.frames {
+            if !in_view(|m| &m.frames, fid) {
+                continue;
+            }
             let (Some(pi), Some(pj)) = (
                 self.model.points.get(&frame.point_i),
                 self.model.points.get(&frame.point_j),
@@ -2458,6 +2940,9 @@ impl SapGuiApp {
         let mut closest_joint: Option<(String, f32)> = None;
 
         for (pid, pt) in &self.model.points {
+            if !in_view(|m| &m.points, pid) {
+                continue;
+            }
             let base = [pt.x, pt.y, pt.z];
             let sp = project(base);
             if let Some(cp) = click_pos {
@@ -2702,6 +3187,94 @@ impl SapGuiApp {
                     }
                 }
                 ToolMode::DrawPoint => {}
+                tool => {
+                    let outcome = draw_tools::on_event(
+                        &mut self.draw_tools,
+                        tool,
+                        &view,
+                        plane,
+                        draw_tools::PointerEvent::Click {
+                            pos: cp,
+                            double: response.double_clicked(),
+                        },
+                        &mut self.model,
+                    );
+                    self.apply_draw_outcome(outcome);
+                }
+            }
+        }
+
+        // A finished window: select, or hand it to the active draw tool. The
+        // old DrawPoint / DrawFrame / DrawArea tools ignore windows.
+        if response.drag_stopped_by(egui::PointerButton::Primary)
+            && self.pane_drag.is_some_and(|d| d.pane == pane)
+        {
+            if let Some(mut d) = self.pane_drag.take() {
+                if let Some(p) = response.interact_pointer_pos() {
+                    d.to = p;
+                }
+                if d.kind == DragKind::Window && d.from.distance(d.to) >= 2.0 {
+                    if self.tool_mode == ToolMode::Select {
+                        let n = selection::select_window(
+                            &mut self.model,
+                            &view,
+                            plane,
+                            d.from,
+                            d.to,
+                        );
+                        self.status_msg = format!("Window selected {n} more object(s).");
+                    } else if draw_tools::is_draw_tool(self.tool_mode) {
+                        let outcome = draw_tools::on_event(
+                            &mut self.draw_tools,
+                            self.tool_mode,
+                            &view,
+                            plane,
+                            draw_tools::PointerEvent::Window {
+                                from: d.from,
+                                to: d.to,
+                            },
+                            &mut self.model,
+                        );
+                        self.apply_draw_outcome(outcome);
+                    }
+                }
+            }
+        }
+
+        // Preview of what the next click of a draw tool would do.
+        if draw_tools::is_draw_tool(self.tool_mode) {
+            let shapes = draw_tools::preview(
+                &self.draw_tools,
+                self.tool_mode,
+                &view,
+                plane,
+                response.hover_pos(),
+                &self.model,
+            );
+            painter.extend(shapes);
+        }
+
+        // Rubber band of a window in progress: solid when dragged left to
+        // right (takes what is inside), dashed right to left (also takes what
+        // it crosses).
+        if let Some(d) = self
+            .pane_drag
+            .filter(|d| d.pane == pane && d.kind == DragKind::Window)
+        {
+            let band = Rect::from_two_pos(d.from, d.to);
+            let col = Color32::from_rgb(255, 235, 150);
+            if d.to.x < d.from.x {
+                let path = [
+                    band.left_top(),
+                    band.right_top(),
+                    band.right_bottom(),
+                    band.left_bottom(),
+                    band.left_top(),
+                ];
+                painter.extend(Shape::dashed_line(&path, Stroke::new(1.2_f32, col), 6.0, 4.0));
+            } else {
+                painter.rect_filled(band, 0.0, Color32::from_rgba_unmultiplied(255, 235, 150, 25));
+                painter.rect_stroke(band, 0.0, Stroke::new(1.2_f32, col));
             }
         }
 
@@ -2760,7 +3333,8 @@ impl SapGuiApp {
             pushover::draw_legend(&painter, rect);
         }
 
-        // Viewport header overlay
+        // Viewport header overlay: the plane of a plane view names the pane.
+        let title = plane.map_or_else(|| title.to_string(), |pl| pl.title());
         painter.text(
             rect.left_top() + Vec2::new(10.0, 8.0),
             egui::Align2::LEFT_TOP,
@@ -2768,28 +3342,24 @@ impl SapGuiApp {
             FontId::proportional(12.5),
             Color32::from_rgb(200, 220, 255),
         );
+        // Coordinates under the pointer in a plane view.
+        if let (Some(pl), Some(hover)) = (plane, response.hover_pos()) {
+            if let Some(p) = view.unproject(hover, pl) {
+                let (h, v) = pl.in_plane_axes();
+                let axis = ["X", "Y", "Z"];
+                painter.text(
+                    rect.left_bottom() + Vec2::new(10.0, -8.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    format!("{} = {:.4}   {} = {:.4}", axis[h], p[h], axis[v], p[v]),
+                    FontId::proportional(11.0),
+                    Color32::from_rgb(170, 190, 220),
+                );
+            }
+        }
     }
 
     fn compute_bounds(&self) -> ([f64; 3], [f64; 3]) {
-        let mut min_p = [f64::INFINITY; 3];
-        let mut max_p = [f64::NEG_INFINITY; 3];
-        let mut count = 0usize;
-        for pt in self.model.points.values() {
-            if pt.x.is_finite() && pt.y.is_finite() && pt.z.is_finite() {
-                min_p[0] = min_p[0].min(pt.x);
-                min_p[1] = min_p[1].min(pt.y);
-                min_p[2] = min_p[2].min(pt.z);
-                max_p[0] = max_p[0].max(pt.x);
-                max_p[1] = max_p[1].max(pt.y);
-                max_p[2] = max_p[2].max(pt.z);
-                count += 1;
-            }
-        }
-        if count == 0 {
-            ([-100.0, -100.0, 0.0], [100.0, 100.0, 100.0])
-        } else {
-            (min_p, max_p)
-        }
+        view::model_bounds(&self.model)
     }
 
     fn load_benchmark_1_001(&mut self) {
@@ -3087,6 +3657,101 @@ impl SapGuiApp {
         self.execute_analysis();
     }
 
+    /// The equal-spacing templates of the New Model dialog.
+    fn generate_template(&self, m: &mut SapModel, span: f64, story_h: f64, bay_y: f64) {
+        match self.tpl_choice {
+            TemplateChoice::Beam => m.generate_beam(
+                self.tpl_num_spans_or_bays,
+                span,
+                self.tpl_restraint,
+                "W18X50",
+            ),
+            TemplateChoice::Frame2D => m.generate_2d_frame(
+                self.tpl_frame2d_type,
+                self.tpl_num_stories,
+                story_h,
+                self.tpl_num_spans_or_bays,
+                span,
+                self.tpl_restraint,
+                "W18X50",
+                "W14X90",
+                "W14X90",
+                (0.15 * span).max(1e-3),
+            ),
+            TemplateChoice::Truss2D => m.generate_2d_truss(
+                self.tpl_num_spans_or_bays,
+                span,
+                story_h,
+                self.tpl_restraint,
+                "W14X90",
+                "W14X90",
+            ),
+            TemplateChoice::Frame3D => m.generate_3d_frame(
+                self.tpl_frame3d_type,
+                self.tpl_num_stories,
+                story_h,
+                self.tpl_num_spans_or_bays,
+                span,
+                self.tpl_num_bays_y,
+                bay_y,
+                self.tpl_restraint,
+                "W18X50",
+                "W14X90",
+                "ASEC1",
+            ),
+            TemplateChoice::ShearWall => m.generate_wall(
+                self.tpl_num_spans_or_bays,
+                span,
+                self.tpl_num_stories,
+                story_h,
+                self.tpl_restraint,
+                "ASEC1",
+            ),
+            TemplateChoice::SphericalDome => m.generate_dome_shell(
+                span,
+                45.0,
+                self.tpl_num_stories.max(3),
+                self.tpl_num_spans_or_bays.max(8),
+                self.tpl_restraint,
+                "ASEC1",
+            ),
+        }
+    }
+
+    /// The 2D frame template on typed bay widths and storey heights, with the
+    /// origin at the first grid line.
+    fn generate_custom_2d_frame(&self, m: &mut SapModel) -> Result<(), String> {
+        let bays = build::parse_lengths(&self.tpl_bays_text)?;
+        let storeys = build::parse_lengths(&self.tpl_storeys_text)?;
+        let narrowest = bays.iter().copied().fold(f64::INFINITY, f64::min);
+        m.generate_2d_frame_custom(
+            self.tpl_frame2d_type,
+            &build::cumulative(0.0, &bays),
+            &build::cumulative(0.0, &storeys),
+            self.tpl_restraint,
+            "W18X50",
+            "W14X90",
+            "W14X90",
+            (0.15 * narrowest).max(1e-3),
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn apply_draw_outcome(&mut self, outcome: draw_tools::DrawOutcome) {
+        match outcome {
+            draw_tools::DrawOutcome::Nothing => {}
+            draw_tools::DrawOutcome::Status(message) => self.status_msg = message,
+            draw_tools::DrawOutcome::Applied(Ok(message)) => {
+                self.status_msg = message;
+                self.sync_active_case();
+            }
+            draw_tools::DrawOutcome::Applied(Err(error)) => {
+                self.status_msg = format!("Not done: {error}");
+            }
+            draw_tools::DrawOutcome::Finish => self.tool_mode = ToolMode::Select,
+        }
+    }
+
     fn render_modals(&mut self, ctx: &egui::Context) {
         // 1. New Model from Parametric Templates Wizard
         let mut open_tpl = self.show_new_template_modal;
@@ -3152,6 +3817,20 @@ impl SapGuiApp {
                                         );
                                     });
                                 ui.end_row();
+                                ui.label("Grid:");
+                                ui.checkbox(
+                                    &mut self.tpl_custom_grid,
+                                    "Use custom grid spacing",
+                                );
+                                ui.end_row();
+                                if self.tpl_custom_grid {
+                                    ui.label("Bay widths along X:");
+                                    ui.text_edit_singleline(&mut self.tpl_bays_text);
+                                    ui.end_row();
+                                    ui.label("Storey heights along Z:");
+                                    ui.text_edit_singleline(&mut self.tpl_storeys_text);
+                                    ui.end_row();
+                                }
                             }
                             if self.tpl_choice == TemplateChoice::Frame3D {
                                 ui.label("3D Building Type:");
@@ -3263,70 +3942,26 @@ impl SapGuiApp {
                         let span = self.tpl_span_or_bay_len.max(1e-3);
                         let story_h = self.tpl_story_height.max(1e-3);
                         let bay_y = self.tpl_bay_width_y.max(1e-3);
-                        match self.tpl_choice {
-                            TemplateChoice::Beam => m.generate_beam(
-                                self.tpl_num_spans_or_bays,
-                                span,
-                                self.tpl_restraint,
-                                "W18X50",
-                            ),
-                            TemplateChoice::Frame2D => m.generate_2d_frame(
-                                self.tpl_frame2d_type,
-                                self.tpl_num_stories,
-                                story_h,
-                                self.tpl_num_spans_or_bays,
-                                span,
-                                self.tpl_restraint,
-                                "W18X50",
-                                "W14X90",
-                                "W14X90",
-                                (0.15 * span).max(1e-3),
-                            ),
-                            TemplateChoice::Truss2D => m.generate_2d_truss(
-                                self.tpl_num_spans_or_bays,
-                                span,
-                                story_h,
-                                self.tpl_restraint,
-                                "W14X90",
-                                "W14X90",
-                            ),
-                            TemplateChoice::Frame3D => m.generate_3d_frame(
-                                self.tpl_frame3d_type,
-                                self.tpl_num_stories,
-                                story_h,
-                                self.tpl_num_spans_or_bays,
-                                span,
-                                self.tpl_num_bays_y,
-                                bay_y,
-                                self.tpl_restraint,
-                                "W18X50",
-                                "W14X90",
-                                "ASEC1",
-                            ),
-                            TemplateChoice::ShearWall => m.generate_wall(
-                                self.tpl_num_spans_or_bays,
-                                span,
-                                self.tpl_num_stories,
-                                story_h,
-                                self.tpl_restraint,
-                                "ASEC1",
-                            ),
-                            TemplateChoice::SphericalDome => m.generate_dome_shell(
-                                span,
-                                45.0,
-                                self.tpl_num_stories.max(3),
-                                self.tpl_num_spans_or_bays.max(8),
-                                self.tpl_restraint,
-                                "ASEC1",
-                            ),
+                        let custom = self.tpl_choice == TemplateChoice::Frame2D
+                            && self.tpl_custom_grid;
+                        let generated = if custom {
+                            self.generate_custom_2d_frame(&mut m)
+                        } else {
+                            self.generate_template(&mut m, span, story_h, bay_y);
+                            Ok(())
+                        };
+                        match generated {
+                            Ok(()) => {
+                                self.replace_model(
+                                    m,
+                                    format!("Generated {:?} parametric model.", self.tpl_choice),
+                                    Vec::new(),
+                                );
+                                self.execute_analysis();
+                                close_tpl = true;
+                            }
+                            Err(error) => self.status_msg = format!("Not done: {error}"),
                         }
-                        self.replace_model(
-                            m,
-                            format!("Generated {:?} parametric model.", self.tpl_choice),
-                            Vec::new(),
-                        );
-                        self.execute_analysis();
-                        close_tpl = true;
                     }
                 });
         }
@@ -4209,7 +4844,24 @@ impl SapGuiApp {
                 .show(ctx, |ui| {
                     ui.label("File Path:");
                     ui.label("S2K preserves source-only data when it can be associated safely. Binary .SDB stream export writes the 64-section binary container.");
-                    ui.text_edit_singleline(&mut self.file_path_input);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.file_path_input);
+                        if ui.button("Browse...").clicked() {
+                            file_browser::open_for(
+                                &mut self.file_browser,
+                                file_browser::Purpose::ModelFile,
+                                std::path::Path::new(&self.file_path_input),
+                                &["s2k", "$2k", "sdb"],
+                                false,
+                            );
+                        }
+                    });
+                    if let Some(path) = file_browser::take_choice(
+                        &mut self.file_browser,
+                        file_browser::Purpose::ModelFile,
+                    ) {
+                        self.file_path_input = path.display().to_string();
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("📂 Open Model").clicked() {
                             match load_model_with_report(&self.file_path_input) {
@@ -4307,7 +4959,24 @@ impl SapGuiApp {
             build::render(ctx, &mut self.panel_build, &mut self.model),
             seismic::render(ctx, &mut self.panel_seismic, &mut self.model),
             steel_design::render(ctx, &mut self.panel_steel_design, &mut self.model),
-            time_history::render(ctx, &mut self.panel_time_history, &mut self.model),
+            time_history::render(
+                ctx,
+                &mut self.panel_time_history,
+                &mut self.model,
+                &mut self.file_browser,
+            ),
+            materials::render(
+                ctx,
+                &mut self.panel_materials,
+                &mut self.model,
+                &mut self.file_browser,
+            ),
+            section_import::render(
+                ctx,
+                &mut self.panel_section_import,
+                &mut self.model,
+                &mut self.file_browser,
+            ),
             modal_tables::render(ctx, &mut self.panel_modal_tables, &mut self.model),
             hinges::render(ctx, &mut self.panel_hinges, &mut self.model),
             pushover::render(ctx, &mut self.panel_pushover, &mut self.model),
@@ -4318,9 +4987,18 @@ impl SapGuiApp {
                 Err(error) => format!("Not done: {error}"),
             };
         }
+        file_browser::render(ctx, &mut self.file_browser);
+        if draw_tools::is_draw_tool(self.tool_mode) {
+            draw_tools::render_properties(ctx, &mut self.draw_tools, self.tool_mode, &self.model);
+        }
     }
 
     pub(crate) fn render_ui(&mut self, ctx: &egui::Context) {
+        selection::track(&mut self.selection, &self.model);
+        if !self.dual_pane {
+            self.last_view[1] = None;
+            self.active_pane = 0;
+        }
         if self.animate_deformed {
             self.anim_phase += 0.08;
             ctx.request_repaint();
@@ -4394,18 +5072,16 @@ impl SapGuiApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.dual_pane {
                 ui.columns(2, |cols| {
-                    let l_proj = self.left_proj;
-                    let r_proj = self.right_proj;
-                    self.render_viewport(&mut cols[0], l_proj, "3D Perspective View");
-                    self.render_viewport(&mut cols[1], r_proj, "2D Plan / Elevation View");
+                    self.render_viewport(&mut cols[0], 0, "3D Perspective View");
+                    self.render_viewport(&mut cols[1], 1, "2D Plan / Elevation View");
                 });
             } else {
-                let l_proj = self.left_proj;
-                self.render_viewport(ui, l_proj, "3D Perspective View");
+                self.render_viewport(ui, 0, "3D Perspective View");
             }
         });
 
         self.render_modals(ctx);
+        self.render_set_2d_view(ctx);
     }
 }
 
@@ -5079,5 +5755,508 @@ mod tests {
             });
         }
         assert!(found, "the explorer must show the saved-state header");
+    }
+
+    // ---- Plane views, window selection and previous selection ----
+
+    use sap_model::generate::GridRegion;
+
+    /// The Part 1 grid (6 x 4 x 7 lines at 6, 5 and 3.2 m) with columns, beams
+    /// and slab areas, drawn with the index commands. Beams and slabs start at
+    /// the second Z line, as in a building whose base level has columns only.
+    fn part1_model() -> SapModel {
+        let mut m = SapModel::new(Units::KnMC);
+        m.quick_grid([6, 4, 7], [6.0, 5.0, 3.2], [0.0; 3]).unwrap();
+        let all = GridRegion {
+            x: (0, 5),
+            y: (0, 3),
+            z: (0, 6),
+        };
+        let floors = GridRegion { z: (1, 6), ..all };
+        m.quick_draw_columns(all, "FSEC1").unwrap();
+        m.quick_draw_beams(floors, true, true, "FSEC1").unwrap();
+        m.quick_draw_areas(floors, "ASEC1").unwrap();
+        m
+    }
+
+    /// Two bays, one storey, in the X-Z plane at y = 0 (columns C1..C3, beams
+    /// B1 and B2).
+    fn portal_model() -> SapModel {
+        let mut m = SapModel::new(Units::KnMC);
+        for (i, x) in [0.0, 6.0, 12.0].iter().enumerate() {
+            m.add_point(format!("B{i}"), *x, 0.0, 0.0);
+            m.add_point(format!("T{i}"), *x, 0.0, 4.0);
+            m.add_frame(format!("C{i}"), format!("B{i}"), format!("T{i}"), "FSEC1");
+        }
+        m.add_frame("G1", "T0", "T1", "FSEC1");
+        m.add_frame("G2", "T1", "T2", "FSEC1");
+        m
+    }
+
+    fn one_pane(app: &mut SapGuiApp, proj: ViewProjection, plane: Option<f64>) {
+        app.dual_pane = false;
+        app.left_proj = proj;
+        app.left_plane = plane;
+    }
+
+    fn texts(out: &egui::FullOutput) -> Vec<(String, Pos2)> {
+        flat_shapes(out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::Text(t) => Some((t.galley.job.text.clone(), t.pos)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn frame_labels(out: &egui::FullOutput) -> Vec<String> {
+        let mut v: Vec<String> = texts(out)
+            .into_iter()
+            .map(|(t, _)| t)
+            .filter(|t| t.ends_with(" (FSEC1)"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn input_with(time: f64, events: Vec<egui::Event>, modifiers: egui::Modifiers) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1800., 1400.))),
+            time: Some(time),
+            events,
+            modifiers,
+            ..Default::default()
+        }
+    }
+
+    /// One frame with pointer events.
+    fn frame_with(
+        app: &mut SapGuiApp,
+        ctx: &egui::Context,
+        time: &mut f64,
+        events: Vec<egui::Event>,
+        modifiers: egui::Modifiers,
+    ) -> egui::FullOutput {
+        *time += 0.05;
+        ctx.run(input_with(*time, events, modifiers), |ctx| app.render_ui(ctx))
+    }
+
+    fn button(pos: Pos2, b: egui::PointerButton, pressed: bool, m: egui::Modifiers) -> egui::Event {
+        egui::Event::PointerButton {
+            pos,
+            button: b,
+            pressed,
+            modifiers: m,
+        }
+    }
+
+    /// A pointer drag from `from` to `to`: press, two moves, release. Returns
+    /// the output of the frame after the first move (drag in progress).
+    fn drag(
+        app: &mut SapGuiApp,
+        ctx: &egui::Context,
+        time: &mut f64,
+        from: Pos2,
+        to: Pos2,
+        b: egui::PointerButton,
+        m: egui::Modifiers,
+    ) -> egui::FullOutput {
+        let mid = from + (to - from) * 0.5;
+        frame_with(app, ctx, time, vec![egui::Event::PointerMoved(from)], m);
+        frame_with(app, ctx, time, vec![button(from, b, true, m)], m);
+        let _ = frame_with(app, ctx, time, vec![egui::Event::PointerMoved(mid)], m);
+        let during = frame_with(app, ctx, time, vec![egui::Event::PointerMoved(to)], m);
+        frame_with(app, ctx, time, vec![button(to, b, false, m)], m);
+        frame_with(app, ctx, time, vec![], m);
+        during
+    }
+
+    fn pane0(app: &SapGuiApp) -> (ViewTransform, Option<PlaneView>) {
+        app.last_view[0].expect("the pane has been drawn")
+    }
+
+    #[test]
+    fn plane_levels_and_steps_follow_the_grid() {
+        let m = part1_model();
+        let z = [0, 1, 2, 3, 4, 5, 6].map(|i| i as f64 * 3.2);
+        let levels = view::plane_levels(&m, view::PlaneAxis::Z);
+        assert_eq!(levels, z.to_vec(), "the seven stored grid floats");
+        let tol = view::plane_tolerance(&m);
+        assert_eq!(view::step_level(&levels, None, true, tol), Some(z[0]));
+        assert_eq!(view::step_level(&levels, Some(z[6]), true, tol), None);
+        assert_eq!(view::step_level(&levels, Some(z[2]), false, tol), Some(z[1]));
+    }
+
+    #[test]
+    fn a_floor_plan_holds_its_beams_and_slabs_and_an_elevation_its_columns_and_beams() {
+        let m = part1_model();
+        let tol = view::plane_tolerance(&m);
+        let z2 = 2.0 * 3.2;
+        let plan = PlaneView::of(ViewProjection::PlanXY, Some(z2)).unwrap();
+        let members = view::plane_members(&m, plan, tol);
+        // 5 bays x 4 lines along X, 3 bays x 6 lines along Y; no column.
+        assert_eq!(members.frames.len(), 20 + 18);
+        assert_eq!(members.areas.len(), 5 * 3);
+        assert_eq!(members.points.len(), 6 * 4);
+        let elevation = PlaneView::of(ViewProjection::ElevationXZ, Some(5.0)).unwrap();
+        // 6 columns x 6 storeys + 5 beams x 6 floors.
+        assert_eq!(view::plane_members(&m, elevation, tol).frames.len(), 36 + 30);
+    }
+
+    #[test]
+    fn a_plane_view_draws_exactly_the_frames_in_its_plane() {
+        let mut app = blank_app();
+        app.model = part1_model();
+        app.show_frame_labels = true;
+        let z2 = 2.0 * 3.2;
+        let ctx = egui::Context::default();
+        // Whole model first: every frame is labelled.
+        one_pane(&mut app, ViewProjection::PlanXY, None);
+        let _ = view(&mut app, &ctx, 0.0);
+        let all = frame_labels(&view(&mut app, &ctx, 1.0));
+        assert_eq!(all.len(), app.model.frames.len());
+        // The plane at z2.
+        one_pane(&mut app, ViewProjection::PlanXY, Some(z2));
+        let _ = view(&mut app, &ctx, 2.0);
+        let out = view(&mut app, &ctx, 3.0);
+        let plan = PlaneView::of(ViewProjection::PlanXY, Some(z2)).unwrap();
+        let members = view::plane_members(&app.model, plan, view::plane_tolerance(&app.model));
+        let mut want: Vec<String> = members
+            .frames
+            .iter()
+            .map(|n| format!("{n} (FSEC1)"))
+            .collect();
+        want.sort();
+        assert_eq!(want.len(), 38);
+        assert_eq!(frame_labels(&out), want);
+        // The header names the plane.
+        assert!(
+            texts(&out).iter().any(|(t, _)| t.starts_with("X-Y Plane @ Z=6.4")),
+            "{:?}",
+            texts(&out).iter().map(|(t, _)| t.clone()).collect::<Vec<_>>()
+        );
+        // Another display mode does not bring the other frames back.
+        app.display_mode = DisplayMode::Reactions;
+        let out = view(&mut app, &ctx, 4.0);
+        assert_eq!(frame_labels(&out), want);
+    }
+
+    #[test]
+    fn a_window_in_an_elevation_follows_the_help_rule_in_either_direction() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        one_pane(&mut app, ViewProjection::ElevationXZ, Some(0.0));
+        let ctx = egui::Context::default();
+        let _ = view(&mut app, &ctx, 0.0);
+        let (v, plane) = pane0(&app);
+        assert!(plane.is_some());
+        // Bay 1 is x = 0..6; the window ends at x = 9, inside beam 2.
+        let a = v.project([-1.0, 0.0, 5.0]);
+        let b = v.project([9.0, 0.0, -1.0]);
+        let mut m = app.model.clone();
+        selection::select_window(&mut m, &v, plane, a, b);
+        let s = selection::snapshot(&m);
+        assert_eq!(
+            s.frames.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["C0", "C1", "G1"]
+        );
+        assert_eq!(s.points.len(), 4);
+        let mut m = app.model.clone();
+        selection::select_window(&mut m, &v, plane, b, a);
+        let s = selection::snapshot(&m);
+        assert_eq!(
+            s.frames.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["C0", "C1", "G1", "G2"]
+        );
+        assert_eq!(s.points.len(), 4);
+    }
+
+    #[test]
+    fn the_previous_selection_survives_clearing_in_the_application() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        let ctx = egui::Context::default();
+        let _ = view(&mut app, &ctx, 0.0);
+        assert!(selection::restore_previous(&app.selection, &mut app.model).is_err());
+        app.model.frames.get_mut("C0").unwrap().selected = true;
+        app.model.frames.get_mut("G1").unwrap().selected = true;
+        let _ = view(&mut app, &ctx, 1.0);
+        app.clear_selection();
+        let _ = view(&mut app, &ctx, 2.0);
+        assert!(selection::snapshot(&app.model).is_empty());
+        let msg = selection::restore_previous(&app.selection, &mut app.model).unwrap();
+        assert!(msg.contains('2'), "{msg}");
+        let s = selection::snapshot(&app.model);
+        assert_eq!(s.frames.iter().map(String::as_str).collect::<Vec<_>>(), ["C0", "G1"]);
+        // A new model forgets it.
+        app.replace_model(portal_model(), "x".into(), Vec::new());
+        assert!(selection::restore_previous(&app.selection, &mut app.model).is_err());
+    }
+
+    #[test]
+    fn a_primary_drag_in_a_2d_pane_selects_and_shift_or_middle_drag_pans() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        one_pane(&mut app, ViewProjection::ElevationXZ, Some(0.0));
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let (v, _) = pane0(&app);
+        let a = v.project([-1.0, 0.0, 5.0]);
+        let b = v.project([9.0, 0.0, -1.0]);
+        let pan0 = app.pan;
+
+        // Left to right: a solid band while dragging, then bay 1 is selected.
+        let during = drag(&mut app, &ctx, &mut t, a, b, egui::PointerButton::Primary, none);
+        let band = Color32::from_rgba_unmultiplied(255, 235, 150, 25);
+        assert!(
+            flat_shapes(&during)
+                .iter()
+                .any(|s| matches!(s, egui::epaint::Shape::Rect(r) if r.fill == band)),
+            "a solid rubber band"
+        );
+        assert_eq!(app.pan, pan0, "a window drag does not pan");
+        let s = selection::snapshot(&app.model);
+        assert_eq!(
+            s.frames.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["C0", "C1", "G1"]
+        );
+        assert!(app.status_msg.contains("selected"), "{}", app.status_msg);
+
+        // Right to left adds beam 2; the band is dashed.
+        let during = drag(&mut app, &ctx, &mut t, b, a, egui::PointerButton::Primary, none);
+        assert!(
+            !flat_shapes(&during)
+                .iter()
+                .any(|s| matches!(s, egui::epaint::Shape::Rect(r) if r.fill == band)),
+            "a dashed band has no fill"
+        );
+        let s = selection::snapshot(&app.model);
+        assert!(s.frames.contains("G2"));
+        assert_eq!(app.pan, pan0);
+
+        // Shift drag pans and leaves the selection as it was.
+        let before = selection::snapshot(&app.model);
+        let shift = egui::Modifiers::SHIFT;
+        let _ = drag(&mut app, &ctx, &mut t, Pos2::new(900.0, 600.0), Pos2::new(1000.0, 650.0), egui::PointerButton::Primary, shift);
+        assert_ne!(app.pan, pan0, "shift drag pans");
+        assert_eq!(selection::snapshot(&app.model), before);
+        // Middle drag pans too.
+        let pan1 = app.pan;
+        let _ = drag(&mut app, &ctx, &mut t, Pos2::new(900.0, 600.0), Pos2::new(800.0, 560.0), egui::PointerButton::Middle, none);
+        assert_ne!(app.pan, pan1, "middle drag pans");
+        assert_eq!(selection::snapshot(&app.model), before);
+    }
+
+    #[test]
+    fn in_3d_a_drag_rotates_and_a_ctrl_drag_draws_a_window() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        app.dual_pane = false;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let (v, _) = pane0(&app);
+        let yaw0 = app.yaw_rad;
+        let c = v.screen_center;
+        let _ = drag(&mut app, &ctx, &mut t, c, c + Vec2::new(60.0, 0.0), egui::PointerButton::Primary, none);
+        assert_ne!(app.yaw_rad, yaw0, "a primary drag rotates the 3D view");
+        assert!(selection::snapshot(&app.model).is_empty());
+        let yaw1 = app.yaw_rad;
+        // Ctrl+drag around the whole model selects it (left to right).
+        let (v, _) = pane0(&app);
+        let pts: Vec<Pos2> = app
+            .model
+            .points
+            .values()
+            .map(|p| v.project([p.x, p.y, p.z]))
+            .collect();
+        let lo = pts.iter().fold(Pos2::new(f32::MAX, f32::MAX), |a, p| a.min(*p));
+        let hi = pts.iter().fold(Pos2::new(f32::MIN, f32::MIN), |a, p| a.max(*p));
+        let ctrl = egui::Modifiers::CTRL;
+        let _ = drag(&mut app, &ctx, &mut t, lo - Vec2::splat(15.0), hi + Vec2::splat(15.0), egui::PointerButton::Primary, ctrl);
+        assert_eq!(app.yaw_rad, yaw1, "ctrl drag does not rotate");
+        assert_eq!(selection::snapshot(&app.model).frames.len(), 5);
+    }
+
+    #[test]
+    fn a_click_in_a_plane_view_cannot_pick_what_the_plane_hides() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        // In plan the column's two joints project to the same point; at z = 4
+        // only the top joint is in the view.
+        one_pane(&mut app, ViewProjection::PlanXY, Some(4.0));
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let (v, plane) = pane0(&app);
+        assert_eq!(plane.map(|p| p.title()), Some("X-Y Plane @ Z=4".to_string()));
+        let at = v.project([0.0, 0.0, 4.0]);
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![egui::Event::PointerMoved(at)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![button(at, egui::PointerButton::Primary, true, none)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![button(at, egui::PointerButton::Primary, false, none)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let s = selection::snapshot(&app.model);
+        assert_eq!(s.points.iter().map(String::as_str).collect::<Vec<_>>(), ["T0"]);
+        // Plane Up from z = 4 has no higher level here (joint coordinates 0, 4
+        // are the levels), so the view stays.
+        app.right_proj = ViewProjection::Perspective3D;
+        app.dual_pane = true;
+        app.active_pane = 0;
+        app.step_plane(true);
+        assert_eq!(app.left_plane, Some(4.0));
+        assert!(app.status_msg.contains("No higher"), "{}", app.status_msg);
+        app.step_plane(false);
+        assert_eq!(app.left_plane, Some(0.0));
+    }
+
+    #[test]
+    fn plane_up_down_set_view_and_whole_model_drive_the_panes() {
+        let mut app = blank_app();
+        app.model = part1_model();
+        // Left 3D, right XZ elevation (the defaults): the right pane is it.
+        assert_eq!(app.plane_pane(), Some(1));
+        app.step_plane(true);
+        assert_eq!(app.right_plane, Some(0.0), "from the whole model up gives the first plane");
+        assert_eq!(app.status_msg, "X-Z Plane @ Y=0");
+        app.step_plane(true);
+        assert_eq!(app.right_plane, Some(5.0));
+        app.step_plane(false);
+        app.step_plane(false);
+        assert_eq!(app.right_plane, Some(0.0), "the view stays at the lowest plane");
+        assert!(app.status_msg.contains("No lower"));
+        // Set 2D View: a plan at a typed coordinate in the left pane.
+        app.set_plane_view(0, view::PlaneAxis::Z, 3.2);
+        assert_eq!(app.left_proj, ViewProjection::PlanXY);
+        assert_eq!(app.left_plane, Some(3.2));
+        // Changing the projection of a pane drops its plane; the same
+        // projection keeps it.
+        app.set_pane_projection(0, ViewProjection::PlanXY);
+        assert_eq!(app.left_plane, Some(3.2));
+        app.set_pane_projection(0, ViewProjection::ElevationYZ);
+        assert_eq!(app.left_plane, None);
+        // Either pane can show a plan or an elevation.
+        app.set_pane_projection(1, ViewProjection::Perspective3D);
+        assert_eq!(app.right_proj, ViewProjection::Perspective3D);
+        app.set_plane_view(0, view::PlaneAxis::X, 12.0);
+        app.right_plane = Some(1.0);
+        app.whole_model_view();
+        assert_eq!((app.left_plane, app.right_plane), (None, None));
+        // Only a 3D pane: Plane Up has nothing to act on.
+        app.left_proj = ViewProjection::Perspective3D;
+        app.step_plane(true);
+        assert!(app.status_msg.contains("needs a plan"), "{}", app.status_msg);
+    }
+
+    #[test]
+    fn the_set_2d_view_dialog_renders_and_applies_a_typed_coordinate() {
+        let mut app = blank_app();
+        app.model = part1_model();
+        app.open_set_2d_view();
+        assert!(app.set_2d.open);
+        let ctx = egui::Context::default();
+        let _ = view(&mut app, &ctx, 0.0);
+        let out = view(&mut app, &ctx, 0.5);
+        assert!(texts(&out).iter().any(|(t, _)| t == "Front face of the plane only."));
+        // A refused coordinate leaves the view alone.
+        app.set_2d.coordinate_text = "abc".into();
+        app.set_2d.normal = view::PlaneAxis::Z;
+        app.set_2d.pane = 0;
+        // Click OK.
+        let ok = texts(&view(&mut app, &ctx, 1.0))
+            .into_iter()
+            .find(|(t, _)| t == "OK")
+            .map(|(_, p)| p + Vec2::new(6.0, 6.0))
+            .expect("OK button");
+        let mut t = 2.0;
+        let none = egui::Modifiers::NONE;
+        frame_with(&mut app, &ctx, &mut t, vec![egui::Event::PointerMoved(ok)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![button(ok, egui::PointerButton::Primary, true, none)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![button(ok, egui::PointerButton::Primary, false, none)], none);
+        assert!(app.status_msg.contains("not a coordinate"), "{}", app.status_msg);
+        assert_eq!(app.left_plane, None);
+    }
+
+    #[test]
+    fn escape_returns_to_select_and_enter_is_routed_while_a_draw_tool_is_active() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        one_pane(&mut app, ViewProjection::ElevationXZ, Some(0.0));
+        app.tool_mode = ToolMode::QuickFrame;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: none,
+        };
+        // Enter reaches the tool (the stub does nothing) and keeps the tool.
+        let frames_before = app.model.frames.len();
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![key(egui::Key::Enter)], none);
+        assert_eq!(app.tool_mode, ToolMode::QuickFrame);
+        assert_eq!(app.model.frames.len(), frames_before);
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![key(egui::Key::Escape)], none);
+        assert_eq!(app.tool_mode, ToolMode::Select);
+    }
+
+    #[test]
+    fn a_draw_tool_window_is_routed_and_the_old_draw_tools_ignore_windows() {
+        let mut app = blank_app();
+        app.model = portal_model();
+        one_pane(&mut app, ViewProjection::ElevationXZ, Some(0.0));
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let (v, _) = pane0(&app);
+        let a = v.project([-1.0, 0.0, 5.0]);
+        let b = v.project([9.0, 0.0, -1.0]);
+        let before = app.pan;
+        for tool in [ToolMode::QuickFrame, ToolMode::RectArea, ToolMode::DrawFrame] {
+            app.tool_mode = tool;
+            let _ = drag(&mut app, &ctx, &mut t, a, b, egui::PointerButton::Primary, none);
+            assert_eq!(app.pan, before);
+            assert!(selection::snapshot(&app.model).is_empty(), "{tool:?} must not select");
+            assert_eq!(app.model.frames.len(), 5);
+        }
+    }
+
+    #[test]
+    fn an_empty_model_with_a_grid_shows_its_bubbles_and_is_framed_by_the_grid() {
+        let mut app = blank_app();
+        app.model = SapModel::new(Units::KnMC);
+        app.model.quick_grid([6, 4, 2], [6.0, 5.0, 3.2], [0.0; 3]).unwrap();
+        let (lo, hi) = app.compute_bounds();
+        assert_eq!((lo, hi), ([0.0, 0.0, 0.0], [30.0, 15.0, 3.2]));
+        let ctx = egui::Context::default();
+        for plane in [None, Some(0.0)] {
+            one_pane(&mut app, ViewProjection::PlanXY, plane);
+            let _ = view(&mut app, &ctx, 0.0);
+            let out = view(&mut app, &ctx, 1.0);
+            let (v, _) = pane0(&app);
+            // Bubbles are drawn inside the viewport, to the right of the explorer.
+            let drawn: Vec<String> = texts(&out)
+                .into_iter()
+                .filter(|(_, p)| p.x > 300.0)
+                .map(|(t, _)| t)
+                .collect();
+            for id in ["A", "B", "C", "D", "E", "F", "1", "2", "3", "4"] {
+                assert!(drawn.iter().any(|t| t == id), "bubble {id} missing for {plane:?}: {drawn:?}");
+            }
+            // The grid is centred in the pane, not in the old +-100 box.
+            let c = v.project([15.0, 7.5, 0.0]);
+            assert!((c - v.screen_center).length() < 1.0);
+        }
     }
 }

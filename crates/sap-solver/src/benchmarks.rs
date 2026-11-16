@@ -73,6 +73,7 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_example_7_001());
     rows.extend(verify_example_7_002());
     rows.extend(verify_example_7_003());
+    rows.extend(verify_shell_cantilever_strip());
     rows
 }
 
@@ -2391,6 +2392,94 @@ pub fn verify_example_7_003() -> Vec<BenchmarkVerificationRow> {
             -1.4745,
             u1[2],
             0.2,
+        ),
+    ]
+}
+
+/// Cantilever plate strip under an axial force and an end moment (kN, m).
+///
+/// Closed form: L = 4, b = 1, t = 0.2, E = 2.5e7, nu = 0, N = 50 and M0 = 10 about +Y at the
+/// tip. Rotation about +Y moves +X points down, so the strip hogs: by the CSI sign convention
+/// (Analysis Reference, Eqns. 2: positive moments give positive stress at the bottom face)
+/// M11 = -M0/b = -10, and at the top face s11 = N/(b t) + 6 M0/(b t^2) = 250 + 1500 = 1750.
+pub fn verify_shell_cantilever_strip() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::{
+        AreaSection, LoadCase, LoadPattern, LoadPatternType, Material, PointLoadForce, SapModel,
+    };
+    use sap_units::Units;
+    let mut m = SapModel::new(Units::KnMC);
+    let mut mat = Material::default_steel_kip_in();
+    mat.name = "MAT".into();
+    mat.e = 2.5e7;
+    mat.u = 0.0;
+    mat.g = 2.5e7 / 2.0;
+    mat.unit_weight = 0.0;
+    mat.unit_mass = 0.0;
+    m.materials.insert("MAT".into(), mat);
+    let mut sec = AreaSection::default();
+    sec.name = "PL".into();
+    sec.material = "MAT".into();
+    sec.thickness_membrane = 0.2;
+    sec.thickness_bending = 0.2;
+    m.area_sections.insert("PL".into(), sec);
+    m.load_cases.clear();
+    m.load_patterns.clear();
+    m.load_patterns.insert(
+        "D".into(),
+        LoadPattern {
+            name: "D".into(),
+            pat_type: LoadPatternType::Dead,
+            self_wt_multiplier: 0.0,
+        },
+    );
+    m.load_cases
+        .insert("D".into(), LoadCase::linear_static("D", "D", 1.0));
+    for i in 0..=4 {
+        for (j, y) in [0.0, 1.0].iter().enumerate() {
+            let name = format!("J{i}{j}");
+            m.add_point(name.clone(), i as f64, *y, 0.0);
+            if i == 0 {
+                m.points[&name].restraint = [true; 6];
+            }
+            if i == 4 {
+                m.points[&name].loads_force.push(PointLoadForce {
+                    load_pat: "D".into(),
+                    csys: "GLOBAL".into(),
+                    force: [25.0, 0.0, 0.0, 0.0, 5.0, 0.0],
+                });
+            }
+        }
+    }
+    for i in 0..4 {
+        m.add_area(
+            format!("A{i}"),
+            vec![
+                format!("J{i}0"),
+                format!("J{}0", i + 1),
+                format!("J{}1", i + 1),
+                format!("J{i}1"),
+            ],
+            "PL",
+        );
+    }
+    crate::analyze_model(&mut m).expect("cantilever strip analyzes");
+    let area = &m.case_results["D"].area_results["A0"];
+    vec![
+        BenchmarkVerificationRow::new(
+            "Shell Cantilever Strip (CSI Eqns. 2)",
+            "D",
+            "S11 top [kN/m2]",
+            1750.0,
+            area.s11_top,
+            1e-6,
+        ),
+        BenchmarkVerificationRow::new(
+            "Shell Cantilever Strip (CSI Eqns. 2)",
+            "D",
+            "M11 [kN-m/m]",
+            -10.0,
+            area.m11,
+            1e-6,
         ),
     ]
 }

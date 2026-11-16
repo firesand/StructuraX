@@ -2341,7 +2341,15 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_n".into(), SdbVal::I32(an_idx)),
                     ("m_lc".into(), SdbVal::I32(lc)),
-                    ("m_LT".into(), SdbVal::I32(lt.my_type)),
+                    // Native numbering: 3 is the gradient the model numbers 2.
+                    (
+                        "m_LT".into(),
+                        SdbVal::I32(match lt.my_type {
+                            2 => 3,
+                            3 => 2,
+                            other => other,
+                        }),
+                    ),
                     ("m_T".into(), SdbVal::F64(lt.val)),
                     ("m_Pattern".into(), SdbVal::I32(p_idx)),
                 ]));

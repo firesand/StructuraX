@@ -2866,10 +2866,30 @@ pub(super) fn parse_s2k_internal(
                 if let (Some(cname), Some(func)) =
                     (get_str(&row, "Case"), get_str(&row, "Function"))
                 {
+                    // A missing CoordDir column keeps meaning U1 (the program's
+                    // default direction; the vendor corpus has no text S2K file to
+                    // show otherwise). A present value must name a direction, or the
+                    // import fails: it would otherwise silently become U1.
+                    let direction = match get_str(&row, "CoordDir") {
+                        None => "U1".to_string(),
+                        Some(d) => {
+                            let upper = d.trim().to_ascii_uppercase();
+                            if !matches!(
+                                upper.as_str(),
+                                "U1" | "UX" | "X" | "1" | "U2" | "UY" | "Y" | "2" | "U3"
+                                    | "UZ" | "Z" | "3" | "R1" | "R2" | "R3" | "RX" | "RY" | "RZ"
+                            ) {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "response spectrum case '{cname}' has unknown direction CoordDir={d}; expected U1, U2 or U3"
+                                )));
+                            }
+                            d.to_string()
+                        }
+                    };
                     if let Some(lc) = model.load_cases.get_mut(cname) {
                         lc.spectrum_loads.push((
                             func.to_string(),
-                            get_str(&row, "CoordDir").unwrap_or("U1").to_string(),
+                            direction,
                             get_f64(&row, "TransAccSF")
                                 .or_else(|| get_f64(&row, "SF"))
                                 .unwrap_or(1.0),

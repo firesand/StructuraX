@@ -1,6 +1,7 @@
 //! SAP2000 file format parser and writer (`.s2k` / `.$2k` text tables and `.sdb` binary model container).
 
 pub mod function_file;
+pub mod material_library;
 pub mod s2k;
 pub mod sdb;
 

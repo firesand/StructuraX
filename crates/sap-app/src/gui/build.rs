@@ -6,7 +6,7 @@
 //! command refuses while the model is locked.
 
 use eframe::egui;
-use sap_model::generate::{BraceKind, GridRegion, SpanDirection, VerticalPlane};
+use sap_model::generate::{BraceKind, GridAxis, GridRegion, SpanDirection, VerticalPlane};
 use sap_model::radial::{CurveKind, ReverseKeep};
 use sap_model::{EditSummary, SapModel};
 
@@ -144,6 +144,36 @@ impl Default for SelectInput {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum GridEditMode {
+    /// One `id coordinate` per line of the text.
+    #[default]
+    Lines,
+    /// Spacings after a first coordinate; the ids are made up.
+    Spacings,
+}
+
+/// Input of the grid line editor (one direction at a time).
+#[derive(Clone, Debug)]
+struct GridEditInput {
+    axis: GridAxis,
+    mode: GridEditMode,
+    text: String,
+    /// Coordinate of the first line in [`GridEditMode::Spacings`].
+    origin: f64,
+}
+
+impl Default for GridEditInput {
+    fn default() -> Self {
+        Self {
+            axis: GridAxis::X,
+            mode: GridEditMode::Lines,
+            text: String::new(),
+            origin: 0.0,
+        }
+    }
+}
+
 /// Window state. It is reset when another model is loaded.
 pub(super) struct State {
     pub(super) open: bool,
@@ -151,10 +181,121 @@ pub(super) struct State {
     grid_counts: [usize; 3],
     grid_spacing: [f64; 3],
     grid_origin: [f64; 3],
+    grid_edit: GridEditInput,
     draw: QuickDrawInput,
     radial: RadialInput,
     curved: CurvedInput,
     select: SelectInput,
+}
+
+/// Tab of the grid commands (quick grid and the grid line editor).
+pub(super) const TAB_GRID: usize = 0;
+
+impl State {
+    /// Open the window on `tab`.
+    pub(super) fn show_tab(&mut self, tab: usize) {
+        self.open = true;
+        self.tab = tab;
+    }
+}
+
+/// Positive lengths from a list separated by commas or blanks.
+pub(super) fn parse_lengths(text: &str) -> Result<Vec<f64>, String> {
+    let mut lengths = Vec::new();
+    for token in text
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+    {
+        let value: f64 = token
+            .parse()
+            .map_err(|_| format!("'{token}' is not a number"))?;
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!("'{token}' is not a positive length"));
+        }
+        lengths.push(value);
+    }
+    if lengths.is_empty() {
+        return Err("enter at least one length".into());
+    }
+    Ok(lengths)
+}
+
+/// Grid coordinates from an origin and spacings: `origin`, then one more
+/// coordinate per spacing.
+pub(super) fn cumulative(origin: f64, spacings: &[f64]) -> Vec<f64> {
+    let mut coordinates = Vec::with_capacity(spacings.len() + 1);
+    let mut at = origin;
+    coordinates.push(at);
+    for spacing in spacings {
+        at += spacing;
+        coordinates.push(at);
+    }
+    coordinates
+}
+
+/// Id of the `i`-th line made up for a direction, as the quick grid names
+/// them: A, B, ..., Z, AA, ... for X; 1, 2, ... for Y; Z1, Z2, ... for Z.
+fn made_up_id(axis: GridAxis, i: usize) -> String {
+    match axis {
+        GridAxis::X => {
+            let mut letters = Vec::new();
+            let mut n = i;
+            loop {
+                letters.push(b'A' + (n % 26) as u8);
+                if n < 26 {
+                    break;
+                }
+                n = n / 26 - 1;
+            }
+            letters.reverse();
+            String::from_utf8(letters).expect("ascii")
+        }
+        GridAxis::Y => (i + 1).to_string(),
+        GridAxis::Z => format!("Z{}", i + 1),
+    }
+}
+
+/// Grid lines typed as one `id coordinate` per line (blank lines are
+/// skipped; blanks, tabs and commas separate the two values).
+fn parse_grid_lines(text: &str) -> Result<Vec<(String, f64)>, String> {
+    let mut lines = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let tokens: Vec<&str> = line
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .filter(|t| !t.is_empty())
+            .collect();
+        match tokens.as_slice() {
+            [] => {}
+            [id, coordinate] => {
+                let value: f64 = coordinate.parse().map_err(|_| {
+                    format!("line {}: '{coordinate}' is not a number", n + 1)
+                })?;
+                lines.push(((*id).to_string(), value));
+            }
+            _ => {
+                return Err(format!(
+                    "line {}: expected an id and a coordinate, e.g. 'A 0'",
+                    n + 1
+                ))
+            }
+        }
+    }
+    Ok(lines)
+}
+
+/// The grid lines of one direction as the editor's text.
+fn grid_lines_text(model: &SapModel, axis: GridAxis) -> String {
+    model
+        .coord_systems
+        .get("GLOBAL")
+        .map(|cs| {
+            cs.grids
+                .iter()
+                .filter(|g| g.axis == axis.label())
+                .map(|g| format!("{} {}\n", g.id, g.coordinate))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl Default for State {
@@ -165,6 +306,7 @@ impl Default for State {
             grid_counts: [4, 4, 4],
             grid_spacing: [20.0, 20.0, 12.0],
             grid_origin: [0.0; 3],
+            grid_edit: GridEditInput::default(),
             draw: QuickDrawInput::default(),
             radial: RadialInput::default(),
             curved: CurvedInput::default(),
@@ -206,6 +348,35 @@ fn apply_grid(
                 "Defined {} x {} x {} grid lines.",
                 counts[0], counts[1], counts[2]
             )
+        })
+        .map_err(|e| e.to_string())
+}
+
+fn apply_grid_lines(model: &mut SapModel, input: &GridEditInput) -> Result<String, String> {
+    guard(model)?;
+    let lines = match input.mode {
+        GridEditMode::Lines => parse_grid_lines(&input.text)?,
+        GridEditMode::Spacings => {
+            if !input.origin.is_finite() {
+                return Err("the first coordinate must be finite".into());
+            }
+            let spacings = parse_lengths(&input.text)?;
+            cumulative(input.origin, &spacings)
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| (made_up_id(input.axis, i), c))
+                .collect()
+        }
+    };
+    let axis = input.axis.label();
+    model
+        .set_grid_lines(input.axis, &lines)
+        .map(|()| {
+            if lines.is_empty() {
+                format!("Removed the {axis} grid lines.")
+            } else {
+                format!("Defined {} {axis} grid lines.", lines.len())
+            }
         })
         .map_err(|e| e.to_string())
 }
@@ -416,6 +587,39 @@ pub(super) fn render(
                             state.grid_origin,
                         ));
                     }
+                    ui.separator();
+                    ui.label("Edit the grid lines of one direction (the other directions stay).");
+                    let g = &mut state.grid_edit;
+                    ui.horizontal(|ui| {
+                        for axis in GridAxis::ALL {
+                            ui.selectable_value(&mut g.axis, axis, axis.label());
+                        }
+                        ui.separator();
+                        ui.selectable_value(&mut g.mode, GridEditMode::Lines, "Ids and coordinates");
+                        ui.selectable_value(&mut g.mode, GridEditMode::Spacings, "Spacings");
+                    });
+                    match g.mode {
+                        GridEditMode::Lines => {
+                            ui.label("One line per grid line: id, then coordinate (e.g. 'A 0'). An empty list removes the direction.");
+                        }
+                        GridEditMode::Spacings => {
+                            ui.horizontal(|ui| {
+                                ui.label("First line at");
+                                ui.add(egui::DragValue::new(&mut g.origin).speed(0.1));
+                            });
+                            ui.label("Spacings separated by commas or blanks (e.g. '4, 6, 4'); ids are made up (A.., 1.., Z1..).");
+                        }
+                    }
+                    ui.add(egui::TextEdit::multiline(&mut g.text).desired_rows(4).desired_width(f32::INFINITY));
+                    ui.horizontal(|ui| {
+                        if ui.button("Read current lines").clicked() {
+                            g.mode = GridEditMode::Lines;
+                            g.text = grid_lines_text(model, g.axis);
+                        }
+                        if ui.button("Apply grid lines").clicked() {
+                            outcome = Some(apply_grid_lines(model, g));
+                        }
+                    });
                 }
                 1 => {
                     let d = &mut state.draw;
@@ -745,5 +949,139 @@ mod tests {
             assert!(render(ctx, &mut state, &mut model).is_none());
         });
         assert!(out.shapes.is_empty());
+    }
+
+    #[test]
+    fn lengths_parse_and_accumulate_into_grid_coordinates() {
+        assert_eq!(parse_lengths("4, 6, 4").unwrap(), vec![4.0, 6.0, 4.0]);
+        assert_eq!(parse_lengths("4 6\t4,\n3.5").unwrap(), vec![4.0, 6.0, 4.0, 3.5]);
+        assert_eq!(cumulative(0.0, &[4.0, 6.0, 4.0]), vec![0.0, 4.0, 10.0, 14.0]);
+        assert_eq!(cumulative(-360.0, &[240.0, 240.0, 240.0]), vec![-360.0, -120.0, 120.0, 360.0]);
+        assert_eq!(cumulative(2.5, &[]), vec![2.5]);
+        for (text, what) in [
+            ("", "at least one"),
+            (" , ", "at least one"),
+            ("4, x", "'x' is not a number"),
+            ("4, 0", "'0' is not a positive"),
+            ("4, -2", "'-2' is not a positive"),
+            ("inf", "'inf' is not a positive"),
+            ("NaN", "'NaN' is not a positive"),
+        ] {
+            let error = parse_lengths(text).unwrap_err();
+            assert!(error.contains(what), "{text:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn grid_line_editor_command_sets_typed_ids_and_spacings() {
+        let mut m = SapModel::default();
+        m.quick_grid([3, 2, 2], [6.0, 5.0, 4.0], [0.0; 3]).unwrap();
+        let y_before = m.coord_systems["GLOBAL"].grids.iter().filter(|g| g.axis == "Y").cloned().collect::<Vec<_>>();
+        let typed = GridEditInput {
+            text: "A 0\nGate, 2.5\n\n  B  10\n".into(),
+            ..Default::default()
+        };
+        assert_eq!(apply_grid_lines(&mut m, &typed).unwrap(), "Defined 3 X grid lines.");
+        let x: Vec<_> = m.coord_systems["GLOBAL"].grids.iter().filter(|g| g.axis == "X").map(|g| (g.id.clone(), g.coordinate)).collect();
+        assert_eq!(x, vec![("A".to_string(), 0.0), ("Gate".to_string(), 2.5), ("B".to_string(), 10.0)]);
+        let y_after: Vec<_> = m.coord_systems["GLOBAL"].grids.iter().filter(|g| g.axis == "Y").cloned().collect();
+        assert_eq!(y_after, y_before);
+        // The editor text of the current lines is what was typed (ids and numbers).
+        assert_eq!(grid_lines_text(&m, GridAxis::X), "A 0\nGate 2.5\nB 10\n");
+        // Spacings: Y lines at 1, 5, 11, 12 with made-up ids.
+        let spacings = GridEditInput {
+            axis: GridAxis::Y,
+            mode: GridEditMode::Spacings,
+            text: "4 6, 1".into(),
+            origin: 1.0,
+        };
+        assert_eq!(apply_grid_lines(&mut m, &spacings).unwrap(), "Defined 4 Y grid lines.");
+        let y: Vec<_> = m.coord_systems["GLOBAL"].grids.iter().filter(|g| g.axis == "Y").map(|g| (g.id.clone(), g.coordinate)).collect();
+        assert_eq!(y, vec![("1".to_string(), 1.0), ("2".to_string(), 5.0), ("3".to_string(), 11.0), ("4".to_string(), 12.0)]);
+        // X ids made up past Z: AA follows Z.
+        assert_eq!(made_up_id(GridAxis::X, 25), "Z");
+        assert_eq!(made_up_id(GridAxis::X, 26), "AA");
+        assert_eq!(made_up_id(GridAxis::Z, 0), "Z1");
+        // An empty list removes the direction.
+        let none = GridEditInput { axis: GridAxis::Z, ..Default::default() };
+        assert_eq!(apply_grid_lines(&mut m, &none).unwrap(), "Removed the Z grid lines.");
+        assert!(m.coord_systems["GLOBAL"].grids.iter().all(|g| g.axis != "Z"));
+    }
+
+    #[test]
+    fn grid_line_editor_refusals_leave_the_model_unchanged() {
+        let mut m = SapModel::default();
+        m.quick_grid([3, 2, 2], [6.0, 5.0, 4.0], [0.0; 3]).unwrap();
+        let before = m.clone();
+        for (text, mode, what) in [
+            ("A 0\nA 5", GridEditMode::Lines, "twice"),
+            ("A 0\nB 0", GridEditMode::Lines, "same coordinate"),
+            ("A 0\nB", GridEditMode::Lines, "line 2: expected an id and a coordinate"),
+            ("A 0 7", GridEditMode::Lines, "line 1: expected"),
+            ("A zero", GridEditMode::Lines, "line 1: 'zero' is not a number"),
+            ("A NaN", GridEditMode::Lines, "nonfinite"),
+            ("4, 0", GridEditMode::Spacings, "not a positive"),
+            ("", GridEditMode::Spacings, "at least one"),
+        ] {
+            let input = GridEditInput { text: text.into(), mode, ..Default::default() };
+            let error = apply_grid_lines(&mut m, &input).unwrap_err();
+            assert!(error.contains(what), "{text:?}: {error}");
+            assert_eq!(m, before, "{text:?}");
+        }
+        let infinite = GridEditInput { mode: GridEditMode::Spacings, text: "1".into(), origin: f64::INFINITY, ..Default::default() };
+        assert!(apply_grid_lines(&mut m, &infinite).is_err());
+        assert_eq!(m, before);
+        locked_model_is_unchanged(|m| {
+            apply_grid_lines(m, &GridEditInput { text: "A 0".into(), ..Default::default() })
+        });
+    }
+
+    #[test]
+    fn edit_grid_lines_menu_entry_opens_the_grid_tab() {
+        let mut state = State::default();
+        state.tab = 3;
+        state.show_tab(TAB_GRID);
+        assert!(state.open);
+        assert_eq!(state.tab, TAB_GRID);
+    }
+
+    #[test]
+    fn grid_tab_renders_the_editor_and_apply_defines_the_typed_lines() {
+        let mut state = State::default();
+        state.show_tab(TAB_GRID);
+        state.grid_edit.text = "A 0\nB 3\nC 9\n".into();
+        let mut model = SapModel::default();
+        let ctx = egui::Context::default();
+        let mut time = 1.0;
+        for _ in 0..2 {
+            time += 1.0;
+            let _ = ctx.run(input(time), |ctx| {
+                render(ctx, &mut state, &mut model);
+            });
+        }
+        let out = ctx.run(input(time + 1.0), |ctx| {
+            render(ctx, &mut state, &mut model);
+        });
+        for label in ["Apply grid lines", "Read current lines", "Create grid lines", "Ids and coordinates", "Spacings"] {
+            assert!(button_center(&out, label).is_some(), "{label} is drawn");
+        }
+        let pos = button_center(&out, "Apply grid lines").unwrap();
+        let mut down = input(time + 2.0);
+        down.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ];
+        let _ = ctx.run(down, |ctx| {
+            render(ctx, &mut state, &mut model);
+        });
+        let mut up = input(time + 2.1);
+        up.events = vec![egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }];
+        let mut outcome = None;
+        let _ = ctx.run(up, |ctx| {
+            outcome = render(ctx, &mut state, &mut model);
+        });
+        assert_eq!(outcome, Some(Ok("Defined 3 X grid lines.".to_string())));
+        let x: Vec<_> = model.coord_systems["GLOBAL"].grids.iter().map(|g| (g.id.clone(), g.coordinate)).collect();
+        assert_eq!(x, vec![("A".to_string(), 0.0), ("B".to_string(), 3.0), ("C".to_string(), 9.0)]);
     }
 }

@@ -1,4 +1,5 @@
 pub mod auto_select;
+pub mod draw;
 pub mod editing;
 pub mod generate;
 pub mod hinge;
@@ -864,7 +865,10 @@ pub struct AreaLoadSurfacePressure {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AreaLoadTemperature {
     pub load_pat: String,
-    /// `1` = Uniform $\Delta T$, `2` = Through-thickness gradient $\Delta T_3$
+    /// `1` = uniform change $\Delta T$; `2` = gradient through the thickness,
+    /// $dT/dx_3$ per unit length, positive when it is warmer toward +local 3.
+    /// (The native file and the OAPI number the gradient 3; the importers
+    /// translate.)
     pub my_type: i32,
     pub val: f64,
     pub pattern_name: Option<String>,

@@ -216,9 +216,10 @@ second-order method preferences are not implemented; design remains AISC
 - **Curved frame** as a number of straight frames on a circular arc or a
   parabola through three points.
 
-Not implemented: drawing with the mouse on a plan or elevation, plane views at
-a level, cylindrical grids, extrusion and replication about other axes,
-keeping a curved frame as one object, edge pressure under reversal (refused).
+Not implemented: cylindrical grids, extrusion and replication about other
+axes, keeping a curved frame as one object, edge pressure under reversal
+(refused). Drawing with the mouse on a plan or elevation and plane views at a
+level were added later; see [tutorial-video-wave3.md](tutorial-video-wave3.md).
 
 ### File formats and GUI
 
@@ -236,8 +237,8 @@ keeping a curved frame as one object, edge pressure under reversal (refused).
   from File and Plot Functions*; *Display > Modal Periods and Participation
   Tables*; *Design > Steel Auto Select, Preferences, Design Combos, Verify* —
   and new controls in the case editor (Ritz loads with cycles and targets; modal
-  case and damping of a history case). Paths are typed; there is no file
-  chooser. The windows were exercised through their command functions and
+  case and damping of a history case). Paths were typed; a file chooser inside
+  the program came with the third wave. The windows were exercised through their command functions and
   headless render tests, not by hand.
 - **API**: the Rust model and design functions only. No `cSapModel` facade was
   added for these features.
@@ -296,7 +297,8 @@ Each refusal named above has a negative test.
 - AISC 360-16, ASCE 7-16, AISC 341 seismic framing types, wind loads.
 - Site-class and occupancy lookups, program-calculated period, eccentric
   diaphragm moments.
-- A material library and multi-selection from a section file.
+- A material library and multi-selection from a section file (since done; see
+  [tutorial-video-wave3.md](tutorial-video-wave3.md)).
 - Displacement contours, shell stress component choice, video export, export to
   other programs.
 - Sparse storage for models beyond a few thousand joints.
@@ -305,5 +307,5 @@ Each refusal named above has a negative test.
   `modal_case` references; they stay direct-integration cases, refused where
   they carry modal damping.
 - The residual of Examples 6-006 and 6-007 above.
-- A response-spectrum case still maps an unknown direction string to U1
-  without an error (found in review, not changed here).
+- A response-spectrum case mapped an unknown direction string to U1 without
+  an error (found in review, not changed here; refused since the third wave).
