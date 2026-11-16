@@ -435,15 +435,22 @@ fn vendor_sdb_unmodeled_hinges_and_modal_damping_refuse_only_affected_cases() {
 
     for fname in ["example_1_026a.sdb", "example_1_026b.sdb"] {
         let mut model = load_sdb_file(dir.join(fname)).expect(fname);
-        assert_eq!(model.unmodeled_source.len(), 1, "{fname}");
-        assert_eq!(model.unmodeled_source[0].scope, UnmodeledScope::NonlinearCases);
-        assert_eq!(
-            model.unmodeled_source[0].description,
-            "2 frame hinge assignment(s)"
-        );
-        let error = analyze_model(&mut model).unwrap_err().to_string();
+        // The hinges are imported (Example 1-026 is verified in
+        // vendor_1_026_hinges.rs): nothing is left unmodeled.
+        assert!(model.unmodeled_source.is_empty(), "{fname}");
+        assert_eq!(model.frames["1"].hinges.len(), 2, "{fname}");
+        // A hinge assignment that is not imported refuses the
+        // nonlinear case.
+        let mut refused = model.clone();
+        refused.unmodeled_source.push(sap_model::UnmodeledSourceData {
+            scope: UnmodeledScope::NonlinearCases,
+            description: "2 frame hinge assignment(s)".into(),
+        });
+        let error = analyze_model(&mut refused).unwrap_err().to_string();
         assert!(error.contains("frame hinge assignment"), "{fname}: {error}");
-        assert!(model.case_results.is_empty());
+        assert!(refused.case_results.is_empty());
+        analyze_model(&mut model).expect(fname);
+        assert!(!model.case_results["NLSTAT1"].static_steps.is_empty(), "{fname}");
 
         // Hinges do not act in a linear case that starts from zero.
         let pattern = model.load_patterns.keys().next().unwrap().clone();

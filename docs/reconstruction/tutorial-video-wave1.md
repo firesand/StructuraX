@@ -286,7 +286,8 @@ Each refusal named above has a negative test.
 
 ## Not done (later waves)
 
-- **Pushover** (the video's second model): frame hinges, hinge states and the
+- **Pushover** (the video's second model; since done in part, see
+  [tutorial-video-wave2.md](tutorial-video-wave2.md)): frame hinges, hinge states and the
   pushover curve, pushover loads from a mode or an acceleration, results saved
   at several steps. The corpus has the material for moment hinges (Analysis
   Reference Ch. VIII, Example 1-026); it needs a new nonlinear path.

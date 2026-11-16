@@ -25,6 +25,7 @@ use crate::FormatError;
 use sap_model::{UnmodeledScope, UnmodeledSourceData};
 
 pub mod native;
+mod hinges;
 mod skipped;
 pub use native::{pack_model_to_native_sdb, save_native_sdb_file};
 
@@ -2575,6 +2576,8 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 .map(|(index, ac)| native_name(ac, "m_name", &(index + 1).to_string())),
         )
         .collect();
+    // Nonlinear static parameters, applied only to a model with an imported frame hinge.
+    let mut nl_static_params: hinges::NlStaticParams = Vec::new();
     for (idx, ac) in raw_analysis_cases.iter().enumerate() {
         let name = ac_names[idx + 1].clone();
         if !native_alive(ac) {
@@ -2608,6 +2611,17 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 } else {
                     None
                 };
+                // A nonlinear static load of a type other than a load pattern or
+                // an acceleration would be dropped. No corpus case has one: its
+                // only other row (Example 1-027, type 0) names no load (index 0).
+                if ctype_code == 2 && !matches!(load_type, 1 | 2) && load_idx != 0 {
+                    model.unmodeled_source.push(UnmodeledSourceData {
+                        scope: UnmodeledScope::Case(name.clone()),
+                        description: format!(
+                            "load assignment of type {load_type} in nonlinear static case '{name}' (not imported)"
+                        ),
+                    });
+                }
                 let function = function_names
                     .get(function_idx)
                     .filter(|n| model.functions.contains_key(*n));
@@ -2655,6 +2669,9 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             3 => ModalComboMethod::AbsSum,
             _ => ModalComboMethod::Cqc,
         };
+        if ctype_code == 2 {
+            nl_static_params.push((name.clone(), hinges::nl_static_params(ac)));
+        }
         if let Some(sc) = ac.get("m_SolControl").and_then(|v| v.as_obj()) {
             // Nonlinear static load application: m_control 2 is displacement
             // control (Example 6-008 stores control 2, target 10 and one
@@ -3232,6 +3249,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
     // Sections that carry analysis-relevant data but are not interpreted
     // above (line springs, added masses, auto-mesh, hinges, several load
     // types, ...) are recorded so they are not silently dropped.
+    hinges::import(sdb, &fr_names, &nl_static_params, &mut model);
     skipped::record(sdb, &lpat_names, &mut model);
 
     Ok(model)

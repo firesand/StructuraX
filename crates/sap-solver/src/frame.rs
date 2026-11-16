@@ -1215,22 +1215,34 @@ pub fn compute_flexible_fef_for_pattern(
     fef
 }
 
-/// Evaluates internal section forces $(P, V_2, V_3, T, M_2, M_3)$ and local deflections $(u_1, u_2, u_3)$
-/// along output stations of a frame element.
-pub fn recover_frame_stations(
-    model: &SapModel,
-    frame: &FrameObj,
-    sec: &FrameSection,
-    mat: &Material,
-    e_axes: &[[f64; 3]; 3],
-    length: f64,
-    u_local: &[f64; 12],
-    f_end_local: &[f64; 12],
-    case_loads: &[(String, f64)],
-) -> Vec<FrameStationResult> {
-    let n_sta = frame.min_stations.max(3);
-    let mut stations = Vec::with_capacity(n_sta);
+/// Fractions of the length at which the section properties of a frame change.
+fn property_break_fractions(sec: &FrameSection, length: f64) -> Vec<f64> {
+    let mut property_breaks = vec![0., 1.];
+    if sec.prop_type == FramePropType::Variable {
+        let mut position = 0.;
+        for (_, segment_length) in resolve_non_prismatic_segments(&sec.non_prismatic, length) {
+            position += segment_length;
+            property_breaks.push((position / length).clamp(0., 1.));
+        }
+    }
+    property_breaks.sort_by(f64::total_cmp);
+    property_breaks.dedup();
+    property_breaks
+}
 
+/// The evaluator behind [`frame_section_forces_at`], built once so that many
+/// stations can be evaluated without rebuilding its tables.
+#[allow(clippy::too_many_arguments)]
+fn section_force_evaluator<'a>(
+    model: &'a SapModel,
+    frame: &'a FrameObj,
+    sec: &'a FrameSection,
+    mat: &'a Material,
+    e_axes: &'a [[f64; 3]; 3],
+    length: f64,
+    f_end_local: &'a [f64; 12],
+    case_loads: &'a [(String, f64)],
+) -> impl Fn(f64) -> [f64; 6] + 'a {
     // End forces at x = 0 in SAP2000 internal section sign convention:
     // P(0) = -f_end[0] (+ tension, - compression)
     // V2(0) = -f_end[1]
@@ -1244,29 +1256,13 @@ pub fn recover_frame_stations(
     let t_0 = -f_end_local[3];
     let m2_0 = -f_end_local[4];
     let m3_0 = -f_end_local[5];
-
-    let p_j = f_end_local[6];
-    let v2_j = f_end_local[7];
-    let v3_j = f_end_local[8];
-    let t_j = f_end_local[9];
     let m2_j = f_end_local[10];
     let m3_j = f_end_local[11];
-    let _ = (p_j, v2_j, v3_j, t_j);
-
-    let mut property_breaks = vec![0., 1.];
-    if sec.prop_type == FramePropType::Variable {
-        let mut position = 0.;
-        for (_, segment_length) in resolve_non_prismatic_segments(&sec.non_prismatic, length) {
-            position += segment_length;
-            property_breaks.push((position / length).clamp(0., 1.));
-        }
-    }
-    property_breaks.sort_by(f64::total_cmp);
-    property_breaks.dedup();
+    let property_breaks = property_break_fractions(sec, length);
     // Use identical segment-aware gravity quadrature for partial and full-span
     // force/moment integrals. Midpoint weight gives the wrong first moment for
     // tapered sections and cannot be used for the end-equilibrium correction.
-    let gravity_integrals = |x: f64, direction: [f64; 3], scale: f64| {
+    let gravity_integrals = move |x: f64, direction: [f64; 3], scale: f64| {
         let mut sum = [0.; 5]; // axial, shear2, shear3, moment2, moment3
         for span in property_breaks.windows(2) {
             let lo = span[0] * length;
@@ -1287,7 +1283,7 @@ pub fn recover_frame_stations(
         }
         sum
     };
-    let section_forces = |s: f64| {
+    move |s: f64| {
         let idx = usize::from(s > 0.0);
         let x = s * length;
 
@@ -1460,7 +1456,64 @@ pub fn recover_frame_stations(
         let m2 = m2_0 + v3_0 * x + int_m2 + pdelta_m2_corr;
 
         [p, v2, v3, t, m2, m3]
-    };
+    }
+}
+
+/// Section forces `[P, V2, V3, T, M2, M3]` (M2 in the element's internal
+/// sense, opposite to the reported one) at the relative position `s` of a
+/// frame element, from its local end forces `f_end_local` and the span loads of
+/// `case_loads`. `recover_frame_stations` reports exactly these values.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn frame_section_forces_at(
+    model: &SapModel,
+    frame: &FrameObj,
+    sec: &FrameSection,
+    mat: &Material,
+    e_axes: &[[f64; 3]; 3],
+    length: f64,
+    f_end_local: &[f64; 12],
+    case_loads: &[(String, f64)],
+    s: f64,
+) -> [f64; 6] {
+    section_force_evaluator(
+        model,
+        frame,
+        sec,
+        mat,
+        e_axes,
+        length,
+        f_end_local,
+        case_loads,
+    )(s)
+}
+
+/// Evaluates internal section forces $(P, V_2, V_3, T, M_2, M_3)$ and local deflections $(u_1, u_2, u_3)$
+/// along output stations of a frame element.
+pub fn recover_frame_stations(
+    model: &SapModel,
+    frame: &FrameObj,
+    sec: &FrameSection,
+    mat: &Material,
+    e_axes: &[[f64; 3]; 3],
+    length: f64,
+    u_local: &[f64; 12],
+    f_end_local: &[f64; 12],
+    case_loads: &[(String, f64)],
+) -> Vec<FrameStationResult> {
+    let n_sta = frame.min_stations.max(3);
+    let mut stations = Vec::with_capacity(n_sta);
+
+    let property_breaks = property_break_fractions(sec, length);
+    let section_forces = section_force_evaluator(
+        model,
+        frame,
+        sec,
+        mat,
+        e_axes,
+        length,
+        f_end_local,
+        case_loads,
+    );
 
     // Integrate equilibrium section forces rather than interpolating only the
     // nodal DOFs. The latter omits the particular deflection caused by span loads

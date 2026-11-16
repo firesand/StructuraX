@@ -1,8 +1,9 @@
 //! Native case/function editor over the validated API definitions.
 use super::*;
+use sap_model::hinge::{HingeUnloading, ModeLoad, ResultsSaved};
 use sap_model::{
-    DynamicFunction, LoadCaseAssignment, LoadCaseType, ModalComboMethod, ModalSubType, NLGeomType,
-    TimeIntegrationMethod,
+    DisplacementControl, DynamicFunction, LoadCaseAssignment, LoadCaseType, ModalComboMethod,
+    ModalSubType, NLGeomType, TimeIntegrationMethod,
 };
 
 pub(super) struct AnalysisEditor {
@@ -276,6 +277,595 @@ fn history_solution_choice(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadC
         case.modal_case = chosen;
     }
 }
+// ---------------------------------------------------------------------------
+// Nonlinear static case commands. They edit the case being drafted, check
+// what they can against the model, and leave the draft unchanged when they
+// refuse. Saving the draft runs the full `sap_api::validate_case_definition`.
+// ---------------------------------------------------------------------------
+
+/// Names of the Accel loads of a nonlinear static case.
+pub(super) const ACCEL_NAMES: [&str; 3] = ["UX", "UY", "UZ"];
+
+const DOF_LABELS: [&str; 6] = ["U1", "U2", "U3", "R1", "R2", "R3"];
+
+fn is_accel(load: &LoadCaseAssignment) -> bool {
+    sap_model::ritz::acceleration_direction(&load.load_name).is_some()
+}
+
+/// Nonlinear static cases the draft can continue from: not itself, and none
+/// whose own chain of initial cases leads back to it.
+pub(super) fn eligible_initial_cases(model: &SapModel, case: &LoadCase) -> Vec<String> {
+    model
+        .load_cases
+        .values()
+        .filter(|c| {
+            c.case_type == LoadCaseType::NonlinearStatic
+                && c.name != case.name
+                && initial_chain_is_clear(model, case, &c.name)
+        })
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// True when following the initial cases from `start` never reaches `case`.
+fn initial_chain_is_clear(model: &SapModel, case: &LoadCase, start: &str) -> bool {
+    // Walk by name: the draft may not be in the model yet, but a stored case
+    // can already continue from its name.
+    let mut seen: Vec<&str> = Vec::new();
+    let mut current = Some(start);
+    while let Some(name) = current {
+        if name == case.name {
+            return false;
+        }
+        if seen.contains(&name) {
+            return true; // a cycle that does not involve the draft
+        }
+        seen.push(name);
+        current = model
+            .load_cases
+            .get(name)
+            .and_then(|c| c.initial_case.as_deref());
+    }
+    true
+}
+
+/// Chooses the case the draft continues from, or none.
+pub(super) fn set_initial_case(
+    model: &SapModel,
+    case: &mut LoadCase,
+    initial: Option<&str>,
+) -> Result<(), String> {
+    if case.case_type != LoadCaseType::NonlinearStatic {
+        return Err("Only a nonlinear static case continues from an initial case here.".into());
+    }
+    let Some(name) = initial else {
+        case.initial_case = None;
+        return Ok(());
+    };
+    if name == case.name {
+        return Err("A case cannot continue from itself.".into());
+    }
+    let Some(source) = model.load_cases.get(name) else {
+        return Err(format!("Case '{name}' does not exist."));
+    };
+    if source.case_type != LoadCaseType::NonlinearStatic {
+        return Err(format!(
+            "Case '{name}' is not a nonlinear static case; only a nonlinear static case can be an initial case."
+        ));
+    }
+    if !initial_chain_is_clear(model, case, name) {
+        return Err(format!(
+            "Case '{name}' continues from '{}' through its own initial cases; that would be a cycle.",
+            case.name
+        ));
+    }
+    case.initial_case = Some(name.to_string());
+    Ok(())
+}
+
+/// Load application control: the load pattern is scaled until the joint
+/// displacement has moved by `target` (a positive magnitude).
+pub(super) fn set_displacement_control(
+    model: &SapModel,
+    case: &mut LoadCase,
+    joint: &str,
+    dof: usize,
+    target: f64,
+    conjugate: bool,
+) -> Result<(), String> {
+    if case.case_type != LoadCaseType::NonlinearStatic {
+        return Err("Only a nonlinear static case has load application control.".into());
+    }
+    if case.nl_geom != NLGeomType::None {
+        return Err("Displacement control needs small displacements; set the geometry to small displacement first.".into());
+    }
+    if !model.points.contains_key(joint) {
+        return Err(format!("Joint '{joint}' does not exist."));
+    }
+    if dof >= 6 {
+        return Err("The monitored degree of freedom must be U1, U2, U3, R1, R2 or R3.".into());
+    }
+    if !target.is_finite() || target <= 0.0 {
+        return Err("The target displacement must be a positive number.".into());
+    }
+    case.displacement_control = Some(DisplacementControl {
+        target,
+        monitored: Some((joint.to_string(), dof)),
+        conjugate,
+    });
+    Ok(())
+}
+
+/// Back to full load application.
+pub(super) fn set_full_load(case: &mut LoadCase) {
+    case.displacement_control = None;
+}
+
+/// Saved states of a nonlinear static case.
+pub(super) fn set_results_saved(case: &mut LoadCase, saved: ResultsSaved) -> Result<(), String> {
+    if case.case_type != LoadCaseType::NonlinearStatic {
+        return Err("Only a nonlinear static case has saved states to choose.".into());
+    }
+    if let ResultsSaved::MultipleStates {
+        min_saved,
+        max_saved,
+        ..
+    } = saved
+    {
+        if min_saved == 0 || max_saved < min_saved || max_saved > 100_000 {
+            return Err("Multiple saved states need 1 <= minimum <= maximum <= 100000.".into());
+        }
+    }
+    case.nl_static.results_saved = saved;
+    Ok(())
+}
+
+/// Maximum total and null steps.
+pub(super) fn set_step_limits(
+    case: &mut LoadCase,
+    max_total: usize,
+    max_null: usize,
+) -> Result<(), String> {
+    if case.case_type != LoadCaseType::NonlinearStatic {
+        return Err("Only a nonlinear static case has step limits.".into());
+    }
+    if !(1..=1_000_000).contains(&max_total) || !(1..=1_000_000).contains(&max_null) {
+        return Err("Maximum total and null steps must each be 1 to 1000000.".into());
+    }
+    case.nl_static.max_total_steps = max_total;
+    case.nl_static.max_null_steps = max_null;
+    Ok(())
+}
+
+pub(super) fn unloading_label(method: HingeUnloading) -> &'static str {
+    match method {
+        HingeUnloading::UnloadEntireStructure => "Unload entire structure",
+        HingeUnloading::ApplyLocalRedistribution => "Apply local redistribution",
+        HingeUnloading::RestartUsingSecantStiffness => "Restart using secant stiffness",
+    }
+}
+
+/// Hinge unloading method. Only "unload entire structure" is implemented.
+pub(super) fn set_hinge_unloading(
+    case: &mut LoadCase,
+    method: HingeUnloading,
+) -> Result<(), String> {
+    if method != HingeUnloading::UnloadEntireStructure {
+        return Err(format!(
+            "{} is not implemented; only \"unload entire structure\" is.",
+            unloading_label(method)
+        ));
+    }
+    case.nl_static.hinge_unloading = method;
+    Ok(())
+}
+
+fn require_nl_static(case: &LoadCase) -> Result<(), String> {
+    if case.case_type == LoadCaseType::NonlinearStatic {
+        Ok(())
+    } else {
+        Err("Only a nonlinear static case takes Accel and Mode loads here.".into())
+    }
+}
+
+fn refuse_if_mode_loads(case: &LoadCase) -> Result<(), String> {
+    if case.nl_static.mode_loads.is_empty() {
+        Ok(())
+    } else {
+        Err("The case has Mode loads, which cannot be mixed with other loads; remove them first."
+            .into())
+    }
+}
+
+/// Adds a load pattern row.
+pub(super) fn add_pattern_load(
+    model: &SapModel,
+    case: &mut LoadCase,
+    pattern: &str,
+    scale: f64,
+) -> Result<(), String> {
+    require_nl_static(case)?;
+    refuse_if_mode_loads(case)?;
+    if !model.load_patterns.contains_key(pattern) {
+        return Err(format!("Load pattern '{pattern}' does not exist."));
+    }
+    if !scale.is_finite() {
+        return Err("The scale factor must be a finite number.".into());
+    }
+    case.loads.push(LoadCaseAssignment {
+        load_name: pattern.to_string(),
+        scale_factor: scale,
+    });
+    Ok(())
+}
+
+/// Adds an acceleration load row (UX, UY or UZ).
+pub(super) fn add_accel_load(
+    model: &SapModel,
+    case: &mut LoadCase,
+    direction: &str,
+    scale: f64,
+) -> Result<(), String> {
+    require_nl_static(case)?;
+    refuse_if_mode_loads(case)?;
+    if !ACCEL_NAMES.contains(&direction) {
+        return Err(format!(
+            "'{direction}' is not an acceleration load; use UX, UY or UZ."
+        ));
+    }
+    if !scale.is_finite() {
+        return Err("The scale factor must be a finite number.".into());
+    }
+    if let Some(clash) = model
+        .load_patterns
+        .keys()
+        .find(|p| sap_model::ritz::acceleration_direction(p).is_some())
+    {
+        return Err(format!(
+            "Load pattern '{clash}' is named like an acceleration load; rename it before using Accel loads."
+        ));
+    }
+    case.loads.push(LoadCaseAssignment {
+        load_name: direction.to_string(),
+        scale_factor: scale,
+    });
+    Ok(())
+}
+
+/// Modal cases that can supply Mode loads: run, and not the draft.
+pub(super) fn modal_cases_for_modes(model: &SapModel, case: &LoadCase) -> Vec<String> {
+    model
+        .load_cases
+        .values()
+        .filter(|c| c.case_type == LoadCaseType::Modal && c.run_flag && c.name != case.name)
+        .map(|c| c.name.clone())
+        .collect()
+}
+
+/// Adds a Mode load: mode number of the Modal case, with a scale factor.
+pub(super) fn add_mode_load(
+    model: &SapModel,
+    case: &mut LoadCase,
+    modal_case: &str,
+    mode: usize,
+    scale: f64,
+) -> Result<(), String> {
+    require_nl_static(case)?;
+    if !case.loads.is_empty() {
+        return Err("Mode loads cannot be mixed with load patterns or Accel loads; remove those rows first.".into());
+    }
+    let modal = model
+        .load_cases
+        .get(modal_case)
+        .filter(|m| m.case_type == LoadCaseType::Modal && m.name != case.name)
+        .ok_or_else(|| format!("'{modal_case}' is not an existing Modal case."))?;
+    if !modal.run_flag {
+        return Err(format!("Modal case '{modal_case}' is not set to run."));
+    }
+    if case.modal_case.as_deref().is_some_and(|m| m != modal_case)
+        && !case.nl_static.mode_loads.is_empty()
+    {
+        return Err("All Mode loads of a case take their modes from one Modal case.".into());
+    }
+    if mode == 0 || mode > modal.max_modes {
+        return Err(format!(
+            "Mode {mode} is outside 1 to {} (the maximum modes of '{modal_case}').",
+            modal.max_modes
+        ));
+    }
+    if !scale.is_finite() {
+        return Err("The scale factor must be a finite number.".into());
+    }
+    if case.nl_static.mode_loads.iter().any(|l| l.mode == mode) {
+        return Err(format!(
+            "Mode {mode} is already loaded; change its scale factor instead."
+        ));
+    }
+    case.modal_case = Some(modal_case.to_string());
+    case.nl_static.mode_loads.push(ModeLoad {
+        mode,
+        scale_factor: scale,
+    });
+    Ok(())
+}
+
+/// Removes a Mode load row; the modal case is cleared with the last one.
+pub(super) fn remove_mode_load(case: &mut LoadCase, index: usize) -> Result<(), String> {
+    if index >= case.nl_static.mode_loads.len() {
+        return Err("There is no such Mode load row.".into());
+    }
+    case.nl_static.mode_loads.remove(index);
+    if case.nl_static.mode_loads.is_empty() {
+        case.modal_case = None;
+    }
+    Ok(())
+}
+
+/// The load rows and settings of a nonlinear static case. Returns the reason
+/// when a command the user triggered was refused.
+fn nl_static_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) -> Option<String> {
+    let mut error: Option<String> = None;
+    let mut note = |r: Result<(), String>| {
+        if let Err(e) = r {
+            error = Some(e);
+        }
+    };
+
+    ui.label("Initial conditions:");
+    let eligible = eligible_initial_cases(model, case);
+    let mut choice = case.initial_case.clone();
+    ui.horizontal(|ui| {
+        ui.label("Continue from case:");
+        egui::ComboBox::from_id_salt("nl_initial_case")
+            .selected_text(choice.as_deref().unwrap_or("Zero initial conditions"))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, None, "Zero initial conditions");
+                for name in &eligible {
+                    ui.selectable_value(&mut choice, Some(name.clone()), name);
+                }
+            });
+    });
+    if choice != case.initial_case {
+        note(set_initial_case(model, case, choice.as_deref()));
+    }
+
+    ui.separator();
+    ui.label("Loads applied:");
+    let mut remove_load = None;
+    let mut remove_mode = None;
+    let patterns: Vec<String> = model.load_patterns.keys().cloned().collect();
+    for (i, load) in case.loads.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            if is_accel(load) {
+                ui.label("Accel");
+                egui::ComboBox::from_id_salt(("nl_accel", i))
+                    .selected_text(load.load_name.as_str())
+                    .show_ui(ui, |ui| {
+                        for name in ACCEL_NAMES {
+                            ui.selectable_value(&mut load.load_name, name.to_string(), name);
+                        }
+                    });
+            } else {
+                ui.label("Load Pattern");
+                text_choice(
+                    ui,
+                    ("nl_pattern", i),
+                    &mut load.load_name,
+                    patterns.iter().cloned(),
+                );
+            }
+            ui.add(egui::DragValue::new(&mut load.scale_factor).speed(0.1));
+            if ui.button("Remove").clicked() {
+                remove_load = Some(i);
+            }
+        });
+    }
+    let mut modal_case = case.modal_case.clone().unwrap_or_default();
+    let modals = modal_cases_for_modes(model, case);
+    for (i, load) in case.nl_static.mode_loads.iter_mut().enumerate() {
+        ui.horizontal(|ui| {
+            ui.label("Mode");
+            ui.add(egui::DragValue::new(&mut load.mode).range(1..=10_000));
+            ui.label("of modal case");
+            text_choice(ui, ("nl_mode_case", i), &mut modal_case, modals.iter().cloned());
+            ui.add(egui::DragValue::new(&mut load.scale_factor).speed(0.1));
+            if ui.button("Remove").clicked() {
+                remove_mode = Some(i);
+            }
+        });
+    }
+    if !case.nl_static.mode_loads.is_empty() {
+        case.modal_case = Some(modal_case);
+    }
+    if let Some(i) = remove_load {
+        case.loads.remove(i);
+    }
+    if let Some(i) = remove_mode {
+        note(remove_mode_load(case, i));
+    }
+    ui.horizontal(|ui| {
+        if ui.button("Add Load Pattern").clicked() {
+            let first = patterns.first().cloned().unwrap_or_default();
+            note(add_pattern_load(model, case, &first, 1.0));
+        }
+        if ui.button("Add Accel").clicked() {
+            note(add_accel_load(model, case, "UX", 1.0));
+        }
+        if ui.button("Add Mode").clicked() {
+            let modal = case
+                .modal_case
+                .clone()
+                .or_else(|| modals.first().cloned())
+                .unwrap_or_default();
+            let next = case
+                .nl_static
+                .mode_loads
+                .iter()
+                .map(|l| l.mode)
+                .max()
+                .map_or(1, |m| m + 1);
+            note(add_mode_load(model, case, &modal, next, 1.0));
+        }
+    });
+    ui.label("Mode load: joint force = scale x omega^2 x mass x mode shape, modes of a Modal case that is run. It cannot be mixed with other loads.");
+
+    ui.separator();
+    ui.horizontal(|ui| {
+        ui.label("Geometry:");
+        ui.selectable_value(&mut case.nl_geom, NLGeomType::None, "Small displacement");
+        ui.selectable_value(&mut case.nl_geom, NLGeomType::PDelta, "P-Delta");
+    });
+    ui.horizontal(|ui| {
+        ui.label("Iterations:");
+        ui.add(egui::DragValue::new(&mut case.max_iterations).range(1..=10000));
+        ui.label("Tolerance:");
+        ui.add(
+            egui::DragValue::new(&mut case.convergence_tol)
+                .speed(1e-7)
+                .max_decimals(12),
+        );
+    });
+
+    ui.separator();
+    ui.label("Load application:");
+    let mut displacement = case.displacement_control.is_some();
+    ui.horizontal(|ui| {
+        if ui.selectable_label(!displacement, "Full load").clicked() {
+            displacement = false;
+        }
+        if ui
+            .selectable_label(displacement, "Displacement control")
+            .clicked()
+        {
+            displacement = true;
+        }
+    });
+    if !displacement {
+        set_full_load(case);
+    } else {
+        let (mut joint, mut dof, mut target, mut conjugate) = match &case.displacement_control {
+            Some(c) => (
+                c.monitored.as_ref().map(|(j, _)| j.clone()),
+                c.monitored.as_ref().map_or(0, |(_, d)| *d),
+                c.target,
+                c.conjugate,
+            ),
+            None => (model.points.keys().next().cloned(), 0, 1.0, true),
+        };
+        let before = (joint.clone(), dof, target, conjugate);
+        ui.horizontal(|ui| {
+            ui.label("Monitored joint");
+            let mut name = joint.clone().unwrap_or_default();
+            text_choice(ui, "nl_monitor_joint", &mut name, model.points.keys().cloned());
+            joint = Some(name).filter(|n| !n.is_empty());
+            ui.label("DOF");
+            egui::ComboBox::from_id_salt("nl_monitor_dof")
+                .selected_text(DOF_LABELS[dof.min(5)])
+                .show_ui(ui, |ui| {
+                    for (i, label) in DOF_LABELS.iter().enumerate() {
+                        ui.selectable_value(&mut dof, i, *label);
+                    }
+                });
+            ui.label("Target displacement");
+            ui.add(egui::DragValue::new(&mut target).speed(0.01).max_decimals(8));
+        });
+        ui.checkbox(&mut conjugate, "Use conjugate displacement");
+        let unchanged =
+            case.displacement_control.is_some() && before == (joint.clone(), dof, target, conjugate);
+        if !unchanged {
+            match &joint {
+                Some(j) => note(set_displacement_control(
+                    model, case, j, dof, target, conjugate,
+                )),
+                None => note(Err("The model has no joint to monitor.".into())),
+            }
+        }
+    }
+
+    ui.separator();
+    ui.label("Results saved:");
+    let was_multiple = matches!(
+        case.nl_static.results_saved,
+        ResultsSaved::MultipleStates { .. }
+    );
+    let mut multiple = was_multiple;
+    ui.horizontal(|ui| {
+        ui.selectable_value(&mut multiple, false, "Final state only");
+        ui.selectable_value(&mut multiple, true, "Multiple states");
+    });
+    if multiple != was_multiple {
+        note(set_results_saved(
+            case,
+            if multiple {
+                ResultsSaved::multiple_default()
+            } else {
+                ResultsSaved::FinalState
+            },
+        ));
+    } else if let ResultsSaved::MultipleStates {
+        mut min_saved,
+        mut max_saved,
+        mut positive_only,
+    } = case.nl_static.results_saved
+    {
+        ui.horizontal(|ui| {
+            ui.label("Minimum number of saved states");
+            ui.add(egui::DragValue::new(&mut min_saved).range(1..=100_000));
+            ui.label("Maximum");
+            ui.add(egui::DragValue::new(&mut max_saved).range(1..=100_000));
+            ui.checkbox(&mut positive_only, "Save positive increments only");
+        });
+        let new = ResultsSaved::MultipleStates {
+            min_saved,
+            max_saved,
+            positive_only,
+        };
+        if new != case.nl_static.results_saved {
+            note(set_results_saved(case, new));
+        }
+    }
+    let (mut total, mut null) = (
+        case.nl_static.max_total_steps,
+        case.nl_static.max_null_steps,
+    );
+    ui.horizontal(|ui| {
+        ui.label("Maximum total steps");
+        ui.add(egui::DragValue::new(&mut total).range(1..=1_000_000));
+        ui.label("Maximum null steps");
+        ui.add(egui::DragValue::new(&mut null).range(1..=1_000_000));
+    });
+    if (total, null)
+        != (
+            case.nl_static.max_total_steps,
+            case.nl_static.max_null_steps,
+        )
+    {
+        note(set_step_limits(case, total, null));
+    }
+    ui.label("Hinge unloading method:");
+    for method in [
+        HingeUnloading::UnloadEntireStructure,
+        HingeUnloading::ApplyLocalRedistribution,
+        HingeUnloading::RestartUsingSecantStiffness,
+    ] {
+        ui.horizontal(|ui| {
+            if method == HingeUnloading::UnloadEntireStructure {
+                let selected = case.nl_static.hinge_unloading == method;
+                if ui
+                    .selectable_label(selected, unloading_label(method))
+                    .clicked()
+                {
+                    note(set_hinge_unloading(case, method));
+                }
+            } else {
+                ui.add_enabled(false, egui::Button::new(unloading_label(method)));
+                ui.weak("not available: not implemented");
+            }
+        });
+    }
+    error
+}
+
 fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
     ui.horizontal(|ui| {
         ui.label("Name:");
@@ -307,53 +897,14 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
         "Changing case type resets its settings. Saving an existing name replaces that definition.",
     );
     match case.case_type {
-        LoadCaseType::LinearStatic | LoadCaseType::NonlinearStatic | LoadCaseType::Buckling => {
-            static_loads(ui, model, case);
-            if case.case_type == LoadCaseType::NonlinearStatic {
-                ui.horizontal(|ui| {
-                    ui.label("Geometry:");
-                    ui.selectable_value(&mut case.nl_geom, NLGeomType::None, "Small displacement");
-                    ui.selectable_value(&mut case.nl_geom, NLGeomType::PDelta, "P-Delta");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Iterations:");
-                    ui.add(egui::DragValue::new(&mut case.max_iterations).range(1..=10000));
-                    ui.label("Tolerance:");
-                    ui.add(
-                        egui::DragValue::new(&mut case.convergence_tol)
-                            .speed(1e-7)
-                            .max_decimals(12),
-                    );
-                });
-                // Displacement control arrives from imported files or the API. It is
-                // shown so an imported push is not silently treated as full load.
-                let mut use_full_load = false;
-                if let Some(control) = &case.displacement_control {
-                    ui.horizontal(|ui| {
-                        let monitored = control.monitored.as_ref().map_or_else(
-                            || "an unsupported monitored quantity".to_string(),
-                            |(joint, dof)| {
-                                format!(
-                                    "joint {joint} {}",
-                                    ["U1", "U2", "U3", "R1", "R2", "R3"]
-                                        .get(*dof)
-                                        .copied()
-                                        .unwrap_or("?")
-                                )
-                            },
-                        );
-                        ui.label(format!(
-                            "Displacement control: load scaled until {monitored} moves {}.",
-                            control.target
-                        ));
-                        use_full_load = ui.button("Use full load instead").clicked();
-                    });
-                }
-                if use_full_load {
-                    case.displacement_control = None;
-                }
-                ui.label("Element applicability and convergence are checked when analysis runs.");
+        LoadCaseType::NonlinearStatic => {
+            if let Some(error) = nl_static_controls(ui, model, case) {
+                ui.colored_label(Color32::YELLOW, format!("Not changed: {error}"));
             }
+            ui.label("Element applicability and convergence are checked when analysis runs.");
+        }
+        LoadCaseType::LinearStatic | LoadCaseType::Buckling => {
+            static_loads(ui, model, case);
             if case.case_type == LoadCaseType::Buckling {
                 ui.horizontal(|ui| {
                     ui.label("Buckling modes:");
@@ -519,7 +1070,7 @@ impl SapGuiApp {
         let mut state = std::mem::take(&mut self.analysis_editor);
         let mut open = state.open;
         if open {
-            egui::Window::new("Analysis Cases and Functions").open(&mut open).default_width(690.0).vscroll(true).show(ctx,|ui| {
+            egui::Window::new("Analysis Cases and Functions").open(&mut open).default_width(690.0).default_height(760.0).vscroll(true).show(ctx,|ui| {
                 ui.horizontal(|ui|{ui.selectable_value(&mut state.tab,0,"Cases");ui.selectable_value(&mut state.tab,1,"Functions");});
                 ui.label(format!("Model units: {}. Time and period are seconds.",self.model.present_units.s2k_label()));
                 if self.model.is_locked {ui.colored_label(Color32::YELLOW,"Use Edit > Unlock Model before saving definitions.");}
@@ -787,5 +1338,373 @@ mod tests {
         }];
         let _ = ctx.run(up, |ctx| app.render_analysis_editor(ctx));
         assert!(app.model.functions.contains_key("FUNCTION1"));
+    }
+
+    // -- nonlinear static (pushover) case commands -------------------------
+
+    fn push_model() -> SapModel {
+        let mut m = SapModel::new(Units::KipInF);
+        m.add_point("J", 0.0, 0.0, 0.0);
+        m.add_point("K", 0.0, 0.0, 3.0);
+        m.load_cases
+            .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 4));
+        let mut n1 = new_case(LoadCaseType::NonlinearStatic, "GRAV");
+        n1.loads[0].load_name = "DEAD".into();
+        m.load_cases.insert("GRAV".into(), n1);
+        m
+    }
+
+    fn draft(name: &str) -> LoadCase {
+        new_case(LoadCaseType::NonlinearStatic, name)
+    }
+
+    #[test]
+    fn initial_case_commands_follow_the_rules() {
+        let mut m = push_model();
+        let mut c = draft("PUSH");
+        assert_eq!(eligible_initial_cases(&m, &c), vec!["GRAV".to_string()]);
+        set_initial_case(&m, &mut c, Some("GRAV")).unwrap();
+        assert_eq!(c.initial_case.as_deref(), Some("GRAV"));
+        set_initial_case(&m, &mut c, None).unwrap();
+        assert!(c.initial_case.is_none());
+        // Refusals leave the draft unchanged.
+        for (initial, needle) in [
+            ("PUSH", "itself"),
+            ("GHOST", "does not exist"),
+            ("MODAL", "not a nonlinear static case"),
+        ] {
+            let before = c.clone();
+            let error = set_initial_case(&m, &mut c, Some(initial)).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+            assert_eq!(c, before);
+        }
+        // A cycle: GRAV continues from PUSH, so PUSH cannot continue from GRAV,
+        // and the chooser does not offer it.
+        let mut grav = m.load_cases["GRAV"].clone();
+        grav.initial_case = Some("PUSH".into());
+        m.load_cases.insert("GRAV".into(), grav);
+        assert!(eligible_initial_cases(&m, &c).is_empty());
+        let error = set_initial_case(&m, &mut c, Some("GRAV")).unwrap_err();
+        assert!(error.contains("cycle"), "{error}");
+        // Not a nonlinear static draft.
+        let mut lin = new_case(LoadCaseType::LinearStatic, "L");
+        assert!(set_initial_case(&m, &mut lin, Some("GRAV")).is_err());
+        assert!(lin.initial_case.is_none());
+    }
+
+    #[test]
+    fn load_application_results_and_step_commands_validate() {
+        let m = push_model();
+        let mut c = draft("PUSH");
+        set_displacement_control(&m, &mut c, "K", 0, 6.0, true).unwrap();
+        assert_eq!(
+            c.displacement_control,
+            Some(DisplacementControl {
+                target: 6.0,
+                monitored: Some(("K".into(), 0)),
+                conjugate: true
+            })
+        );
+        let before = c.clone();
+        for (joint, dof, target) in [
+            ("GHOST", 0, 1.0),
+            ("K", 6, 1.0),
+            ("K", 0, 0.0),
+            ("K", 0, -2.0),
+            ("K", 0, f64::NAN),
+        ] {
+            assert!(set_displacement_control(&m, &mut c, joint, dof, target, false).is_err());
+            assert_eq!(c, before);
+        }
+        c.nl_geom = NLGeomType::PDelta;
+        let error = set_displacement_control(&m, &mut c, "K", 1, 1.0, false).unwrap_err();
+        assert!(error.contains("small displacements"), "{error}");
+        c.nl_geom = NLGeomType::None;
+        set_full_load(&mut c);
+        assert!(c.displacement_control.is_none());
+        let mut lin = new_case(LoadCaseType::LinearStatic, "L");
+        assert!(set_displacement_control(&m, &mut lin, "K", 0, 1.0, true).is_err());
+
+        // Results saved.
+        let multiple = ResultsSaved::MultipleStates {
+            min_saved: 6,
+            max_saved: 10,
+            positive_only: false,
+        };
+        set_results_saved(&mut c, multiple).unwrap();
+        assert_eq!(c.nl_static.results_saved, multiple);
+        for (min_saved, max_saved) in [(0, 5), (7, 6), (1, 100_001)] {
+            let bad = ResultsSaved::MultipleStates {
+                min_saved,
+                max_saved,
+                positive_only: true,
+            };
+            assert!(set_results_saved(&mut c, bad).is_err());
+            assert_eq!(c.nl_static.results_saved, multiple);
+        }
+        set_results_saved(&mut c, ResultsSaved::FinalState).unwrap();
+        assert!(set_results_saved(&mut lin, multiple).is_err());
+
+        // Step limits.
+        set_step_limits(&mut c, 500, 80).unwrap();
+        assert_eq!((c.nl_static.max_total_steps, c.nl_static.max_null_steps), (500, 80));
+        for (total, null) in [(0, 80), (500, 0), (1_000_001, 80), (500, 1_000_001)] {
+            assert!(set_step_limits(&mut c, total, null).is_err());
+        }
+        assert_eq!((c.nl_static.max_total_steps, c.nl_static.max_null_steps), (500, 80));
+        assert!(set_step_limits(&mut lin, 10, 10).is_err());
+
+        // Hinge unloading: only the first method.
+        set_hinge_unloading(&mut c, HingeUnloading::UnloadEntireStructure).unwrap();
+        for method in [
+            HingeUnloading::ApplyLocalRedistribution,
+            HingeUnloading::RestartUsingSecantStiffness,
+        ] {
+            let error = set_hinge_unloading(&mut c, method).unwrap_err();
+            assert!(error.contains("not implemented"), "{error}");
+            assert_eq!(
+                c.nl_static.hinge_unloading,
+                HingeUnloading::UnloadEntireStructure
+            );
+        }
+    }
+
+    #[test]
+    fn load_row_commands_add_accel_and_mode_and_refuse_mixing() {
+        let mut m = push_model();
+        let mut c = draft("PUSH");
+        // Pattern row.
+        assert_eq!(c.loads.len(), 1);
+        add_pattern_load(&m, &mut c, "DEAD", 2.0).unwrap();
+        assert!(add_pattern_load(&m, &mut c, "GHOST", 1.0).is_err());
+        assert!(add_pattern_load(&m, &mut c, "DEAD", f64::NAN).is_err());
+        // Accel rows: UX, UY, UZ only.
+        add_accel_load(&m, &mut c, "UY", -1.0).unwrap();
+        for bad in ["RX", "U4", "ux", "DEAD"] {
+            assert!(add_accel_load(&m, &mut c, bad, 1.0).is_err(), "{bad}");
+        }
+        assert!(add_accel_load(&m, &mut c, "UX", f64::INFINITY).is_err());
+        assert_eq!(c.loads.len(), 3);
+        assert!(is_accel(&c.loads[2]) && !is_accel(&c.loads[0]));
+        // Mode rows are refused while other loads exist, and the other way round.
+        let before = c.clone();
+        let error = add_mode_load(&m, &mut c, "MODAL", 1, 1.0).unwrap_err();
+        assert!(error.contains("cannot be mixed"), "{error}");
+        assert_eq!(c, before);
+        c.loads.clear();
+        add_mode_load(&m, &mut c, "MODAL", 2, 1.5).unwrap();
+        assert_eq!(c.modal_case.as_deref(), Some("MODAL"));
+        assert_eq!(c.nl_static.mode_loads[0].mode, 2);
+        let before = c.clone();
+        assert!(add_pattern_load(&m, &mut c, "DEAD", 1.0).unwrap_err().contains("Mode loads"));
+        assert!(add_accel_load(&m, &mut c, "UX", 1.0).unwrap_err().contains("Mode loads"));
+        for (modal, mode, scale, needle) in [
+            ("GHOST", 1, 1.0, "not an existing Modal"),
+            ("GRAV", 1, 1.0, "not an existing Modal"),
+            ("MODAL", 0, 1.0, "outside 1 to 4"),
+            ("MODAL", 5, 1.0, "outside 1 to 4"),
+            ("MODAL", 2, 1.0, "already loaded"),
+            ("MODAL", 3, f64::NAN, "finite"),
+        ] {
+            let error = add_mode_load(&m, &mut c, modal, mode, scale).unwrap_err();
+            assert!(error.contains(needle), "{error}");
+            assert_eq!(c, before);
+        }
+        add_mode_load(&m, &mut c, "MODAL", 3, 1.0).unwrap();
+        assert_eq!(c.nl_static.mode_loads.len(), 2);
+        // The selector offers run Modal cases only.
+        assert_eq!(modal_cases_for_modes(&m, &c), vec!["MODAL".to_string()]);
+        m.load_cases.get_mut("MODAL").unwrap().run_flag = false;
+        assert!(modal_cases_for_modes(&m, &c).is_empty());
+        let mut other = draft("OTHER");
+        other.loads.clear();
+        assert!(add_mode_load(&m, &mut other, "MODAL", 1, 1.0).unwrap_err().contains("not set to run"));
+        // Removing the last Mode row clears the modal case.
+        remove_mode_load(&mut c, 0).unwrap();
+        assert_eq!(c.modal_case.as_deref(), Some("MODAL"));
+        remove_mode_load(&mut c, 0).unwrap();
+        assert!(c.modal_case.is_none() && c.nl_static.mode_loads.is_empty());
+        assert!(remove_mode_load(&mut c, 0).is_err());
+        // Other case types take none of these rows.
+        let mut lin = new_case(LoadCaseType::LinearStatic, "L");
+        assert!(add_accel_load(&m, &mut lin, "UX", 1.0).is_err());
+        assert!(add_mode_load(&m, &mut lin, "MODAL", 1, 1.0).is_err());
+        assert!(add_pattern_load(&m, &mut lin, "DEAD", 1.0).is_err());
+    }
+
+    #[test]
+    fn a_pushover_chain_drafted_with_the_commands_saves_and_a_locked_model_refuses() {
+        let mut m = push_model();
+        let mut c = draft("PUSH");
+        set_initial_case(&m, &mut c, Some("GRAV")).unwrap();
+        set_displacement_control(&m, &mut c, "K", 0, 6.0, true).unwrap();
+        set_results_saved(
+            &mut c,
+            ResultsSaved::MultipleStates {
+                min_saved: 6,
+                max_saved: 10,
+                positive_only: false,
+            },
+        )
+        .unwrap();
+        set_step_limits(&mut c, 200, 50).unwrap();
+        add_accel_load(&m, &mut c, "UX", 1.0).unwrap();
+        // Locked: refused, the model is unchanged.
+        m.is_locked = true;
+        let before = m.clone();
+        let error = sap_api::set_case_definition(&mut m, c.clone()).unwrap_err();
+        assert!(error.to_string().contains("locked"), "{error}");
+        assert_eq!(m, before);
+        m.is_locked = false;
+        sap_api::set_case_definition(&mut m, c.clone()).unwrap();
+        assert_eq!(m.load_cases["PUSH"], c);
+        // A Mode-load case too.
+        let mut modes = draft("MODEPUSH");
+        modes.loads.clear();
+        add_mode_load(&m, &mut modes, "MODAL", 1, 1.0).unwrap();
+        sap_api::set_case_definition(&mut m, modes.clone()).unwrap();
+        assert_eq!(m.load_cases["MODEPUSH"], modes);
+        // The initial case cannot be deleted while PUSH continues from it.
+        assert!(delete_case(&mut m, "GRAV").unwrap_err().contains("referenced"));
+    }
+
+    fn all_texts(app: &mut SapGuiApp, passes: usize) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let mut out = None;
+        for pass in 0..passes {
+            out = Some(ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400., 2400.))),
+                    time: Some(1.0 + pass as f64),
+                    ..Default::default()
+                },
+                |ctx| app.render_analysis_editor(ctx),
+            ));
+        }
+        out.unwrap()
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn nonlinear_static_editor_renders_every_new_control() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/pushover.s2k")));
+        app.model = push_model();
+        app.analysis_editor.open = true;
+        let mut c = draft("PUSH");
+        set_initial_case(&app.model, &mut c, Some("GRAV")).unwrap();
+        set_displacement_control(&app.model, &mut c, "K", 0, 6.0, true).unwrap();
+        set_results_saved(&mut c, ResultsSaved::multiple_default()).unwrap();
+        add_accel_load(&app.model, &mut c, "UX", 1.0).unwrap();
+        app.analysis_editor.case = c.clone();
+        let t = all_texts(&mut app, 8);
+        for needle in [
+            "Continue from case:",
+            "Loads applied:",
+            "Load Pattern",
+            "Accel",
+            "Add Load Pattern",
+            "Add Accel",
+            "Add Mode",
+            "Full load",
+            "Displacement control",
+            "Monitored joint",
+            "Target displacement",
+            "Use conjugate displacement",
+            "Final state only",
+            "Multiple states",
+            "Minimum number of saved states",
+            "Save positive increments only",
+            "Maximum total steps",
+            "Maximum null steps",
+            "Unload entire structure",
+            "Apply local redistribution",
+            "Restart using secant stiffness",
+        ] {
+            assert!(t.iter().any(|s| s == needle || s.contains(needle)), "{needle}");
+        }
+        assert!(t.iter().any(|s| s == "GRAV"), "initial case shown");
+        assert_eq!(
+            t.iter().filter(|s| s.contains("not available: not implemented")).count(),
+            2
+        );
+        // The rendering did not alter a valid draft.
+        assert_eq!(app.analysis_editor.case, c);
+
+        // A Mode draft shows its row and modal case.
+        let mut modes = draft("MODEPUSH");
+        modes.loads.clear();
+        add_mode_load(&app.model, &mut modes, "MODAL", 2, 1.0).unwrap();
+        app.analysis_editor.case = modes.clone();
+        let t = all_texts(&mut app, 8);
+        assert!(t.iter().any(|s| s == "of modal case"));
+        assert!(t.iter().any(|s| s == "MODAL"));
+        assert_eq!(app.analysis_editor.case, modes);
+    }
+
+    #[test]
+    fn a_click_on_add_accel_adds_a_row_and_a_refusal_is_shown() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/pushover.s2k")));
+        app.model = push_model();
+        app.analysis_editor.open = true;
+        app.analysis_editor.case = draft("PUSH");
+        let ctx = egui::Context::default();
+        let input = |time: f64| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400., 2400.))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let press = |app: &mut SapGuiApp, label: &str, time: f64| {
+            let _ = ctx.run(input(time), |ctx| app.render_analysis_editor(ctx));
+            let out = ctx.run(input(time + 0.1), |ctx| app.render_analysis_editor(ctx));
+            let pos = out
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::epaint::Shape::Text(t) if t.galley.job.text == label => {
+                        Some(t.pos + t.galley.size() * 0.5)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("'{label}' not visible"));
+            let mut down = input(time + 0.2);
+            down.events = vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: Default::default(),
+                },
+            ];
+            let _ = ctx.run(down, |ctx| app.render_analysis_editor(ctx));
+            let mut up = input(time + 0.3);
+            up.events = vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: Default::default(),
+            }];
+            let _ = ctx.run(up, |ctx| app.render_analysis_editor(ctx));
+        };
+        press(&mut app, "Add Accel", 1.0);
+        assert_eq!(app.analysis_editor.case.loads.len(), 2);
+        assert!(is_accel(&app.analysis_editor.case.loads[1]));
+        // Add Mode is refused while load rows exist; the draft is unchanged.
+        let before = app.analysis_editor.case.clone();
+        press(&mut app, "Add Mode", 10.0);
+        assert_eq!(app.analysis_editor.case, before);
+        // Choosing Displacement control sets the default monitored joint.
+        press(&mut app, "Displacement control", 20.0);
+        let control = app.analysis_editor.case.displacement_control.clone().unwrap();
+        assert_eq!(control.monitored, Some(("J".to_string(), 0)));
+        assert!(control.conjugate);
+        press(&mut app, "Full load", 30.0);
+        assert!(app.analysis_editor.case.displacement_control.is_none());
     }
 }

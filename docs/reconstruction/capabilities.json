@@ -1,8 +1,8 @@
 {
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
-  "snapshot_date": "2026-11-15",
-  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md). 2026-11-15: first wave of tutorial-video features (docs/reconstruction/tutorial-video-wave1.md): profile LDLT and subspace eigen solver, mass source, ASCE 7-10 automatic seismic load with entered coefficients, Ritz loads and load participation, modal time history, functions from file, Auto Select design and default design combinations, grid/quick-draw/radial geometry commands. Pushover, AISC 360-16 and ASCE 7-16 remain absent.",
+  "snapshot_date": "2026-11-16",
+  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md). 2026-11-15: first wave of tutorial-video features (docs/reconstruction/tutorial-video-wave1.md): profile LDLT and subspace eigen solver, mass source, ASCE 7-10 automatic seismic load with entered coefficients, Ritz loads and load participation, modal time history, functions from file, Auto Select design and default design combinations, grid/quick-draw/radial geometry commands. Pushover, AISC 360-16 and ASCE 7-16 remain absent. 2026-11-16: second wave of tutorial-video features (docs/reconstruction/tutorial-video-wave2.md): user-defined uncoupled frame hinges in nonlinear static cases checked against CSI Example 1-026, saved states, Accel and Mode loads, pushover curve and hinge-state display, native import of the Example 1-026 hinge records, S2K persistence. Coupled, fiber and automatic hinges remain refused.",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
     "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
@@ -668,15 +668,88 @@
       "limits": "Typed inputs only: no mouse drawing on grids or plane views. Vertical rotation axis only. Assignments a radial copy cannot reproduce exactly are refused. GUI windows tested headless, not by hand."
     },
     {
+      "id": "frame-hinges-pushover",
+      "area": "solver",
+      "feature": "User-defined uncoupled deformation-controlled frame hinges (P, V2, V3, T, M2, M3) in nonlinear static cases, solved event by event with the 10 % slope limit on strength loss, continuation between cases, saved states with hinge states and status, and Accel and Mode loads.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/hinge.rs",
+          "lines": "1-1940",
+          "note": "Backbone curves, slope limit, event stepping, saved-step selection, recovery of saved states."
+        },
+        {
+          "file": "crates/sap-solver/tests/frame_hinges.rs",
+          "lines": "1-2570",
+          "note": "CSI Example 1-026 A and B built in code; portal, beam and cantilever closed forms; 56-hinge frame by the uniqueness theorem; refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/nl_static_mode_accel.rs",
+          "lines": "1-614",
+          "note": "Accel and Mode load vectors and collapse loads in closed form; refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/vendor_1_026_hinges.rs",
+          "lines": "1-275",
+          "note": "Opt-in: the two vendor files imported and analyzed against the published values."
+        },
+        {
+          "file": "crates/sap-app/tests/video_pushover_workflow.rs",
+          "lines": "1-1271",
+          "note": "Four-storey frame of the tutorial video: chained gravity cases, Accel and Mode pushes, S2K round trip."
+        }
+      ],
+      "limits": "Coupled P-M2-M3 hinges and subsets, fiber, parametric, automatic and force-controlled hinges are refused. Models with hinges must consist of frames only, with no other nonlinearity, releases or end offsets on hinged frames. Strength loss is implemented for M2 and M3 only; reversal after yield is refused; only the 'unload entire structure' method exists and it is a reconstruction checked on Example 1-026 B. Events are not lumped. A case that misses its target keeps no partial results. Saved states are kept on the hinge path only."
+    },
+    {
+      "id": "pushover-results-and-definition",
+      "area": "application",
+      "feature": "Pushover curve (API, table and plot), saved-state slider and hinge-state markers in the 3D view, hinge property, assignment and overwrite windows, nonlinear static case editor options, S2K persistence and native import of the Example 1-026 hinge records.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-api/src/hinges.rs",
+          "lines": "1-235",
+          "note": "pushover_curve, get_hinge_assigns, hinge unloading option."
+        },
+        {
+          "file": "crates/sap-api/tests/hinge_results.rs",
+          "lines": "1-515",
+          "note": "Curve points and hinge counts against closed forms; refusals."
+        },
+        {
+          "file": "crates/sap-app/src/gui/hinges.rs",
+          "lines": "1-1238",
+          "note": "Definition and assignment commands with their tests."
+        },
+        {
+          "file": "crates/sap-app/src/gui/pushover.rs",
+          "lines": "1-540",
+          "note": "Curve window and hinge markers with headless tests."
+        },
+        {
+          "file": "crates/sap-format/src/sdb/hinges.rs",
+          "lines": "1-1114",
+          "note": "Native hinge record decoding, pinned to the observed values."
+        },
+        {
+          "file": "crates/sap-format/tests/hinge_s2k.rs",
+          "lines": "1-588",
+          "note": "S2K round trip and import errors."
+        }
+      ],
+      "limits": "GUI verified through command functions and headless renders only. Legend colours are project choices. No capacity-spectrum form of the curve. Hinge definition commands are not in the typed API. S2K uses reconstruction extension tables; genuine vendor hinge tables are kept verbatim and not interpreted. Native export refuses hinge data. Native import accepts only the hinge values the two Example 1-026 files show."
+    },
+    {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "86 live reference checks across 18 benchmark families plus 656 automated tests across 63 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, and catenary cables.",
+      "feature": "90 live reference checks across 19 benchmark families plus 803 automated tests across 69 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/benchmarks.rs",
           "lines": "55-90",
-          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks)."
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks)."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",

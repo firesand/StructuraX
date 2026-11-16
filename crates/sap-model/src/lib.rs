@@ -1,6 +1,7 @@
 pub mod auto_select;
 pub mod editing;
 pub mod generate;
+pub mod hinge;
 pub mod radial;
 pub mod ritz;
 pub mod seismic;
@@ -741,6 +742,12 @@ pub struct FrameObj {
     /// chosen by design and the one the last analysis used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_select: Option<auto_select::AutoSelectState>,
+    /// Hinges assigned to the object, in assignment order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hinges: Vec<hinge::FrameHinge>,
+    /// Frame hinge overwrite; `None` leaves the object undivided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hinge_overwrite: Option<hinge::FrameHingeOverwrite>,
 }
 
 /// Concrete frame design framing type, as in the SAP2000 concrete design
@@ -830,6 +837,8 @@ impl FrameObj {
             concrete_framing: ConcreteFramingType::default(),
             steel_overwrite: None,
             auto_select: None,
+            hinges: Vec::new(),
+            hinge_overwrite: None,
         }
     }
 }
@@ -1025,10 +1034,14 @@ pub struct LoadCase {
     /// entry has no cycle limit and no target.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ritz_controls: Vec<ritz::RitzLoadControl>,
-    /// Linear history cases: the Modal case whose modes are superposed.
-    /// `None` integrates the full equations directly.
+    /// Linear history cases: the Modal case whose modes are superposed;
+    /// `None` integrates the full equations directly. Nonlinear static
+    /// cases: the Modal case of the modal loads in `nl_static.mode_loads`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modal_case: Option<String>,
+    /// Nonlinear static cases: saved states, step limits and modal loads.
+    #[serde(default, skip_serializing_if = "hinge::NonlinearStaticParams::is_default")]
+    pub nl_static: hinge::NonlinearStaticParams,
 }
 
 /// Displacement-controlled nonlinear static load application (CSI Analysis
@@ -1082,6 +1095,7 @@ impl LoadCase {
             displacement_control: None,
             ritz_controls: Vec::new(),
             modal_case: None,
+            nl_static: hinge::NonlinearStaticParams::default(),
         }
     }
 
@@ -1113,6 +1127,7 @@ impl LoadCase {
             displacement_control: None,
             ritz_controls: Vec::new(),
             modal_case: None,
+            nl_static: hinge::NonlinearStaticParams::default(),
         }
     }
 }
@@ -1306,6 +1321,14 @@ pub struct CaseResults {
     /// output step, `joint_name -> Vec<[U1, U2, U3, R1, R2, R3]>`.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub time_history_accel: IndexMap<String, Vec<[f64; 6]>>,
+    /// Nonlinear static cases that save multiple states: every saved state,
+    /// step 0 first. Empty when only the final state is kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_steps: Vec<hinge::NonlinearStaticStep>,
+    /// Frame hinge results at the end of a nonlinear static case, also the
+    /// starting hinge state of a case that continues from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hinge_results: Vec<hinge::FrameHingeResult>,
 }
 
 /// One piece of imported source data that the importer recognized, could not
@@ -1518,6 +1541,9 @@ pub struct SapModel {
     /// Steel frame design preferences.
     #[serde(default, skip_serializing_if = "auto_select::SteelDesignPreferences::is_default")]
     pub steel_design_prefs: auto_select::SteelDesignPreferences,
+    /// User-defined frame hinge properties, keyed by name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub hinge_props: IndexMap<String, hinge::HingeProp>,
 }
 
 impl Default for SapModel {
@@ -1633,6 +1659,7 @@ impl SapModel {
             mass_source: seismic::MassSource::default(),
             auto_seismic: IndexMap::new(),
             steel_design_prefs: auto_select::SteelDesignPreferences::default(),
+            hinge_props: IndexMap::new(),
         }
     }
 
@@ -1690,6 +1717,7 @@ impl SapModel {
         let f_alpha = src.thermal_expansion_factor_to(target_units);
 
         seismic::scale_units(self, src, target_units);
+        hinge::scale_units(self, src, target_units);
 
         for cs in self.coord_systems.values_mut() {
             for c in &mut cs.origin {

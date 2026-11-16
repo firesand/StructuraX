@@ -59,7 +59,7 @@ auto-subdivision was modeled, 51 before joint offsets were read; see
 | Area springs (`ShSpring`) | live records | `AllCases` | 4 |
 | Solid surface springs (`SSpring`) | live records | `AllCases` | 4 |
 | Frame line springs (`FSpring`) | live records | `AllCases` | 3 |
-| Frame hinge assignments | count of `S_Hinge` records | `NonlinearCases` | 2 |
+| Frame hinge assignments the importer does not decode | per frame, with the reason | `NonlinearCases` | 0 (2 until 2026-11-16) |
 | Link gravity loads (`NLGLoad`) | live records with a nonzero multiplier | `LoadPattern` | 2 |
 | Frame added mass (`FMass`) | live records | `DynamicCases` | 2 |
 | Area gravity loads (`ShGLoad`) | live records, by pattern | `LoadPattern` | 2 |
@@ -108,8 +108,11 @@ pattern when the record has `m_lc`/`m_LC`, otherwise all cases). A mass source
 other than the corpus default (one source: element masses plus additional
 masses, nothing from loads) is recorded for dynamic cases.
 
-Hinge entries give a count, not frame names: the hinge section lies beyond the
-sections the model importer reads, and the frame it belongs to is not resolved.
+Hinge entries gave a count, not frame names, when this was written. Since
+2026-11-16 the hinge section is decoded: the hinges of Example 1-026 are
+imported, and any hinge the importer does not accept is recorded per frame
+with its reason ([tutorial-video-wave2.md](tutorial-video-wave2.md)). The
+corpus count of files with such an entry is now 0.
 
 Per the CSI Analysis Reference Manual, frame nonlinear properties "only affect
 nonlinear analyses"; a linear case from zero behaves as if they were absent.
@@ -188,7 +191,9 @@ Native projection of the 336 files is now: 334 S2K roundtrips, **283** native
 roundtrips, 5 incomplete-link-law refusals, **46 unmodeled-source refusals**,
 2 unsupported imports. It was 329 / 5 / 0 before any of these records existed,
 and 250 / 5 / 79 before frame auto-subdivision was modeled. The 46 were
-previously written without the recorded data. Four more files carry entries
+previously written without the recorded data. Since 2026-11-16 the two
+Example 1-026 files are no longer among them: their hinges are imported, and
+native synthesis refuses them for the hinge data instead (283 / 5 / 44 / 2). Four more files carry entries
 but are counted under their incomplete link law.
 
 No test that existed before these records analyzes any of the affected files or
@@ -214,7 +219,8 @@ passing check depended on the dropped data.
   Example 2-006 (only the case using the gravity pattern is refused, the other
   two analyze), 1-015 (modal refused, static runs), 1-009a (tendon), 2-016a
   (auto-mesh options), 1-013a (line springs).
-- The corpus roundtrip test asserts the split (283 / 5 / 46) and one refused
+- The corpus roundtrip test asserts the split (283 / 5 / 44, plus the two
+  Example 1-026 files refused for hinge data) and one refused
   file per kind of recorded data.
 
 The GUI list and discard button have no automated test.

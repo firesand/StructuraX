@@ -187,16 +187,8 @@ pub(super) fn collect(
         }
     }
 
-    // Frame hinge assignments. The `FrameHingeAssign` section holds one record
-    // per frame even when no hinge is assigned (non-empty in 144 corpus files),
-    // so the hinge records themselves are counted. Hinges act in nonlinear cases.
-    let hinges = records.iter().filter(|r| r.class_id == "S_Hinge").count();
-    if hinges > 0 {
-        entries.push(UnmodeledSourceData {
-            scope: UnmodeledScope::NonlinearCases,
-            description: format!("{hinges} frame hinge assignment(s)"),
-        });
-    }
+    // Frame hinge assignments are imported, or recorded frame by frame, by
+    // `hinges::import`.
     entries
 }
 
@@ -371,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn non_default_mass_sources_and_hinge_records_are_reported() {
+    fn non_default_mass_sources_are_reported() {
         for sources in [
             vec![mass_source(true, true, true)],
             vec![mass_source(false, true, false)],
@@ -388,22 +380,15 @@ mod tests {
                 )]
             );
         }
-        // One assignment record per frame; only the nested hinge records count.
+        // Hinge records are accounted for by `hinges::import`, not here.
         let mut s = Stream::new();
         s.section(
             "FrameHingeAssign",
             "S_FrameHingeAssign",
             &[vec![int("m_nhinge", 0)], vec![int("m_nhinge", 0)]],
         );
-        assert!(s.entries().is_empty());
         s.section("Elsewhere", "S_Hinge", &[vec![int("m_iprop", 1)]]);
-        assert_eq!(
-            s.entries(),
-            [(
-                UnmodeledScope::NonlinearCases,
-                "1 frame hinge assignment(s)".to_string()
-            )]
-        );
+        assert!(s.entries().is_empty());
     }
 
     #[test]

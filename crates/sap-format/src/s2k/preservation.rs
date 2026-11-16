@@ -82,6 +82,10 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "RUST MASS SOURCE"
             | "RUST AUTO SEISMIC - ASCE 7-10"
             | "RUST STEEL DESIGN PREFERENCES"
+            | "RUST HINGE PROPERTIES"
+            | "RUST HINGE PROPERTIES - CURVE"
+            | "RUST FRAME HINGE ASSIGNMENTS"
+            | "RUST FRAME HINGE OVERWRITES"
     )
 }
 
@@ -222,6 +226,8 @@ fn identity(table: &str, row: &Row) -> Vec<(String, String)> {
             "COMBONAME",
             "ITEM",
             "DOF",
+            "POINT",
+            "HINGENUM",
             "PATTERN",
             "FUNCTION",
             "TIME",

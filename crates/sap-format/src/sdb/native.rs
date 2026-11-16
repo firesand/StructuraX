@@ -2755,8 +2755,9 @@ mod tests {
         }
         let mut checked = 0usize;
         let mut rejected_incomplete = 0usize;
-        const EXPECTED_UNMODELED: usize = 46;
+        const EXPECTED_UNMODELED: usize = 44;
         let mut rejected_unmodeled: Vec<String> = Vec::new();
+        let mut rejected_hinges: Vec<String> = Vec::new();
         let mut native_checked = 0usize;
         let mut nonlinear_links_checked = 0usize;
         let mut cables_checked = 0usize;
@@ -2813,6 +2814,20 @@ mod tests {
                     );
                     continue;
                 }
+                // Imported frame hinges are modeled and kept by S2K (checked
+                // above), but the native writer has no hinge records.
+                Err(FormatError::UnsupportedNativeExport { field, .. })
+                    if model.frames.values().any(|f| !f.hinges.is_empty())
+                        && (field.starts_with("hinge_props.")
+                            || field.ends_with(".hinges")
+                            || field.ends_with(".hinge_overwrite")
+                            || field.contains(".nl_static.")) =>
+                {
+                    rejected_hinges.push(
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                    );
+                    continue;
+                }
                 Err(e) => panic!("{} native pack failed: {}", path.display(), e),
             };
             let doc = inspect_native_sdb(&native_sdb)
@@ -2834,10 +2849,11 @@ mod tests {
             native_checked += 1;
         }
         rejected_unmodeled.sort();
+        rejected_hinges.sort();
         eprintln!("Vendor projection: {checked} S2K roundtrips, {native_checked} checked native roundtrips, {rejected_incomplete} incomplete-source native rejections, unmodeled-source native rejections: {rejected_unmodeled:?}");
         assert_eq!(
             checked,
-            native_checked + rejected_incomplete + rejected_unmodeled.len()
+            native_checked + rejected_incomplete + rejected_unmodeled.len() + rejected_hinges.len()
         );
         if checked >= 334 {
             // One file per kind of recorded data; the full list is printed above.
@@ -2846,7 +2862,6 @@ mod tests {
                 "example_1_009a.sdb",       // tendon object and prestress load
                 "example_1_013a.sdb",       // frame line springs
                 "example_1_015.sdb",        // frame added mass
-                "example_1_026a.sdb",       // frame hinges
                 "example_2_006_thick.sdb",  // area gravity load
                 "example_2_016a_thick.sdb", // area auto-mesh options not modeled
                 "example_2_009a_thick.sdb", // area springs
@@ -2864,8 +2879,10 @@ mod tests {
                 );
             }
             assert_eq!(rejected_unmodeled.len(), EXPECTED_UNMODELED);
+            // Example 1-026: the only vendor models with assigned frame hinges.
+            assert_eq!(rejected_hinges, ["example_1_026a.sdb", "example_1_026b.sdb"]);
             assert_eq!(rejected_incomplete, 5);
-            assert_eq!(native_checked, 334 - 5 - EXPECTED_UNMODELED);
+            assert_eq!(native_checked, 334 - 5 - EXPECTED_UNMODELED - 2);
         }
         assert!(native_checked > 0, "No supported native models checked");
         assert!(checked >= 334, "Only {} vendor models checked", checked);

@@ -195,3 +195,328 @@ fn modal_history_damping_and_unmodeled_source_need_explicit_decisions() {
     // The model changed in a way that affects results.
     assert!(api.inner.case_results.is_empty());
 }
+
+// ---------------------------------------------------------------------------
+// Nonlinear static pushover definitions: initial case, saved states, step
+// limits, Accel and Mode loads. Each relaxation has its negative tests.
+// ---------------------------------------------------------------------------
+
+fn nl_static(name: &str) -> LoadCase {
+    let mut c = LoadCase::linear_static(name, "DEAD", 1.);
+    c.case_type = LoadCaseType::NonlinearStatic;
+    c
+}
+
+fn refused(api: &cSapModel, case: LoadCase, needle: &str) {
+    let error = sap_api::validate_case_definition(&api.inner, &case)
+        .expect_err(needle)
+        .to_string();
+    assert!(error.contains(needle), "{error} should contain {needle}");
+}
+
+#[test]
+fn nonlinear_static_initial_case_is_accepted_for_nonlinear_static_cases_only() {
+    let mut api = oscillator();
+    set_case_definition(&mut api.inner, nl_static("N1")).unwrap();
+    let mut n2 = nl_static("N2");
+    n2.initial_case = Some("N1".into());
+    set_case_definition(&mut api.inner, n2.clone()).unwrap();
+    assert_eq!(
+        api.inner.load_cases["N2"].initial_case.as_deref(),
+        Some("N1")
+    );
+    // A third link of the chain.
+    let mut n3 = nl_static("N3");
+    n3.initial_case = Some("N2".into());
+    set_case_definition(&mut api.inner, n3).unwrap();
+
+    // Refused: missing, self, a case that is not nonlinear static, a cycle.
+    let mut c = nl_static("N4");
+    c.initial_case = Some("GHOST".into());
+    refused(&api, c, "not an existing");
+    let mut c = nl_static("N4");
+    c.initial_case = Some("N4".into());
+    refused(&api, c, "not an existing, different");
+    set_case_definition(&mut api.inner, LoadCase::linear_static("LIN", "DEAD", 1.)).unwrap();
+    let mut c = nl_static("N4");
+    c.initial_case = Some("LIN".into());
+    refused(&api, c, "not a nonlinear static case");
+    api.inner
+        .load_cases
+        .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 2));
+    let mut c = nl_static("N4");
+    c.initial_case = Some("MODAL".into());
+    refused(&api, c, "not a nonlinear static case");
+    let mut n1 = nl_static("N1");
+    n1.initial_case = Some("N3".into());
+    refused(&api, n1, "cycle");
+    // A stored case may already name a case that is not defined yet.
+    let mut dangling = nl_static("N5");
+    dangling.initial_case = Some("NEW".into());
+    api.inner.load_cases.insert("N5".into(), dangling);
+    let mut new = nl_static("NEW");
+    new.initial_case = Some("N5".into());
+    refused(&api, new, "cycle");
+    api.inner.load_cases.shift_remove("N5");
+    // Redefining N1 with itself unchanged is fine.
+    set_case_definition(&mut api.inner, nl_static("N1")).unwrap();
+
+    // Other case types still refuse an initial case.
+    let mut lin = LoadCase::linear_static("LIN2", "DEAD", 1.);
+    lin.initial_case = Some("N1".into());
+    refused(&api, lin, "initial-state cases are supported only");
+    let mut h = history();
+    h.initial_case = Some("N1".into());
+    refused(&api, h, "initial-state cases are supported only");
+    let mut modal = LoadCase::modal_eigen("M2", 2);
+    modal.initial_case = Some("N1".into());
+    refused(&api, modal, "initial-state cases are supported only");
+
+    // A case that others continue from must stay nonlinear static.
+    refused(
+        &api,
+        LoadCase::linear_static("N1", "DEAD", 1.),
+        "initial case of a nonlinear static",
+    );
+    assert_eq!(
+        api.load_cases()
+            .set_definition(LoadCase::linear_static("N1", "DEAD", 1.)),
+        OAPI_ERR
+    );
+}
+
+#[test]
+fn saved_states_step_limits_and_unloading_are_checked() {
+    use sap_model::hinge::{HingeUnloading, ResultsSaved};
+    let mut api = oscillator();
+    let mut c = nl_static("N");
+    c.nl_static.results_saved = ResultsSaved::MultipleStates {
+        min_saved: 6,
+        max_saved: 10,
+        positive_only: false,
+    };
+    c.nl_static.max_total_steps = 200;
+    c.nl_static.max_null_steps = 50;
+    set_case_definition(&mut api.inner, c.clone()).unwrap();
+    assert_eq!(api.inner.load_cases["N"].nl_static, c.nl_static);
+
+    for (min_saved, max_saved) in [(0, 10), (11, 10), (1, 100_001)] {
+        let mut bad = c.clone();
+        bad.nl_static.results_saved = ResultsSaved::MultipleStates {
+            min_saved,
+            max_saved,
+            positive_only: true,
+        };
+        refused(&api, bad, "multiple saved states");
+    }
+    for (total, null) in [(0, 50), (1_000_001, 50), (200, 0), (200, 1_000_001)] {
+        let mut bad = c.clone();
+        bad.nl_static.max_total_steps = total;
+        bad.nl_static.max_null_steps = null;
+        refused(&api, bad, "steps must be");
+    }
+    for method in [
+        HingeUnloading::ApplyLocalRedistribution,
+        HingeUnloading::RestartUsingSecantStiffness,
+    ] {
+        let mut bad = c.clone();
+        bad.nl_static.hinge_unloading = method;
+        refused(&api, bad, "only \"unload entire structure\"");
+    }
+    // These belong to nonlinear static cases only.
+    let mut lin = LoadCase::linear_static("L", "DEAD", 1.);
+    lin.nl_static.max_total_steps = 10;
+    refused(&api, lin, "belong to nonlinear static cases");
+    let mut dynamic = history();
+    dynamic.nl_static.results_saved = ResultsSaved::multiple_default();
+    refused(&api, dynamic, "belong to nonlinear static cases");
+}
+
+#[test]
+fn displacement_control_definition_keeps_its_checks() {
+    let mut api = oscillator();
+    let mut c = nl_static("PUSH");
+    let control = DisplacementControl {
+        target: 0.5,
+        monitored: Some(("J".into(), 0)),
+        conjugate: true,
+    };
+    c.displacement_control = Some(control.clone());
+    set_case_definition(&mut api.inner, c.clone()).unwrap();
+    for bad in [
+        DisplacementControl {
+            target: 0.,
+            ..control.clone()
+        },
+        DisplacementControl {
+            target: f64::NAN,
+            ..control.clone()
+        },
+        DisplacementControl {
+            monitored: Some(("GHOST".into(), 0)),
+            ..control.clone()
+        },
+        DisplacementControl {
+            monitored: Some(("J".into(), 6)),
+            ..control.clone()
+        },
+        DisplacementControl {
+            monitored: None,
+            ..control.clone()
+        },
+    ] {
+        let mut b = c.clone();
+        b.displacement_control = Some(bad);
+        refused(&api, b, "displacement control needs");
+    }
+    let mut pdelta = c;
+    pdelta.nl_geom = NLGeomType::PDelta;
+    refused(&api, pdelta, "displacement control needs");
+}
+
+#[test]
+fn accel_loads_are_accepted_for_nonlinear_static_cases_only() {
+    let mut api = oscillator();
+    let mut c = nl_static("ACC");
+    c.loads = vec![LoadCaseAssignment {
+        load_name: "UX".into(),
+        scale_factor: -1.,
+    }];
+    set_case_definition(&mut api.inner, c.clone()).unwrap();
+    // Pattern and Accel rows can be mixed.
+    c.loads.push(LoadCaseAssignment {
+        load_name: "DEAD".into(),
+        scale_factor: 2.,
+    });
+    set_case_definition(&mut api.inner, c.clone()).unwrap();
+    // Not finite.
+    let mut bad = c.clone();
+    bad.loads[0].scale_factor = f64::INFINITY;
+    refused(&api, bad, "nonfinite");
+    // Rotational accelerations and unknown names are undefined patterns.
+    for name in ["RX", "U4", "UW", "UXX"] {
+        let mut bad = c.clone();
+        bad.loads[0].load_name = name.into();
+        refused(&api, bad, "undefined static load pattern");
+    }
+    // Linear static and buckling cases still refuse them.
+    for kind in [LoadCaseType::LinearStatic, LoadCaseType::Buckling] {
+        let mut bad = c.clone();
+        bad.name = "OTHER".into();
+        bad.case_type = kind;
+        refused(&api, bad, "undefined static load pattern");
+    }
+    // A pattern named like an acceleration load is ambiguous: refused.
+    api.inner.load_patterns.insert(
+        "UY".into(),
+        LoadPattern {
+            name: "UY".into(),
+            pat_type: LoadPatternType::Live,
+            self_wt_multiplier: 0.,
+        },
+    );
+    refused(&api, c, "named like an acceleration load");
+}
+
+fn with_modal(api: &mut cSapModel, max_modes: usize, run: bool) {
+    let mut m = LoadCase::modal_eigen("MODAL", max_modes);
+    m.run_flag = run;
+    api.inner.load_cases.insert("MODAL".into(), m);
+}
+
+fn mode_case(mode: usize, sf: f64) -> LoadCase {
+    let mut c = nl_static("MODEPUSH");
+    c.loads.clear();
+    c.modal_case = Some("MODAL".into());
+    c.nl_static.mode_loads = vec![sap_model::hinge::ModeLoad {
+        mode,
+        scale_factor: sf,
+    }];
+    c
+}
+
+#[test]
+fn mode_loads_need_a_run_modal_case_and_a_valid_mode() {
+    let mut api = oscillator();
+    with_modal(&mut api, 3, true);
+    // A case with a Mode load and no load pattern is valid.
+    set_case_definition(&mut api.inner, mode_case(2, 1.5)).unwrap();
+    let stored = &api.inner.load_cases["MODEPUSH"];
+    assert_eq!(stored.modal_case.as_deref(), Some("MODAL"));
+    assert_eq!(stored.nl_static.mode_loads[0].mode, 2);
+    assert!(stored.loads.is_empty());
+    // Two different modes.
+    let mut two = mode_case(1, 1.);
+    two.nl_static.mode_loads.push(sap_model::hinge::ModeLoad {
+        mode: 3,
+        scale_factor: 1.,
+    });
+    set_case_definition(&mut api.inner, two).unwrap();
+
+    refused(&api, mode_case(0, 1.), "outside 1..3");
+    refused(&api, mode_case(4, 1.), "outside 1..3");
+    refused(&api, mode_case(1, f64::NAN), "not finite");
+    let mut dup = mode_case(1, 1.);
+    dup.nl_static.mode_loads.push(sap_model::hinge::ModeLoad {
+        mode: 1,
+        scale_factor: 2.,
+    });
+    refused(&api, dup, "loaded twice");
+    let mut no_modal = mode_case(1, 1.);
+    no_modal.modal_case = None;
+    refused(&api, no_modal, "need the Modal case");
+    let mut ghost = mode_case(1, 1.);
+    ghost.modal_case = Some("GHOST".into());
+    refused(&api, ghost, "existing Modal case");
+    set_case_definition(&mut api.inner, nl_static("OTHERNL")).unwrap();
+    let mut wrong = mode_case(1, 1.);
+    wrong.modal_case = Some("OTHERNL".into());
+    refused(&api, wrong, "existing Modal case");
+    // Mode mixed with a load pattern or an Accel load.
+    for name in ["DEAD", "UX"] {
+        let mut mixed = mode_case(1, 1.);
+        mixed.loads = vec![LoadCaseAssignment {
+            load_name: name.into(),
+            scale_factor: 1.,
+        }];
+        refused(&api, mixed, "cannot be mixed");
+    }
+    // A modal case without a Mode load is a leftover.
+    let mut leftover = nl_static("LEFT");
+    leftover.modal_case = Some("MODAL".into());
+    refused(&api, leftover, "no Mode load");
+    // Mode loads of other case types.
+    let mut lin = mode_case(1, 1.);
+    lin.case_type = LoadCaseType::LinearStatic;
+    refused(&api, lin, "belong to nonlinear static cases");
+    // Modal superposition of a linear history still works.
+    set_function_definition(&mut api.inner, function("STEP", true)).unwrap();
+    let mut hist = history();
+    hist.modal_case = Some("MODAL".into());
+    hist.modal_damping = 0.05;
+    set_case_definition(&mut api.inner, hist).unwrap();
+    // The Modal case cannot become another type while a pushover uses it.
+    refused(
+        &api,
+        LoadCase::linear_static("MODAL", "DEAD", 1.),
+        "modal source",
+    );
+    // A modal case that is not run cannot supply modes.
+    with_modal(&mut api, 3, false);
+    refused(&api, mode_case(1, 1.), "must be run");
+}
+
+#[test]
+fn pushover_definitions_refuse_while_locked_and_change_nothing() {
+    let mut api = oscillator();
+    with_modal(&mut api, 3, true);
+    set_case_definition(&mut api.inner, nl_static("N1")).unwrap();
+    api.inner.is_locked = true;
+    let before = api.inner.clone();
+    let mut n2 = nl_static("N2");
+    n2.initial_case = Some("N1".into());
+    assert!(set_case_definition(&mut api.inner, n2.clone()).is_err());
+    assert_eq!(api.load_cases().set_definition(n2), OAPI_ERR);
+    assert!(set_case_definition(&mut api.inner, mode_case(1, 1.)).is_err());
+    assert_eq!(api.inner, before);
+}

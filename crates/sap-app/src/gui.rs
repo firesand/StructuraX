@@ -5,7 +5,9 @@
 
 mod analysis;
 mod build;
+mod hinges;
 mod modal_tables;
+mod pushover;
 mod seismic;
 mod steel_design;
 mod time_history;
@@ -254,7 +256,9 @@ pub struct SapGuiApp {
     workflows: workflows::Workflows,
     analysis_editor: analysis::AnalysisEditor,
     panel_build: build::State,
+    panel_hinges: hinges::State,
     panel_modal_tables: modal_tables::State,
+    panel_pushover: pushover::State,
     panel_seismic: seismic::State,
     panel_steel_design: steel_design::State,
     panel_time_history: time_history::State,
@@ -425,7 +429,9 @@ impl SapGuiApp {
             workflows: workflows::Workflows::default(),
             analysis_editor: analysis::AnalysisEditor::default(),
             panel_build: build::State::default(),
+            panel_hinges: hinges::State::default(),
             panel_modal_tables: modal_tables::State::default(),
+            panel_pushover: pushover::State::default(),
             panel_seismic: seismic::State::default(),
             panel_steel_design: steel_design::State::default(),
             panel_time_history: time_history::State::default(),
@@ -456,8 +462,11 @@ impl SapGuiApp {
             } else {
                 self.active_mode_idx = 0;
             }
-            if !cr.time_steps.is_empty() {
-                self.active_step_idx = self.active_step_idx.min(cr.time_steps.len() - 1);
+            // Time-history steps and saved states of a nonlinear static case
+            // share the step slider; a case has one kind or the other.
+            let step_count = cr.time_steps.len().max(cr.static_steps.len());
+            if step_count > 0 {
+                self.active_step_idx = self.active_step_idx.min(step_count - 1);
             } else {
                 self.active_step_idx = 0;
                 self.use_time_step = false;
@@ -493,7 +502,9 @@ impl SapGuiApp {
         }
         self.analysis_editor = analysis::AnalysisEditor::default();
         self.panel_build = build::State::default();
+        self.panel_hinges = hinges::State::default();
         self.panel_modal_tables = modal_tables::State::default();
+        self.panel_pushover = pushover::State::default();
         self.panel_seismic = seismic::State::default();
         self.panel_steel_design = steel_design::State::default();
         self.panel_time_history = time_history::State::default();
@@ -913,6 +924,11 @@ impl SapGuiApp {
                     self.panel_seismic.open = true;
                     ui.close_menu();
                 }
+                if ui.button("Hinge Properties...").clicked() {
+                    self.panel_hinges.open = true;
+                    self.panel_hinges.tab = hinges::TAB_PROPERTIES;
+                    ui.close_menu();
+                }
                 if ui.button("Functions from File and Plot Functions...").clicked() {
                     self.panel_time_history.open = true;
                     ui.close_menu();
@@ -924,6 +940,16 @@ impl SapGuiApp {
             });
 
             ui.menu_button("Assign", |ui| {
+                if ui.button("Frame Hinges...").clicked() {
+                    self.panel_hinges.open = true;
+                    self.panel_hinges.tab = hinges::TAB_ASSIGN;
+                    ui.close_menu();
+                }
+                if ui.button("Frame Hinge Overwrites...").clicked() {
+                    self.panel_hinges.open = true;
+                    self.panel_hinges.tab = hinges::TAB_OVERWRITES;
+                    ui.close_menu();
+                }
                 for (label, tab) in [
                     ("Frame Section...", 0),
                     ("Area Section and Mesh...", 2),
@@ -1006,6 +1032,10 @@ impl SapGuiApp {
                 }
                 if ui.button("Show Plot Functions...").clicked() {
                     self.panel_time_history.open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Show Static Pushover Curve...").clicked() {
+                    self.panel_pushover.open = true;
                     ui.close_menu();
                 }
                 if ui.button("Show Undeformed Shape (F4)").clicked() {
@@ -1430,6 +1460,42 @@ impl SapGuiApp {
                     .show(ui, |ui| {
                         for (idx, factor) in cr.buckling_factors.iter().enumerate() {
                             ui.label(format!("Mode {}: λ = {:.5}", idx + 1, factor));
+                        }
+                    });
+                }
+
+                if !cr.static_steps.is_empty() {
+                    egui::CollapsingHeader::new(format!(
+                        "Nonlinear Static Steps ({})",
+                        cr.static_steps.len()
+                    ))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if ui
+                            .checkbox(&mut self.use_time_step, "Scrub Deformed Saved State")
+                            .changed()
+                            && self.use_time_step
+                        {
+                            self.display_mode = DisplayMode::Deformed;
+                        }
+                        let max_idx = cr.static_steps.len().saturating_sub(1);
+                        let cur_idx = self.active_step_idx.min(max_idx);
+                        let step = &cr.static_steps[cur_idx];
+                        let monitored = step
+                            .monitored_displacement
+                            .map(|d| format!(", monitored {d:.5}"))
+                            .unwrap_or_default();
+                        ui.label(format!(
+                            "State {cur_idx}/{max_idx}: load factor {:.5}{monitored}",
+                            step.load_factor
+                        ));
+                        if max_idx > 0
+                            && ui
+                                .add(egui::Slider::new(&mut self.active_step_idx, 0..=max_idx))
+                                .changed()
+                        {
+                            self.use_time_step = true;
+                            self.display_mode = DisplayMode::Deformed;
                         }
                     });
                 }
@@ -2053,6 +2119,18 @@ impl SapGuiApp {
 
         // 5. Draw Frame Elements, Deformed Curves, Force/Moment Diagrams, or Design Colors
         let mut frame_screen_segs: Vec<(String, Pos2, Pos2)> = Vec::new();
+        // Yielded hinges of the active case at the shown saved state (the
+        // final state unless a saved state is scrubbed).
+        let show_hinge_legend =
+            case_res.is_some_and(|cr| !cr.static_steps.is_empty() || !cr.hinge_results.is_empty());
+        let hinge_marks = if self.display_mode == DisplayMode::Deformed {
+            let scrubbed = case_res
+                .is_some_and(|cr| use_time_step && !cr.static_steps.is_empty())
+                .then_some(active_step_idx);
+            pushover::hinge_markers(&self.model, &self.active_case, scrubbed)
+        } else {
+            Vec::new()
+        };
         for (fid, frame) in &self.model.frames {
             let (Some(pi), Some(pj)) = (
                 self.model.points.get(&frame.point_i),
@@ -2225,11 +2303,18 @@ impl SapGuiApp {
             // Deformed shape curve (supports Modal, Time-History scrubbing, Station curves, and Buckling joint fallback)
             if self.display_mode == DisplayMode::Deformed {
                 if let Some(cr) = case_res {
+                    // A saved state of a nonlinear static case has its own stations.
+                    let station_source = if use_time_step && !cr.static_steps.is_empty() {
+                        &cr.static_steps[active_step_idx.min(cr.static_steps.len() - 1)]
+                            .frame_forces
+                    } else {
+                        &cr.frame_forces
+                    };
                     let use_stations = cr.modes.is_empty()
                         && !(use_time_step && !cr.time_steps.is_empty())
-                        && cr.frame_forces.contains_key(fid);
+                        && station_source.contains_key(fid);
                     if use_stations {
-                        if let Some(stations) = cr.frame_forces.get(fid) {
+                        if let Some(stations) = station_source.get(fid) {
                             let (_, e_axes) = frame_local_axes(p1, p2, frame.angle_deg);
                             let mut pts = Vec::with_capacity(stations.len());
                             for st in stations {
@@ -2267,6 +2352,19 @@ impl SapGuiApp {
                         );
                     }
                 }
+            }
+
+            // Hinge markers at their relative position on the deformed frame.
+            for (_, rel, class) in hinge_marks.iter().filter(|(f, _, _)| f == fid) {
+                let a = displaced_point(&frame.point_i, p1);
+                let b = displaced_point(&frame.point_j, p2);
+                let at = project([
+                    a[0] + rel * (b[0] - a[0]),
+                    a[1] + rel * (b[1] - a[1]),
+                    a[2] + rel * (b[2] - a[2]),
+                ]);
+                painter.circle_filled(at, 5.5, pushover::class_color(*class));
+                painter.circle_stroke(at, 5.5, Stroke::new(1.0_f32, Color32::from_rgb(10, 12, 18)));
             }
 
             // Internal Force / Moment Diagram along Frame (NaN-safe)
@@ -2655,6 +2753,11 @@ impl SapGuiApp {
                     Color32::from_rgb(180, 200, 230),
                 );
             }
+        }
+
+        // Hinge legend, in the order of the manual.
+        if self.display_mode == DisplayMode::Deformed && rect.width() > 240.0 && show_hinge_legend {
+            pushover::draw_legend(&painter, rect);
         }
 
         // Viewport header overlay
@@ -4206,6 +4309,8 @@ impl SapGuiApp {
             steel_design::render(ctx, &mut self.panel_steel_design, &mut self.model),
             time_history::render(ctx, &mut self.panel_time_history, &mut self.model),
             modal_tables::render(ctx, &mut self.panel_modal_tables, &mut self.model),
+            hinges::render(ctx, &mut self.panel_hinges, &mut self.model),
+            pushover::render(ctx, &mut self.panel_pushover, &mut self.model),
         ];
         for outcome in outcomes.into_iter().flatten() {
             self.status_msg = match outcome {
@@ -4417,6 +4522,12 @@ fn joint_disp_3d(
             .get(mode_idx.min(cr.modes.len() - 1))
             .and_then(|m| m.mode_shape.get(pid))
             .copied()
+    } else if use_step && !cr.static_steps.is_empty() {
+        cr.static_steps
+            .get(step_idx.min(cr.static_steps.len() - 1))
+            .and_then(|st| st.joint_displacements.get(pid))
+            .copied()
+            .or_else(|| cr.joint_displacements.get(pid).copied())
     } else if use_step && !cr.time_steps.is_empty() {
         cr.time_history_disp
             .get(pid)
@@ -4720,7 +4831,9 @@ mod tests {
         let before = titles(&closed).len();
 
         app.panel_build.open = true;
+        app.panel_hinges.open = true;
         app.panel_modal_tables.open = true;
+        app.panel_pushover.open = true;
         app.panel_seismic.open = true;
         app.panel_steel_design.open = true;
         app.panel_time_history.open = true;
@@ -4743,7 +4856,9 @@ mod tests {
         app.replace_model(SapModel::new(Units::KipInF), "x".into(), Vec::new());
         assert!(
             !(app.panel_build.open
+                || app.panel_hinges.open
                 || app.panel_modal_tables.open
+                || app.panel_pushover.open
                 || app.panel_seismic.open
                 || app.panel_steel_design.open
                 || app.panel_time_history.open)
@@ -4795,5 +4910,174 @@ mod tests {
         app.assign_restraint_to_selected([true; 6], "Fixed");
         assert_eq!(app.model.case_results.len(), 1);
         assert_eq!(app.model.points["1"].restraint, [false; 6]);
+    }
+
+    // ---- Saved states of nonlinear static cases (Example 1-026 A) ----
+
+    fn pushover_app() -> SapGuiApp {
+        let mut app = blank_app();
+        app.model = pushover::example_1_026_model();
+        app.active_case = "PUSH".into();
+        app.display_mode = DisplayMode::Deformed;
+        // One viewport, so each marker is drawn once.
+        app.dual_pane = false;
+        app
+    }
+
+    /// Shapes of one frame, flattened.
+    fn flat_shapes(out: &egui::FullOutput) -> Vec<egui::epaint::Shape> {
+        fn walk(shape: &egui::epaint::Shape, into: &mut Vec<egui::epaint::Shape>) {
+            match shape {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|s| walk(s, into)),
+                other => into.push(other.clone()),
+            }
+        }
+        let mut all = Vec::new();
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut all);
+        }
+        all
+    }
+
+    /// Colours of the hinge markers (radius 5.5 filled circles in a class
+    /// colour) and the number of legend entries drawn.
+    fn marker_colours(out: &egui::FullOutput) -> (Vec<egui::Color32>, usize) {
+        use sap_model::hinge::HingeDisplayClass as C;
+        let class_colours: Vec<egui::Color32> =
+            C::ALL.iter().map(|c| pushover::class_color(*c)).collect();
+        let mut markers = Vec::new();
+        let mut legend = 0;
+        for shape in flat_shapes(out) {
+            match shape {
+                egui::epaint::Shape::Circle(c) if class_colours.contains(&c.fill) => {
+                    if (c.radius - 5.5).abs() < 1e-6 {
+                        markers.push(c.fill);
+                    } else if (c.radius - 4.0).abs() < 1e-6 {
+                        legend += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (markers, legend)
+    }
+
+    fn view(app: &mut SapGuiApp, ctx: &egui::Context, time: f64) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1800., 1400.))),
+            time: Some(time),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| app.render_ui(ctx))
+    }
+
+    #[test]
+    fn hinge_markers_and_legend_appear_after_analysis_and_follow_the_saved_state() {
+        use sap_model::hinge::HingeDisplayClass as C;
+        let col = |c: C| pushover::class_color(c);
+        let mut app = pushover_app();
+        let ctx = egui::Context::default();
+        // Before the analysis: no markers, no legend.
+        let _ = view(&mut app, &ctx, 0.0);
+        let (markers, legend) = marker_colours(&view(&mut app, &ctx, 1.0));
+        assert!(markers.is_empty() && legend == 0);
+
+        app.execute_analysis();
+        assert!(app.model.is_locked, "{}", app.status_msg);
+        assert_eq!(app.model.case_results["PUSH"].static_steps.len(), 10);
+        // Final state: the moment hinge is D-E, the shear hinge C-D; the
+        // legend has seven entries.
+        let (markers, legend) = marker_colours(&view(&mut app, &ctx, 2.0));
+        assert_eq!(markers, vec![col(C::DToE), col(C::CToD)]);
+        assert_eq!(legend, 7);
+        // The legend names the classes in the order of the manual.
+        let out = view(&mut app, &ctx, 3.0);
+        let labels: Vec<String> = flat_shapes(&out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::epaint::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        let at = |l: &str| labels.iter().position(|t| t == l).unwrap_or(usize::MAX);
+        let order: Vec<usize> = [
+            "B to IO", "IO to LS", "LS to CP", "CP to C", "C to D", "D to E", ">E",
+        ]
+        .iter()
+        .map(|l| at(l))
+        .collect();
+        assert!(order.iter().all(|i| *i != usize::MAX), "{labels:?}");
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "legend order {order:?}"
+        );
+        // Scrubbing the saved states changes the markers.
+        app.use_time_step = true;
+        for (step, want) in [
+            (0usize, vec![]),
+            (1, vec![]),
+            (2, vec![col(C::BToIO)]),
+            (4, vec![col(C::BToIO), col(C::BToIO)]),
+            (6, vec![col(C::CToD), col(C::CToD)]),
+            (8, vec![col(C::DToE), col(C::CToD)]),
+        ] {
+            app.active_step_idx = step;
+            let (markers, legend) = marker_colours(&view(&mut app, &ctx, 4.0 + step as f64));
+            assert_eq!(markers, want, "markers at saved state {step}");
+            assert_eq!(legend, 7);
+        }
+        // Another display mode draws neither markers nor legend.
+        app.display_mode = DisplayMode::Undeformed;
+        let (markers, legend) = marker_colours(&view(&mut app, &ctx, 20.0));
+        assert!(markers.is_empty() && legend == 0);
+    }
+
+    #[test]
+    fn the_saved_state_slider_drives_the_deformed_shape_from_static_steps() {
+        let mut app = pushover_app();
+        app.execute_analysis();
+        let cr = &app.model.case_results["PUSH"];
+        let tip = |step: usize, use_step: bool| joint_disp_3d(cr, "2", 1.0, 0, use_step, step)[2];
+        // Without scrubbing the final state is shown; with it the saved state.
+        assert_eq!(tip(0, false), cr.joint_displacements["2"][2]);
+        assert!((tip(0, false) - 2.0).abs() < 1e-12);
+        for step in 0..cr.static_steps.len() {
+            assert_eq!(
+                tip(step, true),
+                cr.static_steps[step].joint_displacements["2"][2]
+            );
+        }
+        assert!((tip(6, true) - 1.3846694).abs() < 5e-7);
+        // The scale factor applies and an index past the end is clamped.
+        let scaled = joint_disp_3d(cr, "2", 10.0, 0, true, 99)[2];
+        assert!((scaled - 20.0).abs() < 1e-9);
+        // The slider range follows the saved states and is reset with the case.
+        app.active_step_idx = 99;
+        app.use_time_step = true;
+        app.sync_active_case();
+        assert_eq!(app.active_step_idx, 9);
+        assert!(app.use_time_step);
+        app.model.case_results.shift_remove("PUSH");
+        app.sync_active_case();
+        assert_eq!(app.active_step_idx, 0);
+        assert!(!app.use_time_step);
+    }
+
+    #[test]
+    fn the_explorer_lists_the_saved_states_of_a_nonlinear_static_case() {
+        let mut app = pushover_app();
+        app.execute_analysis();
+        let ctx = egui::Context::default();
+        let mut found = false;
+        for t in 0..3 {
+            let out = view(&mut app, &ctx, t as f64);
+            found |= flat_shapes(&out).into_iter().any(|s| match s {
+                egui::epaint::Shape::Text(t) => {
+                    t.galley.job.text.contains("Nonlinear Static Steps (10)")
+                }
+                _ => false,
+            });
+        }
+        assert!(found, "the explorer must show the saved-state header");
     }
 }

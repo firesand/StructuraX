@@ -9,10 +9,12 @@ mod coordinates;
 pub mod dynamics;
 pub mod frame;
 mod frame_mesh;
+mod hinge;
 pub mod linalg;
 mod link;
 mod mass_source;
 mod modal_history;
+mod nl_static_loads;
 mod nonlinear;
 mod ritz_modal;
 pub mod solid;
@@ -102,6 +104,7 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     }
     refuse_unmodeled_source(model)?;
     validate_analysis_inputs(model)?;
+    hinge::validate_case_types(model)?;
     mass_source::validate(model)?;
     auto_seismic::validate(model)?;
     let ordered_cases = analysis_case_order(model)?;
@@ -123,7 +126,7 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
         } else {
             Vec::new()
         };
-    let frame_mesh = frame_mesh::expand(model, &area_mesh_joints)?;
+    let frame_mesh = frame_mesh::expand(model, &area_mesh_joints, hinge::any_hinge_case(model))?;
 
     // Expand any auto-meshed AreaObjs (`auto_mesh.0 > 1 || auto_mesh.1 > 1`) into a working point/area list
     let (mut work_points, work_areas, orig_area_map) = expand_auto_meshed_areas(model);
@@ -196,6 +199,8 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
                 &joint_rot,
                 &k_struct,
                 &k_base,
+                &diag_mass,
+                &frame_mesh,
                 ndof,
             )?,
             LoadCaseType::Modal => run_modal_case(
@@ -650,6 +655,19 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 | LoadCaseType::Buckling
         ) {
             for load in &lc.loads {
+                let is_accel = sap_model::ritz::acceleration_direction(&load.load_name).is_some();
+                if lc.case_type == LoadCaseType::NonlinearStatic && is_accel {
+                    // Translational acceleration loads are applied by the
+                    // hinge path; a load pattern of the same name would be
+                    // ambiguous with them.
+                    if model.load_patterns.contains_key(&load.load_name) {
+                        return Err(SolverError::UnsupportedInput(format!(
+                            "case '{name}': load '{}' is both a load pattern and an acceleration load name; rename the load pattern",
+                            load.load_name
+                        )));
+                    }
+                    continue;
+                }
                 if model.load_patterns.contains_key(&load.load_name) {
                     continue;
                 }
@@ -660,10 +678,17 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                         "U1" | "U2" | "U3" | "R1" | "R2" | "R3" | "U4" | "U5" | "U6" | "UX"
                             | "UY" | "UZ" | "RX" | "RY" | "RZ"
                     ) {
-                        SolverError::UnsupportedInput(format!(
-                            "case '{name}' applies acceleration load '{}'; acceleration loads in static cases are not implemented",
-                            load.load_name
-                        ))
+                        SolverError::UnsupportedInput(if lc.case_type == LoadCaseType::NonlinearStatic {
+                            format!(
+                                "case '{name}' applies rotational acceleration load '{}'; only translational acceleration loads (UX, UY, UZ) are implemented in nonlinear static cases",
+                                load.load_name
+                            )
+                        } else {
+                            format!(
+                                "case '{name}' applies acceleration load '{}'; acceleration loads in static cases are not implemented",
+                                load.load_name
+                            )
+                        })
                     } else {
                         SolverError::InvalidInput(format!(
                             "case '{name}' references missing load pattern '{}'",
@@ -2448,8 +2473,28 @@ fn run_nonlinear_static_case(
     joint_rot: &[[[f64; 3]; 3]],
     k_struct: &[f64],
     k_base: &[f64],
+    diag_mass: &[f64],
+    mesh: &frame_mesh::FrameMesh,
     ndof: usize,
 ) -> Result<CaseResults, SolverError> {
+    // Frame hinges, saved states, Accel and Mode loads: solved in hinge space.
+    // This comes first so that no other path takes such a case silently.
+    if hinge::applies(model, lc, !mesh.hinge_sites.is_empty()) {
+        return hinge::run_case(
+            model,
+            lc,
+            work_points,
+            work_areas,
+            orig_area_map,
+            pt_index,
+            joint_rot,
+            k_struct,
+            k_base,
+            diag_mass,
+            mesh,
+            ndof,
+        );
+    }
     let case_loads = accumulated_nonlinear_static_loads(model, lc);
 
     if model.frames.values().any(|f| f.cable_params.is_some()) {
@@ -3045,17 +3090,7 @@ fn solve_static_with_stiffness(
     nonlinear_case: Option<&LoadCase>,
     ndof: usize,
 ) -> Result<CaseResults, SolverError> {
-    let StaticLoads {
-        f_ext_joint,
-        f_fef_joint,
-        prescribed_u,
-        spring_ground_u,
-        frame_fef_map,
-        frame_axial_loads,
-        mut rhs,
-        is_fixed,
-        u_fixed_val,
-    } = assemble_static_loads(
+    let loads = assemble_static_loads(
         model,
         case_loads,
         work_points,
@@ -3065,6 +3100,9 @@ fn solve_static_with_stiffness(
         frame_axial,
         ndof,
     )?;
+    let mut rhs = loads.rhs.clone();
+    let is_fixed = &loads.is_fixed;
+    let u_fixed_val = &loads.u_fixed_val;
 
     // Path-dependent link state inherited from the initial case, if any.
     let initial_hysteresis: &[sap_model::LinkHysteresisState] = nonlinear_case
@@ -3079,7 +3117,7 @@ fn solve_static_with_stiffness(
                 pt_index,
                 joint_rot,
                 k_total,
-                &frame_axial_loads,
+                &loads.frame_axial_loads,
                 initial_hysteresis,
                 ndof,
             )
@@ -3087,7 +3125,7 @@ fn solve_static_with_stiffness(
         .transpose()?;
     let u_joint = if let (Some(system), Some(case)) = (&nonlinear_system, nonlinear_case) {
         let u_init = initial_displacement_vector(model, case, work_points, ndof);
-        system.solve_from(&rhs, &is_fixed, &u_fixed_val, u_init.as_deref(), case)?
+        system.solve_from(&rhs, is_fixed, u_fixed_val, u_init.as_deref(), case)?
     } else {
         let mut k_mod = k_total.to_vec();
         for i in 0..ndof {
@@ -3116,16 +3154,57 @@ fn solve_static_with_stiffness(
             SymmetricLdlt::factorize_with_reference(&k_mod, ndof, Some(&structural_diagonal))?;
         ldlt.solve(&rhs)?
     };
+    recover_static_results(
+        model,
+        case_name,
+        case_loads,
+        work_points,
+        work_areas,
+        orig_area_map,
+        pt_index,
+        joint_rot,
+        k_struct,
+        &loads,
+        &u_joint,
+        nonlinear_system.as_ref(),
+        nonlinear_case,
+    )
+}
+
+/// Joint, reaction, frame, area, solid and link results of a static solution
+/// `u_joint` (joint-local DOFs) under the loads `loads`.
+#[allow(clippy::too_many_arguments)]
+fn recover_static_results(
+    model: &SapModel,
+    case_name: &str,
+    case_loads: &[(String, f64)],
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    orig_area_map: &IndexMap<String, Vec<String>>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
+    loads: &StaticLoads,
+    u_joint: &[f64],
+    nonlinear_system: Option<&nonlinear::System>,
+    nonlinear_case: Option<&LoadCase>,
+) -> Result<CaseResults, SolverError> {
+    let ndof = u_joint.len();
+    let StaticLoads {
+        f_ext_joint,
+        f_fef_joint,
+        prescribed_u,
+        spring_ground_u,
+        frame_fef_map,
+        ..
+    } = loads;
     let nonlinear_correction = nonlinear_system
-        .as_ref()
-        .map_or_else(|| vec![0.; ndof], |system| system.correction(&u_joint));
+        .map_or_else(|| vec![0.; ndof], |system| system.correction(u_joint));
     let hysteretic_forces = nonlinear_system
-        .as_ref()
-        .map(|system| system.hysteretic_forces(&u_joint))
+        .map(|system| system.hysteretic_forces(u_joint))
         .unwrap_or_default();
     let link_hysteresis = nonlinear_system
-        .as_ref()
-        .map(|system| system.hysteretic_states(&u_joint))
+        .map(|system| system.hysteretic_states(u_joint))
         .unwrap_or_default();
 
     // 6. Recover Joint Displacements and Support/Spring Reactions
@@ -3186,7 +3265,7 @@ fn solve_static_with_stiffness(
             work_points,
             pt_index,
             joint_rot,
-            &u_joint,
+            u_joint,
             None,
             nonlinear_case.is_some(),
             &hysteretic_forces,
@@ -3358,7 +3437,7 @@ fn solve_static_with_stiffness(
             link::forces_for_case(
                 prop,
                 &op,
-                &u_joint,
+                u_joint,
                 nonlinear_case.is_some(),
                 &link::hysteretic_overrides(&hysteretic_forces, lname),
             ),

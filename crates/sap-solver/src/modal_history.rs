@@ -75,6 +75,9 @@ pub(crate) fn validate_case(
     name: &str,
     lc: &LoadCase,
 ) -> Result<(), SolverError> {
+    if lc.case_type == LoadCaseType::NonlinearStatic || !lc.nl_static.mode_loads.is_empty() {
+        return validate_static_mode_case(model, name, lc);
+    }
     let Some(modal_name) = &lc.modal_case else {
         return Ok(());
     };
@@ -129,6 +132,77 @@ pub(crate) fn validate_case(
         if (0..6).any(|d| prop.dof_active[d] && !prop.dof_fixed[d] && prop.ce[d] != 0.0) {
             return Err(SolverError::UnsupportedInput(format!(
                 "case '{name}' superposes modes and link '{link_name}' has viscous damping; its conversion to modal damping is not implemented"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The modal case of a nonlinear static case: it is named if and only if the
+/// case has Mode loads, must be a Modal case flagged to run, and must have
+/// the requested modes; Mode loads are the only loads of their case.
+fn validate_static_mode_case(
+    model: &SapModel,
+    name: &str,
+    lc: &LoadCase,
+) -> Result<(), SolverError> {
+    let modes = &lc.nl_static.mode_loads;
+    if lc.case_type != LoadCaseType::NonlinearStatic {
+        if modes.is_empty() {
+            return Ok(());
+        }
+        return Err(SolverError::UnsupportedInput(format!(
+            "case '{name}' of type {:?} has Mode loads; Mode loads apply to nonlinear static cases only",
+            lc.case_type
+        )));
+    }
+    match (&lc.modal_case, modes.is_empty()) {
+        (None, true) => return Ok(()),
+        (None, false) => {
+            return Err(SolverError::InvalidInput(format!(
+                "case '{name}' has Mode loads but names no modal case"
+            )))
+        }
+        (Some(modal_name), true) => {
+            return Err(SolverError::UnsupportedInput(format!(
+                "nonlinear static case '{name}' names modal case '{modal_name}' but has no Mode load"
+            )))
+        }
+        (Some(_), false) => {}
+    }
+    let modal_name = lc.modal_case.as_ref().expect("checked above");
+    if !lc.loads.is_empty() {
+        return Err(SolverError::UnsupportedInput(format!(
+            "case '{name}' mixes Mode loads with other loads; the scale of a modal load depends on the mode normalization, so a Mode load must be the only load of its case"
+        )));
+    }
+    let modal = model.load_cases.get(modal_name).ok_or_else(|| {
+        SolverError::InvalidInput(format!(
+            "case '{name}' applies Mode loads of missing case '{modal_name}'"
+        ))
+    })?;
+    if modal.case_type != LoadCaseType::Modal {
+        return Err(SolverError::UnsupportedInput(format!(
+            "case '{name}' applies Mode loads of '{modal_name}', which is a {:?} case, not a Modal case",
+            modal.case_type
+        )));
+    }
+    if !modal.run_flag {
+        return Err(SolverError::InvalidInput(format!(
+            "case '{name}' applies Mode loads of '{modal_name}', which is not flagged to run"
+        )));
+    }
+    for load in modes {
+        if load.mode == 0 || load.mode > modal.max_modes {
+            return Err(SolverError::InvalidInput(format!(
+                "case '{name}': Mode load {} is outside the modes 1..={} of '{modal_name}'",
+                load.mode, modal.max_modes
+            )));
+        }
+        if !load.scale_factor.is_finite() {
+            return Err(SolverError::InvalidInput(format!(
+                "case '{name}': Mode load {} has a nonfinite scale factor",
+                load.mode
             )));
         }
     }

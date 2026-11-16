@@ -30,6 +30,22 @@ struct Piece {
     starts_at_created_joint: bool,
 }
 
+/// A hinge of a frame object and the analysis element that carries it.
+#[derive(Debug, Clone)]
+pub(crate) struct HingeSite {
+    /// The frame object.
+    pub frame: String,
+    /// Index of the hinge in `FrameObj::hinges`.
+    pub index: usize,
+    /// The frame of the expanded model the hinge sits in.
+    pub element: String,
+    /// Position in the element, relative to its length from end I.
+    pub rel: f64,
+    /// Position on the object, as assigned.
+    pub rel_dist: f64,
+    pub prop: String,
+}
+
 /// What [`expand`] did, for [`collapse`].
 #[derive(Default)]
 pub(crate) struct FrameMesh {
@@ -39,6 +55,144 @@ pub(crate) struct FrameMesh {
     parents: IndexMap<String, (Vec<Piece>, f64)>,
     /// Joints created for the subdivision.
     internal_joints: HashSet<String>,
+    /// Hinges of the frame objects, object by object in model order. Empty
+    /// unless hinges were asked for.
+    pub(crate) hinge_sites: Vec<HingeSite>,
+}
+
+/// Relative positions in `(0, 1)` at which an object with a hinge overwrite is
+/// cut: the ends of the interval of relative length `r` around every hinge,
+/// limited to the object. Hinges at the same position share an interval;
+/// overlapping intervals of different hinges are refused (the element of a
+/// hinge would not be defined).
+fn hinge_splits(frame: &FrameObj) -> Result<Vec<f64>, SolverError> {
+    let r = frame
+        .hinge_overwrite
+        .as_ref()
+        .map_or(0.0, |o| o.relative_length);
+    if !(r > 0.0 && r <= 1.0) {
+        return Err(SolverError::InvalidInput(format!(
+            "frame '{}' has a hinge overwrite with relative length {r}; it must lie in (0, 1]",
+            frame.name
+        )));
+    }
+    let mut at: Vec<f64> = frame.hinges.iter().map(|h| h.rel_dist).collect();
+    at.sort_by(f64::total_cmp);
+    at.dedup_by(|a, b| (*a - *b).abs() <= 1e-9);
+    let mut splits: Vec<f64> = Vec::new();
+    let mut previous_end = 0.0f64;
+    for (k, x) in at.iter().enumerate() {
+        let (a, b) = ((x - 0.5 * r).max(0.0), (x + 0.5 * r).min(1.0));
+        if k > 0 && a < previous_end - 1e-9 {
+            return Err(SolverError::UnsupportedInput(format!(
+                "frame '{}' has hinges closer together than its hinge overwrite length {r}; their elements would overlap",
+                frame.name
+            )));
+        }
+        for t in [a, b] {
+            if t > 1e-9 && t < 1.0 - 1e-9 && splits.last().is_none_or(|s| t - s > 1e-9) {
+                splits.push(t);
+            }
+        }
+        previous_end = b;
+    }
+    Ok(splits)
+}
+
+fn check_hinge_positions(frame: &FrameObj) -> Result<(), SolverError> {
+    if frame.hinge_overwrite.as_ref().is_some_and(|o| o.do_not_drop_load) {
+        return Err(SolverError::UnsupportedInput(format!(
+            "frame '{}' has the hinge overwrite \"do not allow hinges to drop loads\", which is stored but not analyzed",
+            frame.name
+        )));
+    }
+    for hinge in &frame.hinges {
+        if !hinge.rel_dist.is_finite() || !(0.0..=1.0).contains(&hinge.rel_dist) {
+            return Err(SolverError::UnsupportedInput(format!(
+                "frame '{}' has a hinge at relative distance {}, outside the object (0 to 1)",
+                frame.name, hinge.rel_dist
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Sites of a frame that is analyzed as one element.
+fn direct_sites(frame: &FrameObj, sites: &mut Vec<HingeSite>) -> Result<(), SolverError> {
+    check_hinge_positions(frame)?;
+    for (index, hinge) in frame.hinges.iter().enumerate() {
+        sites.push(HingeSite {
+            frame: frame.name.clone(),
+            index,
+            element: frame.name.clone(),
+            rel: hinge.rel_dist,
+            rel_dist: hinge.rel_dist,
+            prop: hinge.prop.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// Sites of a frame analyzed as elements between `joints` (relative
+/// positions); element `k` is `{frame}__seg_{k}`.
+fn piece_sites(
+    frame: &FrameObj,
+    joints: &[(f64, String)],
+    sites: &mut Vec<HingeSite>,
+) -> Result<(), SolverError> {
+    check_hinge_positions(frame)?;
+    for (index, hinge) in frame.hinges.iter().enumerate() {
+        let x = hinge.rel_dist;
+        let holding: Vec<usize> = joints
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| x >= pair[0].0 - 1e-9 && x <= pair[1].0 + 1e-9)
+            .map(|(k, _)| k)
+            .collect();
+        let [k] = holding[..] else {
+            return Err(SolverError::UnsupportedInput(format!(
+                "frame '{}' has a hinge at relative distance {x} on the boundary of two analysis elements; which element holds it is not defined, move it or change the subdivision",
+                frame.name
+            )));
+        };
+        let (ta, tb) = (joints[k].0, joints[k + 1].0);
+        sites.push(HingeSite {
+            frame: frame.name.clone(),
+            index,
+            element: format!("{}__seg_{k}", frame.name),
+            rel: ((x - ta) / (tb - ta)).clamp(0.0, 1.0),
+            rel_dist: x,
+            prop: hinge.prop.clone(),
+        });
+    }
+    Ok(())
+}
+
+/// A joint created for a subdivision at relative position `t`.
+fn created_point(
+    frame: &FrameObj,
+    start: &PointObj,
+    end: &PointObj,
+    axis: [f64; 3],
+    joint: &str,
+    t: f64,
+) -> PointObj {
+    let mut point = PointObj::new(
+        joint.to_string(),
+        start.x + t * axis[0],
+        start.y + t * axis[1],
+        start.z + t * axis[2],
+    );
+    // A temperature load scaled by a joint pattern varies linearly between the
+    // object's ends; give the new joints that value.
+    for load in &frame.loads_temp {
+        if let Some(pattern) = &load.pattern_name {
+            let vi = start.pattern_values.get(pattern).copied().unwrap_or(1.0);
+            let vj = end.pattern_values.get(pattern).copied().unwrap_or(1.0);
+            point.pattern_values.insert(pattern.clone(), vi + (vj - vi) * t);
+        }
+    }
+    point
 }
 
 fn unsupported(frame: &str, what: &str) -> SolverError {
@@ -80,16 +234,30 @@ fn joints_on_span<'a>(
 pub(crate) fn expand(
     model: &mut SapModel,
     mesh_points: &[(String, [f64; 3])],
+    with_hinges: bool,
 ) -> Result<FrameMesh, SolverError> {
     let mut mesh = FrameMesh {
         order: model.frames.keys().cloned().collect(),
         ..FrameMesh::default()
     };
+    // Hinges are located only when a case needs them. An object with a hinge
+    // overwrite that subdivides is cut around its hinges (CSI Analysis
+    // Reference, "Frame Hinge Overwrites"); the hinge sits in a short element.
+    let hinged = |f: &FrameObj| with_hinges && !f.hinges.is_empty();
+    let subdivided = |f: &FrameObj| {
+        hinged(f)
+            && f.hinge_overwrite
+                .as_ref()
+                .is_some_and(|o| o.auto_subdivide)
+    };
     if model
         .frames
         .values()
-        .all(|f| f.auto_mesh_segments <= 1 && !f.auto_mesh_at_joints)
+        .all(|f| f.auto_mesh_segments <= 1 && !f.auto_mesh_at_joints && !subdivided(f))
     {
+        for frame in model.frames.values().filter(|f| hinged(f)) {
+            direct_sites(frame, &mut mesh.hinge_sites)?;
+        }
         return Ok(mesh);
     }
 
@@ -109,8 +277,11 @@ pub(crate) fn expand(
         };
         let axis = [pj.x - pi.x, pj.y - pi.y, pj.z - pi.z];
         let length = axis.iter().map(|c| c * c).sum::<f64>().sqrt();
-        if (segments == 1 && !frame.auto_mesh_at_joints) || length <= 0.0 {
+        if (segments == 1 && !frame.auto_mesh_at_joints && !subdivided(frame)) || length <= 0.0 {
             frames.insert(name.clone(), frame.clone());
+            if hinged(frame) {
+                direct_sites(frame, &mut mesh.hinge_sites)?;
+            }
             continue;
         }
 
@@ -155,22 +326,28 @@ pub(crate) fn expand(
                         "joint name '{joint}' is reserved for the automatic subdivision of frame '{name}'"
                     )));
                 }
-                let mut point = PointObj::new(
-                    joint.clone(),
-                    pi.x + t * axis[0],
-                    pi.y + t * axis[1],
-                    pi.z + t * axis[2],
-                );
-                // A temperature load scaled by a joint pattern varies linearly
-                // between the object's ends; give the new joints that value.
-                for load in &frame.loads_temp {
-                    if let Some(pattern) = &load.pattern_name {
-                        let vi = pi.pattern_values.get(pattern).copied().unwrap_or(1.0);
-                        let vj = pj.pattern_values.get(pattern).copied().unwrap_or(1.0);
-                        point.pattern_values.insert(pattern.clone(), vi + (vj - vi) * t);
-                    }
+                new_points.push(created_point(frame, pi, pj, axis, &joint, t));
+                created.push((name.clone(), 1e-6 * length));
+                mesh.internal_joints.insert(joint.clone());
+                joints.push((t, joint));
+            }
+        }
+        if subdivided(frame) {
+            if segments > 1 || frame.auto_mesh_at_joints {
+                return Err(unsupported(
+                    name,
+                    "has a hinge overwrite together with automatic subdivision",
+                ));
+            }
+            check_hinge_positions(frame)?;
+            for (k, t) in hinge_splits(frame)?.into_iter().enumerate() {
+                let joint = format!("__fmesh_{name}_h{}", k + 1);
+                if model.points.contains_key(&joint) {
+                    return Err(SolverError::InvalidInput(format!(
+                        "joint name '{joint}' is reserved for the hinge subdivision of frame '{name}'"
+                    )));
                 }
-                new_points.push(point);
+                new_points.push(created_point(frame, pi, pj, axis, &joint, t));
                 created.push((name.clone(), 1e-6 * length));
                 mesh.internal_joints.insert(joint.clone());
                 joints.push((t, joint));
@@ -179,6 +356,9 @@ pub(crate) fn expand(
         joints.push((1.0, frame.point_j.clone()));
         if joints.len() == 2 {
             frames.insert(name.clone(), frame.clone());
+            if hinged(frame) {
+                direct_sites(frame, &mut mesh.hinge_sites)?;
+            }
             continue;
         }
 
@@ -212,6 +392,9 @@ pub(crate) fn expand(
             piece.point_j = jb.clone();
             piece.auto_mesh_segments = 0;
             piece.auto_mesh_at_joints = false;
+            // The hinges belong to the object; their elements are in the sites.
+            piece.hinges.clear();
+            piece.hinge_overwrite = None;
             piece.min_stations = stations;
             // End releases and partial fixity belong to the object's ends.
             if k > 0 {
@@ -270,6 +453,9 @@ pub(crate) fn expand(
             });
         }
         mesh.parents.insert(name.clone(), (pieces, length));
+        if hinged(frame) {
+            piece_sites(frame, &joints, &mut mesh.hinge_sites)?;
+        }
     }
 
     refuse_coincident_joints(model, mesh_points, &new_points, &created)?;
@@ -423,18 +609,28 @@ pub(crate) fn collapse(results: &mut IndexMap<String, CaseResults>, mesh: &Frame
         return;
     }
     let internal = &mesh.internal_joints;
-    for case in results.values_mut() {
-        if !case.frame_forces.is_empty() {
-            let mut by_element = std::mem::take(&mut case.frame_forces);
-            for name in &mesh.order {
-                let stations = match mesh.parents.get(name) {
-                    None => by_element.shift_remove(name),
-                    Some((pieces, length)) => merge_stations(pieces, *length, &mut by_element),
-                };
-                if let Some(stations) = stations {
-                    case.frame_forces.insert(name.clone(), stations);
-                }
+    let fold = |forces: &mut IndexMap<String, Vec<FrameStationResult>>| {
+        if forces.is_empty() {
+            return;
+        }
+        let mut by_element = std::mem::take(forces);
+        for name in &mesh.order {
+            let stations = match mesh.parents.get(name) {
+                None => by_element.shift_remove(name),
+                Some((pieces, length)) => merge_stations(pieces, *length, &mut by_element),
+            };
+            if let Some(stations) = stations {
+                forces.insert(name.clone(), stations);
             }
+        }
+    };
+    for case in results.values_mut() {
+        fold(&mut case.frame_forces);
+        // Every saved state of a nonlinear static case, too.
+        for step in &mut case.static_steps {
+            fold(&mut step.frame_forces);
+            step.joint_displacements.retain(|joint, _| !internal.contains(joint));
+            step.joint_reactions.retain(|joint, _| !internal.contains(joint));
         }
         case.joint_displacements.retain(|joint, _| !internal.contains(joint));
         case.joint_reactions.retain(|joint, _| !internal.contains(joint));

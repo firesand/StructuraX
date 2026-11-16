@@ -1415,3 +1415,111 @@ fn end_length_offsets_are_written_as_fractions_and_read_back_as_lengths() {
         assert_eq!(back.frames[name].rigid_zone_factor, m.frames[name].rigid_zone_factor);
     }
 }
+
+// Frame hinges and the parameters of nonlinear static cases have no native
+// record in this writer: each field is refused by name instead of dropped.
+mod hinge_data {
+    use super::*;
+    use sap_model::hinge::*;
+
+    fn with_nonlinear_case() -> SapModel {
+        let mut m = supported_model();
+        let mut push = LoadCase::linear_static("PUSH", "DEAD", 1.0);
+        push.case_type = LoadCaseType::NonlinearStatic;
+        m.load_cases.insert("PUSH".into(), push);
+        m
+    }
+
+    fn property() -> HingeProp {
+        HingeProp::symmetric(
+            "MH",
+            HingeDof::M3,
+            [(1440., 0.), (1920., 0.04), (480., 0.04), (480., 0.4)]
+                .map(|(force, deformation)| HingePoint::new(force, deformation)),
+        )
+    }
+
+    #[test]
+    fn the_unchanged_models_export() {
+        pack_model_to_native_sdb(&supported_model()).unwrap();
+        pack_model_to_native_sdb(&with_nonlinear_case()).unwrap();
+        // Ground accelerations of a nonlinear static case are written as
+        // load type 2 by the native writer already.
+        let mut m = with_nonlinear_case();
+        m.load_cases["PUSH"].loads.push(LoadCaseAssignment {
+            load_name: "U1".into(),
+            scale_factor: 1.0,
+        });
+        pack_model_to_native_sdb(&m).unwrap();
+    }
+
+    #[test]
+    fn hinge_properties_are_refused() {
+        pack_model_to_native_sdb(&supported_model()).unwrap();
+        let mut m = supported_model();
+        m.hinge_props.insert("MH".into(), property());
+        assert_rejected_unchanged(&m, "hinge_props.MH");
+    }
+
+    #[test]
+    fn frame_hinges_are_refused() {
+        pack_model_to_native_sdb(&supported_model()).unwrap();
+        let mut m = supported_model();
+        m.frames["F"].hinges.push(FrameHinge { prop: "MH".into(), rel_dist: 0.5 });
+        assert_rejected_unchanged(&m, "frames.F.hinges");
+        // With its property defined as well, the frame is still named.
+        m.hinge_props.insert("MH".into(), property());
+        assert_rejected_unchanged(&m, "frames.F.hinges");
+    }
+
+    #[test]
+    fn frame_hinge_overwrites_are_refused() {
+        pack_model_to_native_sdb(&supported_model()).unwrap();
+        let mut m = supported_model();
+        m.frames["F"].hinge_overwrite = Some(FrameHingeOverwrite::default());
+        assert_rejected_unchanged(&m, "frames.F.hinge_overwrite");
+    }
+
+    #[test]
+    fn each_nonlinear_static_parameter_is_refused() {
+        pack_model_to_native_sdb(&with_nonlinear_case()).unwrap();
+        type Edit = fn(&mut NonlinearStaticParams);
+        let edits: [(&str, Edit); 5] = [
+            ("load_cases.PUSH.nl_static.results_saved", |p| {
+                p.results_saved = ResultsSaved::multiple_default()
+            }),
+            ("load_cases.PUSH.nl_static.max_total_steps", |p| p.max_total_steps = 300),
+            ("load_cases.PUSH.nl_static.max_null_steps", |p| p.max_null_steps = 10),
+            ("load_cases.PUSH.nl_static.hinge_unloading", |p| {
+                p.hinge_unloading = HingeUnloading::RestartUsingSecantStiffness
+            }),
+            ("load_cases.PUSH.nl_static.mode_loads", |p| {
+                p.mode_loads.push(ModeLoad { mode: 1, scale_factor: 1.0 })
+            }),
+        ];
+        for (field, edit) in edits {
+            let mut m = with_nonlinear_case();
+            edit(&mut m.load_cases["PUSH"].nl_static);
+            assert_rejected_unchanged(&m, field);
+        }
+    }
+
+    #[test]
+    fn a_modal_case_of_a_nonlinear_static_case_is_refused() {
+        pack_model_to_native_sdb(&with_nonlinear_case()).unwrap();
+        let mut m = with_nonlinear_case();
+        m.load_cases["PUSH"].modal_case = Some("MODAL".into());
+        assert_rejected_unchanged(&m, "load_cases.PUSH.modal_case");
+    }
+
+    #[test]
+    fn hinge_data_refuses_the_text_round_trip_too() {
+        // What S2K carries and the native writer cannot is refused after a
+        // save and reopen as well.
+        let mut m = with_nonlinear_case();
+        m.hinge_props.insert("MH".into(), property());
+        m.frames["F"].hinges.push(FrameHinge { prop: "MH".into(), rel_dist: 0.5 });
+        let back = parse_s2k(&write_s2k(&m)).unwrap();
+        assert_rejected_unchanged(&back, "frames.F.hinges");
+    }
+}

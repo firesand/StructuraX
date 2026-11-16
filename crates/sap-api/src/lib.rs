@@ -9,12 +9,17 @@
 mod cables;
 mod database_tables;
 mod definitions;
+pub mod hinges;
 mod links;
 pub use cables::cCableObj;
 pub use database_tables::{cDatabaseTables, StagedTable, TableCatalogEntry};
 pub use definitions::{
     cFunctions, discard_unmodeled_source, set_case_definition, set_function_definition,
     validate_case_definition, DefinitionError,
+};
+pub use hinges::{
+    get_hinge_assigns, get_hinge_unloading, pushover_curve, set_hinge_unloading, HingeAssigns,
+    PushoverPoint,
 };
 pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 

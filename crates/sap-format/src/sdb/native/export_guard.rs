@@ -316,9 +316,10 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         if let Some(control) = &case.displacement_control {
             // The native record is written only for nonlinear static cases with
             // one plain joint displacement; anything else would not read back.
-            let monitored_ok = control.monitored.as_ref().is_some_and(|(point, dof)| {
-                model.points.contains_key(point) && *dof < 6
-            });
+            let monitored_ok = control
+                .monitored
+                .as_ref()
+                .is_some_and(|(point, dof)| model.points.contains_key(point) && *dof < 6);
             if case.case_type != sap_model::LoadCaseType::NonlinearStatic || !monitored_ok {
                 return Err(unsupported(
                     format!("load_cases.{name}.displacement_control"),
@@ -332,6 +333,40 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                 format!("load_cases.{name}.initial_case"),
                 target,
             )?;
+        }
+        // Nonlinear static parameters: the native solution-control record is
+        // written with its defaults only, so any other value would be lost.
+        let nl = &case.nl_static;
+        let nl_defaults = sap_model::hinge::NonlinearStaticParams::default();
+        for (field, differs, what) in [
+            (
+                "results_saved",
+                nl.results_saved != nl_defaults.results_saved,
+                "saving multiple states",
+            ),
+            (
+                "max_total_steps",
+                nl.max_total_steps != nl_defaults.max_total_steps,
+                "a step limit other than the default",
+            ),
+            (
+                "max_null_steps",
+                nl.max_null_steps != nl_defaults.max_null_steps,
+                "a null step limit other than the default",
+            ),
+            (
+                "hinge_unloading",
+                nl.hinge_unloading != nl_defaults.hinge_unloading,
+                "a hinge unloading method other than unloading the entire structure",
+            ),
+            ("mode_loads", !nl.mode_loads.is_empty(), "modal loads"),
+        ] {
+            if differs {
+                return Err(unsupported(
+                    format!("load_cases.{name}.nl_static.{field}"),
+                    format!("{what} is not written natively; use S2K"),
+                ));
+            }
         }
         // Reconstruction data with no native record written here; a
         // synthesized file would drop it and the case would change meaning.
@@ -393,6 +428,26 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         if !p.nonlinear_data_complete {
             return Err(unsupported(format!("link_props.{name}.nonlinear_data_complete"),"incomplete source law data cannot be certified by synthesizing a parameter vector; use a private snapshot"));
         }
+    }
+    for (name, frame) in &model.frames {
+        if !frame.hinges.is_empty() {
+            return Err(unsupported(
+                format!("frames.{name}.hinges"),
+                "frame hinge assignments are not written natively; use S2K",
+            ));
+        }
+        if frame.hinge_overwrite.is_some() {
+            return Err(unsupported(
+                format!("frames.{name}.hinge_overwrite"),
+                "frame hinge overwrites are not written natively; use S2K",
+            ));
+        }
+    }
+    if let Some(name) = model.hinge_props.keys().next() {
+        return Err(unsupported(
+            format!("hinge_props.{name}"),
+            "frame hinge properties are not written natively; use S2K",
+        ));
     }
     if !model.mass_source.is_default() {
         return Err(unsupported(

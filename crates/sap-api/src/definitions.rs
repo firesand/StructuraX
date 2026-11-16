@@ -134,6 +134,121 @@ fn validate_ritz_controls(model: &SapModel, case: &LoadCase) -> Result<(), Defin
     Ok(())
 }
 /// Validate definitions represented by this native editor; solver applicability checks still apply.
+/// The initial case of a nonlinear static case: an existing, different
+/// nonlinear static case, with no cycle through the initial cases.
+fn validate_static_initial_case(
+    model: &SapModel,
+    case: &LoadCase,
+    initial: &str,
+) -> Result<(), DefinitionError> {
+    let first = model
+        .load_cases
+        .get(initial)
+        .filter(|c| c.name != case.name)
+        .ok_or_else(|| invalid(format!("initial case '{initial}' is not an existing, different case")))?;
+    if first.case_type != LoadCaseType::NonlinearStatic {
+        return Err(invalid(format!(
+            "initial case '{initial}' is not a nonlinear static case; a nonlinear static case can only continue from another nonlinear static case"
+        )));
+    }
+    // Follow the chain by name as the model would hold it with this
+    // definition: a stored case may already continue from this name even
+    // when the case itself is new.
+    let mut seen = vec![case.name.as_str()];
+    let mut current = Some(first.name.as_str());
+    while let Some(next) = current {
+        if seen.contains(&next) {
+            return Err(invalid(format!(
+                "initial case '{initial}' leads back to '{next}': initial cases must not form a cycle"
+            )));
+        }
+        seen.push(next);
+        current = model
+            .load_cases
+            .get(next)
+            .and_then(|c| c.initial_case.as_deref());
+    }
+    Ok(())
+}
+
+/// Settings particular to nonlinear static cases: saved states, step limits,
+/// hinge unloading, and Mode loads.
+fn validate_nl_static(model: &SapModel, case: &LoadCase) -> Result<(), DefinitionError> {
+    use sap_model::hinge::{HingeUnloading, ResultsSaved};
+    let params = &case.nl_static;
+    if let ResultsSaved::MultipleStates {
+        min_saved,
+        max_saved,
+        ..
+    } = params.results_saved
+    {
+        if min_saved == 0 || max_saved < min_saved || max_saved > 100_000 {
+            return Err(invalid(
+                "multiple saved states require 1 <= minimum <= maximum <= 100000",
+            ));
+        }
+    }
+    if params.max_total_steps == 0 || params.max_total_steps > 1_000_000 {
+        return Err(invalid("maximum total steps must be 1..1000000"));
+    }
+    if params.max_null_steps == 0 || params.max_null_steps > 1_000_000 {
+        return Err(invalid("maximum null steps must be 1..1000000"));
+    }
+    if params.hinge_unloading != HingeUnloading::UnloadEntireStructure {
+        return Err(invalid(format!(
+            "hinge unloading {:?} is not implemented; only \"unload entire structure\" is",
+            params.hinge_unloading
+        )));
+    }
+    if params.mode_loads.is_empty() {
+        if case.modal_case.is_some() {
+            return Err(invalid(
+                "a modal case is named but the case has no Mode load",
+            ));
+        }
+        return Ok(());
+    }
+    if !case.loads.is_empty() {
+        return Err(invalid(
+            "Mode loads cannot be mixed with load patterns or Accel loads in one case",
+        ));
+    }
+    let modal_name = case
+        .modal_case
+        .as_ref()
+        .ok_or_else(|| invalid("Mode loads need the Modal case that supplies the modes"))?;
+    let modal = model
+        .load_cases
+        .get(modal_name)
+        .filter(|m| m.case_type == LoadCaseType::Modal && m.name != case.name)
+        .ok_or_else(|| invalid("select an existing Modal case for the Mode loads"))?;
+    if !modal.run_flag {
+        return Err(invalid("the Modal case of the Mode loads must be run"));
+    }
+    for (i, load) in params.mode_loads.iter().enumerate() {
+        if load.mode == 0 || load.mode > modal.max_modes {
+            return Err(invalid(format!(
+                "Mode load {}: mode {} is outside 1..{} (the maximum modes of '{modal_name}')",
+                i + 1,
+                load.mode,
+                modal.max_modes
+            )));
+        }
+        if !load.scale_factor.is_finite() {
+            return Err(invalid(format!(
+                "Mode load {}: scale factor is not finite",
+                i + 1
+            )));
+        }
+        if params.mode_loads[..i].iter().any(|l| l.mode == load.mode) {
+            return Err(invalid(format!(
+                "Mode {} is loaded twice; combine the scale factors",
+                load.mode
+            )));
+        }
+    }
+    Ok(())
+}
 pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(), DefinitionError> {
     name(&case.name)?;
     if model.load_combos.contains_key(&case.name) {
@@ -153,9 +268,31 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
     ) {
         return Err(invalid("case type is not supported by this editor"));
     }
-    if case.case_type != LoadCaseType::ResponseSpectrum && case.initial_case.is_some() {
+    if let Some(initial) = &case.initial_case {
+        match case.case_type {
+            // A spectrum case names its modal source here.
+            LoadCaseType::ResponseSpectrum => {}
+            LoadCaseType::NonlinearStatic => validate_static_initial_case(model, case, initial)?,
+            _ => {
+                return Err(invalid(
+                    "initial-state cases are supported only by nonlinear static cases (and as the modal source of a response-spectrum case)",
+                ));
+            }
+        }
+    }
+    if case.case_type != LoadCaseType::NonlinearStatic
+        && model.load_cases.values().any(|c| {
+            c.case_type == LoadCaseType::NonlinearStatic
+                && c.initial_case.as_ref() == Some(&case.name)
+        })
+    {
         return Err(invalid(
-            "initial-state cases are not supported by this editor",
+            "case is the initial case of a nonlinear static case and must stay a nonlinear static case",
+        ));
+    }
+    if case.case_type != LoadCaseType::NonlinearStatic && !case.nl_static.is_default() {
+        return Err(invalid(
+            "saved states, step limits and modal loads belong to nonlinear static cases",
         ));
     }
     if case.case_type != LoadCaseType::Modal
@@ -178,10 +315,17 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             "case is referenced as a modal source by a modal time-history case",
         ));
     }
-    if let Some(modal_name) = &case.modal_case {
+    if case.case_type == LoadCaseType::NonlinearStatic {
+        validate_nl_static(model, case)?;
+    }
+    if let Some(modal_name) = case
+        .modal_case
+        .as_ref()
+        .filter(|_| case.case_type != LoadCaseType::NonlinearStatic)
+    {
         if case.case_type != LoadCaseType::LinearHistory {
             return Err(invalid(
-                "only a linear modal time-history case can superpose the modes of a modal case",
+                "only a linear modal time-history case can superpose the modes of a modal case, or supply the modes of a nonlinear static case with Mode loads",
             ));
         }
         let modal = model
@@ -225,6 +369,24 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
         if ritz_acceleration {
             continue;
         }
+        // Nonlinear static: Accel loads UX, UY, UZ (not rotations).
+        if case.case_type == LoadCaseType::NonlinearStatic
+            && sap_model::ritz::acceleration_direction(&load.load_name).is_some()
+        {
+            if !load.scale_factor.is_finite() {
+                return Err(invalid("nonfinite scale factor of an Accel load"));
+            }
+            if let Some(clash) = model
+                .load_patterns
+                .keys()
+                .find(|p| sap_model::ritz::acceleration_direction(p).is_some())
+            {
+                return Err(invalid(format!(
+                    "load pattern '{clash}' is named like an acceleration load; rename it before using Accel loads"
+                )));
+            }
+            continue;
+        }
         if !model.load_patterns.contains_key(&load.load_name) || !load.scale_factor.is_finite() {
             return Err(invalid(format!(
                 "undefined static load pattern or nonfinite scale: '{}'",
@@ -250,7 +412,10 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
     }
     match case.case_type {
         LoadCaseType::LinearStatic | LoadCaseType::NonlinearStatic | LoadCaseType::Buckling => {
-            if case.loads.is_empty() {
+            if case.loads.is_empty()
+                && !(case.case_type == LoadCaseType::NonlinearStatic
+                    && !case.nl_static.mode_loads.is_empty())
+            {
                 return Err(invalid("provide at least one static load pattern"));
             }
             if !case.history_loads.is_empty() || !case.spectrum_loads.is_empty() {

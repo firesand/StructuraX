@@ -402,6 +402,14 @@ impl SapModel {
             {
                 return Err(EditError::Unsupported(format!("frame {}: nonprismatic/cable/limits/offsets/cardinal point/patterned temperature", f.name)));
             }
+            // Every piece is a copy of the object, so its hinges would be
+            // repeated on each piece at the same relative distance.
+            if !f.hinges.is_empty() || f.hinge_overwrite.is_some() {
+                return Err(EditError::Unsupported(format!(
+                    "frame {}: hinge assignments or a hinge overwrite",
+                    f.name
+                )));
+            }
             let pi = self
                 .points
                 .get(&f.point_i)
@@ -708,6 +716,38 @@ mod tests {
             Err(EditError::Unsupported(_))
         ));
         assert_eq!(m, before);
+    }
+
+    #[test]
+    fn dividing_a_frame_with_hinges_or_a_hinge_overwrite_is_refused() {
+        use crate::hinge::{FrameHinge, FrameHingeOverwrite};
+        // The unchanged model divides, so each refusal is caused by the one
+        // assignment it adds.
+        frame_model().divide_selected_frames(2).unwrap();
+        let mut hinged = frame_model();
+        let frame = hinged.frames.values_mut().find(|f| f.selected).unwrap();
+        let name = frame.name.clone();
+        frame.hinges.push(FrameHinge {
+            prop: "H".into(),
+            rel_dist: 0.0,
+        });
+        let mut overwritten = frame_model();
+        overwritten
+            .frames
+            .values_mut()
+            .find(|f| f.selected)
+            .unwrap()
+            .hinge_overwrite = Some(FrameHingeOverwrite::default());
+        for mut m in [hinged, overwritten] {
+            let before = m.clone();
+            match m.divide_selected_frames(2) {
+                Err(EditError::Unsupported(message)) => {
+                    assert!(message.contains(&name) && message.contains("hinge"), "{message}")
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(m, before);
+        }
     }
 
     #[test]

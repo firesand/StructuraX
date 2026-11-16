@@ -65,6 +65,7 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_frame_auto_subdivision());
     rows.extend(verify_example_1_011());
     rows.extend(verify_example_1_021());
+    rows.extend(verify_example_1_026());
     rows.extend(verify_example_5_001());
     rows.extend(verify_example_6_003());
     rows.extend(verify_example_6_005());
@@ -1422,6 +1423,137 @@ pub fn verify_example_1_021() -> Vec<BenchmarkVerificationRow> {
             )
         })
         .collect()
+}
+
+/// Example 1-026: a 24 in cantilever with a moment hinge and a shear hinge
+/// at its fixed end, pushed by a tip load until the tip has moved 2 in
+/// (E = 3600 ksi, G = 1500 ksi, A = 216 in2, I = 5832 in4, Av = 180 in2).
+/// Model A leaves the object whole; model B applies the default hinge
+/// overwrite, which puts the hinge in an element of 1 % of the length.
+///
+/// The references are the SAP2000 values the problem prints for the state
+/// after the moment hinge has dropped to its residual strength (P = 20 kips).
+/// The printed tables are mislabelled: the first is model A although headed
+/// "Model B", and at this state their SAP2000 and Independent columns are
+/// exchanged, as the problem's own hand calculation (1.36617 in, 0.04027 rad
+/// for a vertical drop) shows. The tolerances are the rounding of the
+/// printed values.
+pub fn verify_example_1_026() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::hinge::{
+        FrameHinge, FrameHingeOverwrite, HingeDof, HingePoint, HingeProp, ResultsSaved,
+    };
+    let build = |overwrite: Option<FrameHingeOverwrite>| {
+        let mut model = SapModel::new(Units::KipInF);
+        model.load_cases.clear();
+        model.load_patterns.clear();
+        model.active_dofs = [true, false, true, false, true, false];
+        let mut material = Material::default_steel_kip_in();
+        material.name = "CONC".into();
+        material.e = 3600.0;
+        material.g = 1500.0;
+        material.u = 0.2;
+        material.unit_weight = 0.0;
+        material.unit_mass = 0.0;
+        model.materials.insert("CONC".into(), material);
+        let mut section = make_rectangular("BEAM", "CONC", 12.0, 18.0);
+        section.area = 216.0;
+        section.i33 = 5832.0;
+        section.as2 = 180.0;
+        model.frame_sections.insert("BEAM".into(), section);
+        model.add_point("1", 0.0, 0.0, 0.0);
+        model.add_point("2", 24.0, 0.0, 0.0);
+        model.points["1"].restraint = [true; 6];
+        model.add_frame("1", "1", "2", "BEAM");
+        model.load_patterns.insert(
+            "P".into(),
+            LoadPattern {
+                name: "P".into(),
+                pat_type: LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+        model.points["2"].loads_force.push(PointLoadForce {
+            load_pat: "P".into(),
+            csys: "GLOBAL".into(),
+            force: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        });
+        let point = HingePoint::new;
+        model.hinge_props.insert(
+            "Moment".into(),
+            HingeProp::symmetric(
+                "Moment",
+                HingeDof::M3,
+                [point(1440.0, 0.0), point(1920.0, 0.04), point(480.0, 0.04), point(480.0, 0.4)],
+            ),
+        );
+        model.hinge_props.insert(
+            "Shear".into(),
+            HingeProp::symmetric(
+                "Shear",
+                HingeDof::V2,
+                [point(70.0, 0.0), point(80.0, 0.4), point(90.0, 0.8), point(100.0, 1.2)],
+            ),
+        );
+        let frame = &mut model.frames["1"];
+        frame.hinges = ["Moment", "Shear"]
+            .map(|prop| FrameHinge {
+                prop: prop.into(),
+                rel_dist: 0.0,
+            })
+            .to_vec();
+        frame.hinge_overwrite = overwrite;
+        let mut push = LoadCase::linear_static("PUSH", "P", 1.0);
+        push.case_type = LoadCaseType::NonlinearStatic;
+        push.displacement_control = Some(sap_model::DisplacementControl {
+            target: 2.0,
+            monitored: Some(("2".into(), 2)),
+            conjugate: false,
+        });
+        push.nl_static.results_saved = ResultsSaved::MultipleStates {
+            min_saved: 6,
+            max_saved: 10,
+            positive_only: false,
+        };
+        model.load_cases.insert("PUSH".into(), push);
+        model
+    };
+    let mut rows = Vec::new();
+    for (label, overwrite, uz, ry) in [
+        ("A, no overwrite", None, 1.7612, -0.0567),
+        ("B, hinge overwrite", Some(FrameHingeOverwrite::default()), 1.3701, -0.0404),
+    ] {
+        let mut model = build(overwrite);
+        analyze_model(&mut model).expect("Example 1-026 analysis failed");
+        let steps = &model.case_results["PUSH"].static_steps;
+        // The first saved state at P = 20 kips after the peak of 80 kips.
+        let peak = steps
+            .iter()
+            .position(|s| (s.load_factor - 80.0).abs() < 1e-6)
+            .expect("Example 1-026 never reaches 80 kips");
+        let state = steps[peak..]
+            .iter()
+            .find(|s| (s.load_factor - 20.0).abs() < 1e-6)
+            .expect("Example 1-026 never drops to 20 kips");
+        let tip = state.joint_displacements["2"];
+        let case = format!("PUSH ({label})");
+        rows.push(BenchmarkVerificationRow::new(
+            "Ex 1-026",
+            &case,
+            "Uz (tip) at P = 20 k [in]",
+            uz,
+            tip[2],
+            0.005,
+        ));
+        rows.push(BenchmarkVerificationRow::new(
+            "Ex 1-026",
+            &case,
+            "Ry (tip) at P = 20 k [rad]",
+            ry,
+            tip[4],
+            0.15,
+        ));
+    }
+    rows
 }
 
 /// Example 5-001: Solid Element Patch Test (MacNeal & Harder 1985, 7-Element Irregular Unit Cube).

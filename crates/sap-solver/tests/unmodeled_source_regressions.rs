@@ -81,8 +81,7 @@ fn refused(base: &SapModel, enabled: &[&str]) -> bool {
         Err(error) => {
             let text = error.to_string();
             assert!(
-                text.contains("test data that is not modeled")
-                    && text.contains("Remove the entry"),
+                text.contains("test data that is not modeled") && text.contains("Remove the entry"),
                 "{text}"
             );
             assert!(m.case_results.is_empty());
@@ -251,6 +250,12 @@ fn static_cases_refuse_load_names_that_are_not_load_patterns() {
             ("UZ", "acceleration load 'UZ'"),
             ("WIND", "missing load pattern 'WIND'"),
         ] {
+            // Translational acceleration loads are implemented in nonlinear
+            // static cases (nl_static_mode_accel.rs); the rotational names
+            // below stand in for them.
+            if case_type == LoadCaseType::NonlinearStatic && load != "WIND" {
+                continue;
+            }
             let mut m = model();
             for case in m.load_cases.values_mut() {
                 case.run_flag = case.name == "LIN";
@@ -267,6 +272,21 @@ fn static_cases_refuse_load_names_that_are_not_load_patterns() {
             assert!(m.case_results.is_empty());
         }
     }
+    // A nonlinear static case refuses a rotational acceleration by name.
+    let mut m = model();
+    for case in m.load_cases.values_mut() {
+        case.run_flag = case.name == "LIN";
+    }
+    m.load_cases["LIN"].case_type = LoadCaseType::NonlinearStatic;
+    m.load_cases["LIN"].loads.push(LoadCaseAssignment {
+        load_name: "U4".into(),
+        scale_factor: 1.,
+    });
+    let error = analyze_model(&mut m).unwrap_err().to_string();
+    assert!(
+        error.contains("rotational acceleration load 'U4'"),
+        "{error}"
+    );
     // A load pattern that happens to be named like a direction is a pattern.
     let mut m = model();
     m.load_patterns.insert(
