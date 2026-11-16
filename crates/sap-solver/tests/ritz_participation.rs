@@ -361,8 +361,11 @@ fn eigen_case_reports_acceleration_participation() {
         .insert("E".into(), LoadCase::modal_eigen("E", 2));
     analyze_model(&mut model).unwrap();
     let res = &model.case_results["E"];
-    // Only UX has mass: UY and UZ are not reported.
-    assert_eq!(res.load_participation.len(), 1);
+    // UX has mass, and RY acts on the UX masses about their centroid (the
+    // joints sit at different heights); UY, UZ, RX and RZ act on no mass and
+    // are not reported.
+    assert_eq!(res.load_participation.len(), 2);
+    assert_eq!(res.load_participation[1].load_name, "RY");
     let part = &res.load_participation[0];
     assert_eq!(part.load_name, "UX");
     assert_eq!(part.vectors_generated, 0);
@@ -376,13 +379,31 @@ fn eigen_case_reports_acceleration_participation() {
     }
     assert!(rel(part.dynamic_cumulative[1], 1.0) < 1e-10);
     assert!(rel(part.static_cumulative[1], 1.0) < 1e-10);
+    // R8: RY about the centre of mass. The UX masses m sit at z = 100 and 200,
+    // so the UX centroid is z_c = 150 and the rigid rotation r = (z - z_c) on
+    // the UX DOFs is (-50, +50); the RY DOF has no mass. Then
+    // r^T M r = m (2500 + 2500) = 5000 m and, with phi = psi / sqrt(m),
+    // phi^T M r = sqrt(m) 50 (psi2 - psi1). Dynamic ratio
+    // (phi^T M r)^2 / (r^T M r) = (psi2 - psi1)^2 / 2, summing to
+    // |(-1, 1)|^2 / 2 = 1 over the two modes. Tolerance 1e-9 (relative).
+    let ry = &res.load_participation[1];
+    assert!(ry.is_acceleration);
+    for (n, (_, psi)) in eig.iter().enumerate() {
+        let d = psi[1] - psi[0];
+        assert!(rel(ry.dynamic_ratio[n], d * d / 2.0) < 1e-9, "RY mode {n}");
+    }
+    assert!(rel(ry.dynamic_cumulative[1], 1.0) < 1e-10);
 }
 
-// Cycles, order and redundancy.
+// Cycles, order and redundancy. Only the starting loads of case "R" count;
+// the table also lists the accelerations that act on mass and are not starting
+// loads (each with zero generated vectors).
 fn generated(model: &SapModel) -> Vec<usize> {
+    let starting = model.load_cases["R"].loads.len();
     model.case_results["R"]
         .load_participation
         .iter()
+        .take(starting)
         .map(|p| p.vectors_generated)
         .collect()
 }
@@ -543,8 +564,10 @@ fn legacy_ritz_without_starting_loads_is_bitwise_unchanged() {
         assert_eq!(mode.participation_factors[0].to_bits(), want[2]);
     }
     // The table of the legacy path reports UX against these modes.
+    // (and RY about the UX centroid, see the eigen-case test above).
     let part = &model.case_results["R"].load_participation;
-    assert_eq!(part.len(), 1);
+    assert_eq!(part.len(), 2);
+    assert_eq!(part[1].load_name, "RY");
     assert!(rel(part[0].dynamic_cumulative[2], 1.0) < 1e-10);
 }
 

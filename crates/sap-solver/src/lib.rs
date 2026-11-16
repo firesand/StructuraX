@@ -20,6 +20,8 @@ mod ritz_modal;
 pub mod solid;
 mod supported_subset;
 
+pub use modal_history::ground_acceleration_trace;
+
 use indexmap::IndexMap;
 use sap_model::{
     AreaObj, CaseResults, ComboType, ConstraintAxis, ConstraintType, FrameStationResult, LoadCase,
@@ -3679,13 +3681,23 @@ fn run_modal_case(
         }
         solve_modal_eigen_checked(&k_mod, &ldlt, &m_mod, lc.max_modes)?
     };
-    if participation_loads.is_empty() {
-        for (label, dir) in sap_model::ritz::ACCELERATION_LOADS {
-            participation_loads.push((
-                label.to_string(),
-                true,
-                ritz_modal::acceleration_load(&m_mod, joint_rot, dir, 1.0),
-            ));
+    // Items of the load-participation table (Analysis Reference p. 378): the
+    // starting loads of the case in case order, then each of UX..RZ that no
+    // starting load already stands for (U1..U3 count as UX..UZ). An item that
+    // acts on no mass is dropped by `load_participation`.
+    let coords: Vec<[f64; 3]> = work_points.values().map(|p| [p.x, p.y, p.z]).collect();
+    let rigid = ritz_modal::RigidBodyShapes::new(&m_mod, joint_rot, &coords);
+    let accel_items = sap_model::ritz::ACCELERATION_LOADS
+        .iter()
+        .chain(sap_model::ritz::ROTATIONAL_ACCELERATION_LOADS.iter());
+    for (label, dir) in accel_items {
+        let listed = participation_loads.iter().any(|(name, is_acc, _)| {
+            *is_acc
+                && (name.eq_ignore_ascii_case(label)
+                    || sap_model::ritz::acceleration_direction(name) == Some(*dir))
+        });
+        if !listed {
+            participation_loads.push((label.to_string(), true, rigid.load(&m_mod, *dir)));
         }
     }
     let load_participation = ritz_modal::load_participation(
@@ -3697,30 +3709,14 @@ fn run_modal_case(
         &generated,
     )?;
 
-    // Total unrestrained mass along global X, Y, Z for modal mass ratio calculation
-    let mut total_mass = [0.0f64; 6];
-    for i in 0..ndof {
-        let d = i % 6;
-        total_mass[d] += m_mod[i];
-    }
-
     let mut modes = Vec::with_capacity(raw_modes.len());
     for (m_idx, (omega_sq, phi)) in raw_modes.into_iter().enumerate() {
         let omega = omega_sq.max(0.0).sqrt();
         let freq_hz = omega / (2.0 * PI);
         let period_sec = if freq_hz > 1e-12 { 1.0 / freq_hz } else { 0.0 };
 
-        let mut pf = [0.0f64; 6];
-        for i in 0..ndof {
-            let d = i % 6;
-            pf[d] += m_mod[i] * phi[i];
-        }
-        let mut mmr = [0.0f64; 6];
-        for d in 0..6 {
-            if total_mass[d] > 1e-18 {
-                mmr[d] = (pf[d] * pf[d]) / total_mass[d];
-            }
-        }
+        let pf = rigid.factors(&m_mod, &phi);
+        let mmr = rigid.mass_ratios(&pf);
 
         let mut mode_shape = IndexMap::new();
         for (idx, pname) in work_points.keys().enumerate() {

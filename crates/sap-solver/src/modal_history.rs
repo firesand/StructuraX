@@ -237,6 +237,66 @@ pub(crate) fn advance_mode(
     (x1 + a + b * h, y1 + b)
 }
 
+/// Global ground acceleration `[ax, ay, az]` (model length/s²) at every output
+/// step `k·dt`, `k = 0..=num_time_steps`, of the linear history case `case`,
+/// which must name a modal case (mode superposition): the sum of
+/// `scale factor · f(t)` over the case's acceleration entries (`UX`, `UY`,
+/// `UZ`, and the spellings this module accepts for them), with this module's
+/// function rule (`function_value` with a tolerance of `1e-9·dt`). Load
+/// pattern entries add nothing.
+pub fn ground_acceleration_trace(
+    model: &SapModel,
+    case: &str,
+) -> Result<Vec<[f64; 3]>, SolverError> {
+    let lc = model
+        .load_cases
+        .get(case)
+        .ok_or_else(|| SolverError::InvalidInput(format!("case '{case}' does not exist")))?;
+    if lc.case_type != LoadCaseType::LinearHistory {
+        return Err(SolverError::UnsupportedInput(format!(
+            "case '{case}' is of type {:?}; ground accelerations are traced for modal linear history cases",
+            lc.case_type
+        )));
+    }
+    if lc.modal_case.is_none() {
+        return Err(SolverError::UnsupportedInput(format!(
+            "case '{case}' is a direct-integration history case; only modal time-history cases record accelerations"
+        )));
+    }
+    let dt = lc.time_step_dt;
+    if !dt.is_finite() || dt <= 0.0 {
+        return Err(SolverError::InvalidInput(format!(
+            "case '{case}' has time step {dt}; it must be positive"
+        )));
+    }
+    let mut entries: Vec<(usize, f64, &[(f64, f64)])> = Vec::new();
+    for (function, target, sf) in &lc.history_loads {
+        let points = model
+            .functions
+            .get(function)
+            .map(|f| f.points.as_slice())
+            .ok_or_else(|| {
+                SolverError::InvalidInput(format!(
+                    "case '{case}' references missing function '{function}'"
+                ))
+            })?;
+        if let Some(dir) = acceleration_direction(target) {
+            entries.push((dir, *sf, points));
+        }
+    }
+    let tol = 1e-9 * dt;
+    Ok((0..=lc.num_time_steps)
+        .map(|k| {
+            let t = k as f64 * dt;
+            let mut a = [0.0; 3];
+            for (dir, sf, points) in &entries {
+                a[*dir] += sf * function_value(points, t, tol);
+            }
+            a
+        })
+        .collect())
+}
+
 /// Time function value, zero before the first point and constant after the
 /// last. Right-continuous: at a jump the later value is returned. Times within
 /// `tol` of a point count as that point.

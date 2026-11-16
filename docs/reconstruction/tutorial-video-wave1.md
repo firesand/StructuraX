@@ -299,7 +299,8 @@ Each refusal named above has a negative test.
   diaphragm moments.
 - A material library and multi-selection from a section file (since done; see
   [tutorial-video-wave3.md](tutorial-video-wave3.md)).
-- Displacement contours, shell stress component choice, video export, export to
+- Displacement contours and shell stress component choice (since done; see
+  [tutorial-video-wave4.md](tutorial-video-wave4.md)), video export, export to
   other programs.
 - Sparse storage for models beyond a few thousand joints.
 - `cSapModel` facades and native persistence for the new data.

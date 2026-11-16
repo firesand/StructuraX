@@ -5,19 +5,25 @@
 
 mod analysis;
 mod build;
+mod contours;
+mod display_units;
 mod draw_tools;
 mod file_browser;
 mod hinges;
 mod materials;
 mod modal_tables;
 mod pushover;
+mod result_display;
 mod section_import;
 mod seismic;
 mod selection;
+mod shell_output;
 mod steel_design;
 mod time_history;
 #[cfg(test)]
 mod video_drawing_e2e;
+#[cfg(test)]
+mod video_results_e2e;
 mod view;
 mod workflows;
 
@@ -28,10 +34,12 @@ use sap_format::{
     save_sdb_file_with_report,
 };
 use sap_model::{
-    CaseResults, ConcreteDesignResult, ConcreteRebarConfig, FrameLoadDistributed, FrameLoadPoint,
+    ConcreteDesignResult, ConcreteRebarConfig, FrameLoadDistributed, FrameLoadPoint,
     FrameSection, FrameType2D, FrameType3D, LoadCase, LoadPattern, LoadPatternType, MatType,
     Material, PointLoadForce, SapModel, SteelDesignResult,
 };
+#[cfg(test)]
+use sap_model::CaseResults;
 use sap_section::{
     make_box_tube, make_circle, make_i_section, make_pipe, make_rectangular, ProDatabase,
 };
@@ -92,7 +100,7 @@ pub enum DisplayMode {
     Deformed,
     Reactions,
     FrameDiagram(FrameForceComponent),
-    ShellContour(ShellComponent),
+    ShellContour(shell_output::ShellQuantity),
     SolidContour(SolidComponent),
     DesignRatioSteel,
     DesignRatioConcrete,
@@ -117,27 +125,6 @@ impl FrameForceComponent {
             Self::TorsionT => "Torsion T",
             Self::MomentM2 => "Moment M2 (Minor)",
             Self::MomentM3 => "Moment M3 (Major)",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ShellComponent {
-    F11,
-    F22,
-    M11,
-    M22,
-    SvmTop,
-}
-
-impl ShellComponent {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::F11 => "Membrane F11",
-            Self::F22 => "Membrane F22",
-            Self::M11 => "Plate Moment M11",
-            Self::M22 => "Plate Moment M22",
-            Self::SvmTop => "Von Mises Stress SVM",
         }
     }
 }
@@ -229,6 +216,8 @@ pub struct SapGuiApp {
     pub deform_scale: f32,
     pub animate_deformed: bool,
     pub anim_phase: f32,
+    /// Result forms, contour and joint read-out (see `result_display`).
+    results: result_display::State,
     pub diagram_scale: f32,
 
     // Viewports
@@ -436,6 +425,7 @@ impl SapGuiApp {
             deform_scale: 25.0,
             animate_deformed: false,
             anim_phase: 0.0,
+            results: result_display::State::default(),
             diagram_scale: 1.0,
             dual_pane: true,
             left_proj: ViewProjection::Perspective3D,
@@ -558,6 +548,14 @@ impl SapGuiApp {
                 self.inspected_frame = None;
             }
         }
+        if self
+            .results
+            .readout_joint
+            .as_ref()
+            .is_some_and(|j| !self.model.points.contains_key(j))
+        {
+            self.results.readout_joint = None;
+        }
         if !self.model.materials.contains_key(&self.custom_sec_material) {
             if let Some(first_mat) = self.model.materials.keys().next().cloned() {
                 self.custom_sec_material = first_mat;
@@ -598,6 +596,7 @@ impl SapGuiApp {
         self.panel_seismic = seismic::State::default();
         self.panel_steel_design = steel_design::State::default();
         self.panel_time_history = time_history::State::default();
+        self.results = result_display::State::default();
         self.import_warnings = import_warnings;
         self.export_warnings.clear();
         self.draw_first_point = None;
@@ -1034,6 +1033,7 @@ impl SapGuiApp {
             }
             if f6 {
                 self.display_mode = DisplayMode::Deformed;
+                self.results.contour = result_display::Contour::Off;
             }
             if f7 {
                 self.display_mode = DisplayMode::Reactions;
@@ -1423,8 +1423,19 @@ impl SapGuiApp {
                 }
                 if ui.button("Show Deformed Shape (F6)").clicked() {
                     self.display_mode = DisplayMode::Deformed;
+                    self.results.contour = result_display::Contour::Off;
                     ui.close_menu();
                 }
+                if ui.button("Show Deformed Shape...").clicked() {
+                    self.open_deformed_form();
+                    ui.close_menu();
+                }
+                ui.menu_button("Show Forces/Stresses", |ui| {
+                    if ui.button("Shells...").clicked() {
+                        self.open_shell_form();
+                        ui.close_menu();
+                    }
+                });
                 if ui.button("Show Support Reactions (F7)").clicked() {
                     self.display_mode = DisplayMode::Reactions;
                     ui.close_menu();
@@ -1447,18 +1458,13 @@ impl SapGuiApp {
                     }
                 }
                 ui.separator();
-                for scomp in [
-                    ShellComponent::F11,
-                    ShellComponent::F22,
-                    ShellComponent::M11,
-                    ShellComponent::M22,
-                    ShellComponent::SvmTop,
-                ] {
+                for scomp in shell_output::ShellQuantity::LEGACY {
                     if ui
                         .button(format!("Shell Contour: {}", scomp.label()))
                         .clicked()
                     {
                         self.display_mode = DisplayMode::ShellContour(scomp);
+                        self.results.contour = result_display::Contour::Off;
                         ui.close_menu();
                     }
                 }
@@ -2111,7 +2117,7 @@ impl SapGuiApp {
         }
 
         // Animation phase & deformed displacement scale
-        let anim_mult = if self.animate_deformed {
+        let anim_mult = if self.animate_deformed && !self.results.stepping {
             self.anim_phase.sin() as f64
         } else {
             1.0
@@ -2122,42 +2128,37 @@ impl SapGuiApp {
         let use_time_step = self.use_time_step;
         let active_step_idx = self.active_step_idx;
 
+        // Joint results are stored in joint-local axes: the shape is drawn from
+        // their global components.
+        let step_sel = contours::StepSelection {
+            mode_idx: active_mode_idx,
+            use_step: use_time_step,
+            step_idx: active_step_idx,
+        };
+        let model_ref = &self.model;
         let displaced_point = |pid: &str, base: [f64; 3]| -> [f64; 3] {
-            if let Some(cr) = case_res {
-                let d = joint_disp_3d(
-                    cr,
-                    pid,
-                    def_scale,
-                    active_mode_idx,
-                    use_time_step,
-                    active_step_idx,
-                );
-                [base[0] + d[0], base[1] + d[1], base[2] + d[2]]
-            } else {
-                base
-            }
+            result_display::displaced_point(model_ref, case_res, pid, base, def_scale, step_sel)
         };
 
-        // Precompute normalized contour range for ShellContour / SolidContour
+        // Contour of the shell forms and the displacement contour: one value
+        // table and legend per pane and frame.
+        let frame_contour = result_display::contour_spec(
+            self.display_mode,
+            self.results.contour,
+            self.model.present_units,
+        )
+        .map(|spec| {
+            result_display::frame_contour(
+                &self.model,
+                &self.active_case,
+                spec,
+                step_sel,
+                result_display::toward_viewer(&view),
+            )
+        });
+
+        // Precompute normalized contour range for SolidContour
         let contour_range: Option<(&str, f64, f64)> = match (self.display_mode, case_res) {
-            (DisplayMode::ShellContour(scomp), Some(cr)) if !cr.area_results.is_empty() => {
-                let mut lo = f64::INFINITY;
-                let mut hi = f64::NEG_INFINITY;
-                for ar in cr.area_results.values() {
-                    let v = match scomp {
-                        ShellComponent::F11 => ar.f11,
-                        ShellComponent::F22 => ar.f22,
-                        ShellComponent::M11 => ar.m11,
-                        ShellComponent::M22 => ar.m22,
-                        ShellComponent::SvmTop => ar.svm_top,
-                    };
-                    if v.is_finite() {
-                        lo = lo.min(v);
-                        hi = hi.max(v);
-                    }
-                }
-                (lo <= hi).then_some((scomp.label(), lo, hi))
-            }
             (DisplayMode::SolidContour(sol_comp), Some(cr)) if !cr.solid_results.is_empty() => {
                 let mut lo = f64::INFINITY;
                 let mut hi = f64::NEG_INFINITY;
@@ -2326,7 +2327,7 @@ impl SapGuiApp {
                             SolidComponent::S33 => s.s33,
                             SolidComponent::VonMises => s.von_mises,
                         };
-                        normalized_contour_color(v, lo, hi, 115)
+                        contours::value_color(v, lo, hi, 115)
                     } else {
                         Color32::from_rgba_unmultiplied(110, 130, 175, 45)
                     }
@@ -2405,22 +2406,15 @@ impl SapGuiApp {
                     } else {
                         &poly_undef
                     };
+                let contour_fill = frame_contour
+                    .as_ref()
+                    .map(|fc| fc.fill(aid, active_poly))
+                    .unwrap_or(result_display::AreaFill::Plain);
                 let fill_col =
-                    if let (DisplayMode::ShellContour(scomp), Some(cr), Some((_, lo, hi))) =
-                        (self.display_mode, case_res, contour_range)
-                    {
-                        if let Some(ar) = cr.area_results.get(aid) {
-                            let val = match scomp {
-                                ShellComponent::F11 => ar.f11,
-                                ShellComponent::F22 => ar.f22,
-                                ShellComponent::M11 => ar.m11,
-                                ShellComponent::M22 => ar.m22,
-                                ShellComponent::SvmTop => ar.svm_top,
-                            };
-                            normalized_contour_color(val, lo, hi, 145)
-                        } else {
-                            Color32::from_rgba_unmultiplied(60, 120, 180, 65)
-                        }
+                    if let result_display::AreaFill::Flat(colour) = &contour_fill {
+                        *colour
+                    } else if matches!(contour_fill, result_display::AreaFill::Mesh(_)) {
+                        Color32::TRANSPARENT
                     } else if area.selected {
                         Color32::from_rgba_unmultiplied(255, 200, 60, 90)
                     } else if self.display_mode == DisplayMode::Deformed {
@@ -2435,6 +2429,9 @@ impl SapGuiApp {
                 } else {
                     Color32::from_rgb(100, 160, 220)
                 };
+                if let result_display::AreaFill::Mesh(mesh) = contour_fill {
+                    painter.add(Shape::mesh(mesh));
+                }
                 painter.add(Shape::convex_polygon(
                     active_poly.clone(),
                     fill_col,
@@ -2938,6 +2935,8 @@ impl SapGuiApp {
             None
         };
         let mut closest_joint: Option<(String, f32)> = None;
+        // Joints as drawn on the deformed shape, for the right-click read-out.
+        let mut joint_screen: Vec<(String, Pos2)> = Vec::new();
 
         for (pid, pt) in &self.model.points {
             if !in_view(|m| &m.points, pid) {
@@ -2955,6 +2954,9 @@ impl SapGuiApp {
             if self.display_mode == DisplayMode::Deformed {
                 painter.circle_filled(sp, 2.5, Color32::from_rgba_unmultiplied(150, 165, 185, 100));
                 let sp_def = project(displaced_point(pid, base));
+                if right_click_pos.is_some() {
+                    joint_screen.push((pid.clone(), sp_def));
+                }
                 let pt_col = if pt.selected {
                     Color32::from_rgb(255, 230, 50)
                 } else {
@@ -3082,8 +3084,30 @@ impl SapGuiApp {
             }
         }
 
-        // Right-click on frame opens Member Station Diagram Inspector
-        if let Some(rcp) = right_click_pos {
+        // A click elsewhere closes the joint read-out.
+        if click_pos.is_some() {
+            self.results.readout_joint = None;
+        }
+        // Right-click: on the deformed shape a joint within
+        // `JOINT_PICK_RADIUS` of the pointer wins and opens the Joint
+        // Displacements read-out; otherwise (and in every other display) a
+        // frame within 8 px opens the Member Station Diagram Inspector.
+        let joint_pick = right_click_pos
+            .filter(|_| self.display_mode == DisplayMode::Deformed && case_res.is_some())
+            .and_then(|rcp| {
+                result_display::closest_within(
+                    &joint_screen,
+                    rcp,
+                    result_display::JOINT_PICK_RADIUS,
+                )
+            });
+        if let Some(jid) = joint_pick {
+            self.status_msg = match self.results.open_readout(&jid, self.animate_deformed) {
+                Ok(()) => format!("Joint {jid}: displacements shown."),
+                Err(refused) => refused,
+            };
+        } else if let Some(rcp) = right_click_pos {
+            self.results.readout_joint = None;
             if let Some((fid, _)) = frame_screen_segs
                 .iter()
                 .map(|(fid, a, b)| (fid, point_to_segment_dist(rcp, *a, *b)))
@@ -3278,7 +3302,14 @@ impl SapGuiApp {
             }
         }
 
-        // Contour Legend Overlay (when viewing ShellContour or SolidContour)
+        // Legend of the shell forms and of the displacement contour.
+        if let Some(fc) = &frame_contour {
+            if rect.width() > 240.0 {
+                result_display::draw_legend(&painter, rect, &fc.legend);
+            }
+        }
+
+        // Contour Legend Overlay (when viewing SolidContour)
         if let Some((label, lo, hi)) = contour_range {
             let leg_rect = Rect::from_min_size(
                 Pos2::new(rect.right() - 175.0, rect.top() + 8.0),
@@ -3309,7 +3340,7 @@ impl SapGuiApp {
                         ),
                         Vec2::new(bar_w + 0.5, 8.0),
                     );
-                    painter.rect_filled(sub, 0.0, normalized_contour_color(v, lo, hi, 230));
+                    painter.rect_filled(sub, 0.0, contours::value_color(v, lo, hi, 230));
                 }
                 painter.text(
                     Pos2::new(leg_rect.left() + 6.0, leg_rect.bottom() - 2.0),
@@ -5000,8 +5031,26 @@ impl SapGuiApp {
             self.active_pane = 0;
         }
         if self.animate_deformed {
-            self.anim_phase += 0.08;
+            // A result with steps is animated through its steps; the input
+            // time of the frame drives it. Modal results keep the sine.
+            let now = ctx.input(|i| i.time);
+            let start = *self.results.anim_start.get_or_insert(now);
+            let step = result_display::step_animation(
+                self.model.case_results.get(&self.active_case),
+                start,
+                now,
+            );
+            self.results.stepping = step.is_some();
+            if let Some(step) = step {
+                self.active_step_idx = step;
+                self.use_time_step = true;
+            } else {
+                self.anim_phase += 0.08;
+            }
             ctx.request_repaint();
+        } else {
+            self.results.anim_start = None;
+            self.results.stepping = false;
         }
 
         // Top Menu & Ribbon
@@ -5081,6 +5130,7 @@ impl SapGuiApp {
         });
 
         self.render_modals(ctx);
+        self.render_result_forms(ctx);
         self.render_set_2d_view(ctx);
     }
 }
@@ -5159,32 +5209,9 @@ fn concrete_result_color(res: &ConcreteDesignResult) -> Color32 {
     }
 }
 
-fn normalized_contour_color(val: f64, lo: f64, hi: f64, alpha: u8) -> Color32 {
-    if !val.is_finite() || !lo.is_finite() || !hi.is_finite() {
-        return Color32::from_rgba_unmultiplied(90, 110, 140, alpha);
-    }
-    let span = hi - lo;
-    let t = if span.abs() > 1e-15 {
-        ((val - lo) / span).clamp(0.0, 1.0) as f32
-    } else {
-        0.5
-    };
-    let (r, g, b) = if t < 0.25 {
-        let s = t / 0.25;
-        (40.0, 90.0 + 150.0 * s, 245.0)
-    } else if t < 0.50 {
-        let s = (t - 0.25) / 0.25;
-        (40.0 + 40.0 * s, 240.0, 245.0 * (1.0 - s) + 90.0 * s)
-    } else if t < 0.75 {
-        let s = (t - 0.50) / 0.25;
-        (80.0 + 175.0 * s, 240.0 - 20.0 * s, 90.0 * (1.0 - s))
-    } else {
-        let s = (t - 0.75) / 0.25;
-        (255.0, 220.0 * (1.0 - 0.72 * s), 45.0 * (1.0 - s))
-    };
-    Color32::from_rgba_unmultiplied(r as u8, g as u8, b as u8, alpha)
-}
-
+/// The expression the deformed shape used before joint-local results were
+/// rotated to global axes; kept as the reference of the tests.
+#[cfg(test)]
 fn joint_disp_3d(
     cr: &CaseResults,
     pid: &str,
@@ -5193,31 +5220,15 @@ fn joint_disp_3d(
     use_step: bool,
     step_idx: usize,
 ) -> [f64; 3] {
-    let raw = if !cr.modes.is_empty() {
-        cr.modes
-            .get(mode_idx.min(cr.modes.len() - 1))
-            .and_then(|m| m.mode_shape.get(pid))
-            .copied()
-    } else if use_step && !cr.static_steps.is_empty() {
-        cr.static_steps
-            .get(step_idx.min(cr.static_steps.len() - 1))
-            .and_then(|st| st.joint_displacements.get(pid))
-            .copied()
-            .or_else(|| cr.joint_displacements.get(pid).copied())
-    } else if use_step && !cr.time_steps.is_empty() {
-        cr.time_history_disp
-            .get(pid)
-            .and_then(|steps| {
-                if steps.is_empty() {
-                    None
-                } else {
-                    steps.get(step_idx.min(steps.len() - 1)).copied()
-                }
-            })
-            .or_else(|| cr.joint_displacements.get(pid).copied())
-    } else {
-        cr.joint_displacements.get(pid).copied()
-    };
+    let raw = contours::joint_displacement_local(
+        cr,
+        pid,
+        contours::StepSelection {
+            mode_idx,
+            use_step,
+            step_idx,
+        },
+    );
     if let Some(u) = raw {
         let dx = if u[0].is_finite() { u[0] * scale } else { 0.0 };
         let dy = if u[1].is_finite() { u[1] * scale } else { 0.0 };

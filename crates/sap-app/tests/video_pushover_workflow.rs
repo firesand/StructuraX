@@ -984,7 +984,10 @@ fn gravity_chain_equals_the_linear_solution_and_carries_the_weight() {
     // The Ritz case reached its targets, or used all eight vectors.
     let modal = &m.case_results["MODAL"];
     assert!(modal.modes.len() <= 8 && !modal.modes.is_empty());
-    for part in &modal.load_participation {
+    // Only the starting loads carry a target; the table also lists the other
+    // accelerations (UX..RZ), whose participation the Ritz vectors do not aim at.
+    let starting = m.load_cases["MODAL"].loads.len();
+    for part in modal.load_participation.iter().take(starting) {
         let reached = *part.dynamic_cumulative.last().unwrap();
         assert!(
             reached >= 0.95 || modal.modes.len() == 8,

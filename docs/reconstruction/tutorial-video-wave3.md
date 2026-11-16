@@ -302,13 +302,15 @@ synthetic pointer and key input. **Nobody has used them by hand.**
   dialog.
 - Material values the model has no field for (expected strengths, strains);
   lightweight concrete; aluminum and cold-formed materials.
-- A message when a combination drops shell, solid or link results; von Mises
-  and principal values of SRSS and absolute combinations (still combined field
-  by field).
+- A message when a combination drops shell, solid or link results (since
+  shown in the result display); von Mises and principal values of SRSS and
+  absolute combinations (the stored value is still combined field by field;
+  the display refuses it since the fourth wave).
 - Temperature loads on three-joint areas, with joint patterns, and on plane
   and axisymmetric-solid sections.
 - Result display: displacement contours, the choice of shell stress component
-  and face, absolute-acceleration plot functions, animation export.
+  and face, absolute-acceleration plot functions (since done; see
+  [tutorial-video-wave4.md](tutorial-video-wave4.md)), animation export.
 - Reinforcement "to be checked" with a bar layout (the corpus has ACI 318-14
   Example 002 as a reference; it belongs to a design wave).
 - Coupled and automatic hinges, capacity spectrum, partial pushover results,

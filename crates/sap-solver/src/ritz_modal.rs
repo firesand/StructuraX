@@ -57,6 +57,132 @@ pub(crate) fn acceleration_load(
     f
 }
 
+/// Rigid-body acceleration shapes of the six global acceleration loads, in the
+/// solver's joint-local DOF numbering (CSI Analysis Reference Manual, "Modal
+/// Analysis Output", printed pp. 376-378, and "Acceleration Loads", p. 339).
+///
+/// `r[dir]` is the displacement of every DOF under a unit rigid-body motion:
+/// `dir` 0..3 translates along global X, Y, Z (`R[dir][d]` on the translational
+/// DOFs of a joint with local-to-global matrix `R`); `dir` 3..6 rotates about
+/// the axis X, Y, Z through the centre of mass the reference defines: the
+/// lever arms use the centroid of the mass acting in each translational
+/// component (RX: y of UZ, z of UY; RY: z of UX, x of UZ; RZ: y of UX, x of UY).
+/// The printed text of p. 339 gives "z centroid of the UY load" for RZ, which
+/// cannot place a vertical axis; the x centroid of UY is used (project choice).
+#[derive(Debug, Clone)]
+pub(crate) struct RigidBodyShapes {
+    r: [Vec<f64>; 6],
+    /// `r^T M r` per direction: the unrestrained mass or rotational inertia.
+    pub total: [f64; 6],
+    /// True when every joint has exactly identity axes: translational factors
+    /// then use the plain `i % 6` accumulation.
+    identity_axes: bool,
+}
+
+impl RigidBodyShapes {
+    pub(crate) fn new(m: &[f64], joint_rot: &[[[f64; 3]; 3]], coords: &[[f64; 3]]) -> Self {
+        let n = m.len();
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let identity_axes = joint_rot.iter().all(|r| *r == identity);
+        // Mass acting in global component c at joint i: sum_d m_d R[c][d]^2.
+        let comp_mass = |i: usize, c: usize| -> f64 {
+            (0..3)
+                .map(|d| m[6 * i + d] * joint_rot[i][c][d] * joint_rot[i][c][d])
+                .sum()
+        };
+        // Centroid (x, y, z) of the mass acting in component c.
+        let mut centroid = [[0.0f64; 3]; 3];
+        for (c, cen) in centroid.iter_mut().enumerate() {
+            let mut w = 0.0;
+            for (i, xyz) in coords.iter().enumerate() {
+                let mi = comp_mass(i, c);
+                w += mi;
+                for k in 0..3 {
+                    cen[k] += mi * xyz[k];
+                }
+            }
+            if w > 0.0 {
+                for v in cen.iter_mut() {
+                    *v /= w;
+                }
+            }
+        }
+        let mut r: [Vec<f64>; 6] = std::array::from_fn(|_| vec![0.0; n]);
+        for (i, xyz) in coords.iter().enumerate() {
+            let rot = &joint_rot[i];
+            for dir in 0..3 {
+                for d in 0..3 {
+                    r[dir][6 * i + d] = rot[dir][d];
+                }
+            }
+            // Global translation of the point under a unit rotation about
+            // each axis through its own centroids.
+            let [x, y, z] = *xyz;
+            let g: [[f64; 3]; 3] = [
+                [0.0, -(z - centroid[1][2]), y - centroid[2][1]],
+                [z - centroid[0][2], 0.0, -(x - centroid[2][0])],
+                [-(y - centroid[0][1]), x - centroid[1][0], 0.0],
+            ];
+            for a in 0..3 {
+                for d in 0..3 {
+                    // local = R^T global
+                    r[3 + a][6 * i + d] = (0..3).map(|k| rot[k][d] * g[a][k]).sum();
+                    // unit rotation about the global axis, in local components
+                    r[3 + a][6 * i + 3 + d] = rot[a][d];
+                }
+            }
+        }
+        let total = std::array::from_fn(|dir| {
+            if dir < 3 && identity_axes {
+                (0..n).filter(|i| i % 6 == dir).map(|i| m[i]).sum()
+            } else {
+                (0..n).map(|i| m[i] * r[dir][i] * r[dir][i]).sum()
+            }
+        });
+        Self {
+            r,
+            total,
+            identity_axes,
+        }
+    }
+
+    /// The load vector `-M r` of unit acceleration `dir` (sign as the
+    /// time-history code builds it).
+    pub(crate) fn load(&self, m: &[f64], dir: usize) -> Vec<f64> {
+        m.iter().zip(&self.r[dir]).map(|(mi, ri)| -mi * ri).collect()
+    }
+
+    /// Participation factors `phi^T M r` of one mode for the six directions.
+    pub(crate) fn factors(&self, m: &[f64], phi: &[f64]) -> [f64; 6] {
+        let mut pf = [0.0f64; 6];
+        for (dir, out) in pf.iter_mut().enumerate() {
+            if dir < 3 && self.identity_axes {
+                for i in 0..m.len() {
+                    if i % 6 == dir {
+                        *out += m[i] * phi[i];
+                    }
+                }
+            } else {
+                for i in 0..m.len() {
+                    *out += m[i] * self.r[dir][i] * phi[i];
+                }
+            }
+        }
+        pf
+    }
+
+    /// Participating mass ratios `f^2 / total` (zero where the total is zero).
+    pub(crate) fn mass_ratios(&self, pf: &[f64; 6]) -> [f64; 6] {
+        std::array::from_fn(|d| {
+            if self.total[d] > MASS_TOL {
+                pf[d] * pf[d] / self.total[d]
+            } else {
+                0.0
+            }
+        })
+    }
+}
+
 fn has_mass(m: &[f64], is_fixed: &[bool], i: usize) -> bool {
     !is_fixed[i] && m[i] > MASS_TOL
 }
@@ -441,4 +567,101 @@ pub(crate) fn load_participation(
 pub(crate) fn uses_starting_loads(lc: &LoadCase) -> bool {
     lc.modal_sub_type == ModalSubType::Ritz
         && (!lc.loads.is_empty() || !lc.ritz_controls.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const I3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+
+    fn weighted_dot(m: &[f64], a: &[f64], b: &[f64]) -> f64 {
+        (0..m.len()).map(|i| m[i] * a[i] * b[i]).sum()
+    }
+
+    /// Three joints at arbitrary positions with isotropic translational
+    /// masses 2, 5, 3 and some rotational mass.
+    fn scattered() -> (Vec<f64>, Vec<[f64; 3]>) {
+        let coords = vec![[1.0, 2.0, 0.5], [4.0, -1.0, 3.0], [-2.0, 3.5, 1.5]];
+        let masses = [2.0, 5.0, 3.0];
+        let mut m = Vec::new();
+        for (i, mass) in masses.iter().enumerate() {
+            m.extend([*mass, *mass, *mass, 1.0 + i as f64, 2.0, 0.5]);
+        }
+        (m, coords)
+    }
+
+    /// R4: with isotropic masses the rotation about the centre of mass is
+    /// M-orthogonal to every translation (this is why the manual reports the
+    /// rotational factors about the centre of mass, p. 339):
+    /// r_RZ^T M r_UX = -sum m (y - y_c) = 0, r_RZ^T M r_UY = sum m (x - x_c)
+    /// = 0, and likewise for RX with UY, UZ and RY with UX, UZ. The rotational
+    /// inertia is the sum of m (distance to the axis through the centroid)^2
+    /// plus the rotational DOF mass.
+    #[test]
+    fn rotations_about_the_centre_of_mass_are_orthogonal_to_translations() {
+        let (m, coords) = scattered();
+        let rot = vec![I3; 3];
+        let shapes = RigidBodyShapes::new(&m, &rot, &coords);
+        for (rotation, translations) in [(3, [1, 2]), (4, [0, 2]), (5, [0, 1])] {
+            for t in translations {
+                let dot = weighted_dot(&m, &shapes.r[rotation], &shapes.r[t]);
+                assert!(dot.abs() < 1e-12, "r{rotation}.M.r{t} = {dot}");
+            }
+        }
+        assert_eq!(shapes.total[0], 10.0);
+        let xc = (2.0 * 1.0 + 5.0 * 4.0 - 3.0 * 2.0) / 10.0;
+        let yc = (2.0 * 2.0 - 5.0 + 3.0 * 3.5) / 10.0;
+        let zc = (2.0 * 0.5 + 5.0 * 3.0 + 3.0 * 1.5) / 10.0;
+        // Rotational DOF masses: Jx = 1 + 2 + 3, Jz = 0.5 * 3.
+        let mut jz = 1.5;
+        let mut jx = 6.0;
+        for (i, c) in coords.iter().enumerate() {
+            let mass = [2.0, 5.0, 3.0][i];
+            jz += mass * ((c[0] - xc).powi(2) + (c[1] - yc).powi(2));
+            jx += mass * ((c[1] - yc).powi(2) + (c[2] - zc).powi(2));
+        }
+        assert!((shapes.total[5] - jz).abs() < 1e-12, "{} {jz}", shapes.total[5]);
+        assert!((shapes.total[3] - jx).abs() < 1e-12, "{} {jx}", shapes.total[3]);
+    }
+
+    /// The documented exception: a joint turned about Z with different masses
+    /// along its local axes has a global mass matrix with an X-Y coupling
+    /// term, so the translations are not orthogonal to each other any more
+    /// and the centroid rule cannot make the rotation about Z independent.
+    /// With R[0] = (c, -s), R[1] = (s, c) and local masses 1 and 4:
+    /// r_UX^T M r_UY = 1 c s + 4 (-s) c = -3 c s.
+    #[test]
+    fn anisotropic_rotated_masses_leave_a_coupling_term() {
+        let (c, s) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+        let rot = vec![[[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]];
+        let coords = vec![[2.0, 1.0, 0.0]];
+        let m = vec![1.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+        let shapes = RigidBodyShapes::new(&m, &rot, &coords);
+        let coupling = weighted_dot(&m, &shapes.r[0], &shapes.r[1]);
+        assert!((coupling + 3.0 * c * s).abs() < 1e-12, "{coupling}");
+        assert!(coupling.abs() > 1.0);
+    }
+
+    /// A model with a rotated joint does not take the identity fast path; one
+    /// with exact identity axes does, and then the translational factor is
+    /// the plain `i % 6` sum, bit for bit.
+    #[test]
+    fn identity_axes_take_the_plain_accumulation() {
+        let (m, coords) = scattered();
+        let shapes = RigidBodyShapes::new(&m, &vec![I3; 3], &coords);
+        assert!(shapes.identity_axes);
+        let phi: Vec<f64> = (0..m.len()).map(|i| 0.1 * i as f64 - 0.7).collect();
+        let pf = shapes.factors(&m, &phi);
+        let mut want = 0.0;
+        for i in 0..m.len() {
+            if i % 6 == 1 {
+                want += m[i] * phi[i];
+            }
+        }
+        assert_eq!(pf[1].to_bits(), want.to_bits());
+        let mut rot = vec![I3; 3];
+        rot[1] = [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        assert!(!RigidBodyShapes::new(&m, &rot, &coords).identity_axes);
+    }
 }

@@ -21,6 +21,12 @@ pub struct RitzLoadControl {
 /// pattern, with the global direction index each one stands for.
 pub const ACCELERATION_LOADS: [(&str, usize); 3] = [("UX", 0), ("UY", 1), ("UZ", 2)];
 
+/// The names of the unit rotational accelerations about the global axes, with
+/// the global rotation index each one stands for. They are items of the modal
+/// load-participation results (CSI Analysis Reference Manual, p. 378) but not
+/// Ritz starting loads.
+pub const ROTATIONAL_ACCELERATION_LOADS: [(&str, usize); 3] = [("RX", 3), ("RY", 4), ("RZ", 5)];
+
 /// Direction index (0, 1, 2) when `name` is `UX`, `UY` or `UZ` (any case) or
 /// the imported spelling `U1`, `U2`, `U3` (the SDB importer stores a Ritz
 /// case's acceleration starting loads under those names); otherwise `None`.
@@ -45,7 +51,7 @@ pub fn acceleration_direction(name: &str) -> Option<usize> {
 /// degrees of freedom as the reference describes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoadParticipation {
-    /// Load pattern name, or `UX`, `UY`, `UZ`.
+    /// Load pattern name, or `UX`, `UY`, `UZ`, `RX`, `RY`, `RZ`.
     pub load_name: String,
     /// True for a unit ground acceleration, false for a load pattern.
     pub is_acceleration: bool,

@@ -116,7 +116,11 @@ impl ViewTransform {
                 let (sp, cp) = self.pitch.sin_cos();
                 let x1 = dx * cyaw - dy * syaw;
                 let y1 = dx * syaw + dy * cyaw;
-                let z2 = dz * cp - y1 * sp;
+                // Screen up is `z cos(pitch) + y1 sin(pitch)`: a positive pitch
+                // looks down on the model, and at 90 degrees with zero yaw the
+                // picture is the plan view (x right, y up). The eye is then at
+                // `right x up = (-sin yaw cos pitch, -cos yaw cos pitch, sin pitch)`.
+                let z2 = dz * cp + y1 * sp;
                 (x1, -z2)
             }
             ViewProjection::ElevationXZ => (dx, -dz),
@@ -414,6 +418,61 @@ impl PlaneAxis {
 mod tests {
     use super::*;
     use sap_units::Units;
+
+    fn view_3d(yaw: f32, pitch: f32) -> ViewTransform {
+        ViewTransform {
+            proj: ViewProjection::Perspective3D,
+            center: [0.0; 3],
+            scale: 100.0,
+            screen_center: Pos2::new(400.0, 300.0),
+            yaw,
+            pitch,
+        }
+    }
+
+    #[test]
+    fn the_3d_view_is_right_handed_and_looks_down_at_a_positive_pitch() {
+        // Looking straight down with zero yaw is the plan view: x to the
+        // right, y up the screen (screen y grows downward).
+        let top = view_3d(0.0, std::f32::consts::FRAC_PI_2);
+        let plan = ViewTransform {
+            proj: ViewProjection::PlanXY,
+            ..top
+        };
+        for p in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.3, -0.7, 0.0]] {
+            let (a, b) = (top.project(p), plan.project(p));
+            assert!((a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3, "{p:?}: {a:?} {b:?}");
+        }
+        // Screen right and up as model vectors; right x up points at the eye.
+        // At the default yaw and pitch the eye is above the model (z > 0), and
+        // a point farther from the eye along the ground is higher on screen.
+        for (yaw, pitch) in [(-0.65f32, 0.42f32), (0.0, 0.42), (1.1, 0.9), (2.5, 0.1)] {
+            let v = view_3d(yaw, pitch);
+            let o = v.project([0.0; 3]);
+            let axis = |p: [f64; 3]| {
+                let s = v.project(p);
+                // (right, up) components on screen of a unit model vector
+                [f64::from(s.x - o.x) / 100.0, f64::from(o.y - s.y) / 100.0]
+            };
+            let (ex, ey, ez) = (axis([1.0, 0.0, 0.0]), axis([0.0, 1.0, 0.0]), axis([0.0, 0.0, 1.0]));
+            let right = [ex[0], ey[0], ez[0]];
+            let up = [ex[1], ey[1], ez[1]];
+            let eye = [
+                right[1] * up[2] - right[2] * up[1],
+                right[2] * up[0] - right[0] * up[2],
+                right[0] * up[1] - right[1] * up[0],
+            ];
+            let (sy, cy) = f64::from(yaw).sin_cos();
+            let (sp, cp) = f64::from(pitch).sin_cos();
+            let want = [-sy * cp, -cy * cp, sp];
+            for k in 0..3 {
+                assert!((eye[k] - want[k]).abs() < 1e-5, "yaw {yaw} pitch {pitch}: {eye:?} {want:?}");
+            }
+            assert!(eye[2] > 0.0, "a positive pitch looks from above");
+            // +Z is up the screen.
+            assert!(ez[1] > 0.0);
+        }
+    }
 
     #[test]
     fn bounds_include_grid_lines_and_fall_back_per_axis() {

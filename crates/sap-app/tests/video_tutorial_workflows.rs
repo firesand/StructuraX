@@ -299,7 +299,10 @@ fn six_storey_steel_building_from_grid_to_auto_select_design() {
     let modal = &m.case_results["MODAL"];
     assert!(!modal.modes.is_empty() && modal.modes.len() <= 12);
     assert!(modal.modes.windows(2).all(|w| w[0].period_sec >= w[1].period_sec));
-    for part in &modal.load_participation {
+    // Only the starting loads carry a target; the table also lists the other
+    // accelerations (UX..RZ), whose participation the Ritz vectors do not aim at.
+    let starting = m.load_cases["MODAL"].loads.len();
+    for part in modal.load_participation.iter().take(starting) {
         let reached = *part.dynamic_cumulative.last().unwrap();
         assert!(reached <= 1.0 + 1e-9);
         assert!(reached >= 0.99 || modal.modes.len() == 12, "{}: {reached}", part.load_name);

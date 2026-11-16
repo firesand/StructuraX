@@ -1,7 +1,7 @@
 {
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
-  "snapshot_date": "2026-11-16",
+  "snapshot_date": "2026-11-17",
   "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md). 2026-11-15: first wave of tutorial-video features (docs/reconstruction/tutorial-video-wave1.md): profile LDLT and subspace eigen solver, mass source, ASCE 7-10 automatic seismic load with entered coefficients, Ritz loads and load participation, modal time history, functions from file, Auto Select design and default design combinations, grid/quick-draw/radial geometry commands. Pushover, AISC 360-16 and ASCE 7-16 remain absent. 2026-11-16: second wave of tutorial-video features (docs/reconstruction/tutorial-video-wave2.md): user-defined uncoupled frame hinges in nonlinear static cases checked against CSI Example 1-026, saved states, Accel and Mode loads, pushover curve and hinge-state display, native import of the Example 1-026 hinge records, S2K persistence. Coupled, fiber and automatic hinges remain refused.",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
@@ -870,18 +870,81 @@
           "note": "Opt-in CSI Example 2-015: sign of the edge moment and of the top stress."
         }
       ],
-      "limits": "Top stresses, thermal resultants and combination von Mises values differ from versions before 2026-11-16. Temperature loads on three-joint areas, with joint patterns, and on sections without the stiffness they act on (plane and axisymmetric-solid sections included) are refused. Von Mises and principal values of SRSS and absolute combinations are still combined field by field. A combination that drops shell, solid or link results gives no message. Example 2-014 is matched to the independent solution within 4 % on the vendor's coarse mesh and 1 % on its fine mesh, not to the vendor's element."
+      "limits": "Top stresses, thermal resultants and combination von Mises values differ from versions before 2026-11-16. Temperature loads on three-joint areas, with joint patterns, and on sections without the stiffness they act on (plane and axisymmetric-solid sections included) are refused. The stored top-face von Mises value of an SRSS, absolute, envelope or range combination is still combined field by field; since 2026-11-17 the display refuses it and names the cases behind a combination without shell results. Example 2-014 is matched to the independent solution within 4 % on the vendor's coarse mesh and 1 % on its fine mesh, not to the vendor's element."
+    },
+    {
+      "id": "result-display-shells-contours-plots-modal-tables",
+      "area": "application",
+      "feature": "Result forms: shell resultants and stresses (the vendor form's 14 resultants and 9 stresses; top, bottom or visible face, maximum, minimum, absolute maximum) in display units with a banded legend; deformed shape with displacement contours on areas, right-click joint read-out and animation through result steps; plot functions with absolute acceleration, several traces, a horizontal function, time range, extremes and named sets; the vendor's modal participating mass ratio and modal load participation ratio tables.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-app/src/gui/shell_output.rs",
+          "lines": "1-558",
+          "note": "Shell quantities derived from stored resultants; single-valued rule; refusals. Tests in shell_output/tests.rs include opt-in CSI Example 2-010 (hoop stress, printed and closed form)."
+        },
+        {
+          "file": "crates/sap-app/src/gui/contours.rs",
+          "lines": "1-407",
+          "note": "Joint results to global axes, area-local components, contour range, legend ticks, vertex-coloured meshes, joint read-out. Tests in contours/tests.rs include opt-in CSI Example 2-010 displacements."
+        },
+        {
+          "file": "crates/sap-app/src/gui/result_display.rs",
+          "lines": "1-1119",
+          "note": "The two forms, value tables, legend, visible-face direction, step animation; headless tests in result_display/tests.rs."
+        },
+        {
+          "file": "crates/sap-app/src/gui/time_history.rs",
+          "lines": "160-760",
+          "note": "Plot quantities, absolute acceleration, named functions, sets, extremes; closed-form tests (damped single mass)."
+        },
+        {
+          "file": "crates/sap-solver/tests/ground_acceleration.rs",
+          "lines": "1-372",
+          "note": "Ground acceleration trace; absolute acceleration against closed forms and M·a + K·u = 0."
+        },
+        {
+          "file": "crates/sap-app/src/gui/modal_tables.rs",
+          "lines": "29-330",
+          "note": "Rows, cells, totals and Ritz target lines of the two vendor tables."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_results_e2e.rs",
+          "lines": "1-20",
+          "note": "End-to-end through the application: cylinder closed form, strip, the video's tower, the third part's frames, opt-in CSI Examples 2-010 and 1-022 (files under video_results_e2e/)."
+        }
+      ],
+      "limits": "Shell values are element-centre values: no Gauss-point extrapolation, no averaging at joints, one flat colour per area. Derived shell values (principal, von Mises, bottom face, face extremes) are refused for multi-valued results, and quantities a plate, membrane or plane-stress section lacks, and all quantities of plane-strain and axisymmetric-solid sections, are refused; some of these were shown before 2026-11-17. The solver recovers the forces of plane-strain areas with the plane-stress relation (found, not changed). Velocity, reaction, base and energy plot functions are not recorded; absolute acceleration only for modal time histories; plot sets are not saved with the model. No image or video export. Display units belong to a form; a units change of the model still needs it unlocked. Windows tested through command functions and headless renders, not by hand."
+    },
+    {
+      "id": "modal-participation-global-and-rotational",
+      "area": "solver",
+      "feature": "Modal participation factors and participating mass ratios in global directions for joints with local axes, rotational ratios (RX, RY, RZ) about the centre of mass, and load participation items for the case's starting loads and the six unit accelerations.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/ritz_modal.rs",
+          "lines": "60-185",
+          "note": "Rigid-body acceleration shapes, factors and ratios (CSI Analysis Reference pp. 339, 376-378)."
+        },
+        {
+          "file": "crates/sap-solver/tests/modal_participation_global.rs",
+          "lines": "1-426",
+          "note": "Rotated joint at five angles, bitwise equality without joint axes, two offset masses, completeness over all modes, load participation identities."
+        }
+      ],
+      "limits": "RX, RY, RZ ratios differ from versions before 2026-11-17 for every model; UX, UY, UZ ratios and response-spectrum results differ for models with joint local axes. The manual's printed centroid for RZ is read as a misprint (x centroid of the UY load used). Masses that differ by direction on a rotated joint couple the global X and Y masses; the vendor's treatment is unknown. No printed vendor table of rotational ratios was available as a reference."
     },
     {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "92 live reference checks plus 965 automated tests across 77 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
+      "feature": "94 live reference checks plus 1102 automated tests across 79 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/benchmarks.rs",
           "lines": "55-90",
-          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks). A cantilever shell strip (top-face stress and moment sign) added 2026-11-16 (92 checks)."
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks). A cantilever shell strip (top-face stress and moment sign) added 2026-11-16 (92 checks). Modal participation of two offset masses (RZ) and of a mass on a rotated joint (UX) added 2026-11-17 (94 checks)."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",

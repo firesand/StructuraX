@@ -74,6 +74,7 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_example_7_002());
     rows.extend(verify_example_7_003());
     rows.extend(verify_shell_cantilever_strip());
+    rows.extend(verify_modal_participation_global());
     rows
 }
 
@@ -2479,6 +2480,68 @@ pub fn verify_shell_cantilever_strip() -> Vec<BenchmarkVerificationRow> {
             "M11 [kN-m/m]",
             -10.0,
             area.m11,
+            1e-6,
+        ),
+    ]
+}
+
+/// Modal participating mass ratios about the centre of mass and along rotated joint axes
+/// (CSI Analysis Reference Manual, "Acceleration Loads" p. 339 and "Modal Analysis Output"
+/// pp. 376-378). Closed forms:
+///
+/// - Two offset masses: A at x = -2 (m = 1) and B at x = +2 (m = 3), only UY free, ky = 1 and
+///   12, so w^2 = 1 and 4. The UY centroid is x = 1, M_rz = 1*9 + 3*1 = 12; mode 1 moves A only
+///   (f_rz = -3) so the RZ ratio is 9/12 = 0.75.
+/// - A joint with local axes turned 30 degrees about Z, mass 2, global springs kx = 50 and
+///   ky = 200: mode 1 (w^2 = 25) moves along global X only, so its UX ratio is 1.
+pub fn verify_modal_participation_global() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::{LoadCase, SapModel};
+    let setup = |m: &mut SapModel| {
+        m.load_patterns.clear();
+        m.load_cases.clear();
+        m.load_cases
+            .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 2));
+    };
+    let mut offset = SapModel::new(Units::KipInF);
+    setup(&mut offset);
+    for (name, x, mass, k) in [("A", -2.0, 1.0, 1.0), ("B", 2.0, 3.0, 12.0)] {
+        offset.add_point(name, x, 0.0, 0.0);
+        let p = offset.points.get_mut(name).unwrap();
+        p.restraint = [true, false, true, true, true, true];
+        p.mass = [mass, mass, mass, 0.0, 0.0, 0.0];
+        p.spring = [0.0, k, 0.0, 0.0, 0.0, 0.0];
+    }
+    analyze_model(&mut offset).expect("modal participation: offset masses failed");
+    let rz = offset.case_results["MODAL"].modes[0].modal_mass_ratios[5];
+
+    let mut turned = SapModel::new(Units::KipInF);
+    setup(&mut turned);
+    turned.add_point("C", 0.0, 0.0, 0.0);
+    {
+        let c = turned.points.get_mut("C").unwrap();
+        c.restraint = [false, false, true, true, true, true];
+        c.mass = [2.0, 2.0, 2.0, 0.0, 0.0, 0.0];
+        c.spring = [50.0, 200.0, 0.0, 0.0, 0.0, 0.0];
+        c.spring_is_local = false;
+        c.local_axes_deg = [30.0, 0.0, 0.0];
+    }
+    analyze_model(&mut turned).expect("modal participation: rotated joint failed");
+    let ux = turned.case_results["MODAL"].modes[0].modal_mass_ratios[0];
+    vec![
+        BenchmarkVerificationRow::new(
+            "Modal participation",
+            "Two offset masses",
+            "RZ participating mass ratio, mode 1",
+            0.75,
+            rz,
+            1e-6,
+        ),
+        BenchmarkVerificationRow::new(
+            "Modal participation",
+            "Joint axes turned 30 degrees",
+            "UX participating mass ratio, mode 1",
+            1.0,
+            ux,
             1e-6,
         ),
     ]
