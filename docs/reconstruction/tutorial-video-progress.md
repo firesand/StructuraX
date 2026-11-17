@@ -42,11 +42,11 @@ established") stands. No number shown in the video is used as a reference.
 | 2 | 2026-11-16 | `6b33019` | frame hinges and static pushover | 803 | 825 | 90/90 |
 | 3 | 2026-11-16 | `7ee7d44` | drawing and editing on plane views and the grid; material library; shell output repairs | 965 | 990 | 92/92 |
 | 4 | 2026-11-17 | `0dfc0ba` | result display: shell stresses, displacement contours, plot functions, modal tables; participation and 3D view repairs | 1102 | 1127 | 94/94 |
-| 5 | 2026-11-17 | not committed | repairs: rigid zones, released ends, loads, non-prismatic sections, geometric stiffness and output stations of frames with end offsets, constraints at rotated joints, the unstable joint named, orthotropic and plane-strain areas, material angle, combinations as maximum and minimum, design by states and permutations, modal histories from native files, the Ritz projection, window defects found by review, by looking and by a hand check on a private display; video export, load read-out, seismic eccentricity, Grid Only, unequal flanges | 1348 | 1383 | 106/106 |
+| 5 | 2026-11-17 | `1a7d2e8` | repairs: rigid zones, released ends, loads, non-prismatic sections, geometric stiffness and output stations of frames with end offsets, constraints at rotated joints, the unstable joint named, orthotropic and plane-strain areas, material angle, combinations as maximum and minimum, design by states and permutations, modal histories from native files, the Ritz projection, window defects found by review, by looking and by a hand check on a private display; video export, load read-out, seismic eccentricity, Grid Only, unequal flanges | 1348 | 1383 | 106/106 |
 
 ## The video's 63 feature rows
 
-Status after the fifth wave (not committed). "Ledger" names the item that
+Status after the fifth wave (`1a7d2e8`). "Ledger" names the item that
 holds the missing part. A row the fifth wave moved names the tests that
 prove it; the tests are in `crates/sap-app/src/gui/` unless a crate is
 named. The second test group of such a row, in `video_wave5_e2e/`, is the
@@ -238,7 +238,7 @@ have no wave yet.
 | Wave | Theme | Ledger items | Video rows done / partial / open afterwards |
 | --- | --- | --- | --- |
 | 4 (done) | result display | | 53 / 8 / 2 |
-| 5 (not committed) | repairs of the defects with evidence in hand, of what two reviews found and of what the hand check found; video export, load read-out, eccentricity, Grid Only | done: D01, D02, D04, D05, D07, D10 to D12, D15, D16, D18 to D24, D26 to D28, D31 to D42, D45 to D49, D51 to D56; G07, G08, G24, G36. Partial: D03 (rest is D03b), D06, D09 (rest is D09b), D17. Found and left open: D43, D44, D50, D57, D58, D59 | 55 / 7 / 1 |
+| 5 (`1a7d2e8`) | repairs of the defects with evidence in hand, of what two reviews found and of what the hand check found; video export, load read-out, eccentricity, Grid Only | done: D01, D02, D04, D05, D07, D10 to D12, D15, D16, D18 to D24, D26 to D28, D31 to D42, D45 to D49, D51 to D56; G07, G08, G24, G36. Partial: D03 (rest is D03b), D06, D09 (rest is D09b), D17. Found and left open: D43, D44, D50, D57, D58, D59 | 55 / 7 / 1 |
 | 6 | global system: exact constraints by internal master joints, sparse storage; then the detection of mechanisms and the Ritz projection on stiff models | D03b, D08, D50, G34 | 55 / 7 / 1 |
 | 7 | area and solid elements and their output: joint stresses and averaging, shell results per mode and of response-spectrum cases, incompatible modes, axisymmetric solid, temperature and pressure variants, plane display, the orthotropic solid; the open points of frames with end offsets | D43, D44, D57, D60, D61, D62, D65, G01, G02, G33, G37, G38, G42, G43 | 55 / 7 / 1 |
 | 8 | time histories: envelopes, velocity and reaction plots, plot sets in the model, modal damping types, periodic and nonlinear modal histories | D25, D29, G03, G04, G05, G39, G40, G41 (and with it the remainder of D06) | 55 / 7 / 1 |
