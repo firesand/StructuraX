@@ -432,6 +432,35 @@ fn three_horizontal_restraints_hold_the_cylinder() {
     // Whether the solver reports the plan's mechanism as singular depends on
     // roundoff (it does at this wall thickness and not at a bending thickness of
     // 0.5 or 0.8), so nothing is asserted about that model.
+    //
+    // What is asserted is the closed form. A rigid motion of the horizontal plane
+    // is (a, b, w): u = (a - w y, b + w x). A restrained direction d at (x, y)
+    // gives the row [dx, dy, -dx y + dy x] of a 3 x 3 system. The vertical
+    // restraints of the bottom ring leave no other rigid motion.
+    let rows = |m: &SapModel| -> Vec<[f64; 3]> {
+        let mut rows = Vec::new();
+        for p in m.points.values() {
+            for (dof, d) in [(0, [1.0, 0.0]), (1, [0.0, 1.0])] {
+                if p.restraint[dof] {
+                    rows.push([d[0], d[1], -d[0] * p.y + d[1] * p.x]);
+                }
+            }
+        }
+        rows
+    };
+    let det = |r: &[[f64; 3]]| {
+        r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+            - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+            + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0])
+    };
     let mut m = cylinder(8);
+    let three = rows(&m);
+    assert_eq!(three.len(), 3, "the three horizontal restraints of the plan");
+    // UY at (R, 0), UX at (0, R), UY at (-R, 0): the determinant is 2 R.
+    close("determinant of the rigid-motion system", det(&three), 2.0 * RADIUS, 1e-9);
     sap_solver::analyze_model(&mut m).expect("three horizontal restraints solve");
+    // Without the third (the plan's two) the system has two rows for three
+    // unknowns: the rotation about (R, R) is free.
+    let two = rows(&cylinder_with(8, true));
+    assert_eq!(two.len(), 2);
 }

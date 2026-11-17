@@ -37,6 +37,11 @@ pub(super) struct State {
     /// the window state when another model is loaded (`gui.rs` replaces the
     /// whole `State` there), so nothing here outlives its model.
     plots: PlotWindow,
+    /// Counter of the application's results (every analysis, unlock and model
+    /// replacement increments it); `gui.rs` sets it each frame. A cached trace
+    /// is valid for one value of it (D10).
+    pub(super) revision: u64,
+    cache: TraceCache,
 }
 
 impl Default for State {
@@ -59,8 +64,100 @@ impl Default for State {
             component: 0,
             quantity: Quantity::Displacement,
             plots: PlotWindow::default(),
+            revision: 0,
+            cache: TraceCache::default(),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cache of the traces (D10)
+// ---------------------------------------------------------------------------
+
+/// What a single-response trace is built from.
+#[derive(Clone, Debug, PartialEq)]
+struct SeriesKey {
+    revision: u64,
+    stamp: u64,
+    case: String,
+    joint: String,
+    component: usize,
+    quantity: Quantity,
+}
+
+/// What the plot of the named functions is built from: the results' revision
+/// and the plot setup.
+#[derive(Clone, Debug, PartialEq)]
+struct PlotKey {
+    revision: u64,
+    stamp: u64,
+    setup: Result<PlotSetup, String>,
+}
+
+/// The last single trace and the last plot, each with the key it was built for.
+/// A frame with an equal key reads the stored value; nothing is rebuilt while
+/// the window is only redrawn.
+#[derive(Default)]
+struct TraceCache {
+    series: Option<(SeriesKey, Result<Vec<(f64, f64)>, String>)>,
+    plot: Option<(PlotKey, Result<Vec<Curve>, String>)>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Number of traces and plots built in this thread (tests only).
+    static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn count_build() {
+    BUILDS.with(|b| b.set(b.get() + 1));
+}
+#[cfg(not(test))]
+fn count_build() {}
+
+/// A fingerprint of what the plots read from the results, as a safeguard for a
+/// change of results that did not go through the application's counter (a
+/// panel that ran its own analysis): the units, the history cases' step times
+/// and, per joint, the length and three samples of each trace; the history
+/// loads and the functions they name. Cheap: it does not touch every value.
+fn results_stamp(model: &SapModel) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let bits = |v: f64| v.to_bits();
+    model.present_units.hash(&mut h);
+    model.is_locked.hash(&mut h);
+    model.case_results.len().hash(&mut h);
+    for (name, cr) in &model.case_results {
+        name.hash(&mut h);
+        cr.time_steps.len().hash(&mut h);
+        cr.time_steps.first().map(|v| bits(*v)).hash(&mut h);
+        cr.time_steps.last().map(|v| bits(*v)).hash(&mut h);
+        for (joint, trace) in cr.time_history_disp.iter().chain(cr.time_history_accel.iter()) {
+            joint.hash(&mut h);
+            trace.len().hash(&mut h);
+            for k in [0, trace.len() / 2, trace.len().saturating_sub(1)] {
+                trace.get(k).map(|v| v.map(bits)).hash(&mut h);
+            }
+        }
+    }
+    for (name, case) in &model.load_cases {
+        if case.history_loads.is_empty() {
+            continue;
+        }
+        name.hash(&mut h);
+        bits(case.time_step_dt).hash(&mut h);
+        for (f, t, sf) in &case.history_loads {
+            (f, t, bits(*sf)).hash(&mut h);
+        }
+    }
+    for (name, f) in &model.functions {
+        name.hash(&mut h);
+        f.points.len().hash(&mut h);
+        f.points.first().map(|p| (bits(p.0), bits(p.1))).hash(&mut h);
+        f.points.last().map(|p| (bits(p.0), bits(p.1))).hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Response quantity of a time-history case, as the vendor's form lists them.
@@ -398,30 +495,6 @@ fn is_acceleration_target(target: &str) -> bool {
     )
 }
 
-/// Time function value as the solvers read it: zero before the first point,
-/// held at the last value after the last point, linear between, the later
-/// value at a jump; times within `tol` of a point count as that point.
-fn load_function_value(points: &[(f64, f64)], t: f64, tol: f64) -> f64 {
-    let Some(&(t0, _)) = points.first() else {
-        return 0.0;
-    };
-    let (tn, yn) = points[points.len() - 1];
-    if t < t0 - tol {
-        return 0.0;
-    }
-    if t >= tn - tol {
-        return yn;
-    }
-    for w in points.windows(2) {
-        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-        if t < x1 - tol {
-            let s = t.clamp(x0, x1);
-            return y0 + (y1 - y0) * (s - x0) / (x1 - x0);
-        }
-    }
-    yn
-}
-
 /// `(time, value)` of a plot function in model units.
 fn function_series(model: &SapModel, f: &PlotFunction) -> Result<Vec<(f64, f64)>, String> {
     match &f.source {
@@ -458,7 +531,7 @@ fn function_series(model: &SapModel, f: &PlotFunction) -> Result<Vec<(f64, f64)>
             Ok(results
                 .time_steps
                 .iter()
-                .map(|&t| (t, sf * load_function_value(&points.points, t, tol)))
+                .map(|&t| (t, sf * sap_solver::time_function_value(&points.points, t, tol)))
                 .collect())
         }
     }
@@ -643,6 +716,19 @@ fn legend_text(curve: &Curve) -> String {
         format_value(curve.min.value),
         format_value(curve.min.time),
         curve.unit
+    )
+}
+
+/// The line under a function read from a file: the number of points, the
+/// duration and the largest absolute value, with the digits of `number_text`
+/// (a duration of 1999 steps of 0.02 s is `39.980000000000004` as a float).
+pub(super) fn loaded_summary(points: &[(f64, f64)]) -> String {
+    let duration = points.last().map_or(0.0, |p| p.0) - points.first().map_or(0.0, |p| p.0);
+    format!(
+        "{} points, duration {} s, largest |value| {}",
+        points.len(),
+        super::view::number_text(duration),
+        super::view::number_text(peak_of(points).map_or(0.0, |p| p.1.abs()))
     )
 }
 
@@ -942,12 +1028,7 @@ fn function_tab(
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
         Some(Ok(points)) => {
-            let duration = points.last().map_or(0.0, |p| p.0) - points.first().map_or(0.0, |p| p.0);
-            ui.label(format!(
-                "{} points, duration {duration} s, largest |value| {}",
-                points.len(),
-                peak_of(points).map_or(0.0, |p| p.1.abs())
-            ));
+            ui.label(loaded_summary(points));
             draw_curve(ui, points);
             if ui.button("Add as function").clicked() {
                 outcome = Some(add_function(model, &state.name, points));
@@ -958,7 +1039,7 @@ fn function_tab(
     outcome
 }
 
-fn plot_tab(ui: &mut egui::Ui, state: &mut State, model: &SapModel) {
+fn plot_tab(ui: &mut egui::Ui, state: &mut State, model: &SapModel, stamp: u64) {
     let cases = history_cases(model);
     if cases.is_empty() {
         ui.label("Run an analysis with a time-history case first.");
@@ -1014,34 +1095,43 @@ fn plot_tab(ui: &mut egui::Ui, state: &mut State, model: &SapModel) {
             state.joint = first.clone();
         }
     }
-    match history_series(
-        model,
-        &state.case,
-        &state.joint,
-        state.component,
-        state.quantity,
-    ) {
-        Err(error) => {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
-        }
-        Ok(series) => {
-            if let Some((t, value)) = peak_of(&series) {
-                ui.label(format!(
-                    "Maximum absolute value {} at t = {t} s.",
-                    value.abs()
-                ));
+    let key = SeriesKey {
+        revision: state.revision,
+        stamp,
+        case: state.case.clone(),
+        joint: state.joint.clone(),
+        component: state.component,
+        quantity: state.quantity,
+    };
+    if state.cache.series.as_ref().is_none_or(|(k, _)| *k != key) {
+        count_build();
+        let built = history_series(model, &key.case, &key.joint, key.component, key.quantity);
+        state.cache.series = Some((key, built));
+    }
+    if let Some((_, trace)) = &state.cache.series {
+        match trace {
+            Err(error) => {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
             }
-            draw_curve(ui, &series);
+            Ok(series) => {
+                if let Some((t, value)) = peak_of(series) {
+                    ui.label(format!(
+                        "Maximum absolute value {} at t = {t} s.",
+                        value.abs()
+                    ));
+                }
+                draw_curve(ui, series);
+            }
         }
     }
     ui.separator();
-    plot_functions_section(ui, state, model);
+    plot_functions_section(ui, state, model, stamp);
 }
 
 /// Named plot functions, several traces, a horizontal function, a time
 /// range, display units, the legend with extremes, and named sets. All
 /// numbers come from [`build_plot`] and [`legend_text`].
-fn plot_functions_section(ui: &mut egui::Ui, state: &mut State, model: &SapModel) {
+fn plot_functions_section(ui: &mut egui::Ui, state: &mut State, model: &SapModel, stamp: u64) {
     ui.heading("Named plot functions");
     ui.label("Add functions from the selection above (joint, quantity, component) or from a load of the case, tick the vertical ones, and optionally pick a horizontal function of the same case instead of time.");
     // Actions are collected and applied after the widgets are drawn.
@@ -1125,18 +1215,28 @@ fn plot_functions_section(ui: &mut egui::Ui, state: &mut State, model: &SapModel
                 }
             });
     });
-    match current_setup(w).and_then(|setup| build_plot(model, &setup)) {
-        Err(error) => {
+    // The plot is rebuilt only when the results (counter and fingerprint) or the
+    // setup changed since the last frame (D10).
+    let setup = current_setup(w);
+    let key = PlotKey { revision: state.revision, stamp, setup };
+    if state.cache.plot.as_ref().is_none_or(|(k, _)| *k != key) {
+        count_build();
+        let built = key.setup.clone().and_then(|setup| build_plot(model, &setup));
+        state.cache.plot = Some((key, built));
+    }
+    match state.cache.plot.as_ref().map(|(_, plot)| plot) {
+        None => {}
+        Some(Err(error)) => {
             ui.colored_label(egui::Color32::LIGHT_RED, error);
         }
-        Ok(curves) => {
-            for curve in &curves {
+        Some(Ok(curves)) => {
+            for curve in curves {
                 ui.label(legend_text(curve));
             }
             if let Some(first) = curves.first() {
                 ui.label(format!("Horizontal: {}; vertical: {}", first.x_label, first.y_label));
             }
-            draw_curves(ui, &curves);
+            draw_curves(ui, curves);
         }
     }
     ui.horizontal(|ui| {
@@ -1262,7 +1362,8 @@ pub(super) fn render(
             if state.tab == 0 {
                 outcome = function_tab(ui, state, model, files);
             } else {
-                plot_tab(ui, state, model);
+                let stamp = results_stamp(model);
+                plot_tab(ui, state, model, stamp);
             }
         });
     state.open = open;
@@ -1519,6 +1620,47 @@ mod tests {
             .any(|t| t.contains("Maximum absolute value 3 at t = 0.2 s")));
         assert_eq!(state.case, "H");
         assert_eq!(state.joint, "J");
+    }
+
+    /// D10: the traces are built once per (results revision, plot setup).
+    #[test]
+    fn the_plot_traces_are_cached_by_the_results_revision_and_the_setup() {
+        let ctx = egui::Context::default();
+        let mut model = model_with_history(true);
+        let mut state = State::default();
+        state.open = true;
+        state.tab = 1;
+        let mut time = 1.0;
+        let mut run = |state: &mut State, model: &mut SapModel, n: usize| {
+            for _ in 0..n {
+                time += 1.0;
+                let _ = frame(&ctx, time, vec![], state, model);
+            }
+        };
+        run(&mut state, &mut model, 3);
+        let built = BUILDS.with(|b| b.get());
+        // One single trace and one plot of the named functions.
+        assert_eq!(built, 2, "first builds");
+        // The same setup and results, five more frames: nothing is rebuilt.
+        run(&mut state, &mut model, 5);
+        assert_eq!(BUILDS.with(|b| b.get()), built);
+        // A setup change rebuilds the plot only.
+        state.plots.units = Some(Units::NMmC);
+        run(&mut state, &mut model, 3);
+        assert_eq!(BUILDS.with(|b| b.get()), built + 1);
+        // A new analysis (the application's counter) rebuilds both.
+        state.revision += 1;
+        run(&mut state, &mut model, 3);
+        assert_eq!(BUILDS.with(|b| b.get()), built + 3);
+        // A change of results that did not go through the counter is seen by the
+        // fingerprint: both are rebuilt again, and the new peak is shown.
+        model.case_results.get_mut("H").unwrap().time_history_disp.get_mut("J").unwrap()[2][0] = -30.0;
+        model.case_results.get_mut("H").unwrap().time_steps.push(0.4);
+        model.case_results.get_mut("H").unwrap().time_history_disp.get_mut("J").unwrap().push([1.0; 6]);
+        time += 1.0;
+        let out = frame(&ctx, time, vec![], &mut state, &mut model).0;
+        assert_eq!(BUILDS.with(|b| b.get()), built + 5);
+        assert!(texts(&out).iter().any(|t| t.contains("Maximum absolute value 30")));
     }
 
     // -----------------------------------------------------------------
@@ -1968,17 +2110,19 @@ mod tests {
     }
 
     #[test]
-    fn sets_and_functions_are_reset_with_the_window_state() {
-        // gui.rs replaces the whole State when another model is loaded
-        // (`self.panel_time_history = time_history::State::default()`).
-        let mut state = State::default();
-        state.plots.functions.push(response("J", Quantity::Displacement, 0));
-        state.plots.sets.push(NamedSet {
+    fn sets_and_functions_are_reset_when_another_model_is_loaded() {
+        // The application replaces the whole window state in `replace_model`.
+        let mut app = super::super::SapGuiApp::new(Some(std::path::PathBuf::from("/nonexistent/th-reset.s2k")));
+        app.panel_time_history.plots.functions.push(response("J", Quantity::Displacement, 0));
+        app.panel_time_history.plots.sets.push(NamedSet {
             name: "S".into(),
             setup: PlotSetup::default(),
         });
-        state = State::default();
-        assert!(state.plots.functions.is_empty() && state.plots.sets.is_empty());
+        app.panel_time_history.plots.set_name = "S".into();
+        assert_eq!(app.panel_time_history.plots.functions.len(), 1);
+        app.replace_model(SapModel::new(Units::KipInF), "new".into(), Vec::new());
+        let plots = &app.panel_time_history.plots;
+        assert!(plots.functions.is_empty() && plots.sets.is_empty() && plots.set_name.is_empty());
     }
 
     #[test]

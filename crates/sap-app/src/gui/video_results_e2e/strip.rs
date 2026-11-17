@@ -140,8 +140,11 @@ fn apply_stress(run: &mut Run, case: &str, component: &str, face: &str, range: (
     // Always typed, so that a range of an earlier call is replaced or cleared.
     run.type_into("Min", range.0);
     run.type_into("Max", range.1);
-    run.click_text("kN, m, C");
-    run.click_text("N, mm, C");
+    // A reopened form shows the units of the contour it applied.
+    if run.app.results.shells.units != Units::NMmC {
+        run.click_text("kN, m, C");
+        run.click_text("N, mm, C");
+    }
     run.click_text("OK");
     assert!(!run.app.results.shells.open, "{}", run.app.results.shells.error);
     run.settle();

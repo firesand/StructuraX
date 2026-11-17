@@ -261,6 +261,11 @@ nothing about the video's result, whose hinge data are not stated.
 
 ## Not done
 
+Of this wave's differences the missing kink of a flexural hinge in the
+station deflections is since repaired (see
+[tutorial-video-wave5.md](tutorial-video-wave5.md)); the current list is
+[tutorial-video-progress.md](tutorial-video-progress.md).
+
 - Coupled P-M2-M3, fiber and automatic hinges; the reinforcement layout
   "to be checked" that automatic concrete hinges need.
 - Hinge unloading by local redistribution or secant restart; hysteresis.

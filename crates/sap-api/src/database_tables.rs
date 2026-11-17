@@ -1105,19 +1105,23 @@ impl<'a> cDatabaseTables<'a> {
             "JOINT DISPLACEMENTS" => {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
-                        for (jid, u) in &cr.joint_displacements {
-                            let mut r = BTreeMap::new();
-                            r.insert("Joint", jid.clone());
-                            r.insert("OutputCase", cname.clone());
-                            r.insert("StepType", "Static".to_string());
-                            r.insert("StepNum", "1".to_string());
-                            r.insert("U1", format!("{:.6}", u[0]));
-                            r.insert("U2", format!("{:.6}", u[1]));
-                            r.insert("U3", format!("{:.6}", u[2]));
-                            r.insert("R1", format!("{:.6}", u[3]));
-                            r.insert("R2", format!("{:.6}", u[4]));
-                            r.insert("R3", format!("{:.6}", u[5]));
-                            rows.push(r);
+                        for (jid, u_max) in &cr.joint_displacements {
+                            // A multi-valued combination has a Max and then a Min row per joint.
+                            for (step, row) in sap_results_rows(cr) {
+                                let u = row.joint_displacements.get(jid).unwrap_or(u_max);
+                                let mut r = BTreeMap::new();
+                                r.insert("Joint", jid.clone());
+                                r.insert("OutputCase", cname.clone());
+                                r.insert("StepType", step.to_string());
+                                r.insert("StepNum", "1".to_string());
+                                r.insert("U1", format!("{:.6}", u[0]));
+                                r.insert("U2", format!("{:.6}", u[1]));
+                                r.insert("U3", format!("{:.6}", u[2]));
+                                r.insert("R1", format!("{:.6}", u[3]));
+                                r.insert("R2", format!("{:.6}", u[4]));
+                                r.insert("R3", format!("{:.6}", u[5]));
+                                rows.push(r);
+                            }
                         }
                     }
                 }
@@ -1125,19 +1129,22 @@ impl<'a> cDatabaseTables<'a> {
             "JOINT REACTIONS" => {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
-                        for (jid, re) in &cr.joint_reactions {
-                            let mut r = BTreeMap::new();
-                            r.insert("Joint", jid.clone());
-                            r.insert("OutputCase", cname.clone());
-                            r.insert("StepType", "Static".to_string());
-                            r.insert("StepNum", "1".to_string());
-                            r.insert("F1", format!("{:.4}", re[0]));
-                            r.insert("F2", format!("{:.4}", re[1]));
-                            r.insert("F3", format!("{:.4}", re[2]));
-                            r.insert("M1", format!("{:.4}", re[3]));
-                            r.insert("M2", format!("{:.4}", re[4]));
-                            r.insert("M3", format!("{:.4}", re[5]));
-                            rows.push(r);
+                        for (jid, re_max) in &cr.joint_reactions {
+                            for (step, row) in sap_results_rows(cr) {
+                                let re = row.joint_reactions.get(jid).unwrap_or(re_max);
+                                let mut r = BTreeMap::new();
+                                r.insert("Joint", jid.clone());
+                                r.insert("OutputCase", cname.clone());
+                                r.insert("StepType", step.to_string());
+                                r.insert("StepNum", "1".to_string());
+                                r.insert("F1", format!("{:.4}", re[0]));
+                                r.insert("F2", format!("{:.4}", re[1]));
+                                r.insert("F3", format!("{:.4}", re[2]));
+                                r.insert("M1", format!("{:.4}", re[3]));
+                                r.insert("M2", format!("{:.4}", re[4]));
+                                r.insert("M3", format!("{:.4}", re[5]));
+                                rows.push(r);
+                            }
                         }
                     }
                 }
@@ -1145,17 +1152,20 @@ impl<'a> cDatabaseTables<'a> {
             "BASE REACTIONS" => {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
-                        let mut r = BTreeMap::new();
-                        r.insert("OutputCase", cname.clone());
-                        r.insert("StepType", "Static".to_string());
-                        r.insert("StepNum", "1".to_string());
-                        r.insert("GlobalFX", format!("{:.4}", cr.base_reactions[0]));
-                        r.insert("GlobalFY", format!("{:.4}", cr.base_reactions[1]));
-                        r.insert("GlobalFZ", format!("{:.4}", cr.base_reactions[2]));
-                        r.insert("GlobalMX", format!("{:.4}", cr.base_reactions[3]));
-                        r.insert("GlobalMY", format!("{:.4}", cr.base_reactions[4]));
-                        r.insert("GlobalMZ", format!("{:.4}", cr.base_reactions[5]));
-                        rows.push(r);
+                        for (step, row) in sap_results_rows(cr) {
+                            let b = &row.base_reactions;
+                            let mut r = BTreeMap::new();
+                            r.insert("OutputCase", cname.clone());
+                            r.insert("StepType", step.to_string());
+                            r.insert("StepNum", "1".to_string());
+                            r.insert("GlobalFX", format!("{:.4}", b[0]));
+                            r.insert("GlobalFY", format!("{:.4}", b[1]));
+                            r.insert("GlobalFZ", format!("{:.4}", b[2]));
+                            r.insert("GlobalMX", format!("{:.4}", b[3]));
+                            r.insert("GlobalMY", format!("{:.4}", b[4]));
+                            r.insert("GlobalMZ", format!("{:.4}", b[5]));
+                            rows.push(r);
+                        }
                     }
                 }
             }
@@ -1163,20 +1173,28 @@ impl<'a> cDatabaseTables<'a> {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
                         for (fid, stations) in &cr.frame_forces {
-                            for st in stations {
-                                let mut r = BTreeMap::new();
-                                r.insert("Frame", fid.clone());
-                                r.insert("Station", format!("{:.4}", st.station));
-                                r.insert("OutputCase", cname.clone());
-                                r.insert("StepType", "Static".to_string());
-                                r.insert("StepNum", "1".to_string());
-                                r.insert("P", format!("{:.4}", st.p));
-                                r.insert("V2", format!("{:.4}", st.v2));
-                                r.insert("V3", format!("{:.4}", st.v3));
-                                r.insert("T", format!("{:.4}", st.t));
-                                r.insert("M2", format!("{:.4}", st.m2));
-                                r.insert("M3", format!("{:.4}", st.m3));
-                                rows.push(r);
+                            for (index, st_max) in stations.iter().enumerate() {
+                                // Max row, then Min row, at every station of a multi-valued combination.
+                                for (step, row) in sap_results_rows(cr) {
+                                    let st = row
+                                        .frame_forces
+                                        .get(fid)
+                                        .and_then(|l| l.get(index))
+                                        .unwrap_or(st_max);
+                                    let mut r = BTreeMap::new();
+                                    r.insert("Frame", fid.clone());
+                                    r.insert("Station", format!("{:.4}", st.station));
+                                    r.insert("OutputCase", cname.clone());
+                                    r.insert("StepType", step.to_string());
+                                    r.insert("StepNum", "1".to_string());
+                                    r.insert("P", format!("{:.4}", st.p));
+                                    r.insert("V2", format!("{:.4}", st.v2));
+                                    r.insert("V3", format!("{:.4}", st.v3));
+                                    r.insert("T", format!("{:.4}", st.t));
+                                    r.insert("M2", format!("{:.4}", st.m2));
+                                    r.insert("M3", format!("{:.4}", st.m3));
+                                    rows.push(r);
+                                }
                             }
                         }
                     }
@@ -1982,5 +2000,15 @@ fn apply_single_table(
             OAPI_OK
         }
         _ => OAPI_OK,
+    }
+}
+
+/// The Max and Min rows of a multi-valued combination, with the step type the tables print
+/// ("Max", "Min"); every other result has one row of step type "Static". Max comes first
+/// (the vendor's order is not stated: a project choice).
+fn sap_results_rows(cr: &sap_model::CaseResults) -> Vec<(&'static str, &sap_model::CaseResults)> {
+    match cr.combo_min.as_deref() {
+        Some(min) => vec![("Max", cr), ("Min", min)],
+        None => vec![("Static", cr)],
     }
 }

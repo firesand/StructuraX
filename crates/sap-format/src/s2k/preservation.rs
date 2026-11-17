@@ -81,6 +81,7 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "RUST CASE - MODAL RITZ CONTROLS"
             | "RUST MASS SOURCE"
             | "RUST AUTO SEISMIC - ASCE 7-10"
+            | "RUST AUTO SEISMIC ECCENTRICITY"
             | "RUST STEEL DESIGN PREFERENCES"
             | "RUST HINGE PROPERTIES"
             | "RUST HINGE PROPERTIES - CURVE"

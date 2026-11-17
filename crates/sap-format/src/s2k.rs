@@ -2750,6 +2750,38 @@ pub(super) fn parse_s2k_internal(
                     },
                 );
             }
+            "RUST AUTO SEISMIC ECCENTRICITY" => {
+                const TABLE: &str = "RUST AUTO SEISMIC ECCENTRICITY";
+                let pattern = required_str(&row, TABLE, "LoadPat")?;
+                let diaphragm = required_str(&row, TABLE, "Diaphragm")?;
+                let distance = strict_f64(&row, TABLE, "Distance")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE}: line '{line}' needs Distance"))
+                })?;
+                if !model.load_patterns.contains_key(pattern) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: line '{line}' names unknown load pattern '{pattern}'"
+                    )));
+                }
+                if !model.constraints.contains_key(diaphragm) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: line '{line}' names unknown joint constraint '{diaphragm}'"
+                    )));
+                }
+                if model
+                    .auto_seismic_eccentricity
+                    .get(pattern)
+                    .is_some_and(|t| t.contains_key(diaphragm))
+                {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: line '{line}' repeats the overwrite of pattern '{pattern}' for '{diaphragm}'"
+                    )));
+                }
+                model
+                    .auto_seismic_eccentricity
+                    .entry(pattern.to_string())
+                    .or_default()
+                    .insert(diaphragm.to_string(), distance);
+            }
             "RUST STEEL DESIGN PREFERENCES" => {
                 let Some(limit) = get_f64(&row, "DCLimit") else {
                     return Err(FormatError::ParseS2k(
@@ -4784,6 +4816,25 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                 }
             }
             out.push('\n');
+        }
+        out.push('\n');
+    }
+    if model
+        .auto_seismic_eccentricity
+        .values()
+        .any(|table| !table.is_empty())
+    {
+        // Distances are lengths in the units of the file, like MinZ and MaxZ above.
+        out.push_str("TABLE:  \"RUST AUTO SEISMIC ECCENTRICITY\"\n");
+        for (pattern, table) in &model.auto_seismic_eccentricity {
+            for (diaphragm, distance) in table {
+                out.push_str(&format!(
+                    "   LoadPat={}   Diaphragm={}   Distance={}\n",
+                    format_val(pattern),
+                    format_val(diaphragm),
+                    distance
+                ));
+            }
         }
         out.push('\n');
     }

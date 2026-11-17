@@ -605,7 +605,12 @@ impl SapModel {
     /// 3 axis (`[p0..pn]` becomes `[pn..p0]`). The in-plane local 1 axis keeps
     /// its direction and local 2 reverses (the angle is replaced by `180 - a`
     /// for a normal that is not vertical and `-a` for a vertical normal, `a`
-    /// being the section material angle plus `angle_deg`).
+    /// being `angle_deg`). The section's material angle is not part of the element
+    /// axes: it turns the material inside the element (Analysis Reference p. 193),
+    /// so reversing local 3 leaves it alone. It would mirror an orthotropic
+    /// material (the material 1 axis would turn the other way about the new
+    /// local 3), so an area whose section has a nonzero material angle and an
+    /// orthotropic material is refused.
     ///
     /// Assignments that depend on local 3 are transformed:
     ///
@@ -648,6 +653,15 @@ impl SapModel {
                 .get(&a.section)
                 .ok_or_else(|| invalid(format!("area {name}: missing section {}", a.section)))?;
             finite([sec.mat_angle_deg])?;
+            let orthotropic = self.materials.get(&sec.material).is_some_and(|m| {
+                m.e_ortho.is_some() || m.u_ortho.is_some() || m.g_ortho.is_some()
+            });
+            if orthotropic && sec.mat_angle_deg != 0.0 {
+                return unsupported(&format!(
+                    "section {} has the material angle {} and the orthotropic material {}; reversing local 3 would mirror the material direction",
+                    sec.name, sec.mat_angle_deg, sec.material
+                ));
+            }
             let old: Vec<[f64; 3]> = a
                 .points
                 .iter()
@@ -673,13 +687,13 @@ impl SapModel {
             };
             let mut area = a.clone();
             area.points.reverse();
-            let total = a.angle_deg + sec.mat_angle_deg;
-            let reversed_total = if class.is_some() {
-                -total
+            // The element axes are the area's angle alone (the material angle turns the
+            // material, not the axes).
+            area.angle_deg = if class.is_some() {
+                -a.angle_deg
             } else {
-                180.0 - total
+                180.0 - a.angle_deg
             };
-            area.angle_deg = reversed_total - sec.mat_angle_deg;
             finite([area.angle_deg])?;
             // Edge numbering under reversal is not evidenced by the solver (it
             // refuses edge pressures) or by the help topics, so edge pressures

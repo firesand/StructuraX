@@ -29,7 +29,7 @@ use sap_format::{
     save_sdb_file_with_report,
 };
 use sap_model::{
-    AreaLoadSurfacePressure, AreaLoadUniform, AreaSection, CableParams, ComboType,
+    AreaLoadSurfacePressure, AreaLoadUniform, AreaSection, CableParams, CaseResults, ComboType,
     ConcreteDesignResult, EditError, EditSummary, FrameLoadDistributed, FrameLoadPoint,
     FrameLoadTemperature, FramePropType, FrameSection, FrameStationResult, FrameType2D,
     FrameType3D, LoadCase, LoadCaseAssignment, LoadCaseType, LoadCombo, LoadPattern,
@@ -2333,6 +2333,19 @@ impl cAnalyze<'_> {
     }
 }
 
+/// The rows of one result: a multi-valued combination has a Max row (the result itself)
+/// and a Min row (`combo_min`), every other result one row with an empty step type.
+pub fn step_rows(cr: &CaseResults) -> Vec<(&'static str, &CaseResults)> {
+    match cr.combo_min.as_deref() {
+        Some(min) => vec![("Max", cr), ("Min", min)],
+        None => vec![("", cr)],
+    }
+}
+
+fn drop_step<T>(rows: Vec<(String, &'static str, T)>) -> Vec<(String, T)> {
+    rows.into_iter().map(|(name, _, value)| (name, value)).collect()
+}
+
 /// Analysis Results Extraction API (`SAP2000v19.cAnalysisResults`).
 pub struct cAnalysisResults<'a> {
     api: &'a mut cSapModel,
@@ -2361,8 +2374,27 @@ impl cAnalysisResults<'_> {
         OAPI_OK
     }
 
-    /// Queries joint displacements `[U1, U2, U3, R1, R2, R3]` across selected output cases (`cAnalysisResults.JointDispl`).
-    pub fn joint_displ(&self, name: &str) -> Vec<(String, [f64; 6])> {
+    /// `Results.Setup.SetOptionMultiValuedCombo`: how multi-valued combinations are reported.
+    /// Option 1 (envelopes: a Max row and a Min row per quantity, Analysis Reference
+    /// p. 351) is the only one implemented; 2 (multiple values) and 3 (correspondence) are
+    /// refused with an error, as is any other value.
+    pub fn setup_set_option_multi_valued_combo(&mut self, option: i32) -> i32 {
+        if option == 1 {
+            OAPI_OK
+        } else {
+            OAPI_ERR
+        }
+    }
+
+    /// The results of the selected cases and combinations as `(output case, step type, value)`.
+    /// A multi-valued combination gives its Max row and then its Min row (the order is a
+    /// project choice: the Step Type topic of the OAPI help says only "either Max or Min"),
+    /// both under the name of the combination; every other result gives one row whose step
+    /// type is the empty string. `pick` extracts the value from one row of results.
+    fn selected_rows<T>(
+        &self,
+        mut pick: impl FnMut(&CaseResults) -> Option<T>,
+    ) -> Vec<(String, &'static str, T)> {
         let mut out = Vec::new();
         for cname in self
             .api
@@ -2371,48 +2403,49 @@ impl cAnalysisResults<'_> {
             .chain(self.api.selected_combos.iter())
         {
             if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(&u) = cr.joint_displacements.get(name) {
-                    out.push((cname.clone(), u));
+                for (step, row) in step_rows(cr) {
+                    if let Some(v) = pick(row) {
+                        out.push((cname.clone(), step, v));
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Queries joint displacements `[U1, U2, U3, R1, R2, R3]` across selected output cases (`cAnalysisResults.JointDispl`).
+    /// A multi-valued combination returns its Max row and then its Min row (see [`Self::joint_displ_step_type`]).
+    pub fn joint_displ(&self, name: &str) -> Vec<(String, [f64; 6])> {
+        drop_step(self.joint_displ_step_type(name))
+    }
+
+    /// `JointDispl` with the Step Type of each row: "Max" or "Min" for a multi-valued
+    /// combination, "" otherwise.
+    pub fn joint_displ_step_type(&self, name: &str) -> Vec<(String, &'static str, [f64; 6])> {
+        self.selected_rows(|cr| cr.joint_displacements.get(name).copied())
     }
 
     /// Queries support reactions `[F1, F2, F3, M1, M2, M3]` across selected output cases (`cAnalysisResults.JointReact`).
     pub fn joint_react(&self, name: &str) -> Vec<(String, [f64; 6])> {
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(&r) = cr.joint_reactions.get(name) {
-                    out.push((cname.clone(), r));
-                }
-            }
-        }
-        out
+        drop_step(self.joint_react_step_type(name))
+    }
+
+    /// `JointReact` with the Step Type of each row.
+    pub fn joint_react_step_type(&self, name: &str) -> Vec<(String, &'static str, [f64; 6])> {
+        self.selected_rows(|cr| cr.joint_reactions.get(name).copied())
     }
 
     /// Queries internal frame station forces across selected output cases (`cAnalysisResults.FrameForce`).
     pub fn frame_force(&self, name: &str) -> Vec<(String, Vec<FrameStationResult>)> {
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(st) = cr.frame_forces.get(name) {
-                    out.push((cname.clone(), st.clone()));
-                }
-            }
-        }
-        out
+        drop_step(self.frame_force_step_type(name))
+    }
+
+    /// `FrameForce` with the Step Type of each row.
+    pub fn frame_force_step_type(
+        &self,
+        name: &str,
+    ) -> Vec<(String, &'static str, Vec<FrameStationResult>)> {
+        self.selected_rows(|cr| cr.frame_forces.get(name).cloned())
     }
 
     /// Queries internal cable station forces across selected output cases (`cAnalysisResults.CableForce`).
@@ -2439,64 +2472,49 @@ impl cAnalysisResults<'_> {
         out
     }
 
-    /// Queries 3D solid stresses (`cAnalysisResults.SolidStress`).
+    /// Queries 3D solid stresses (`cAnalysisResults.SolidStress`). A multi-valued combination
+    /// returns its Max row and then its Min row; its principal and von Mises values are 0 in
+    /// both (not available for multi-valued results, Analysis Reference p. 213).
     pub fn solid_stress(&self, name: &str) -> Vec<(String, SolidResult)> {
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(sr) = cr.solid_results.get(name) {
-                    out.push((cname.clone(), sr.clone()));
-                }
-            }
-        }
-        out
+        drop_step(self.solid_stress_step_type(name))
+    }
+
+    /// `SolidStress` with the Step Type of each row.
+    pub fn solid_stress_step_type(&self, name: &str) -> Vec<(String, &'static str, SolidResult)> {
+        self.selected_rows(|cr| cr.solid_results.get(name).cloned())
     }
 
     /// Queries shell/area internal forces and stresses across selected output cases (`cAnalysisResults.AreaForceShell`).
+    /// A multi-valued combination returns its Max row and then its Min row; `svm_top` is 0.0
+    /// in both: the von Mises stress is not available for a multi-valued result (p. 213).
     pub fn area_force_shell(&self, name: &str) -> (i32, Vec<(String, sap_model::AreaResult)>) {
+        let (code, rows) = self.area_force_shell_step_type(name);
+        (code, drop_step(rows))
+    }
+
+    /// `AreaForceShell` with the Step Type of each row.
+    pub fn area_force_shell_step_type(
+        &self,
+        name: &str,
+    ) -> (i32, Vec<(String, &'static str, sap_model::AreaResult)>) {
         if self.api.inner.case_results.is_empty() || !self.api.inner.areas.contains_key(name) {
             return (OAPI_ERR, Vec::new());
         }
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(ar) = cr.area_results.get(name) {
-                    out.push((cname.clone(), ar.clone()));
-                }
-            }
-        }
-        (OAPI_OK, out)
+        (OAPI_OK, self.selected_rows(|cr| cr.area_results.get(name).cloned()))
     }
 
     /// Queries link internal forces `[P, V2, V3, T, M2, M3]` across selected output cases (`cAnalysisResults.LinkForce`).
     pub fn link_force(&self, name: &str) -> (i32, Vec<(String, [f64; 6])>) {
+        let (code, rows) = self.link_force_step_type(name);
+        (code, drop_step(rows))
+    }
+
+    /// `LinkForce` with the Step Type of each row.
+    pub fn link_force_step_type(&self, name: &str) -> (i32, Vec<(String, &'static str, [f64; 6])>) {
         if self.api.inner.case_results.is_empty() || !self.api.inner.links.contains_key(name) {
             return (OAPI_ERR, Vec::new());
         }
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(&lf) = cr.link_forces.get(name) {
-                    out.push((cname.clone(), lf));
-                }
-            }
-        }
-        (OAPI_OK, out)
+        (OAPI_OK, self.selected_rows(|cr| cr.link_forces.get(name).copied()))
     }
 
     /// Queries buckling eigenvalues `(case_name, mode_num, factor)` across selected buckling cases (`cAnalysisResults.BucklingFactor`).
@@ -2521,7 +2539,14 @@ impl cAnalysisResults<'_> {
     }
 
     /// Queries global base reactions `[FX, FY, FZ, MX, MY, MZ]` across selected output cases (`cAnalysisResults.BaseReact`).
+    /// A multi-valued combination returns its Max row and then its Min row.
     pub fn base_react(&self) -> (i32, Vec<(String, [f64; 6])>) {
+        let (code, rows) = self.base_react_step_type();
+        (code, drop_step(rows))
+    }
+
+    /// `BaseReact` with the Step Type of each row.
+    pub fn base_react_step_type(&self) -> (i32, Vec<(String, &'static str, [f64; 6])>) {
         if self.api.inner.case_results.is_empty() {
             return (OAPI_ERR, Vec::new());
         }
@@ -2538,7 +2563,9 @@ impl cAnalysisResults<'_> {
                 continue;
             }
             if let Some(cr) = self.api.inner.case_results.get(cname) {
-                out.push((cname.clone(), cr.base_reactions));
+                for (step, row) in step_rows(cr) {
+                    out.push((cname.clone(), step, row.base_reactions));
+                }
             }
         }
         (OAPI_OK, out)

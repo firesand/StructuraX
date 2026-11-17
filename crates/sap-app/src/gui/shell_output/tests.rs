@@ -819,3 +819,65 @@ fn vendor_example_2_010_hoop_stress_matches_the_closed_form() {
         assert!(checked > 0, "{file}");
     }
 }
+
+#[test]
+fn multi_valued_result_shows_the_value_of_larger_magnitude_with_its_sign() {
+    // ENV: maximum row F11 = +3, minimum row F11 = -5 (an envelope of +3 and -5):
+    // the larger magnitude is the minimum, so the form shows -5. M11: maximum
+    // +0.3, minimum -0.1: the maximum, +0.3. SRS has min = -max (tie): the
+    // maximum row, +4.
+    let mut m = syn();
+    let (hi, lo) = (
+        AreaResult {
+            f11: 3.0,
+            m11: 0.3,
+            s11_top: -165.0,
+            ..stress_result()
+        },
+        AreaResult {
+            f11: -5.0,
+            m11: -0.1,
+            s11_top: 35.0,
+            ..stress_result()
+        },
+    );
+    let mut env = m.case_results["ENV"].clone();
+    env.area_results.insert("A".into(), hi);
+    let mut min = CaseResults::default();
+    min.area_results.insert("A".into(), lo);
+    env.combo_min = Some(Box::new(min));
+    m.case_results.insert("ENV".into(), env);
+    let v = |m: &SapModel, name: &str, q| area_value(m, name, "A", q).unwrap();
+    close("F11", v(&m, "ENV", Res(R::F11)), -5.0, 1e-14);
+    close("M11", v(&m, "ENV", Res(R::M11)), 0.3, 1e-14);
+    // Top-face S11 = F/tm - 6M/tb^2 on each row (tm = 0.2, tb = 0.1):
+    //   maximum row 3/0.2 - 6 * 0.3 / 0.01 = 15 - 180 = -165,
+    //   minimum row -5/0.2 + 6 * 0.1 / 0.01 = -25 + 60 = 35;
+    //   -165 has the larger magnitude.
+    close("S11 top", v(&m, "ENV", Str(S::S11, Top)), -165.0, 1e-12);
+    let mut srs = m.case_results["SRS"].clone();
+    srs.area_results.insert(
+        "A".into(),
+        AreaResult {
+            f11: 4.0,
+            ..stress_result()
+        },
+    );
+    let mut neg = CaseResults::default();
+    neg.area_results.insert(
+        "A".into(),
+        AreaResult {
+            f11: -4.0,
+            ..stress_result()
+        },
+    );
+    srs.combo_min = Some(Box::new(neg));
+    m.case_results.insert("SRS".into(), srs);
+    close("tie", v(&m, "SRS", Res(R::F11)), 4.0, 1e-14);
+    // Derived values stay refused for a multi-valued result.
+    for q in [Res(R::FMax), Str(S::Svm, Top), Str(S::S11, Bottom)] {
+        assert!(area_value(&m, "ENV", "A", q).is_err(), "{q:?}");
+    }
+    // A single-valued result is unaffected.
+    close("S F11", v(&m, "S", Res(R::F11)), 10.0, 1e-14);
+}

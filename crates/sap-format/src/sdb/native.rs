@@ -864,6 +864,18 @@ fn csys_index(coord_index: &HashMap<String, i32>, name: &str) -> i32 {
     }
 }
 
+/// Whether the native writer carries `lc.modal_case`: a linear modal history whose modal case
+/// exists in `model` and is a Modal case.
+fn writes_modal_case(model: &SapModel, lc: &LoadCase) -> bool {
+    lc.case_type == LoadCaseType::LinearHistory
+        && lc.modal_case.as_ref().is_some_and(|modal| {
+            model
+                .load_cases
+                .get(modal)
+                .is_some_and(|m| m.case_type == LoadCaseType::Modal)
+        })
+}
+
 /// Experimental synthesis of a schema-checked v19-style native stream. Vendor
 /// application acceptance is unverified. Unsupported or lossy state is rejected;
 /// analysis/design results and lock state are intentionally not serialized.
@@ -2099,6 +2111,23 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_name".into(), SdbVal::Str(lc.name.clone())),
             ("m_casetype".into(), SdbVal::I32(ctype_code)),
+            // The modal case of a linear modal history (1-based; 0 is none) and its motion
+            // type (1 is transient, the only one this program has).
+            (
+                "m_modalcase".into(),
+                SdbVal::I32(if writes_modal_case(model, lc) {
+                    lc.modal_case
+                        .as_ref()
+                        .and_then(|modal| ac_index.get(modal).copied())
+                        .unwrap_or(0)
+                } else {
+                    0
+                }),
+            ),
+            (
+                "m_MotionType".into(),
+                SdbVal::I32(if matches!(ctype_code, 5 | 6) { 1 } else { 0 }),
+            ),
             ("m_SelectedForRun".into(), SdbVal::Bool(lc.run_flag)),
             ("m_previous".into(), SdbVal::I32(prev_idx)),
             ("m_NumberLAs".into(), SdbVal::I32(las.len() as i32)),
@@ -2763,7 +2792,9 @@ mod tests {
         }
         let mut checked = 0usize;
         let mut rejected_incomplete = 0usize;
-        const EXPECTED_UNMODELED: usize = 44;
+        // 45 since wave 5: Example 6-005a NLMHIST1 (nonlinear modal, FNA) is recorded as
+        // unmodeled instead of being integrated directly.
+        const EXPECTED_UNMODELED: usize = 45;
         let mut rejected_unmodeled: Vec<String> = Vec::new();
         let mut rejected_hinges: Vec<String> = Vec::new();
         let mut native_checked = 0usize;
@@ -2878,6 +2909,7 @@ mod tests {
                 "example_5_006.sdb",        // solid gravity load
                 "example_5_012a.sdb",       // solid surface springs
                 "example_5_013.sdb",        // solid pore pressure
+                "example_6_005a.sdb",       // nonlinear modal (FNA) history
                 "example_6_006.sdb",        // per-mode modal damping
                 "example_6_008.sdb",        // link gravity load and advanced axes
             ] {

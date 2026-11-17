@@ -268,19 +268,33 @@ fn ten_storey_frame_roof_traces_range_named_set_and_animation() {
     let mut run3 = Run::new(m.clone());
     run3.app.active_case = "HIST".into();
     run3.app.display_mode = DisplayMode::Deformed;
-    run3.app.deform_scale = 10.0;
+    // The tower moves by a few thousandths of a unit: at a factor of 10 no joint
+    // moves by a hundredth of a pixel and any step would look the same.
+    const SCALE: f64 = 1.0e4;
+    run3.app.deform_scale = SCALE as f32;
     run3.settle();
     run3.app.animate_deformed = true;
     let t0 = 100.0;
     run3.frame_at(t0, vec![]);
     assert_eq!((run3.app.active_step_idx, run3.app.use_time_step), (0, true));
-    let full = m.case_results["HIST"].time_history_disp[&roof].clone();
-    let base_xy = (m.points[&roof].x, m.points[&roof].y);
+    // Every joint is drawn at its base position plus the factor times its stored
+    // displacement of the step, and nothing else is drawn as a joint: the plan
+    // view stacks the storeys, so one circle at a roof position proves little
+    // when the step moves the building by a fraction of a pixel.
+    let expected = |run: &Run, step: usize| -> Vec<Pos2> {
+        m.points
+            .values()
+            .map(|p| {
+                let u = m.case_results["HIST"].time_history_disp[&p.name][step];
+                run.screen([p.x + SCALE * u[0], p.y + SCALE * u[1], p.z + SCALE * u[2]])
+            })
+            .collect()
+    };
+    let mut moved_by_more_than_a_pixel = 0;
     for (elapsed, step) in [(0.025, 0usize), (0.075, 1), (0.62, 12), (7.31, 146), (149.97, 2999), (150.02, 0), (150.07, 1)] {
         run3.frame_at(t0 + elapsed, vec![]);
         assert_eq!(run3.app.active_step_idx, step, "elapsed {elapsed}");
-        let u = full[step];
-        let want = run3.screen([base_xy.0 + 10.0 * u[0], base_xy.1 + 10.0 * u[1], 30.0 + 10.0 * u[2]]);
+        let want = expected(&run3, step);
         let circles: Vec<Pos2> = flat(&run3.last)
             .into_iter()
             .filter_map(|s| match s {
@@ -288,6 +302,20 @@ fn ten_storey_frame_roof_traces_range_named_set_and_animation() {
                 _ => None,
             })
             .collect();
-        assert!(circles.iter().any(|c| c.distance(want) < 1e-2), "step {step}: roof joint not drawn at {want:?}");
+        assert_eq!(circles.len(), want.len(), "step {step}: joints drawn");
+        for w in &want {
+            assert!(circles.iter().any(|c| c.distance(*w) < 1e-2), "step {step}: no joint drawn at {w:?}");
+        }
+        for c in &circles {
+            assert!(want.iter().any(|w| w.distance(*c) < 1e-2), "step {step}: a joint drawn at {c:?} where none belongs");
+        }
+        let undisplaced: Vec<Pos2> = m.points.values().map(|p| run3.screen([p.x, p.y, p.z])).collect();
+        let moved = want.iter().zip(&undisplaced).map(|(w, u)| w.distance(*u)).fold(0.0_f32, f32::max);
+        if moved > 1.0 {
+            moved_by_more_than_a_pixel += 1;
+        }
     }
+    // The steps that tell one step from another (12, 146 and 2999 move a joint by
+    // 39, 20 and 3.6 pixels at this factor; steps 0 and 1 by 0 and 0.4).
+    assert!(moved_by_more_than_a_pixel >= 3, "only {moved_by_more_than_a_pixel} sampled steps move a joint by a pixel");
 }

@@ -117,7 +117,15 @@ impl State {
             } else {
                 self.dir.clone()
             }
-        } else if let Some(name) = &self.selected {
+        } else if let Some(name) = self
+            .selected
+            .as_ref()
+            // The highlighted file counts only while the path field still
+            // shows it (or the directory); a path typed afterwards is the choice.
+            .filter(|n| {
+                text.is_empty() || text == shown || text == self.dir.join(n).display().to_string()
+            })
+        {
             self.dir.join(name)
         } else if text != shown && !text.is_empty() {
             let typed = PathBuf::from(&text);
@@ -624,5 +632,32 @@ mod tests {
                 if t.galley.job.text.contains("cannot read directory"))
         });
         assert!(shown);
+    }
+
+    /// D34 (review item 1): a path typed after a row was clicked is the choice;
+    /// the highlighted file is chosen only while the field still shows it.
+    #[test]
+    fn a_path_typed_after_a_highlighted_file_is_the_choice() {
+        let tmp = TempDir::new("typed_after_click");
+        std::fs::write(tmp.0.join("a.s2k"), "x").unwrap();
+        let mut state = State::default();
+        open_for(&mut state, Purpose::ModelFile, &tmp.0, &["s2k"], false);
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut out = frame(&ctx, &mut state, &mut time);
+        for _ in 0..2 {
+            out = frame(&ctx, &mut state, &mut time);
+        }
+        let row = text_center(&out, "a.s2k").expect("file row");
+        click(&ctx, &mut state, row, &mut time);
+        assert_eq!(state.selected.as_deref(), Some("a.s2k"));
+        // Untouched field: the highlighted file is chosen.
+        assert!(state.choose());
+        assert_eq!(take_choice(&mut state, Purpose::ModelFile), Some(tmp.0.join("a.s2k")));
+        // The field edited afterwards: the typed path is chosen.
+        state.open = true;
+        state.typed = tmp.0.join("b.s2k").display().to_string();
+        assert!(state.choose());
+        assert_eq!(take_choice(&mut state, Purpose::ModelFile), Some(tmp.0.join("b.s2k")));
     }
 }

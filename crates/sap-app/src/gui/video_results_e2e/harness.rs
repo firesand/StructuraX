@@ -336,13 +336,14 @@ pub fn geometry(m: &SapModel) -> Geometry {
     (joints, frames, areas)
 }
 
-/// Fills of the closed polygons that are not transparent.
+/// Fills of the closed polygons that are not transparent (`view::outlined_polygon`
+/// draws a fill as a one-colour fan; other closed paths keep their fill).
 pub fn polygon_fills(out: &egui::FullOutput) -> Vec<Color32> {
     flat(out)
         .into_iter()
         .filter_map(|s| match s {
             Shape::Path(p) if p.closed && p.fill != Color32::TRANSPARENT => Some(p.fill),
-            _ => None,
+            other => super::super::view::polygon_fill_of(&other),
         })
         .collect()
 }

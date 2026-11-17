@@ -2,7 +2,7 @@
   "project": "sap2000-rs",
   "target": "SAP2000 v19 reconstruction",
   "snapshot_date": "2026-11-17",
-  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md). 2026-11-15: first wave of tutorial-video features (docs/reconstruction/tutorial-video-wave1.md): profile LDLT and subspace eigen solver, mass source, ASCE 7-10 automatic seismic load with entered coefficients, Ritz loads and load participation, modal time history, functions from file, Auto Select design and default design combinations, grid/quick-draw/radial geometry commands. Pushover, AISC 360-16 and ASCE 7-16 remain absent. 2026-11-16: second wave of tutorial-video features (docs/reconstruction/tutorial-video-wave2.md): user-defined uncoupled frame hinges in nonlinear static cases checked against CSI Example 1-026, saved states, Accel and Mode loads, pushover curve and hinge-state display, native import of the Example 1-026 hinge records, S2K persistence. Coupled, fiber and automatic hinges remain refused.",
+  "snapshot_note": "Multi-milestone parity & hardening updates across native SDB codecs (local_axes_matrix, fys != fy, project_info, grids), concrete beam M2 (as_side) & EC3 10-shape V3/multi-axis design, frame tc_limits span axial equilibrium & modal LinearHistory continuation, and OAPI cCableObj / cDatabaseTables facades (405 tests across 44 suites, 64/64 reference checks). Full vendor runtime parity remains unestablished. Merged with the 2026-11-12 additions: plastic Wen links and displacement-controlled nonlinear static (docs/reconstruction/solver-wen.md). Unmodeled source data recorded and refused; modal damping refused on modal history types (docs/reconstruction/unmodeled-source.md). Area mesh/mass/modifier import and native section-code corrections (docs/reconstruction/area-import.md). Automatic frame subdivision modeled and checked against published per-mesh values; span-moment sign, non-prismatic span-load and buckling reference-state defects fixed (docs/reconstruction/frame-auto-mesh.md). Frame insertion points modeled for linear static cases against Example 1-011; frame M2 sign corrected (docs/reconstruction/frame-insertion-point.md). 2026-11-15: first wave of tutorial-video features (docs/reconstruction/tutorial-video-wave1.md): profile LDLT and subspace eigen solver, mass source, ASCE 7-10 automatic seismic load with entered coefficients, Ritz loads and load participation, modal time history, functions from file, Auto Select design and default design combinations, grid/quick-draw/radial geometry commands. Pushover, AISC 360-16 and ASCE 7-16 remain absent. 2026-11-16: second wave of tutorial-video features (docs/reconstruction/tutorial-video-wave2.md): user-defined uncoupled frame hinges in nonlinear static cases checked against CSI Example 1-026, saved states, Accel and Mode loads, pushover curve and hinge-state display, native import of the Example 1-026 hinge records, S2K persistence. Coupled, fiber and automatic hinges remain refused. 2026-11-17: fifth wave of the tutorial-video work, repairs (docs/reconstruction/tutorial-video-wave5.md; the third and fourth waves are in tutorial-video-wave3.md and tutorial-video-wave4.md): frame end offsets, orthotropic and plane-strain areas, combinations as maximum and minimum, design of multi-valued combinations, native import of modal histories, the Ritz projection, video export; the real program was run for the first time, by an agent on a private display. Results of these features differ from earlier versions. Test counts of that wave: 1348 portable tests, 1383 with the local vendor corpus, 107 suites, 106/106 reference checks.",
   "status_legend": {
     "implemented-tested": "Source implementation exists and a relevant repository test or fixture workflow is present; this status does not mean the current test run passed.",
     "implemented-partial": "Some behavior exists, with documented scope limits, approximations, or incomplete end-to-end evidence.",
@@ -72,7 +72,7 @@
           "note": "Insertion-point transformation: scope, bounds, evidence, native FOffset layout, and the M2 sign correction."
         }
       ],
-      "limits": "Frame theory and loads still require broader vendor fixture comparisons; the selected synthetic benchmark suite is not full v19 validation. Automatic frame subdivision (a number of segments, or at joints lying on the frame) is analyzed and results are reported per object; it is refused with cables, member T/C limits, end length offsets, a segment count together with joints on the span, and area-mesh joints on the frame. Subdivision at crossings with other objects and by maximum segment length is not modeled. A frame insertion point (cardinal point other than the centroid, or joint offsets) with stiffness transformation is modeled as rigid arms for equal offsets across the member, doubly symmetric shapes and linear static cases only; other cases and forms are refused. Frame M2 follows the SAP2000 sign convention as of 2026-11-12 (it had the opposite sign)."
+      "limits": "Frame theory and loads still require broader vendor fixture comparisons; the selected synthetic benchmark suite is not full v19 validation. Automatic frame subdivision (a number of segments, or at joints lying on the frame) is analyzed and results are reported per object; it is refused with cables, member T/C limits, end length offsets, a segment count together with joints on the span, and area-mesh joints on the frame. Subdivision at crossings with other objects and by maximum segment length is not modeled. A frame insertion point (cardinal point other than the centroid, or joint offsets) with stiffness transformation is modeled as rigid arms for equal offsets across the member, doubly symmetric shapes and linear static cases only; other cases and forms are refused. Frame M2 follows the SAP2000 sign convention as of 2026-11-12 (it had the opposite sign). End offsets since 2026-11-17: see frame-end-offsets."
     },
     {
       "id": "frame-geometric-nonlinearity",
@@ -103,7 +103,7 @@
           "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "No general large-displacement corotational frame/shell behavior. Capped frames with geometric nonlinearity and unsupported loading/offset combinations reject. Displacement-controlled nonlinear static is limited to small displacements, one monitored joint displacement and a monotonically increasing load factor; see docs/reconstruction/solver-wen.md."
+      "limits": "No general large-displacement corotational frame/shell behavior. Capped frames with geometric nonlinearity and unsupported loading/offset combinations reject. Displacement-controlled nonlinear static is limited to small displacements, one monitored joint displacement and a monotonically increasing load factor; see docs/reconstruction/solver-wen.md. Since 2026-11-17 each rigid end zone of a frame adds P x arm to the geometric stiffness, which changes P-Delta and buckling results of members with rigid arms (see frame-end-offsets)."
     },
     {
       "id": "frame-modal-buckling-spectrum",
@@ -159,7 +159,7 @@
           "note": "Chained modal and direct-integration restart stress regressions (< 1e-11 analytical agreement)."
         }
       ],
-      "limits": "Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending. Since 2026-11-15 a LinearHistory case may name a modal case and is then solved by mode superposition (see modal-time-history)."
+      "limits": "Nonlinear Wilson-theta Maxwell integration, unsupported solid history loads and prescribed support motion reject. Complete history viewers and vendor differential validation remain pending. Since 2026-11-15 a LinearHistory case may name a modal case and is then solved by mode superposition (see modal-time-history). Since 2026-11-17 direct-integration histories take a time function as zero before its first point (before, the first value was held) and refuse a function that does not exist."
     },
     {
       "id": "other-case-types",
@@ -212,7 +212,7 @@
           "note": "Selected Example 1-008 verification implementation."
         }
       ],
-      "limits": "The model documentation allows higher-order plane/ASolid connectivity, but solver preflight rejects more than four nodes. Layered shell enum is not evidence of nonlinear layered material behavior."
+      "limits": "The model documentation allows higher-order plane/ASolid connectivity, but solver preflight rejects more than four nodes. Layered shell enum is not evidence of nonlinear layered material behavior. Orthotropic materials, plane strain and the material angle changed on 2026-11-17: see area-orthotropic-plane-strain-material-angle."
     },
     {
       "id": "solid-elements",
@@ -239,7 +239,7 @@
           "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Mesh/constitutive coverage is partial; solid surface/temperature history loading is rejected. No comprehensive vendor physics acceptance."
+      "limits": "Mesh/constitutive coverage is partial; solid surface/temperature history loading is rejected. No comprehensive vendor physics acceptance. The orthotropic compliance of the solid is built with other Poisson terms than the manual's printed equation, which the area element follows since 2026-11-17 (found, not changed)."
     },
     {
       "id": "links",
@@ -313,9 +313,14 @@
           "file": "crates/sap-model/src/lib.rs",
           "lines": "165-179",
           "note": "Nine constraint types declared."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_constraints_rotated.rs",
+          "lines": "1-173",
+          "note": "Diaphragm, Body and Equal constraints with one joint's local axes rotated give the results of the unrotated model (2026-11-17)."
         }
       ],
-      "limits": "Rod, Beam, and Line hit the generic equal-DOF fallback rather than their named geometric constraint models. Penalty enforcement also needs comparison against exact vendor behavior."
+      "limits": "Rod, Beam, and Line hit the generic equal-DOF fallback rather than their named geometric constraint models. Penalty enforcement also needs comparison against exact vendor behavior. Since 2026-11-17 the constraint equations act in global directions at joints with local axes (the Local type stays joint-local); before, joint-local components were tied."
     },
     {
       "id": "coordinates-and-load-systems",
@@ -355,7 +360,7 @@
           "note": "Adversarial stress tests across all 10 steel cross-section families and combined 6-DOF loading."
         }
       ],
-      "limits": "ERW/SAW design-thickness overwrites, auto-select lists, comprehensive lateral-torsional/local buckling, and full vendor design-code validation remain incomplete. Auto Select lists and default combinations: see steel-design-workflow."
+      "limits": "ERW/SAW design-thickness overwrites, auto-select lists, comprehensive lateral-torsional/local buckling, and full vendor design-code validation remain incomplete. Auto Select lists and default combinations: see steel-design-workflow. Multi-valued combinations: see design-multi-valued-combinations."
     },
     {
       "id": "concrete-design",
@@ -373,7 +378,7 @@
           "note": "Adversarial tests covering ACI 318-14 and Eurocode 2 minor-axis beam flexure and side-face reinforcement."
         }
       ],
-      "limits": "Existing column PMM remains partial; concrete torsion and full detailing acceptance remain unimplemented."
+      "limits": "Existing column PMM remains partial; concrete torsion and full detailing acceptance remain unimplemented. Since 2026-11-17 design is refused when neither the section's rebar material nor the concrete gives a rebar yield stress (before, 60 ksi was assumed). Multi-valued combinations: see design-multi-valued-combinations."
     },
     {
       "id": "s2k-interoperability",
@@ -395,7 +400,7 @@
           "note": "Roundtrip support for nonlinear link param1/param2 and cable parameters."
         }
       ],
-      "limits": "Unknown data is preserved but not interpreted. Ambiguous owner mapping and unit changes with opaque dimensions reject export. Full vendor export acceptance is untested."
+      "limits": "Unknown data is preserved but not interpreted. Ambiguous owner mapping and unit changes with opaque dimensions reject export. Full vendor export acceptance is untested. The seismic eccentricity overwrites of 2026-11-17 are kept in the extension table RUST AUTO SEISMIC ECCENTRICITY."
     },
     {
       "id": "sdb-import",
@@ -413,7 +418,7 @@
           "note": "Wave 4 extraction of NLLINKPROPARRAY.m_param, single-joint grounded links, parametric Sine functions, and CABLEPROPERTYARRAY / S_CableData."
         }
       ],
-      "limits": "Native inventory and source-preserving serialization cover all schema-known records in the checked 336-file local corpus, but only recognized schema paths become SapModel fields. Data in sections the importer does not interpret (frame hinges, tendons, line/area/solid springs, frame added mass, area auto-mesh options the model cannot express, link gravity loads, advanced link axes, several load types, per-mode modal damping) is recorded as unmodeled source data that blocks analysis and native synthesis; 50 of 336 corpus files carry such data and 283 remain exportable. See docs/reconstruction/unmodeled-source.md for what the pass does not cover. The N x N area auto-mesh, area added mass and object-level area modifiers are imported, and the native shell-type, element-type and incompatible-modes codes are corrected (docs/reconstruction/area-import.md)."
+      "limits": "Native inventory and source-preserving serialization cover all schema-known records in the checked 336-file local corpus, but only recognized schema paths become SapModel fields. Data in sections the importer does not interpret (frame hinges, tendons, line/area/solid springs, frame added mass, area auto-mesh options the model cannot express, link gravity loads, advanced link axes, several load types, per-mode modal damping, and since 2026-11-17 Ritz starting loads other than patterns and accelerations and periodic or nonlinear modal histories) is recorded as unmodeled source data that blocks analysis and native synthesis; 51 of 336 corpus files carry such data and 282 remain exportable (50 and 283 before 2026-11-17; the new figures follow from the corpus round-trip test, which expects one more refused file, Example 6-005a). The modal case of a history is imported since 2026-11-17 (see native-modal-history-import). See docs/reconstruction/unmodeled-source.md for what the pass does not cover. The N x N area auto-mesh, area added mass and object-level area modifiers are imported, and the native shell-type, element-type and incompatible-modes codes are corrected (docs/reconstruction/area-import.md)."
     },
     {
       "id": "native-sdb-preservation",
@@ -454,7 +459,7 @@
           "note": "Adversarial roundtrip tests for project_info and coordinate system grid lines."
         }
       ],
-      "limits": "Recognized S2K source formatting is accepted; opaque tables/columns and unrepresented assignments reject. All native export entry points require a new destination and verify disk readback. Internal schema success is not licensed vendor-runtime acceptance."
+      "limits": "Recognized S2K source formatting is accepted; opaque tables/columns and unrepresented assignments reject. All native export entry points require a new destination and verify disk readback. Internal schema success is not licensed vendor-runtime acceptance. Since 2026-11-17 the modal case of a linear modal history is written; any other modal-case reference and the seismic eccentricity overwrites are refused by name."
     },
     {
       "id": "oapi",
@@ -502,7 +507,7 @@
           "note": "Post-review repair scope and regression evidence; supersedes broader wave-4 claims."
         }
       ],
-      "limits": "Headless rendering/input tests cover selected paths only. Full tutorial, native desktop and Windows/macOS runtime acceptance remain unverified."
+      "limits": "Headless rendering/input tests cover selected paths only. On 2026-11-17 the real program was run for the first time, by an agent on a private virtual display with synthetic input and screenshots, through the four parts of the tutorial video; what it found was repaired, and what was not looked at (among others window resizing, the local-3 arrow and the file chooser behind Browse) is listed in docs/reconstruction/tutorial-video-progress.md, item D17. No person has used the windows. Native desktop and Windows/macOS runtime acceptance remain unverified."
     },
     {
       "id": "templates",
@@ -557,9 +562,14 @@
           "file": "crates/sap-solver/tests/mass_source_auto_seismic.rs",
           "lines": "1-1070",
           "note": "Closed-form periods, statics, each Cs branch recomputed in the test, refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_eccentricity.rs",
+          "lines": "1-311",
+          "note": "Eccentric moment on diaphragms: ratio x width x force and overwrite distance against the lateral loads manual formula and statics; refusals (2026-11-17)."
         }
       ],
-      "limits": "Fa, Fv and Ie are entered (code tables absent from the vendor material). Program-calculated period and eccentricity on diaphragms are refused. One code edition; no wind. The vendor's rule for the weight W is not printed; W is the mass-source weight above the base elevation. One mass source per model."
+      "limits": "Fa, Fv and Ie are entered (code tables absent from the vendor material). The program-calculated period is refused. Since 2026-11-17 the eccentric moment on diaphragms about Z is applied (ratio x width perpendicular to the load x force, or an overwrite distance per pattern and diaphragm, kept by S2K); the sense of a positive eccentricity is a project choice, and the moment is added at one joint of the diaphragm. One code edition; no wind. The vendor's rule for the weight W is not printed; W is the mass-source weight above the base elevation. One mass source per model."
     },
     {
       "id": "ritz-and-participation",
@@ -576,9 +586,14 @@
           "file": "crates/sap-solver/tests/ritz_participation.rs",
           "lines": "1-679",
           "note": "Closed-form two- and three-mass cantilevers; refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_ritz_bound.rs",
+          "lines": "1-724",
+          "note": "Ritz frequencies against an independent condensed solution on stiff models, below, at and above the number of mass degrees of freedom (2026-11-17)."
         }
       ],
-      "limits": "A Ritz case with an empty load list keeps the previous UX/UY/UZ start. Rotational accelerations, loads without a mass component and min_modes above 1 with starting loads are refused. Native import does not read participation targets."
+      "limits": "A Ritz case with an empty load list keeps the previous UX/UY/UZ start. Rotational accelerations, loads without a mass component and min_modes above 1 with starting loads are refused. Native import does not read participation targets. Since 2026-11-17 a Ritz case returns at most as many modes as there are mass degrees of freedom and switches its projection from the stiffness form to a flexibility form on stiff models (before, such models could give periods above the exact ones, too many modes or a failure); the switch is a project threshold, and in the flexibility form the static participation of a starting load is not exactly 100 % (at most 7.2e-6 off in the stiffest test model). A native Modal case with Ritz starting vectors for link degrees of freedom is refused as imported."
     },
     {
       "id": "modal-time-history",
@@ -602,7 +617,7 @@
           "note": "Reader following the vendor help topic."
         }
       ],
-      "limits": "Constant damping only; no initial case, no link damping, no nonlinear modal history, no ramp/arrival-time options. Reactions omit the modal damping force. Without a modal case a history case is integrated directly as before."
+      "limits": "Constant damping only; no initial case, no link damping, no nonlinear modal history, no ramp/arrival-time options. Reactions omit the modal damping force. Without a modal case a history case is integrated directly as before. Native files: see native-modal-history-import."
     },
     {
       "id": "steel-design-workflow",
@@ -870,7 +885,7 @@
           "note": "Opt-in CSI Example 2-015: sign of the edge moment and of the top stress."
         }
       ],
-      "limits": "Top stresses, thermal resultants and combination von Mises values differ from versions before 2026-11-16. Temperature loads on three-joint areas, with joint patterns, and on sections without the stiffness they act on (plane and axisymmetric-solid sections included) are refused. The stored top-face von Mises value of an SRSS, absolute, envelope or range combination is still combined field by field; since 2026-11-17 the display refuses it and names the cases behind a combination without shell results. Example 2-014 is matched to the independent solution within 4 % on the vendor's coarse mesh and 1 % on its fine mesh, not to the vendor's element."
+      "limits": "Top stresses, thermal resultants and combination von Mises values differ from versions before 2026-11-16. Temperature loads on three-joint areas, with joint patterns, and on sections without the stiffness they act on (plane and axisymmetric-solid sections included) are refused. The stored top-face von Mises value of a multi-valued combination was combined field by field; since 2026-11-17 it is stored as 0 in both rows of the result, the tables print n/a, and the display refuses it and names the cases behind a combination without shell results. A response-spectrum case stores no area results. Example 2-014 is matched to the independent solution within 4 % on the vendor's coarse mesh and 1 % on its fine mesh, not to the vendor's element."
     },
     {
       "id": "result-display-shells-contours-plots-modal-tables",
@@ -914,7 +929,7 @@
           "note": "End-to-end through the application: cylinder closed form, strip, the video's tower, the third part's frames, opt-in CSI Examples 2-010 and 1-022 (files under video_results_e2e/)."
         }
       ],
-      "limits": "Shell values are element-centre values: no Gauss-point extrapolation, no averaging at joints, one flat colour per area. Derived shell values (principal, von Mises, bottom face, face extremes) are refused for multi-valued results, and quantities a plate, membrane or plane-stress section lacks, and all quantities of plane-strain and axisymmetric-solid sections, are refused; some of these were shown before 2026-11-17. The solver recovers the forces of plane-strain areas with the plane-stress relation (found, not changed). Velocity, reaction, base and energy plot functions are not recorded; absolute acceleration only for modal time histories; plot sets are not saved with the model. No image or video export. Display units belong to a form; a units change of the model still needs it unlocked. Windows tested through command functions and headless renders, not by hand."
+      "limits": "Shell values are element-centre values: no Gauss-point extrapolation, no averaging at joints, one flat colour per area. Derived shell values (principal, von Mises, bottom face, face extremes) are refused for multi-valued results, and quantities a plate, membrane or plane-stress section lacks, and all quantities of plane-strain and axisymmetric-solid sections, are refused; some of these were shown before 2026-11-17. The forces of plane-strain areas are recovered with the plane-strain relation since the fifth wave of 2026-11-17 (before, with the plane-stress relation); their display is still not done. Velocity, reaction, base and energy plot functions are not recorded; absolute acceleration only for modal time histories; plot sets are not saved with the model. Video export exists since the fifth wave of 2026-11-17 (see video-export-and-window-additions); no image export. Display units belong to a form; a units change of the model still needs it unlocked. Windows tested through command functions and headless renders; looked at by an agent on a private display on 2026-11-17 (see gui), not used by a person."
     },
     {
       "id": "modal-participation-global-and-rotational",
@@ -936,15 +951,194 @@
       "limits": "RX, RY, RZ ratios differ from versions before 2026-11-17 for every model; UX, UY, UZ ratios and response-spectrum results differ for models with joint local axes. The manual's printed centroid for RZ is read as a misprint (x centroid of the UY load used). Masses that differ by direction on a rotated joint couple the global X and Y masses; the vendor's treatment is unknown. No printed vendor table of rotational ratios was available as a reference."
     },
     {
+      "id": "frame-end-offsets",
+      "area": "solver",
+      "feature": "Frames with end offsets and a rigid-zone factor: axial and torsional stiffness on the full length; a full moment or shear release makes its offset rigid in that plane; span loads and self weight over the full length with the part on a rigid arm carried to its joint; non-prismatic sections over the clear length; P x arm geometric stiffness of the rigid arms; output stations from support face to support face, read by design as the ends of the member.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/tests/wave5_rigid_zones.rs",
+          "lines": "1-383",
+          "note": "PL/EA and TL/GJ over the full length, released ends (CSI Analysis Reference pp. 130-131); opt-in CSI Examples 6-006 and 6-007 periods within 1 % of the published ones."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_end_offset_loads.rs",
+          "lines": "1-314",
+          "note": "Equilibrium and fixed-fixed closed forms for loads on arm and span, every rigid-end factor, with and without releases."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_nonprismatic_offsets.rs",
+          "lines": "1-325",
+          "note": "Flexibilities over the clear length, unit-load integrals, free thermal expansion, axial span load."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_rigid_arm_geometry.rs",
+          "lines": "1-182",
+          "note": "Buckling of a pinned column with rigid arms against a hand derivation and against the arms as stiff elements."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_end_offset_stations.rs",
+          "lines": "1-245",
+          "note": "Station positions, zero moment at a released support face, closed forms."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_p13_unchanged.rs",
+          "lines": "1-252",
+          "note": "Members without offsets are bitwise unchanged (fingerprints recorded before the repairs)."
+        },
+        {
+          "file": "crates/sap-design/tests/wave5_p17_offset_stations.rs",
+          "lines": "1-328",
+          "note": "Cb and the concrete end minimums with stations between the support faces."
+        }
+      ],
+      "limits": "Results of members with end offsets differ from versions before 2026-11-17, including P-Delta and buckling of members with rigid arms and the station positions and station moments of CSI Examples 1-010b to d (their published tip deflections are unchanged). Not implemented: the manual's reduction of offsets to a clear length of 1 %, the mass of non-prismatic members and end zones, the geometric stiffness of the flexible part beyond its flexible length, automatic subdivision and hinges on a member with offsets. A partial-fixity spring keeps the rigid-zone factor (project choice). The repairs of loads, non-prismatic members, geometric stiffness and stations followed an independent review and were not reviewed again line by line."
+    },
+    {
+      "id": "area-orthotropic-plane-strain-material-angle",
+      "area": "solver",
+      "feature": "Area elements with orthotropic materials (plane stress for shells and plates, reduced compliance for plane strain), plane-strain recovery with stored S33 and anti-plane shear stiffness, a section material angle that turns only the material, one constitutive function for stiffness and recovery, and no drilling stiffness on plane and axisymmetric-solid sections.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/tests/wave5_area_materials.rs",
+          "lines": "1-739",
+          "note": "Uniform-strain patches by hand, rotated laminate stiffness at 30 degrees, isotropic invariance, symmetry of the recovery law, refusals."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_area_materials_vendor.rs",
+          "lines": "1-382",
+          "note": "Opt-in CSI Examples 2-015 (orthotropic plate, published and closed-form deflection) and 3-002 (plane beam without incompatible modes)."
+        },
+        {
+          "file": "crates/sap-solver/src/bench_w5_p2.rs",
+          "lines": "1-87",
+          "note": "Two rows of the live verification: plane-strain S33 and the material angle."
+        }
+      ],
+      "limits": "Area results differ from versions before 2026-11-17 for orthotropic materials, plane-strain sections, sections with a material angle (which before also turned the output axes) and sections with unequal stiffness modifiers. The scaling of the coupling terms by the root of the product of the modifiers is a project choice; whether the vendor does the same is not established. U3 of a plane-strain area has real stiffness and must be supported. A law that is not positive definite, a temperature load with unequal in-plane expansion coefficients, and reversing local 3 with an orthotropic material at an angle are refused. S33 is stored and has no reader (no table, API call or display). The stored von Mises of a plane-strain area ignores S33. Incompatible bending modes of plane sections are not implemented, so plain plane elements are 2 to 3 % soft against CSI Example 3-004, whose files stay refused as imported."
+    },
+    {
+      "id": "combinations-maximum-and-minimum",
+      "area": "solver",
+      "feature": "Multi-valued combinations (additive with a response-spectrum case, envelope, range, SRSS, absolute, nested) store a maximum and a minimum; the API and the database tables return a Max row and a Min row.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-solver/src/combos.rs",
+          "lines": "1-638",
+          "note": "Combination by pairs with unit tests on the worked numbers of the CSI Analysis Reference p. 353."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_combinations.rs",
+          "lines": "1-177",
+          "note": "The same pairs through a response-spectrum solve; stations of a subdivided frame."
+        },
+        {
+          "file": "crates/sap-api/tests/wave5_combo_rows.rs",
+          "lines": "1-233",
+          "note": "Row order and step type in the API and the tables; the multi-valued option."
+        },
+        {
+          "file": "crates/sap-solver/src/bench_w5_p3.rs",
+          "lines": "1-127",
+          "note": "Eight rows of the live verification."
+        }
+      ],
+      "limits": "Results of envelope and range combinations differ from versions before 2026-11-17 (an envelope kept the value of larger magnitude, a range was added linearly, no minimum was stored); an additive combination of single-valued cases is bitwise unchanged, and the vendor corpus has only such combinations, so no vendor number tests the pairs. Row order (Max, then Min) and the zero stored for derived fields (von Mises, principal values) are project choices. Only the envelope option of the API's multi-valued setting is implemented. A response-spectrum case stores no area results, so a combination with one has none. API readers other than the result tables (cable force and similar) return the Max row only."
+    },
+    {
+      "id": "design-multi-valued-combinations",
+      "area": "design",
+      "feature": "Steel and concrete design of a multi-valued combination by states (Max row, Min row, each contributing state of an envelope, each with its own moment diagram and Cb) and by the permutations of the maxima and minima of the interacting forces.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-design/tests/wave5_design_combos.rs",
+          "lines": "1-161",
+          "note": "Both senses of a multi-valued contributor: ratios equal to those of static cases."
+        },
+        {
+          "file": "crates/sap-design/tests/wave5_design_states.rs",
+          "lines": "1-619",
+          "note": "Permutations of P, M2, M3 against hand-enumerated static force sets; Cb per state by AISC F1-1; Eurocode 3 with shear; concrete column; single-valued combinations bitwise unchanged."
+        }
+      ],
+      "limits": "Design ratios of multi-valued combinations differ from versions before 2026-11-17 (only the positive sense was designed). The vendor's design manuals ask for sub-combinations of maxima and minima; that one permutation takes the same choice at every station, and that Cb comes from that diagram, are project choices. The permutation of torsion and shears for the closed-section interaction has no test. Concrete beams are designed per state without permutations. Sub-combinations per time step of a history and the corresponding-values option of moving loads are not implemented. The vendor corpus has no multi-valued design combination, so no vendor number tests this. Written after an independent review and not reviewed again line by line."
+    },
+    {
+      "id": "native-modal-history-import",
+      "area": "format",
+      "feature": "Native import of the modal case and motion type of a time-history case, native export of the modal case of a linear history, and refusal by name of periodic and nonlinear modal (FNA) histories and of Ritz starting loads the solver does not have.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-format/src/sdb.rs",
+          "lines": "1-4042",
+          "note": "Case-record import; unit test native_modal_history_import_branches."
+        },
+        {
+          "file": "crates/sap-format/tests/wave5_native_history.rs",
+          "lines": "1-109",
+          "note": "Round trip of the modal-case index; refusals of the writer."
+        },
+        {
+          "file": "crates/sap-format/tests/wave5_p10_formats.rs",
+          "lines": "1-243",
+          "note": "Ritz starting-load records, S2K eccentricity table, export guard."
+        },
+        {
+          "file": "crates/sap-solver/tests/wave5_vendor_history.rs",
+          "lines": "1-251",
+          "note": "Opt-in CSI Example 6-001 against its published values and the closed form; Examples 1-015 and 6-005a refused by name; Example 1-022."
+        }
+      ],
+      "limits": "CSI Example 6-005a NLMHIST1 ran as direct integration before 2026-11-17 and is now refused (nonlinear modal history is not implemented); Example 1-015 MHIST1 is refused (periodic). The Modal cases of Examples 6-006, 6-007, 6-010, 6-011a and 6-011b are refused as imported for their Ritz starting vectors on link degrees of freedom; with that entry removed explicitly, Examples 6-006 and 6-007 give periods within 0.17 %, 0.02 % and 0.39 % of the published ones, the first not inside the printed rounding and not explained. The modal-case index is taken as 1-based over all case records, which holds in the files scanned and is not documented. Example 6-001 needs its ramp samples attached."
+    },
+    {
+      "id": "video-export-and-window-additions",
+      "area": "application",
+      "feature": "Export of an animation as an uncompressed AVI (steps of a history or of saved static states, or cycles of a mode) with the project's own writer and software rasteriser; Object Information with the loads on an object; Grid Only start; I section with unequal flanges; automatic deformed scale and view titles; Max and Min rows and curves; rebar material choice; Messages window; number printing with significant digits.",
+      "status": "implemented-partial",
+      "evidence": [
+        {
+          "file": "crates/sap-app/src/gui/video_export.rs",
+          "lines": "1-683",
+          "note": "Frame plan, form and recorder; avi.rs and raster.rs beside it."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_export/tests.rs",
+          "lines": "1-1165",
+          "note": "Byte layout against a hand-written file, read-back with ffprobe and ffmpeg when present, rasteriser rules, refusals."
+        },
+        {
+          "file": "crates/sap-app/src/gui/wave5_windows_tests.rs",
+          "lines": "1-740",
+          "note": "Object Information, Grid Only, I-section dialog, automatic scale, titles, table messages, video through the menu."
+        },
+        {
+          "file": "crates/sap-app/src/gui/video_wave5_e2e.rs",
+          "lines": "1-23",
+          "note": "End-to-end tests (files under video_wave5_e2e/): the video rows of the wave, repairs seen through the windows, opt-in CSI Examples 6-001, 2-015a and 6-010."
+        },
+        {
+          "file": "crates/sap-app/src/gui/p16_open_tests.rs",
+          "lines": "1-123",
+          "note": "Open resets display, lock and planes; with p16_messages_tests.rs, p16_misc_tests.rs, p16_offset_tests.rs and wave5_hand_check_tests.rs the repairs of the hand check."
+        }
+      ],
+      "limits": "No compressor choice, no cyclic video of a plain deformed shape, no file above 1 GiB; frames match the screen in geometry and colour values, not pixel for pixel. The cycles, frames per cycle and rate of the form, the automatic scale of 10 % of the bounding-box diagonal, the title wording and the printing rule are project choices. Result-table cells keep a fixed number of decimals. The windows were looked at by an agent on a private display (see gui); window resizing and the file chooser behind Browse were not. The window repairs that followed the hand check were not reviewed line by line."
+    },
+    {
       "id": "verification-suite",
       "area": "validation",
-      "feature": "94 live reference checks plus 1102 automated tests across 79 suites and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
+      "feature": "Live reference checks and automated tests (106 checks / 1348 tests / 107 suites) and vendor SDB integration regressions covering frames, shells, solids, nonlinear links, catenary cables and frame hinges.",
       "status": "implemented-partial",
       "evidence": [
         {
           "file": "crates/sap-solver/src/benchmarks.rs",
           "lines": "55-90",
-          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks). A cantilever shell strip (top-face stress and moment sign) added 2026-11-16 (92 checks). Modal participation of two offset masses (RZ) and of a mass on a rotated joint (UX) added 2026-11-17 (94 checks)."
+          "note": "Live runner covers Examples 1-001..1-016, 5-001, 6-003 (including NLSTAT3/NLDHIST2 continuation), 6-005, 7-001, 7-002, and 7-003 (64 checks). CSI Example 1-021 eigenvalues added 2026-11-15 (86 checks). CSI Example 1-026 hinge end states added 2026-11-16 (90 checks). A cantilever shell strip (top-face stress and moment sign) added 2026-11-16 (92 checks). Modal participation of two offset masses (RZ) and of a mass on a rotated joint (UX) added 2026-11-17 (94 checks). Twelve rows added by the fifth wave on 2026-11-17: rigid end zones (2), plane strain and the material angle (2), combination pairs of the manual's p. 353 (8) (106 checks)."
         },
         {
           "file": "crates/sap-solver/tests/wave4_vendor_regressions.rs",

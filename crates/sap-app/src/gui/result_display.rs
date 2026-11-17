@@ -28,6 +28,7 @@ use super::shell_output::{self, Face, ResultKind, ShellQuantity, ShellResultant,
 use super::view::ViewTransform;
 use super::{DisplayMode, SapGuiApp, ViewProjection};
 
+pub(super) mod scaling;
 #[cfg(test)]
 mod tests;
 
@@ -150,6 +151,9 @@ pub(super) struct DeformedForm {
     pub mode: usize,
     /// Zero-based step of a multi-step result.
     pub step: usize,
+    /// "Scaling: Auto" (the factor is set from the model and the result, see
+    /// [`scaling`]) or "Scale Factor" (`scale`).
+    pub auto: bool,
     pub scale: f32,
     pub contour: bool,
     pub component: DisplacementComponent,
@@ -166,6 +170,7 @@ impl Default for DeformedForm {
             case: String::new(),
             mode: 1,
             step: 0,
+            auto: true,
             scale: 1.0,
             contour: false,
             component: DisplacementComponent::Uz,
@@ -185,6 +190,8 @@ pub(super) struct DeformedApply {
     pub mode_idx: usize,
     pub use_step: bool,
     pub step_idx: usize,
+    /// Automatic scale; `scale` is then the factor shown in the form, not applied.
+    pub auto: bool,
     pub scale: f32,
     pub contour: Contour,
     pub units: Units,
@@ -210,7 +217,7 @@ impl DeformedForm {
             .case_results
             .get(&self.case)
             .ok_or_else(|| format!("'{}' has no results; run the analysis first", self.case))?;
-        if !(self.scale.is_finite() && self.scale > 0.0) {
+        if !self.auto && !(self.scale.is_finite() && self.scale > 0.0) {
             return Err("the scale factor must be a positive number".into());
         }
         let (mut mode_idx, mut use_step, mut step_idx) = (0, false, 0);
@@ -250,6 +257,7 @@ impl DeformedForm {
             mode_idx,
             use_step,
             step_idx,
+            auto: self.auto,
             scale: self.scale,
             contour,
             units: self.units,
@@ -896,6 +904,20 @@ impl SapGuiApp {
         let (case, scale, units) = (self.active_case.clone(), self.deform_scale, self.model.present_units);
         let form = &mut self.results.deformed;
         form.open_with(&case, scale, units);
+        form.auto = self.deform_auto;
+        // The mode and step that are on screen; the final state of a result
+        // with steps is its last step.
+        let cr = self.model.case_results.get(&case);
+        let steps = cr.map_or(0, contours::step_count);
+        form.mode = self.active_mode_idx + 1;
+        form.step = if steps >= 2 {
+            if self.use_time_step { self.active_step_idx.min(steps - 1) } else { steps - 1 }
+        } else {
+            0
+        };
+        form.contour = false;
+        form.min.clear();
+        form.max.clear();
         if let Contour::Displacement { component, range, units } = self.results.contour {
             let form = &mut self.results.deformed;
             form.contour = true;
@@ -908,7 +930,18 @@ impl SapGuiApp {
 
     pub(super) fn open_shell_form(&mut self) {
         let (case, units) = (self.active_case.clone(), self.model.present_units);
-        self.results.shells.open_with(&case, units);
+        let form = &mut self.results.shells;
+        form.open_with(&case, units);
+        // Units and range belong together: an applied shell contour gives
+        // both back, otherwise the range text is cleared with the units reset.
+        form.min.clear();
+        form.max.clear();
+        if let Contour::Shell { range, units, .. } = self.results.contour {
+            let form = &mut self.results.shells;
+            form.units = units;
+            form.min = if range.0 == 0.0 { String::new() } else { range.0.to_string() };
+            form.max = if range.1 == 0.0 { String::new() } else { range.1.to_string() };
+        }
     }
 
     fn apply_deformed(&mut self, a: DeformedApply) {
@@ -917,7 +950,13 @@ impl SapGuiApp {
         self.active_mode_idx = a.mode_idx;
         self.use_time_step = a.use_step;
         self.active_step_idx = a.step_idx;
-        self.deform_scale = a.scale;
+        self.deform_auto = a.auto;
+        if !a.auto {
+            self.deform_scale = a.scale;
+        }
+        // With Auto the next frame sets the factor; what is there now counts
+        // as set by it, so it is not read as a change by the user.
+        self.deform_auto_written = Some(self.deform_scale);
         self.display_mode = DisplayMode::Deformed;
         self.results.contour = a.contour;
         self.results.readout_units = Some(a.units);
@@ -929,7 +968,8 @@ impl SapGuiApp {
         self.sync_active_case();
         self.display_mode = DisplayMode::ShellContour(a.quantity);
         self.results.contour = a.contour;
-        self.status_msg = format!("{} of '{}'.", a.quantity.label(), self.active_case);
+        let visible = matches!(a.contour, Contour::Shell { visible: true, .. });
+        self.status_msg = format!("{} of '{}'.", shell_title(a.quantity, visible), self.active_case);
     }
 
     /// The two forms and the joint read-out.
@@ -971,9 +1011,23 @@ impl SapGuiApp {
                     });
                 }
                 ui.horizontal(|ui| {
-                    ui.label("Scale Factor");
-                    ui.add(egui::DragValue::new(&mut form.scale).speed(1.0));
+                    ui.label("Scaling");
+                    ui.radio_value(&mut form.auto, true, "Auto");
+                    ui.radio_value(&mut form.auto, false, "Scale Factor");
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Scale Factor");
+                    ui.add_enabled(
+                        !form.auto,
+                        egui::DragValue::new(&mut form.scale).speed(1.0).max_decimals(6),
+                    );
+                });
+                if form.auto {
+                    ui.label(format!(
+                        "Auto: largest displacement = {:.0} % of the model diagonal (project choice).",
+                        scaling::AUTO_FRACTION * 100.0
+                    ));
+                }
                 ui.separator();
                 ui.checkbox(&mut form.contour, "Draw Displacement Contours on Area Objects");
                 ui.add_enabled_ui(form.contour, |ui| {

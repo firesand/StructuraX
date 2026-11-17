@@ -4,6 +4,7 @@ pub mod editing;
 pub mod generate;
 pub mod hinge;
 pub mod radial;
+pub mod results;
 pub mod ritz;
 pub mod seismic;
 pub mod templates;
@@ -1212,6 +1213,10 @@ pub struct AreaResult {
     pub s22_top: f64,
     pub s12_top: f64,
     pub svm_top: f64,
+    /// Thickness-normal stress S33 of a plane-strain section (Analysis Reference
+    /// p. 218); zero for every other section.
+    #[serde(default)]
+    pub s33: f64,
     /// Nodal forces at each corner joint in global coordinates `[FX, FY, FZ, MX, MY, MZ]`
     pub joint_forces: Vec<(String, [f64; 6])>,
 }
@@ -1333,6 +1338,11 @@ pub struct CaseResults {
     /// starting hinge state of a case that continues from it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hinge_results: Vec<hinge::FrameHingeResult>,
+    /// Combinations: the minimum of every quantity when the combination is
+    /// multi-valued (Analysis Reference p. 351); the ordinary fields then hold the
+    /// maximum. `None` for a single-valued result, whose maximum and minimum are equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combo_min: Option<Box<CaseResults>>,
 }
 
 /// One piece of imported source data that the importer recognized, could not
@@ -1542,6 +1552,12 @@ pub struct SapModel {
     /// Automatic seismic load definitions, keyed by load pattern name.
     #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
     pub auto_seismic: IndexMap<String, seismic::AutoSeismicAsce710>,
+    /// Overwrites of the diaphragm eccentricity of an automatic seismic load
+    /// (Lateral Loads Manual, section 2.2.3): load pattern name, then
+    /// diaphragm constraint name, to the eccentricity distance in model length
+    /// units (replaces ratio times width; measured perpendicular to the load).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub auto_seismic_eccentricity: IndexMap<String, IndexMap<String, f64>>,
     /// Steel frame design preferences.
     #[serde(default, skip_serializing_if = "auto_select::SteelDesignPreferences::is_default")]
     pub steel_design_prefs: auto_select::SteelDesignPreferences,
@@ -1662,6 +1678,7 @@ impl SapModel {
             concrete_design_results: IndexMap::new(),
             mass_source: seismic::MassSource::default(),
             auto_seismic: IndexMap::new(),
+            auto_seismic_eccentricity: IndexMap::new(),
             steel_design_prefs: auto_select::SteelDesignPreferences::default(),
             hinge_props: IndexMap::new(),
         }

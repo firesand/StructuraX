@@ -899,12 +899,17 @@ fn topological_nested_load_combinations_and_skipped_first_envelope_case() {
     close(m.case_results["C1"].frame_forces["B"][0].p, -100.0);
     close(m.case_results["C1"].base_reactions[0], 100.0);
 
-    // ENV_SKIP: first contributed case is 0.2 * CASE_B (-0.10), which beats 0.3 * CASE_A (+0.06)
-    close(
-        m.case_results["ENV_SKIP"].joint_displacements["J"][0],
-        -0.10,
-    );
-    close(m.case_results["ENV_SKIP"].frame_forces["B"][0].p, -10.0);
+    // ENV_SKIP (Analysis Reference p. 352: maximum of the maxima, minimum of the
+    // minima): the contributions are 0.2 * CASE_B = -0.10 (P = -10) and
+    // 0.3 * CASE_A = +0.06 (P = +6), the unrun first case is skipped. Maximum +0.06
+    // and +6, minimum -0.10 and -10. (The old assertion kept the value of larger
+    // magnitude, -0.10 / -10, which is the minimum row now.)
+    let env = &m.case_results["ENV_SKIP"];
+    close(env.joint_displacements["J"][0], 0.06);
+    close(env.frame_forces["B"][0].p, 6.0);
+    let lo = env.combo_min.as_ref().expect("an envelope is multi-valued");
+    close(lo.joint_displacements["J"][0], -0.10);
+    close(lo.frame_forces["B"][0].p, -10.0);
 
     assert!(!m.case_results.contains_key("EMPTY_COMBO"));
     assert!(!m.case_results.contains_key("CYC_A"));

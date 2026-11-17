@@ -201,7 +201,8 @@ impl LinearStepper {
                 .flat_map(|i| massless_dofs.iter().map(move |j| k[i * n + j]))
                 .collect();
             Some(MasslessBlock {
-                factor: SymmetricLdlt::factorize(&block, massless_dofs.len())?,
+                factor: SymmetricLdlt::factorize(&block, massless_dofs.len())
+                    .map_err(|e| crate::linalg::remap_singular_index(e, &massless_dofs))?,
                 dofs: massless_dofs,
             })
         };
@@ -240,7 +241,7 @@ impl LinearStepper {
         // Kzz*uz = Fz(0); forcing them to zero violates initial equilibrium.
         if let Some(block) = &self.massless {
             let rhs: Vec<f64> = block.dofs.iter().map(|i| force[*i]).collect();
-            let uz = block.factor.solve(&rhs)?;
+            let uz = block.factor.solve(&rhs).map_err(|e| crate::linalg::remap_singular_index(e, &block.dofs))?;
             for (&i, value) in block.dofs.iter().zip(uz) {
                 self.state.u[i] = value;
             }
@@ -248,7 +249,7 @@ impl LinearStepper {
                 // Differentiated algebraic constraint, using the right-hand
                 // derivative of the piecewise-linear applied load at t=0.
                 let rhs: Vec<f64> = block.dofs.iter().map(|i| slope[*i]).collect();
-                let vz = block.factor.solve(&rhs)?;
+                let vz = block.factor.solve(&rhs).map_err(|e| crate::linalg::remap_singular_index(e, &block.dofs))?;
                 for (&i, value) in block.dofs.iter().zip(vz) {
                     self.state.v[i] = value;
                 }
@@ -281,7 +282,7 @@ impl LinearStepper {
                     }
                 })
                 .collect();
-            let az = block.factor.solve(&rhs)?;
+            let az = block.factor.solve(&rhs).map_err(|e| crate::linalg::remap_singular_index(e, &block.dofs))?;
             for (&i, value) in block.dofs.iter().zip(az) {
                 self.state.a[i] = value;
             }
@@ -370,7 +371,7 @@ impl LinearStepper {
                                 .sum::<f64>()
                         })
                         .collect();
-                    let solved = block.factor.solve(&rhs)?;
+                    let solved = block.factor.solve(&rhs).map_err(|e| crate::linalg::remap_singular_index(e, &block.dofs))?;
                     let values = match component {
                         0 => &mut self.state.u,
                         1 => &mut self.state.v,

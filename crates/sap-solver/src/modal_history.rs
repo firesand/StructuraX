@@ -300,7 +300,7 @@ pub fn ground_acceleration_trace(
 /// Time function value, zero before the first point and constant after the
 /// last. Right-continuous: at a jump the later value is returned. Times within
 /// `tol` of a point count as that point.
-fn function_value(points: &[(f64, f64)], t: f64, tol: f64) -> f64 {
+pub fn function_value(points: &[(f64, f64)], t: f64, tol: f64) -> f64 {
     let Some(&(t0, _)) = points.first() else {
         return 0.0;
     };

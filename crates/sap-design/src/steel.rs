@@ -439,25 +439,89 @@ pub fn frame_clear_length(model: &SapModel, frame: &FrameObj) -> f64 {
     }
 }
 
+/// Coordinate along the output stations of one member: the relative position `rel_dist`
+/// (`station / L`), or the distance `station` when `rel_dist` is not populated.
+///
+/// The stations of a member with end offsets run from the face of the support at the I end
+/// to the face at the J end (CSI Analysis Reference, "Effect upon Internal Force Output"),
+/// so the first has `rel_dist > 0` and the last `rel_dist < 1`. The unbraced length of the
+/// design is the length between those faces (`frame_clear_length`), and the quarter points
+/// of $C_b$ (AISC F1-1: $M_A$, $M_B$, $M_C$ "at quarter point, centerline and three-quarter
+/// point of the unbraced segment") refer to that length: `at(u)` maps the fraction `u` of the
+/// span between the first and the last station to a coordinate that lies inside the stations.
+/// Without offsets the first station is at 0 and the last at 1 and `at(u)` is `u` itself.
+struct StationSpan {
+    coordinate: Vec<f64>,
+    first: f64,
+    last: f64,
+}
+
+impl StationSpan {
+    fn new(stations: &[FrameStationResult]) -> Self {
+        let rel: Vec<f64> = stations.iter().map(|s| s.rel_dist).collect();
+        let spread = |v: &[f64]| v.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
+            - v.iter().cloned().fold(f64::INFINITY, f64::min);
+        let coordinate = if spread(&rel) > 1e-12 {
+            rel
+        } else {
+            stations.iter().map(|s| s.station).collect()
+        };
+        let first = coordinate.iter().cloned().fold(f64::INFINITY, f64::min);
+        let last = coordinate.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        Self { coordinate, first, last }
+    }
+
+    /// Coordinate of the fraction `u` of the span between the first and the last station.
+    /// `u` is held inside [0, 1]: a moment is never read outside the stations.
+    fn at(&self, u: f64) -> f64 {
+        self.first + u.clamp(0.0, 1.0) * (self.last - self.first)
+    }
+
+    /// The stations sorted by coordinate as (coordinate, M3) pairs.
+    fn moments(&self, stations: &[FrameStationResult]) -> Vec<(f64, f64)> {
+        let mut v: Vec<(f64, f64)> = self
+            .coordinate
+            .iter()
+            .zip(stations)
+            .map(|(&x, s)| (x, s.m3))
+            .collect();
+        v.sort_by(|a, b| a.0.total_cmp(&b.0));
+        v
+    }
+}
+
+/// Linear interpolation of M3 at coordinate `x` between the two stations around it; the
+/// stations must be sorted and `x` inside their range (guaranteed by `StationSpan::at`).
+fn interpolate_m3(sorted: &[(f64, f64)], x: f64, tol: f64) -> f64 {
+    for w in sorted.windows(2) {
+        let (s0, s1) = (w[0].0, w[1].0);
+        if x >= s0 - tol && x <= s1 + tol {
+            let t = ((x - s0) / (s1 - s0).max(1e-12)).clamp(0.0, 1.0);
+            return w[0].1 + t * (w[1].1 - w[0].1);
+        }
+    }
+    // Only reachable by roundoff at the ends of the range: the nearest station.
+    if x <= sorted[0].0 {
+        sorted[0].1
+    } else {
+        sorted[sorted.len() - 1].1
+    }
+}
+
 /// Moment gradient factor for a member braced at equal spacings of `ratio`
-/// times its length: $C_b$ is computed within each unbraced segment and the
+/// times its (clear) length: $C_b$ is computed within each unbraced segment and the
 /// smallest value is used for the member. With `ratio >= 1` the member is one
 /// segment. (SAP2000 likewise bases $C_b$ on the moments of each unbraced
-/// segment, not of the whole member.)
+/// segment, not of the whole member.) The segments and their quarter points are
+/// measured between the first and the last output station, which for a member with end
+/// offsets are the faces of the supports (see `StationSpan`).
 pub fn compute_cb_for_unbraced_ratio(stations: &[FrameStationResult], ratio: f64) -> f64 {
     if !(ratio > 0.0 && ratio < 1.0) || stations.len() < 2 {
         return compute_cb_from_stations(stations);
     }
-    let moment_at = |rel: f64| -> f64 {
-        for w in stations.windows(2) {
-            let (s0, s1) = (w[0].rel_dist, w[1].rel_dist);
-            if rel >= s0 - 1e-12 && rel <= s1 + 1e-12 {
-                let t = ((rel - s0) / (s1 - s0).max(1e-12)).clamp(0.0, 1.0);
-                return w[0].m3 + t * (w[1].m3 - w[0].m3);
-            }
-        }
-        stations.last().map_or(0.0, |s| s.m3)
-    };
+    let span = StationSpan::new(stations);
+    let sorted = span.moments(stations);
+    let moment_at = |u: f64| -> f64 { interpolate_m3(&sorted, span.at(u), 1e-12) };
     // Bracing closer than a thousandth of the length is continuous bracing;
     // the moment gradient within such a segment is flat.
     if ratio < 1e-3 {
@@ -470,9 +534,10 @@ pub fn compute_cb_for_unbraced_ratio(stations: &[FrameStationResult], ratio: f64
         if b <= a {
             continue;
         }
+        let (xa, xb) = (span.at(a), span.at(b));
         let mut m_max = moment_at(a).abs().max(moment_at(b).abs());
-        for s in stations.iter().filter(|s| s.rel_dist > a && s.rel_dist < b) {
-            m_max = m_max.max(s.m3.abs());
+        for &(_, m3) in sorted.iter().filter(|(x, _)| *x > xa && *x < xb) {
+            m_max = m_max.max(m3.abs());
         }
         if m_max <= 1e-12 {
             continue;
@@ -490,7 +555,9 @@ pub fn compute_cb_for_unbraced_ratio(stations: &[FrameStationResult], ratio: f64
 
 /// Computes the AISC Chapter F lateral-torsional buckling moment gradient factor:
 /// $$C_b = \frac{12.5 M_{\max}}{2.5 M_{\max} + 3 M_A + 4 M_B + 3 M_C}$$
-/// from a sequence of station results along the member.
+/// from a sequence of station results along the member. The quarter points are those of the
+/// span between the first and the last station (the faces of the supports for a member with
+/// end offsets; see `StationSpan`).
 pub fn compute_cb_from_stations(stations: &[FrameStationResult]) -> f64 {
     if stations.len() < 2 {
         return 1.0;
@@ -500,33 +567,9 @@ pub fn compute_cb_from_stations(stations: &[FrameStationResult]) -> f64 {
         return 1.0;
     }
 
-    let sample_abs_m3 = |target_rel: f64| -> f64 {
-        // Find surrounding stations by rel_dist
-        for w in stations.windows(2) {
-            let s0 = w[0].rel_dist;
-            let s1 = w[1].rel_dist;
-            if target_rel >= s0 - 1e-9 && target_rel <= s1 + 1e-9 {
-                let ds = (s1 - s0).max(1e-12);
-                let t = ((target_rel - s0) / ds).clamp(0.0, 1.0);
-                let m = w[0].m3 + t * (w[1].m3 - w[0].m3);
-                return m.abs();
-            }
-        }
-        // Fallback if stations aren't sorted or don't have rel_dist populated
-        let l_min = stations.first().map(|s| s.station).unwrap_or(0.0);
-        let l_max = stations.last().map(|s| s.station).unwrap_or(1.0);
-        let span = (l_max - l_min).max(1e-12);
-        let target_x = l_min + target_rel * span;
-        for w in stations.windows(2) {
-            if target_x >= w[0].station - 1e-9 && target_x <= w[1].station + 1e-9 {
-                let dx = (w[1].station - w[0].station).max(1e-12);
-                let t = ((target_x - w[0].station) / dx).clamp(0.0, 1.0);
-                let m = w[0].m3 + t * (w[1].m3 - w[0].m3);
-                return m.abs();
-            }
-        }
-        stations[0].m3.abs()
-    };
+    let span = StationSpan::new(stations);
+    let sorted = span.moments(stations);
+    let sample_abs_m3 = |u: f64| -> f64 { interpolate_m3(&sorted, span.at(u), 1e-9).abs() };
 
     let ma = sample_abs_m3(0.25);
     let mb = sample_abs_m3(0.50);
@@ -890,22 +933,60 @@ pub fn evaluate_station_interaction(
     }
 }
 
-/// Resolves all design load combinations (or analysis cases if no combos are defined)
-/// into a list of `(combo_or_case_name, IndexMap<frame_name, Vec<FrameStationResult>>)`.
-pub(crate) fn collect_design_combo_forces(
-    model: &SapModel,
-) -> Vec<(String, Vec<(String, Vec<FrameStationResult>)>)> {
+/// The design states of one combination at one frame: each state is a complete list of
+/// station forces, a state of its own with its own station list (so its own moment diagram).
+/// A single-valued combination or case has one state.
+pub(crate) type FrameStates = Vec<Vec<FrameStationResult>>;
+
+/// All design combinations (or analysis cases if no combos are defined) as
+/// `(combo_or_case_name, [(frame_name, states)])`.
+pub(crate) type ComboForces = Vec<(String, Vec<(String, FrameStates)>)>;
+
+/// Resolves all design load combinations (or analysis cases if no combos are defined) into
+/// the states of every frame. The rows of a multi-valued combination are NOT stations of
+/// one member: its maximum row and its minimum row are two states (CSI Analysis Reference
+/// pp. 351-352), each a design entry with its own station list.
+pub(crate) fn collect_design_combo_forces(model: &SapModel) -> ComboForces {
     let mut out = Vec::new();
 
     if !model.load_combos.is_empty() {
         for (combo_name, combo) in &model.load_combos {
             // If case_results already has pre-computed forces for this combo, use them directly
             if let Some(cr) = model.case_results.get(combo_name) {
+                if !cr.frame_forces.is_empty() && cr.combo_min.is_some() {
+                    // A multi-valued combination (Analysis Reference p. 351): the design sees
+                    // both senses, the maximum row and the minimum row, as two states of
+                    // every frame. An envelope is rebuilt from its contributors instead:
+                    // every contributing state stays a state of its own with the forces of
+                    // that state together (the permutations of the maxima and minima are
+                    // formed from them by `design_entries`).
+                    let lo = cr.combo_min.as_deref();
+                    let frames_vec = cr
+                        .frame_forces
+                        .iter()
+                        .map(|(k, v)| {
+                            if combo.combo_type == ComboType::Envelope {
+                                if let Some(st) = synthesize_combo_states(model, combo, k, 0)
+                                    .filter(|st| !st.is_empty())
+                                {
+                                    return (k.clone(), st);
+                                }
+                            }
+                            let mut states = vec![v.clone()];
+                            if let Some(l) = lo.and_then(|l| l.frame_forces.get(k)) {
+                                states.push(l.clone());
+                            }
+                            (k.clone(), states)
+                        })
+                        .collect();
+                    out.push((combo_name.clone(), frames_vec));
+                    continue;
+                }
                 if !cr.frame_forces.is_empty() {
                     let frames_vec = cr
                         .frame_forces
                         .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .map(|(k, v)| (k.clone(), vec![v.clone()]))
                         .collect();
                     out.push((combo_name.clone(), frames_vec));
                     continue;
@@ -914,9 +995,9 @@ pub(crate) fn collect_design_combo_forces(
             // Otherwise synthesize from constituent cases
             let mut frames_vec = Vec::new();
             for frame_name in model.frames.keys() {
-                if let Some(stations) = synthesize_combo_frame_forces(model, combo, frame_name, 0) {
-                    if !stations.is_empty() {
-                        frames_vec.push((frame_name.clone(), stations));
+                if let Some(states) = synthesize_combo_states(model, combo, frame_name, 0) {
+                    if states.iter().any(|s| !s.is_empty()) {
+                        frames_vec.push((frame_name.clone(), states));
                     }
                 }
             }
@@ -930,10 +1011,31 @@ pub(crate) fn collect_design_combo_forces(
     if out.is_empty() {
         for (case_name, cr) in &model.case_results {
             if !cr.frame_forces.is_empty() {
+                // A response-spectrum, moving-load, steady-state or PSD case is a pair
+                // (+v, -v) (p. 351): both senses are two states.
+                let both_senses = sap_model::results::is_range_case(model, case_name);
                 let frames_vec = cr
                     .frame_forces
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .map(|(k, v)| {
+                        if both_senses {
+                            let states = [1.0, -1.0]
+                                .map(|sign| {
+                                    v.iter()
+                                        .map(|s| {
+                                            station_from_values(
+                                                s,
+                                                station_values(s).map(|x| sign * x.abs()),
+                                            )
+                                        })
+                                        .collect()
+                                })
+                                .to_vec();
+                            (k.clone(), states)
+                        } else {
+                            (k.clone(), vec![v.clone()])
+                        }
+                    })
                     .collect();
                 out.push((case_name.clone(), frames_vec));
             }
@@ -943,122 +1045,298 @@ pub(crate) fn collect_design_combo_forces(
     out
 }
 
-fn synthesize_combo_frame_forces(
+/// Bits of the forces that a design check combines, for [`design_entries`].
+pub(crate) mod interacting {
+    pub const P: u8 = 1;
+    pub const V2: u8 = 2;
+    pub const V3: u8 = 4;
+    pub const T: u8 = 8;
+    pub const M2: u8 = 16;
+    pub const M3: u8 = 32;
+}
+
+fn field_of(s: &FrameStationResult, bit: u8) -> f64 {
+    match bit {
+        interacting::P => s.p,
+        interacting::V2 => s.v2,
+        interacting::V3 => s.v3,
+        interacting::T => s.t,
+        interacting::M2 => s.m2,
+        _ => s.m3,
+    }
+}
+
+fn set_field(s: &mut FrameStationResult, bit: u8, v: f64) {
+    match bit {
+        interacting::P => s.p = v,
+        interacting::V2 => s.v2 = v,
+        interacting::V3 => s.v3 = v,
+        interacting::T => s.t = v,
+        interacting::M2 => s.m2 = v,
+        _ => s.m3 = v,
+    }
+}
+
+/// The design entries (each its own station list, so its own moment diagram) of one frame
+/// of one combination, given its states.
+///
+/// A single state is its own entry, unchanged (bitwise the numbers of a single-valued
+/// combination or a plain case). A multi-valued combination (two or more states) gives
+/// first its states as they are, then the sub-combinations of the maxima and minima of the
+/// interacting forces.
+///
+/// Rule (CSI Steel Frame Design AISC 360-10, section 2.4: "For multi-valued design
+/// combinations, such as those involving response spectrum, time history, moving loads and
+/// envelopes, where any correspondence between forces is lost, the program automatically
+/// produces sub-combinations using the maxima/minima values of the interacting forces."
+/// Concrete Frame Design ACI 318-14, section 2.1: "...multiple sub combinations using
+/// maxima/minima permutations of interacting quantities"; both say that the minima of a
+/// response spectrum case are the negatives of the maxima, which the pair of states
+/// (+v, -v) of the combination already carries, Analysis Reference p. 351): at every
+/// station each force in `mask` is taken at its maximum or at its minimum over the states
+/// at that station, every choice of the 2^k, one design entry per choice.
+///
+/// `mask` names the forces the check combines (see `interacting`). A force that is not in
+/// the mask (a shear that is checked alone, a torsion the check ignores) is not permuted:
+/// it is taken from the state that supplies the chosen M3, so each entry stays a
+/// consistent state in all that the permutation does not touch, and the largest value of
+/// such a force over the states is reached by the state entries themselves.
+///
+/// Choice of the project (the manuals say nothing on it): an entry is one choice at ALL
+/// stations, so its moment diagram, and with it $C_b$ and the largest moment of the
+/// unbraced length, is the diagram of the maximum row (M3 at its maximum) or of the minimum
+/// row (M3 at its minimum), never a mixture of the two. The state entries keep the diagrams
+/// of the states themselves. Entries equal to an earlier entry are dropped. When the states
+/// do not have the same stations, only the states are designed.
+pub(crate) fn design_entries(
+    states: &[Vec<FrameStationResult>],
+    mask: u8,
+) -> Vec<std::borrow::Cow<'_, [FrameStationResult]>> {
+    use std::borrow::Cow;
+    let mut entries: Vec<Cow<'_, [FrameStationResult]>> =
+        states.iter().map(|s| Cow::Borrowed(s.as_slice())).collect();
+    let n = states.first().map_or(0, Vec::len);
+    if states.len() < 2 || n == 0 || states.iter().any(|s| s.len() != n) {
+        return entries;
+    }
+    let bits: Vec<u8> = [
+        interacting::P,
+        interacting::M2,
+        interacting::M3,
+        interacting::V2,
+        interacting::V3,
+        interacting::T,
+    ]
+    .into_iter()
+    .filter(|b| mask & b != 0 || *b == interacting::M3)
+    .collect();
+    let m3_slot = bits.iter().position(|b| *b == interacting::M3).unwrap_or(0);
+    // Per station and force: (index of the state with the maximum, with the minimum).
+    let mut ext: Vec<Vec<(usize, usize)>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let mut row = Vec::with_capacity(bits.len());
+        for &b in &bits {
+            let (mut hi, mut lo) = (0, 0);
+            for (k, st) in states.iter().enumerate() {
+                let v = field_of(&st[i], b);
+                if v > field_of(&states[hi][i], b) {
+                    hi = k;
+                }
+                if v < field_of(&states[lo][i], b) {
+                    lo = k;
+                }
+            }
+            row.push((hi, lo));
+        }
+        ext.push(row);
+    }
+    for choice in 0..(1usize << bits.len()) {
+        let pick = |slot: usize, i: usize| {
+            let (hi, lo) = ext[i][slot];
+            if (choice >> slot) & 1 == 0 {
+                hi
+            } else {
+                lo
+            }
+        };
+        let list: Vec<FrameStationResult> = (0..n)
+            .map(|i| {
+                let mut st = states[pick(m3_slot, i)][i].clone();
+                for (slot, &b) in bits.iter().enumerate() {
+                    set_field(&mut st, b, field_of(&states[pick(slot, i)][i], b));
+                }
+                st
+            })
+            .collect();
+        if !entries.iter().any(|e| **e == list[..]) {
+            entries.push(Cow::Owned(list));
+        }
+    }
+    entries
+}
+
+/// The design states of one combination for one frame: each state is a complete list of
+/// station forces. A single-valued combination has one state; a multi-valued one has the
+/// maximum and the minimum sense of the manual (Analysis Reference pp. 351-352), and an
+/// envelope keeps every contributing state of every contributor.
+type DesignStates = Vec<Vec<FrameStationResult>>;
+
+fn station_values(s: &FrameStationResult) -> [f64; 9] {
+    [
+        s.p,
+        s.v2,
+        s.v3,
+        s.t,
+        s.m2,
+        s.m3,
+        s.local_disp[0],
+        s.local_disp[1],
+        s.local_disp[2],
+    ]
+}
+
+fn station_from_values(base: &FrameStationResult, v: [f64; 9]) -> FrameStationResult {
+    FrameStationResult {
+        station: base.station,
+        rel_dist: base.rel_dist,
+        p: v[0],
+        v2: v[1],
+        v3: v[2],
+        t: v[3],
+        m2: v[4],
+        m3: v[5],
+        local_disp: [v[6], v[7], v[8]],
+    }
+}
+
+/// The states a case or combination contributes at `frame_name`: a stored result gives its
+/// row, or its maximum and minimum rows when it is a multi-valued combination, or `(+v, -v)`
+/// for a response-spectrum, moving-load, steady-state or PSD case (p. 351); a combination
+/// without stored results is synthesized from its own contributors.
+fn constituent_states(
+    model: &SapModel,
+    name: &str,
+    frame_name: &str,
+    depth: usize,
+) -> Option<DesignStates> {
+    if let Some(cr) = model.case_results.get(name) {
+        if let Some(st) = cr.frame_forces.get(frame_name).filter(|st| !st.is_empty()) {
+            if let Some(lo) = cr
+                .combo_min
+                .as_deref()
+                .and_then(|m| m.frame_forces.get(frame_name))
+                .filter(|l| l.len() == st.len())
+            {
+                return Some(vec![st.clone(), lo.clone()]);
+            }
+            if sap_model::results::is_range_case(model, name) {
+                let signed = |sign: f64| -> Vec<FrameStationResult> {
+                    st.iter()
+                        .map(|s| station_from_values(s, station_values(s).map(|v| sign * v.abs())))
+                        .collect()
+                };
+                return Some(vec![signed(1.0), signed(-1.0)]);
+            }
+            return Some(vec![st.clone()]);
+        }
+    }
+    let sub = model.load_combos.get(name)?;
+    synthesize_combo_states(model, sub, frame_name, depth + 1)
+}
+
+fn synthesize_combo_states(
     model: &SapModel,
     combo: &LoadCombo,
     frame_name: &str,
     depth: usize,
-) -> Option<Vec<FrameStationResult>> {
+) -> Option<DesignStates> {
     if depth > 8 {
         return None;
     }
-    let mut constituent_lists: Vec<(f64, Vec<FrameStationResult>)> = Vec::new();
+    let mut constituents: Vec<(f64, DesignStates)> = Vec::new();
     for (ref_name, sf) in &combo.cases {
-        if let Some(cr) = model.case_results.get(ref_name) {
-            if let Some(st) = cr.frame_forces.get(frame_name) {
-                if !st.is_empty() {
-                    constituent_lists.push((*sf, st.clone()));
-                    continue;
-                }
-            }
-        }
-        if let Some(sub_combo) = model.load_combos.get(ref_name) {
-            if let Some(st) = synthesize_combo_frame_forces(model, sub_combo, frame_name, depth + 1)
-            {
-                if !st.is_empty() {
-                    constituent_lists.push((*sf, st));
-                }
+        if let Some(states) = constituent_states(model, ref_name, frame_name, depth) {
+            if !states.is_empty() {
+                constituents.push((*sf, states));
             }
         }
     }
-
-    if constituent_lists.is_empty() {
+    if constituents.is_empty() {
         return None;
     }
 
-    let num_stations = constituent_lists[0].1.len();
-
     if combo.combo_type == ComboType::Envelope {
-        // An Envelope combination evaluates each constituent case/combo independently (not summed!)
-        let mut env_stations = Vec::with_capacity(num_stations * constituent_lists.len());
-        for (sf, list) in &constituent_lists {
-            for item in list {
-                env_stations.push(FrameStationResult {
-                    station: item.station,
-                    rel_dist: item.rel_dist,
-                    p: sf * item.p,
-                    v2: sf * item.v2,
-                    v3: sf * item.v3,
-                    t: sf * item.t,
-                    m2: sf * item.m2,
-                    m3: sf * item.m3,
-                    local_disp: [
-                        sf * item.local_disp[0],
-                        sf * item.local_disp[1],
-                        sf * item.local_disp[2],
-                    ],
-                });
+        // An envelope evaluates each constituent state independently (not summed), which
+        // keeps the correlation between the forces of one state; the rows of a
+        // multi-valued constituent are all candidates.
+        let mut env = DesignStates::new();
+        for (sf, states) in &constituents {
+            for state in states {
+                env.push(
+                    state
+                        .iter()
+                        .map(|s| station_from_values(s, station_values(s).map(|v| sf * v)))
+                        .collect(),
+                );
             }
         }
-        return Some(env_stations);
+        return Some(env);
     }
 
-    let is_unsigned = matches!(combo.combo_type, ComboType::AbsAdd | ComboType::Srss);
-    let mut combined = Vec::with_capacity(if is_unsigned {
-        num_stations * 2
-    } else {
-        num_stations
-    });
-    for idx in 0..num_stations {
-        let base = &constituent_lists[0].1[idx];
-        let mut res = FrameStationResult {
-            station: base.station,
-            rel_dist: base.rel_dist,
-            ..Default::default()
-        };
-        for (sf, list) in &constituent_lists {
-            let item = list.get(idx).unwrap_or_else(|| list.last().unwrap());
-            match combo.combo_type {
-                ComboType::LinearAdd | ComboType::RangeAdd | ComboType::Envelope => {
-                    res.p += sf * item.p;
-                    res.v2 += sf * item.v2;
-                    res.v3 += sf * item.v3;
-                    res.t += sf * item.t;
-                    res.m2 += sf * item.m2;
-                    res.m3 += sf * item.m3;
-                    for d in 0..3 {
-                        res.local_disp[d] += sf * item.local_disp[d];
+    let num_stations = constituents[0].1[0].len();
+    // Every contributor is a pair (maximum, minimum) per quantity: the largest and the
+    // smallest value over its states (a single state gives the pair (v, v)).
+    let pair_at = |states: &DesignStates, idx: usize, k: usize| -> (f64, f64) {
+        let mut hi = f64::NEG_INFINITY;
+        let mut lo = f64::INFINITY;
+        for state in states {
+            let item = state.get(idx).unwrap_or_else(|| state.last().unwrap());
+            let v = station_values(item)[k];
+            hi = hi.max(v);
+            lo = lo.min(v);
+        }
+        (hi, lo)
+    };
+    let all_single = constituents.iter().all(|(_, states)| states.len() == 1);
+    let single_valued = all_single && combo.combo_type == ComboType::LinearAdd;
+    let senses: &[bool] = if single_valued { &[true] } else { &[true, false] };
+    let mut out = DesignStates::new();
+    for &maximum in senses {
+        let mut list = Vec::with_capacity(num_stations);
+        for idx in 0..num_stations {
+            let base = &constituents[0].1[0][idx];
+            let mut values = [0.0; 9];
+            for (k, slot) in values.iter_mut().enumerate() {
+                let mut acc = 0.0;
+                for (n, (sf, states)) in constituents.iter().enumerate() {
+                    // A pair read off a state list built from a response-spectrum case
+                    // is already (+v, -v), so `range` is false here.
+                    acc = sap_model::results::combo_step(
+                        combo.combo_type,
+                        maximum,
+                        acc,
+                        pair_at(states, idx, k),
+                        false,
+                        *sf,
+                        n == 0,
+                    );
+                }
+                *slot = if combo.combo_type == ComboType::Srss {
+                    let r = acc.max(0.0).sqrt();
+                    if maximum {
+                        r
+                    } else {
+                        -r
                     }
-                }
-                ComboType::AbsAdd => {
-                    let s = sf.abs();
-                    res.p += s * item.p.abs();
-                    res.v2 += s * item.v2.abs();
-                    res.v3 += s * item.v3.abs();
-                    res.t += s * item.t.abs();
-                    res.m2 += s * item.m2.abs();
-                    res.m3 += s * item.m3.abs();
-                }
-                ComboType::Srss => {
-                    res.p = (res.p * res.p + (sf * item.p).powi(2)).sqrt();
-                    res.v2 = (res.v2 * res.v2 + (sf * item.v2).powi(2)).sqrt();
-                    res.v3 = (res.v3 * res.v3 + (sf * item.v3).powi(2)).sqrt();
-                    res.t = (res.t * res.t + (sf * item.t).powi(2)).sqrt();
-                    res.m2 = (res.m2 * res.m2 + (sf * item.m2).powi(2)).sqrt();
-                    res.m3 = (res.m3 * res.m3 + (sf * item.m3).powi(2)).sqrt();
-                }
+                } else {
+                    acc
+                };
             }
+            list.push(station_from_values(base, values));
         }
-        if is_unsigned {
-            // For SRSS and AbsAdd, axial force magnitude can act in compression (-P) as well as tension (+P)
-            let mut comp_res = res.clone();
-            comp_res.p = -res.p.abs();
-            combined.push(comp_res);
-        }
-        combined.push(res);
+        out.push(list);
     }
-
-    Some(combined)
+    Some(out)
 }
 
 /// Runs steel frame design for all steel frame members in `model` and populates `model.steel_design_results`.
@@ -1211,7 +1489,7 @@ fn run_steel_design_validated(
     model: &mut SapModel,
     overwrites: &std::collections::HashMap<String, SteelMemberOverwrite>,
     code: SteelCode,
-    combo_forces: Vec<(String, Vec<(String, Vec<FrameStationResult>)>)>,
+    combo_forces: ComboForces,
 ) -> Result<(), DesignError> {
     let _ = compute_ec3_rectangular_minor_shear;
 
@@ -1316,13 +1594,14 @@ pub(crate) fn design_frame_with_section(
     mat: &Material,
     overwrites: &std::collections::HashMap<String, SteelMemberOverwrite>,
     code: SteelCode,
-    combo_forces: &[(String, Vec<(String, Vec<FrameStationResult>)>)],
+    combo_forces: &[(String, Vec<(String, FrameStates)>)],
 ) -> Result<Option<SteelDesignResult>, DesignError> {
     let is_asd = code == SteelCode::Aisc360Asd;
     let has_ec3_v3 = code == SteelCode::Eurocode3
         && combo_forces.iter().any(|(_, frames)| {
-            frames.iter().any(|(name, stations)| {
-                name == frame_name && stations.iter().any(|st| st.v3.abs() > 1e-9)
+            frames.iter().any(|(name, states)| {
+                name == frame_name
+                    && states.iter().flatten().any(|st| st.v3.abs() > 1e-9)
             })
         });
     let ow = overwrites.get(frame_name).or(frame.steel_overwrite.as_ref());
@@ -1361,8 +1640,8 @@ pub(crate) fn design_frame_with_section(
             | FramePropType::Pipe
             | FramePropType::ColdPipe
     ) && combo_forces.iter().any(|(_, frames)| {
-        frames.iter().any(|(name, stations)| {
-            name == frame_name && stations.iter().any(|station| station.t.abs() > 1e-9)
+        frames.iter().any(|(name, states)| {
+            name == frame_name && states.iter().flatten().any(|station| station.t.abs() > 1e-9)
         })
     });
     let phi_tn = if has_closed_torsion {
@@ -1388,284 +1667,305 @@ pub(crate) fn design_frame_with_section(
         _ => compute_aisc_minor_shear(sec, mat, is_asd)?,
     };
 
+    // The forces this check combines, whose maxima and minima are permuted for a
+    // multi-valued combination (CSI Steel Frame Design AISC 360-10, section 2.4, quoted at
+    // `design_entries`). Axial-flexure interaction (AISC H1-1a/b, EC3 6.2.1): P, M2, M3.
+    // The shear checks (AISC G, EC3 6.2.6) use one shear alone: the state entries reach its
+    // largest absolute value, so it is not permuted. The Eurocode shear-moment reduction
+    // (6.2.8) combines V2 with M3 and V3 with M2, and the torsion-shear-flexure-axial check
+    // of closed sections (AISC H3-6) combines T, V2, V3, P, M2 and M3: those forces are
+    // permuted where the check is active.
+    let mut interacting_forces = interacting::P | interacting::M2 | interacting::M3;
+    if code == SteelCode::Eurocode3 {
+        interacting_forces |= interacting::V2 | interacting::V3;
+    }
+    if phi_tn.is_some() {
+        interacting_forces |= interacting::V2 | interacting::V3 | interacting::T;
+    }
     let mut best_result: Option<SteelDesignResult> = None;
 
     for (combo_name, frame_map) in combo_forces {
-        let Some((_, stations)) = frame_map.iter().find(|(fn_k, _)| fn_k == frame_name) else {
+        let Some((_, states)) = frame_map.iter().find(|(fn_k, _)| fn_k == frame_name) else {
             continue;
         };
-        if stations.is_empty() {
-            continue;
-        }
+        // Every state is a design entry of its own, with its own station list (so its own
+        // moment diagram and Cb); a multi-valued combination adds the sub-combinations of
+        // the maxima and minima of the forces this check combines (see `design_entries`).
+        for stations in design_entries(states, interacting_forces) {
+            let stations: &[FrameStationResult] = &stations;
+            if stations.is_empty() {
+                continue;
+            }
 
-        let cb = ow
-            .and_then(|o| o.cb)
-            .unwrap_or_else(|| {
-                let ratio = ow.and_then(|o| o.l_ratio_ltb).unwrap_or(1.0);
-                let minor = ow.and_then(|o| o.l_ratio_minor).unwrap_or(1.0);
-                // As in SAP2000, Cb is 1.0 when the unbraced length is
-                // set longer than the member.
-                if ratio > 1.0 || minor > 1.0 {
-                    1.0
-                } else {
-                    compute_cb_for_unbraced_ratio(stations, ratio)
+            let cb = ow
+                .and_then(|o| o.cb)
+                .unwrap_or_else(|| {
+                    let ratio = ow.and_then(|o| o.l_ratio_ltb).unwrap_or(1.0);
+                    let minor = ow.and_then(|o| o.l_ratio_minor).unwrap_or(1.0);
+                    // As in SAP2000, Cb is 1.0 when the unbraced length is
+                    // set longer than the member.
+                    if ratio > 1.0 || minor > 1.0 {
+                        1.0
+                    } else {
+                        compute_cb_for_unbraced_ratio(stations, ratio)
+                    }
+                });
+
+            let (phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness) = match code {
+                SteelCode::Aisc360Lrfd | SteelCode::Aisc360Asd => {
+                    compute_aisc_360_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb, is_asd)
                 }
-            });
-
-        let (phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness) = match code {
-            SteelCode::Aisc360Lrfd | SteelCode::Aisc360Asd => {
-                compute_aisc_360_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb, is_asd)
-            }
-            SteelCode::Eurocode3 => {
-                compute_ec3_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb)
-            }
-        };
-
-        for st in stations {
-            let mut reported_phi_mn33 = phi_mn33;
-            let mut reported_phi_mn22 = phi_mn22;
-            let (
-                mut total_ratio,
-                mut pr_ratio,
-                mut mr_major_ratio,
-                mut mr_minor_ratio,
-                shear_major_ratio,
-                mut eq_name,
-            ) = if code == SteelCode::Eurocode3 {
-                let r_v2 = st.v2.abs() / phi_vn2.max(1e-12);
-                let r_v3 = if phi_vn3 > 0.0 {
-                    st.v3.abs() / phi_vn3
-                } else {
-                    0.0
-                };
-
-                let rho2 = if r_v2 > 0.5 {
-                    (2.0 * r_v2 - 1.0).powi(2)
-                } else {
-                    0.0
-                };
-                let rho3 = if r_v3 > 0.5 {
-                    (2.0 * r_v3 - 1.0).powi(2)
-                } else {
-                    0.0
-                };
-
-                let reduced_m3 = if rho2 > 0.0 {
-                    let m_red = match sec.prop_type {
-                        FramePropType::I | FramePropType::Channel => {
-                            let n = 1.0;
-                            let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
-                            let aw = hw * sec.tw;
-                            let wpl = if sec.z33 > 1e-9 {
-                                sec.z33
-                            } else {
-                                sec.s33.max(1e-9)
-                            };
-                            (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
-                        }
-                        FramePropType::T => {
-                            let n = 1.0;
-                            let hw = (sec.t3 - sec.tf).max(1e-6);
-                            let aw = hw * sec.tw;
-                            let wpl = if sec.z33 > 1e-9 {
-                                sec.z33
-                            } else {
-                                sec.s33.max(1e-9)
-                            };
-                            (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
-                        }
-                        FramePropType::Box
-                        | FramePropType::ColdBox
-                        | FramePropType::DbChannel
-                        | FramePropType::DblAngle => {
-                            let n = 2.0;
-                            let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
-                            let aw = hw * sec.tw;
-                            let wpl = if sec.z33 > 1e-9 {
-                                sec.z33
-                            } else {
-                                sec.s33.max(1e-9)
-                            };
-                            (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
-                        }
-                        _ => (1.0 - rho2) * phi_mn33,
-                    };
-                    m_red.min(phi_mn33).max(1e-12)
-                } else {
-                    phi_mn33
-                };
-                reported_phi_mn33 = reduced_m3;
-
-                let reduced_m2 = if rho3 > 0.0 {
-                    let m_red = match sec.prop_type {
-                        FramePropType::T => {
-                            let n = 1.0;
-                            let af = sec.t2 * sec.tf;
-                            let wpl = if sec.z22 > 1e-9 {
-                                sec.z22
-                            } else {
-                                sec.s22.max(1e-9)
-                            };
-                            (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
-                        }
-                        FramePropType::I
-                        | FramePropType::Channel
-                        | FramePropType::Box
-                        | FramePropType::ColdBox
-                        | FramePropType::DblAngle => {
-                            let n = 2.0;
-                            let af = sec.t2 * sec.tf;
-                            let wpl = if sec.z22 > 1e-9 {
-                                sec.z22
-                            } else {
-                                sec.s22.max(1e-9)
-                            };
-                            (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
-                        }
-                        FramePropType::DbChannel => {
-                            let n = 4.0;
-                            let af = sec.t2 * sec.tf;
-                            let wpl = if sec.z22 > 1e-9 {
-                                sec.z22
-                            } else {
-                                sec.s22.max(1e-9)
-                            };
-                            (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
-                        }
-                        _ => (1.0 - rho3) * phi_mn22,
-                    };
-                    m_red.min(phi_mn22).max(1e-12)
-                } else {
-                    phi_mn22
-                };
-                reported_phi_mn22 = reduced_m2;
-
-                let pc = if st.p >= 0.0 {
-                    phi_pnt.max(1e-12)
-                } else {
-                    phi_pnc.max(1e-12)
-                };
-                let pr_part = st.p.abs() / pc;
-                let mr3_part = st.m3.abs() / reduced_m3;
-                let mr2_part = st.m2.abs() / reduced_m2;
-
-                let tot = if matches!(
-                    sec.prop_type,
-                    FramePropType::Pipe | FramePropType::ColdPipe | FramePropType::Circle
-                ) {
-                    pr_part + (mr3_part * mr3_part + mr2_part * mr2_part).sqrt()
-                } else {
-                    pr_part + mr3_part + mr2_part
-                };
-
-                let eq = if rho2 > 0.0 || rho3 > 0.0 {
-                    "EC3-6.2.6+6.2.8(3)"
-                } else {
-                    "EC3-6.2"
-                };
-
-                (tot, pr_part, mr3_part, mr2_part, r_v2, eq)
-            } else {
-                evaluate_station_interaction(
-                    code, st.p, st.v2, st.m3, st.m2, phi_pnc, phi_pnt, phi_mn33, phi_mn22,
-                    phi_vn2,
-                )
+                SteelCode::Eurocode3 => {
+                    compute_ec3_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb)
+                }
             };
 
-            let shear_minor_ratio = if phi_vn3 > 0.0 {
-                st.v3.abs() / phi_vn3
-            } else {
-                0.0
-            };
+            for st in stations {
+                let mut reported_phi_mn33 = phi_mn33;
+                let mut reported_phi_mn22 = phi_mn22;
+                let (
+                    mut total_ratio,
+                    mut pr_ratio,
+                    mut mr_major_ratio,
+                    mut mr_minor_ratio,
+                    shear_major_ratio,
+                    mut eq_name,
+                ) = if code == SteelCode::Eurocode3 {
+                    let r_v2 = st.v2.abs() / phi_vn2.max(1e-12);
+                    let r_v3 = if phi_vn3 > 0.0 {
+                        st.v3.abs() / phi_vn3
+                    } else {
+                        0.0
+                    };
 
-            // AISC H3.2 Eq. H3-6: When |Tr| > 0.20 * Tc, check combined torsion + flexure + shear + axial
-            if let Some(tc) = phi_tn {
-                let tr = st.t.abs();
-                if tr > 0.20 * tc {
+                    let rho2 = if r_v2 > 0.5 {
+                        (2.0 * r_v2 - 1.0).powi(2)
+                    } else {
+                        0.0
+                    };
+                    let rho3 = if r_v3 > 0.5 {
+                        (2.0 * r_v3 - 1.0).powi(2)
+                    } else {
+                        0.0
+                    };
+
+                    let reduced_m3 = if rho2 > 0.0 {
+                        let m_red = match sec.prop_type {
+                            FramePropType::I | FramePropType::Channel => {
+                                let n = 1.0;
+                                let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
+                                let aw = hw * sec.tw;
+                                let wpl = if sec.z33 > 1e-9 {
+                                    sec.z33
+                                } else {
+                                    sec.s33.max(1e-9)
+                                };
+                                (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::T => {
+                                let n = 1.0;
+                                let hw = (sec.t3 - sec.tf).max(1e-6);
+                                let aw = hw * sec.tw;
+                                let wpl = if sec.z33 > 1e-9 {
+                                    sec.z33
+                                } else {
+                                    sec.s33.max(1e-9)
+                                };
+                                (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::Box
+                            | FramePropType::ColdBox
+                            | FramePropType::DbChannel
+                            | FramePropType::DblAngle => {
+                                let n = 2.0;
+                                let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
+                                let aw = hw * sec.tw;
+                                let wpl = if sec.z33 > 1e-9 {
+                                    sec.z33
+                                } else {
+                                    sec.s33.max(1e-9)
+                                };
+                                (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
+                            }
+                            _ => (1.0 - rho2) * phi_mn33,
+                        };
+                        m_red.min(phi_mn33).max(1e-12)
+                    } else {
+                        phi_mn33
+                    };
+                    reported_phi_mn33 = reduced_m3;
+
+                    let reduced_m2 = if rho3 > 0.0 {
+                        let m_red = match sec.prop_type {
+                            FramePropType::T => {
+                                let n = 1.0;
+                                let af = sec.t2 * sec.tf;
+                                let wpl = if sec.z22 > 1e-9 {
+                                    sec.z22
+                                } else {
+                                    sec.s22.max(1e-9)
+                                };
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::I
+                            | FramePropType::Channel
+                            | FramePropType::Box
+                            | FramePropType::ColdBox
+                            | FramePropType::DblAngle => {
+                                let n = 2.0;
+                                let af = sec.t2 * sec.tf;
+                                let wpl = if sec.z22 > 1e-9 {
+                                    sec.z22
+                                } else {
+                                    sec.s22.max(1e-9)
+                                };
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            FramePropType::DbChannel => {
+                                let n = 4.0;
+                                let af = sec.t2 * sec.tf;
+                                let wpl = if sec.z22 > 1e-9 {
+                                    sec.z22
+                                } else {
+                                    sec.s22.max(1e-9)
+                                };
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            _ => (1.0 - rho3) * phi_mn22,
+                        };
+                        m_red.min(phi_mn22).max(1e-12)
+                    } else {
+                        phi_mn22
+                    };
+                    reported_phi_mn22 = reduced_m2;
+
                     let pc = if st.p >= 0.0 {
                         phi_pnt.max(1e-12)
                     } else {
                         phi_pnc.max(1e-12)
                     };
-                    let pr_over_pc = st.p.abs() / pc;
-                    let mr3_over_mc3 = st.m3.abs() / phi_mn33.max(1e-12);
-                    let mr2_over_mc2 = st.m2.abs() / phi_mn22.max(1e-12);
-                    let shear_sum = shear_major_ratio + shear_minor_ratio;
-                    let tr_over_tc = tr / tc.max(1e-12);
-                    let shear_torsion_ratio = (shear_sum + tr_over_tc).powi(2);
-                    let ratio_h3 = if matches!(
+                    let pr_part = st.p.abs() / pc;
+                    let mr3_part = st.m3.abs() / reduced_m3;
+                    let mr2_part = st.m2.abs() / reduced_m2;
+
+                    let tot = if matches!(
                         sec.prop_type,
-                        FramePropType::Pipe | FramePropType::ColdPipe
+                        FramePropType::Pipe | FramePropType::ColdPipe | FramePropType::Circle
                     ) {
-                        pr_over_pc
-                            + mr3_over_mc3.powi(2)
-                            + mr2_over_mc2.powi(2)
-                            + shear_torsion_ratio
+                        pr_part + (mr3_part * mr3_part + mr2_part * mr2_part).sqrt()
                     } else {
-                        pr_over_pc + mr3_over_mc3 + mr2_over_mc2 + shear_torsion_ratio
+                        pr_part + mr3_part + mr2_part
                     };
-                    if ratio_h3 > total_ratio {
-                        total_ratio = ratio_h3;
-                        pr_ratio = pr_over_pc;
-                        mr_major_ratio = mr3_over_mc3;
-                        mr_minor_ratio = mr2_over_mc2;
-                        eq_name = "H3-6";
+
+                    let eq = if rho2 > 0.0 || rho3 > 0.0 {
+                        "EC3-6.2.6+6.2.8(3)"
+                    } else {
+                        "EC3-6.2"
+                    };
+
+                    (tot, pr_part, mr3_part, mr2_part, r_v2, eq)
+                } else {
+                    evaluate_station_interaction(
+                        code, st.p, st.v2, st.m3, st.m2, phi_pnc, phi_pnt, phi_mn33, phi_mn22,
+                        phi_vn2,
+                    )
+                };
+
+                let shear_minor_ratio = if phi_vn3 > 0.0 {
+                    st.v3.abs() / phi_vn3
+                } else {
+                    0.0
+                };
+
+                // AISC H3.2 Eq. H3-6: When |Tr| > 0.20 * Tc, check combined torsion + flexure + shear + axial
+                if let Some(tc) = phi_tn {
+                    let tr = st.t.abs();
+                    if tr > 0.20 * tc {
+                        let pc = if st.p >= 0.0 {
+                            phi_pnt.max(1e-12)
+                        } else {
+                            phi_pnc.max(1e-12)
+                        };
+                        let pr_over_pc = st.p.abs() / pc;
+                        let mr3_over_mc3 = st.m3.abs() / phi_mn33.max(1e-12);
+                        let mr2_over_mc2 = st.m2.abs() / phi_mn22.max(1e-12);
+                        let shear_sum = shear_major_ratio + shear_minor_ratio;
+                        let tr_over_tc = tr / tc.max(1e-12);
+                        let shear_torsion_ratio = (shear_sum + tr_over_tc).powi(2);
+                        let ratio_h3 = if matches!(
+                            sec.prop_type,
+                            FramePropType::Pipe | FramePropType::ColdPipe
+                        ) {
+                            pr_over_pc
+                                + mr3_over_mc3.powi(2)
+                                + mr2_over_mc2.powi(2)
+                                + shear_torsion_ratio
+                        } else {
+                            pr_over_pc + mr3_over_mc3 + mr2_over_mc2 + shear_torsion_ratio
+                        };
+                        if ratio_h3 > total_ratio {
+                            total_ratio = ratio_h3;
+                            pr_ratio = pr_over_pc;
+                            mr_major_ratio = mr3_over_mc3;
+                            mr_minor_ratio = mr2_over_mc2;
+                            eq_name = "H3-6";
+                        }
                     }
                 }
-            }
 
-            let gov_ratio = total_ratio.max(shear_major_ratio).max(shear_minor_ratio);
-            let gov_eq = if code == SteelCode::Eurocode3 {
-                if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
-                    "EC3-6.2.6 (V3)"
+                let gov_ratio = total_ratio.max(shear_major_ratio).max(shear_minor_ratio);
+                let gov_eq = if code == SteelCode::Eurocode3 {
+                    if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
+                        "EC3-6.2.6 (V3)"
+                    } else if shear_major_ratio > total_ratio {
+                        "EC3-6.2.6 (V2)"
+                    } else {
+                        eq_name
+                    }
+                } else if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
+                    "G7/G2-1 (V3)"
                 } else if shear_major_ratio > total_ratio {
-                    "EC3-6.2.6 (V2)"
+                    "G2-1"
                 } else {
                     eq_name
+                };
+
+                let status = if gov_ratio > 1.0 {
+                    "OVERSTRESSED".to_string()
+                } else if compactness.is_slender() {
+                    "SLENDER".to_string()
+                } else {
+                    "OK".to_string()
+                };
+
+                let is_more_critical = match &best_result {
+                    None => true,
+                    Some(prev) => gov_ratio > prev.total_ratio.max(prev.shear_major_ratio) + 1e-12,
+                };
+
+                if is_more_critical {
+                    best_result = Some(SteelDesignResult {
+                        frame_name: frame_name.to_string(),
+                        section_name: sec.name.clone(),
+                        design_code: model.steel_design_code.clone(),
+                        governing_combo: combo_name.clone(),
+                        governing_station: st.station,
+                        total_ratio: gov_ratio,
+                        pr_ratio,
+                        mr_major_ratio,
+                        mr_minor_ratio,
+                        shear_major_ratio,
+                        shear_minor_ratio,
+                        phi_pnc,
+                        phi_pnt,
+                        phi_mn33: reported_phi_mn33,
+                        phi_mn22: reported_phi_mn22,
+                        phi_vn2,
+                        phi_vn3,
+                        status,
+                        eq_name: gov_eq.to_string(),
+                    });
                 }
-            } else if shear_minor_ratio > total_ratio.max(shear_major_ratio) {
-                "G7/G2-1 (V3)"
-            } else if shear_major_ratio > total_ratio {
-                "G2-1"
-            } else {
-                eq_name
-            };
-
-            let status = if gov_ratio > 1.0 {
-                "OVERSTRESSED".to_string()
-            } else if compactness.is_slender() {
-                "SLENDER".to_string()
-            } else {
-                "OK".to_string()
-            };
-
-            let is_more_critical = match &best_result {
-                None => true,
-                Some(prev) => gov_ratio > prev.total_ratio.max(prev.shear_major_ratio) + 1e-12,
-            };
-
-            if is_more_critical {
-                best_result = Some(SteelDesignResult {
-                    frame_name: frame_name.to_string(),
-                    section_name: sec.name.clone(),
-                    design_code: model.steel_design_code.clone(),
-                    governing_combo: combo_name.clone(),
-                    governing_station: st.station,
-                    total_ratio: gov_ratio,
-                    pr_ratio,
-                    mr_major_ratio,
-                    mr_minor_ratio,
-                    shear_major_ratio,
-                    shear_minor_ratio,
-                    phi_pnc,
-                    phi_pnt,
-                    phi_mn33: reported_phi_mn33,
-                    phi_mn22: reported_phi_mn22,
-                    phi_vn2,
-                    phi_vn3,
-                    status,
-                    eq_name: gov_eq.to_string(),
-                });
             }
         }
     }

@@ -75,6 +75,9 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_example_7_003());
     rows.extend(verify_shell_cantilever_strip());
     rows.extend(verify_modal_participation_global());
+    rows.extend(crate::bench_w5_p1::rows());
+    rows.extend(crate::bench_w5_p2::rows());
+    rows.extend(crate::bench_w5_p3::rows());
     rows
 }
 

@@ -294,6 +294,11 @@ synthetic pointer and key input. **Nobody has used them by hand.**
 
 ## Not done
 
+The table message for dropped results, the stored von Mises of multi-valued
+combinations, animation export and eccentric diaphragm moments are since
+done (see [tutorial-video-wave5.md](tutorial-video-wave5.md)); the current
+list is [tutorial-video-progress.md](tutorial-video-progress.md).
+
 - Drawing aids: snapping to midpoints, intersections and perpendiculars, the
   length and angle constraints, back-face views, cylindrical grids, the 3D
   template with custom spacing, areas with more than four joints, an area

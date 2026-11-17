@@ -17,6 +17,9 @@ const MASS_TOL: f64 = 1e-18;
 /// A generated vector whose M-norm falls to this fraction of its norm before
 /// orthogonalization is redundant.
 const REDUNDANT: f64 = 1e-10;
+/// The stiffness form `B^T K B` of the Ritz projection is used while its round-off
+/// estimate stays below this fraction of its lowest eigenvalue.
+const STIFFNESS_FORM_TOL: f64 = 1e-9;
 
 /// One starting load vector of a Ritz case.
 #[derive(Debug, Clone)]
@@ -338,6 +341,8 @@ struct LoadState {
     active: bool,
     created: usize,
     last: Vec<f64>,
+    /// Index in the basis of `last`.
+    last_idx: usize,
     dyn_sum: f64,
     a_p: f64,
 }
@@ -352,7 +357,11 @@ struct LoadState {
 /// cumulative dynamic participation `sum (b.p)^2 / (a.p)`, summed over all
 /// vectors generated so far whichever load made them, reaches its target.
 /// Generation ends at `max_modes` vectors (the last cycle makes only as many
-/// as are needed) or when no load is active.
+/// as are needed), at the number of mass degrees of freedom (the rank of M: more
+/// M-orthonormal vectors do not exist) or when no load is active.
+///
+/// The Ritz values come from `B^T K B`, or from `B^T M K^-1 M B` where the first loses
+/// its digits: see the comment at the projection.
 pub(crate) fn generate_ritz_modes(
     k: &[f64],
     ldlt: &SymmetricLdlt,
@@ -362,18 +371,25 @@ pub(crate) fn generate_ritz_modes(
     max_modes: usize,
 ) -> Result<RitzModes, SolverError> {
     let n = ldlt.n;
+    // A set of M-orthonormal vectors has at most as many members as M has rank, and
+    // the manual lets the program "compute fewer modes if there are fewer mass degrees
+    // of freedom" (Analysis Reference, Ritz-Vector Analysis, Number of Modes, p. 373).
+    let rank = (0..n).filter(|&i| has_mass(m, is_fixed, i)).count();
+    let max_modes = max_modes.min(rank);
     let mut states: Vec<LoadState> = loads
         .iter()
         .map(|l| LoadState {
             active: true,
             created: 0,
             last: Vec::new(),
+            last_idx: 0,
             dyn_sum: 0.0,
             a_p: a_dot_p(m, is_fixed, &l.p),
         })
         .collect();
     let mut basis: Vec<Vec<f64>> = Vec::new();
-    let mut kb: Vec<Vec<f64>> = Vec::new();
+    // `ab[i] = K^-1 M basis[i]`, the next vector of the sequence before orthogonalization.
+    let mut ab: Vec<Option<Vec<f64>>> = Vec::new();
 
     'cycles: loop {
         if !states.iter().any(|s| s.active) {
@@ -397,6 +413,9 @@ pub(crate) fn generate_ritz_modes(
                     .collect()
             };
             let mut cand = ldlt.solve(&rhs)?;
+            if states[li].created > 0 {
+                ab[states[li].last_idx] = Some(cand.clone());
+            }
             let before = m_norm(m, &cand);
             for _pass in 0..2 {
                 for b in &basis {
@@ -433,6 +452,7 @@ pub(crate) fn generate_ritz_modes(
             }
             states[li].created += 1;
             states[li].last = cand.clone();
+            states[li].last_idx = basis.len();
             if load.max_cycles != 0 && states[li].created >= load.max_cycles {
                 states[li].active = false;
             }
@@ -449,7 +469,7 @@ pub(crate) fn generate_ritz_modes(
                     states[lj].active = false;
                 }
             }
-            kb.push(matvec(k, &cand));
+            ab.push(None);
             basis.push(cand);
         }
     }
@@ -460,8 +480,33 @@ pub(crate) fn generate_ritz_modes(
             "no Ritz vector could be generated from the starting loads".into(),
         ));
     }
-    // Rayleigh-Ritz on span(basis): K_r z = w^2 z, because the basis is
-    // M-orthonormal (B^T M B = I).
+    // Rayleigh-Ritz on span(basis). The basis is M-orthonormal (B^T M B = I), so the
+    // projected problem is the standard one, and by the min-max theorem no Ritz value lies
+    // below the exact one of the same index.
+    //
+    // Stiffness form: K_r z = w^2 z with K_r = B^T K B, a Galerkin projection with the true K.
+    // It is a sum of terms of size |K| |b|^2, so its error is about eps * max |b| |K b| per
+    // entry; where that exceeds a small fraction of the lowest Ritz value (stiff models:
+    // penalty constraints, axial stiffness modifiers, whose massless components are large)
+    // K_r has lost its digits and may even be indefinite.
+    //
+    // Carrying K b along while the vectors are made (K x = rhs from the solve, the same
+    // Gram-Schmidt coefficients applied to K b) was tried as a single form (wave 5, P15) and
+    // rejected: the rounding of `cand -= proj * b` is not mirrored in the carried K b, and
+    // it enters K_r multiplied by |K| / (M-norm after orthogonalization). On the stiff
+    // models of `wave5_ritz_bound` that gave K_r asymmetric by up to 1e-7 of its norm and
+    // violations of the Rayleigh-Ritz bound of 1e-3 up to indefinite matrices (soft model
+    // 1.7e-7 against a tolerance of 2e-11), worse than either form below.
+    //
+    // Flexibility form (used then): F_r = B^T M K^-1 M B, F_r z = mu z, w^2 = 1 / mu, the
+    // Rayleigh-Ritz of the operator K^-1 M in the M inner product. It meets only products
+    // of B with M K^-1 M B, whose error is the one of the solve with K, the same as the
+    // Eigen solver's.
+    let kb: Vec<Vec<f64>> = basis.iter().map(|b| matvec(k, b)).collect();
+    let norm2 = |v: &[f64]| v.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let scale = (0..nb)
+        .map(|a| norm2(&basis[a]) * norm2(&kb[a]))
+        .fold(0.0f64, f64::max);
     let mut kr = vec![0.0; nb * nb];
     for a in 0..nb {
         for b in a..nb {
@@ -472,17 +517,52 @@ pub(crate) fn generate_ritz_modes(
             kr[b * nb + a] = v;
         }
     }
-    let (vals, vecs) = jacobi_symmetric_eigen(&kr, nb, 80)?;
-    let mut order: Vec<usize> = (0..nb).collect();
-    order.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
-    let mut modes = Vec::with_capacity(nb);
-    for &j in &order {
-        let w2 = vals[j];
-        if w2.is_nan() || w2 <= 0.0 || !w2.is_finite() {
-            return Err(SolverError::InvalidInput(format!(
-                "Ritz projection produced a non-positive eigenvalue {w2:e}; the stiffness matrix is not positive definite"
-            )));
-        }
+    let (kvals, kvecs) = jacobi_symmetric_eigen(&kr, nb, 80)?;
+    let lowest = kvals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let error = f64::EPSILON * nb as f64 * scale;
+    // (w^2, column of `vecs`), ascending
+    let (pairs, vecs): (Vec<(f64, usize)>, Vec<f64>) =
+        if lowest > 0.0 && error <= STIFFNESS_FORM_TOL * lowest {
+            let mut order: Vec<usize> = (0..nb).collect();
+            order.sort_by(|&a, &b| kvals[a].total_cmp(&kvals[b]));
+            (order.into_iter().map(|j| (kvals[j], j)).collect(), kvecs)
+        } else {
+            for (i, slot) in ab.iter_mut().enumerate() {
+                if slot.is_none() {
+                    let mb: Vec<f64> = basis[i].iter().zip(m).map(|(b, mi)| b * mi).collect();
+                    *slot = Some(ldlt.solve(&mb)?);
+                }
+            }
+            let mdot = |u: &[f64], v: &[f64]| -> f64 {
+                u.iter().zip(v).zip(m).map(|((a, b), mi)| a * b * mi).sum()
+            };
+            let mut fr = vec![0.0; nb * nb];
+            for a in 0..nb {
+                for b in a..nb {
+                    let ab_b = ab[b].as_ref().expect("filled above");
+                    let ab_a = ab[a].as_ref().expect("filled above");
+                    let v = 0.5 * (mdot(&basis[a], ab_b) + mdot(&basis[b], ab_a));
+                    fr[a * nb + b] = v;
+                    fr[b * nb + a] = v;
+                }
+            }
+            let (mus, fvecs) = jacobi_symmetric_eigen(&fr, nb, 80)?;
+            let mu_max = mus.iter().cloned().fold(0.0f64, f64::max);
+            if mu_max.is_nan() || mu_max <= 0.0 || !mu_max.is_finite() {
+                return Err(SolverError::InvalidInput(format!(
+                    "Ritz projection has no positive flexibility eigenvalue (largest {mu_max:e}); the stiffness matrix is not positive definite"
+                )));
+            }
+            // F_r is positive definite for independent vectors; an eigenvalue at the
+            // round-off level of the largest one stands for a frequency that cannot be
+            // resolved.
+            let floor = f64::EPSILON * nb as f64 * mu_max;
+            let mut order: Vec<usize> = (0..nb).filter(|&j| mus[j] > floor).collect();
+            order.sort_by(|&a, &b| mus[b].total_cmp(&mus[a]));
+            (order.into_iter().map(|j| (1.0 / mus[j], j)).collect(), fvecs)
+        };
+    let mut modes = Vec::with_capacity(pairs.len());
+    for &(w2, j) in &pairs {
         let mut phi = vec![0.0; n];
         for (b, basis_vec) in basis.iter().enumerate() {
             let z = vecs[b * nb + j];

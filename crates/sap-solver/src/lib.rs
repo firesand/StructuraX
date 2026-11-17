@@ -3,8 +3,12 @@
 
 pub mod area;
 mod auto_seismic;
+mod bench_w5_p1;
+mod bench_w5_p2;
+mod bench_w5_p3;
 pub mod benchmarks;
 pub mod cable;
+mod combos;
 mod coordinates;
 pub mod dynamics;
 pub mod frame;
@@ -21,12 +25,12 @@ pub mod solid;
 mod supported_subset;
 
 pub use modal_history::ground_acceleration_trace;
+pub use modal_history::function_value as time_function_value;
 
 use indexmap::IndexMap;
 use sap_model::{
-    AreaObj, CaseResults, ComboType, ConstraintAxis, ConstraintType, FrameStationResult, LoadCase,
+    AreaObj, CaseResults, ConstraintAxis, ConstraintType, FrameStationResult, LoadCase,
     LoadCaseType, ModalComboMethod, ModalModeResult, ModalSubType, NLGeomType, PointObj, SapModel,
-    SolidStress,
 };
 use std::f64::consts::PI;
 use thiserror::Error;
@@ -35,11 +39,11 @@ use crate::area::{
     area_local_system, compute_area_local_loads, compute_area_local_stiffness, recover_area_result,
 };
 use crate::frame::{
-    apply_insertion_offset, apply_rigid_offsets, compute_flexible_fef_for_pattern,
-    compute_flexible_local_stiffness, insertion_offset_local, insertion_to_element_ends,
-    compute_local_geometric_stiffness, condense_releases_and_springs, eval_section_props_at,
-    frame_local_axes, joint_local_to_global_matrix, mat3_mul, mat3_transpose,
-    recover_frame_stations, resolve_load_dir_to_local,
+    add_rigid_arm_geometric_stiffness, apply_insertion_offset, apply_zoned_rigid_offsets, compute_zoned_fef_for_pattern,
+    compute_zoned_geometric_stiffness, compute_zoned_local_stiffness,
+    condense_releases_and_springs, eval_section_props_at, frame_local_axes,
+    insertion_offset_local, insertion_to_element_ends, joint_local_to_global_matrix, mat3_mul,
+    mat3_transpose, recover_frame_stations, resolve_load_dir_to_local, rigid_zones,
 };
 use crate::linalg::{
     solve_buckling_eigen, solve_modal_eigen, solve_modal_eigen_checked, solve_ritz_vectors,
@@ -47,7 +51,7 @@ use crate::linalg::{
 };
 use crate::solid::{
     compute_solid_nodal_loads, compute_solid_stiffness_and_mass, recover_solid_result,
-    solid_constitutive_matrix, solid_stress_from_components, solid_face_nodes, validate_solid_geometry,
+    solid_constitutive_matrix, solid_face_nodes, validate_solid_geometry,
 };
 
 #[derive(Debug, Error)]
@@ -62,6 +66,24 @@ pub enum SolverError {
     SectionNotFound(String),
     #[error("Referenced material '{0}' not found in model")]
     MaterialNotFound(String),
+    #[error("Singular matrix: the structure is unstable at joint '{joint}' {dof} ({detail})")]
+    Unstable {
+        joint: String,
+        dof: String,
+        detail: String,
+    },
+    /// As `Unstable`, at a joint that the automatic subdivision of a frame object
+    /// created: that joint is not one of the model, so the message names the
+    /// object, the joints at its ends and the one the singular joint is nearer to.
+    #[error("Singular matrix: the structure is unstable in frame '{frame}' between its joints '{from}' and '{to}' (an internal joint of its automatic subdivision, nearest to joint '{nearest}') {what}")]
+    UnstableFrame {
+        frame: String,
+        from: String,
+        to: String,
+        nearest: String,
+        /// The degree of freedom and the detail, as in `Unstable`.
+        what: String,
+    },
     #[error("Unsupported analysis input: {0}")]
     UnsupportedInput(String),
     #[error("Nonlinear case '{case}' did not converge after {iterations} iterations (residual {residual:e}): {reason}")]
@@ -176,7 +198,7 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
 
     for case_name in ordered_cases {
         let lc = model.load_cases.get(&case_name).unwrap().clone();
-        let res = match lc.case_type {
+        let res = (|| -> Result<CaseResults, SolverError> { Ok(match lc.case_type {
             LoadCaseType::LinearStatic | LoadCaseType::LinearStaticMultiStep => {
                 run_linear_static_case(
                     model,
@@ -277,19 +299,79 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
                     case_name, lc.case_type
                 )))
             }
-        };
+        }) })()
+        .map_err(|e| name_unstable_joint(e, &work_points, &frame_mesh, &model.frames))?;
         model.case_results.insert(case_name, res);
     }
 
     auto_seismic::attach(model, &auto_lateral);
 
     // Evaluate all LoadCombos
-    evaluate_load_combos(model);
+    combos::evaluate_load_combos(model);
     frame_mesh::collapse(&mut model.case_results, &frame_mesh);
 
     model.is_locked = true;
     Ok(())
 }
+
+/// Names the joint and degree of freedom of a singular pivot (D03). A
+/// `LinalgError::SingularMatrix(i)` always indexes the global (joint-local)
+/// degrees of freedom `6 * joint + component`: every factorization of a
+/// sub-matrix reports its failures as `SingularReduced`, or maps its index
+/// through its DOF list first (`linalg::remap_singular_index`).
+fn name_unstable_joint(
+    error: SolverError,
+    work_points: &IndexMap<String, PointObj>,
+    mesh: &frame_mesh::FrameMesh,
+    frames: &IndexMap<String, sap_model::FrameObj>,
+) -> SolverError {
+    match error {
+        SolverError::Linalg(LinalgError::SingularMatrix(i)) => {
+            let named = unstable_at_dof(
+                work_points,
+                i,
+                "zero or negative pivot after restraints".to_string(),
+            );
+            // A joint created for an automatic subdivision is not a joint of the
+            // model: name the frame it lies on and the joints at its ends.
+            match &named {
+                SolverError::Unstable { joint, dof, detail } => {
+                    match mesh.locate_internal_joint(joint, frames) {
+                        Some(at) => SolverError::UnstableFrame {
+                            frame: at.frame,
+                            from: at.from,
+                            to: at.to,
+                            nearest: at.nearest,
+                            what: format!("{dof} ({detail})"),
+                        },
+                        None => named,
+                    }
+                }
+                _ => named,
+            }
+        }
+        other => other,
+    }
+}
+
+/// `SolverError::Unstable` for the global degree of freedom `dof`.
+fn unstable_at_dof(work_points: &IndexMap<String, PointObj>, dof: usize, detail: String) -> SolverError {
+    const NAMES: [&str; 6] = ["U1", "U2", "U3", "R1", "R2", "R3"];
+    let Some((joint, point)) = work_points.get_index(dof / 6) else {
+        return SolverError::Linalg(LinalgError::SingularMatrix(dof));
+    };
+    let mut name = NAMES[dof % 6].to_string();
+    if joint_local_to_global_matrix(point) != IDENTITY3 {
+        name.push_str(" (joint local axes)");
+    }
+    SolverError::Unstable {
+        joint: joint.clone(),
+        dof: name,
+        detail,
+    }
+}
+
+const IDENTITY3: [[f64; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
 
 /// The insertion offset of a frame, with the reason as a solver error if the
 /// assignment is one the element does not implement. Validation refuses those
@@ -889,6 +971,15 @@ fn validate_active_loads(model: &SapModel) -> Result<(), SolverError> {
         }
     }
     for (name, area) in &model.areas {
+        // An orthotropic material must have positive moduli and a positive definite
+        // compliance; an indefinite set would be analysed without a trace.
+        let area_material = model
+            .area_sections
+            .get(&area.section)
+            .and_then(|sec| model.materials.get(&sec.material));
+        if let Some(mat) = area_material {
+            crate::area::validate_area_material(name, mat).map_err(SolverError::InvalidInput)?;
+        }
         for load in &area.loads_pressure {
             if used_patterns.contains(load.load_pat.as_str())
                 && load.val != 0.
@@ -912,6 +1003,10 @@ fn validate_active_loads(model: &SapModel) -> Result<(), SolverError> {
             // Anything else would be dropped without a trace.
             if !used_patterns.contains(load.load_pat.as_str()) || load.val == 0. {
                 continue;
+            }
+            if let Some(mat) = area_material {
+                crate::area::validate_area_thermal_material(name, mat)
+                    .map_err(SolverError::UnsupportedInput)?;
             }
             if !matches!(
                 load.my_type,
@@ -1254,14 +1349,11 @@ fn assemble_elastic_stiffness_and_mass(
             [pt_j.x, pt_j.y, pt_j.z],
             frame.angle_deg,
         );
-        let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
-        let di = rz * frame.end_offset_i;
-        let dj = rz * frame.end_offset_j;
-        let lf = (length - di - dj).max(1e-6 * length);
-
-        let mut k_loc = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
+        let zones = rigid_zones(frame, length);
+        
+        let mut k_loc = compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
         if frame.pdelta_force.abs() > 1e-18 {
-            let kg_loc = compute_local_geometric_stiffness(frame.pdelta_force, lf);
+            let kg_loc = compute_zoned_geometric_stiffness(frame.pdelta_force, &zones);
             for r in 0..12 {
                 for c in 0..12 {
                     k_loc[r][c] += kg_loc[r][c];
@@ -1270,7 +1362,8 @@ fn assemble_elastic_stiffness_and_mass(
         }
         let mut dummy_fef = [0.0; 12];
         condense_releases_and_springs(&mut k_loc, &mut dummy_fef, frame);
-        apply_rigid_offsets(&mut k_loc, &mut dummy_fef, di, dj);
+        apply_zoned_rigid_offsets(&mut k_loc, &mut dummy_fef, &zones);
+        add_rigid_arm_geometric_stiffness(&mut k_loc, frame.pdelta_force, &zones);
         let insertion = frame_insertion_offset(model, frame)?;
         apply_insertion_offset(&mut k_loc, &mut dummy_fef, insertion);
 
@@ -1318,7 +1411,7 @@ fn assemble_elastic_stiffness_and_mass(
         }
 
         let (e_axes, _centroid, local_xy) =
-            area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
+            area_local_system(&coords, crate::area::area_axes_angle(area, sec));
         let (k_loc, elem_area) = compute_area_local_stiffness(area, sec, mat, &local_xy);
 
         assemble_area_into_global(
@@ -1662,12 +1755,26 @@ fn add_springs_and_constraints(
             let dz = ps.z - pm.z;
 
             match cdef.constraint_type {
-                ConstraintType::Equal | ConstraintType::Local => {
+                ConstraintType::Local => {
+                    // Local constraint: the joint-local DOFs themselves are tied.
+                    for d in 0..6 {
+                        if cdef.dofs[d] {
+                            add_penalty_constraint_local(
+                                &mut k,
+                                ndof,
+                                &[(6 * slave + d, 1.0), (6 * master + d, -1.0)],
+                                penalty,
+                            );
+                        }
+                    }
+                }
+                ConstraintType::Equal => {
                     for d in 0..6 {
                         if cdef.dofs[d] {
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave + d, 1.0), (6 * master + d, -1.0)],
                                 penalty,
                             );
@@ -1682,6 +1789,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave, 1.0), (6 * master, -1.0), (6 * master + 5, dy)],
                                 penalty,
                             );
@@ -1689,6 +1797,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[
                                     (6 * slave + 1, 1.0),
                                     (6 * master + 1, -1.0),
@@ -1700,6 +1809,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave + 5, 1.0), (6 * master + 5, -1.0)],
                                 penalty,
                             );
@@ -1710,6 +1820,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[
                                     (6 * slave + 1, 1.0),
                                     (6 * master + 1, -1.0),
@@ -1721,6 +1832,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[
                                     (6 * slave + 2, 1.0),
                                     (6 * master + 2, -1.0),
@@ -1732,6 +1844,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave + 3, 1.0), (6 * master + 3, -1.0)],
                                 penalty,
                             );
@@ -1742,6 +1855,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave, 1.0), (6 * master, -1.0), (6 * master + 4, -dz)],
                                 penalty,
                             );
@@ -1749,6 +1863,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[
                                     (6 * slave + 2, 1.0),
                                     (6 * master + 2, -1.0),
@@ -1760,6 +1875,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave + 4, 1.0), (6 * master + 4, -1.0)],
                                 penalty,
                             );
@@ -1773,6 +1889,7 @@ fn add_springs_and_constraints(
                         add_penalty_constraint(
                             &mut k,
                             ndof,
+                            joint_rot,
                             &[
                                 (6 * slave, 1.0),
                                 (6 * master, -1.0),
@@ -1787,6 +1904,7 @@ fn add_springs_and_constraints(
                         add_penalty_constraint(
                             &mut k,
                             ndof,
+                            joint_rot,
                             &[
                                 (6 * slave + 1, 1.0),
                                 (6 * master + 1, -1.0),
@@ -1801,6 +1919,7 @@ fn add_springs_and_constraints(
                         add_penalty_constraint(
                             &mut k,
                             ndof,
+                            joint_rot,
                             &[
                                 (6 * slave + 2, 1.0),
                                 (6 * master + 2, -1.0),
@@ -1815,6 +1934,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave + d, 1.0), (6 * master + d, -1.0)],
                                 penalty,
                             );
@@ -1826,6 +1946,7 @@ fn add_springs_and_constraints(
                     add_penalty_constraint(
                         &mut k,
                         ndof,
+                        joint_rot,
                         &[
                             (6 * slave + 2, 1.0),
                             (6 * master + 2, -1.0),
@@ -1837,12 +1958,14 @@ fn add_springs_and_constraints(
                     add_penalty_constraint(
                         &mut k,
                         ndof,
+                        joint_rot,
                         &[(6 * slave + 3, 1.0), (6 * master + 3, -1.0)],
                         penalty,
                     );
                     add_penalty_constraint(
                         &mut k,
                         ndof,
+                        joint_rot,
                         &[(6 * slave + 4, 1.0), (6 * master + 4, -1.0)],
                         penalty,
                     );
@@ -1853,6 +1976,7 @@ fn add_springs_and_constraints(
                             add_penalty_constraint(
                                 &mut k,
                                 ndof,
+                                joint_rot,
                                 &[(6 * slave + d, 1.0), (6 * master + d, -1.0)],
                                 penalty,
                             );
@@ -1866,7 +1990,47 @@ fn add_springs_and_constraints(
     k
 }
 
-fn add_penalty_constraint(k: &mut [f64], ndof: usize, terms: &[(usize, f64)], penalty: f64) {
+/// Adds the penalty of the constraint equation `sum c_i u_i = 0` whose terms are
+/// `(6 * joint + component, c)` in GLOBAL components (`component` 0..3 the
+/// translations, 3..6 the rotations). The DOFs of a joint with local axes are
+/// joint-local, `u_global = R u_local`, so each term is written on the three
+/// local components of its kind: `c * R[component][l]` on local component `l`.
+/// A joint without local axes keeps its single term bitwise.
+fn add_penalty_constraint(
+    k: &mut [f64],
+    ndof: usize,
+    joint_rot: &[[[f64; 3]; 3]],
+    terms: &[(usize, f64)],
+    penalty: f64,
+) {
+    let norm_sq: f64 = terms.iter().map(|(_, c)| c * c).sum();
+    if norm_sq <= 1e-30 {
+        return;
+    }
+    let scale = penalty / norm_sq;
+    let mut local: Vec<(usize, f64)> = Vec::with_capacity(3 * terms.len());
+    for &(dof, c) in terms {
+        let (joint, component) = (dof / 6, dof % 6);
+        let rotation = &joint_rot[joint];
+        if *rotation == IDENTITY3 {
+            local.push((dof, c));
+        } else {
+            let first = 6 * joint + 3 * (component / 3);
+            for l in 0..3 {
+                local.push((first + l, c * rotation[component % 3][l]));
+            }
+        }
+    }
+    for &(i, ci) in &local {
+        for &(j, cj) in &local {
+            k[i * ndof + j] += scale * ci * cj;
+        }
+    }
+}
+
+/// As [`add_penalty_constraint`] for a constraint written in joint-local DOFs
+/// (the Local constraint): the terms are added as given.
+fn add_penalty_constraint_local(k: &mut [f64], ndof: usize, terms: &[(usize, f64)], penalty: f64) {
     let norm_sq: f64 = terms.iter().map(|(_, c)| c * c).sum();
     if norm_sq <= 1e-30 {
         return;
@@ -1931,17 +2095,14 @@ fn assemble_global_geometric_stiffness(
             [pt_j.x, pt_j.y, pt_j.z],
             frame.angle_deg,
         );
-        let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
-        let di = rz * frame.end_offset_i;
-        let dj = rz * frame.end_offset_j;
-        let lf = (length - di - dj).max(1e-6 * length);
-
+        let zones = rigid_zones(frame, length);
+        
         let has_release = frame.release_i.iter().any(|&r| r) || frame.release_j.iter().any(|&r| r);
         let mut kg_eff = if has_release {
-            let ke_raw = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
+            let ke_raw = compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
             let mut k_base_loc = ke_raw;
             if p_base.abs() > 1e-18 {
-                let kg_b = compute_local_geometric_stiffness(p_base, lf);
+                let kg_b = compute_zoned_geometric_stiffness(p_base, &zones);
                 for r in 0..12 {
                     for c in 0..12 {
                         k_base_loc[r][c] += kg_b[r][c];
@@ -1950,7 +2111,7 @@ fn assemble_global_geometric_stiffness(
             }
             let mut k_tot_loc = ke_raw;
             if p_target.abs() > 1e-18 {
-                let kg_t = compute_local_geometric_stiffness(p_target, lf);
+                let kg_t = compute_zoned_geometric_stiffness(p_target, &zones);
                 for r in 0..12 {
                     for c in 0..12 {
                         k_tot_loc[r][c] += kg_t[r][c];
@@ -1969,11 +2130,12 @@ fn assemble_global_geometric_stiffness(
             }
             diff
         } else {
-            compute_local_geometric_stiffness(p_delta, lf)
+            compute_zoned_geometric_stiffness(p_delta, &zones)
         };
 
         let mut dummy_fef = [0.0; 12];
-        apply_rigid_offsets(&mut kg_eff, &mut dummy_fef, di, dj);
+        apply_zoned_rigid_offsets(&mut kg_eff, &mut dummy_fef, &zones);
+        add_rigid_arm_geometric_stiffness(&mut kg_eff, p_delta, &zones);
 
         let ti = mat3_mul(&e_axes, &joint_rot[idx_i]);
         let tj = mat3_mul(&e_axes, &joint_rot[idx_j]);
@@ -2092,7 +2254,14 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
                     upper.as_str(),
                     "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
                 ) {
-                    let f_end = eval_dynamic_function(model, func_name, t_end);
+                    // A case that runs and names a missing function is refused by
+                    // `validate_analysis_inputs`; a predecessor that does not run
+                    // contributes nothing here rather than a factor of one.
+                    let Some(function) = model.functions.get(func_name) else {
+                        continue;
+                    };
+                    let f_end =
+                        time_function_value(&function.points, t_end, 1e-9 * c.time_step_dt);
                     let sf = scale_factor * f_end;
                     if sf.abs() > 1e-18 {
                         loads.push((pat_or_acc.clone(), sf));
@@ -2936,18 +3105,15 @@ fn assemble_static_loads(
             [pt_j.x, pt_j.y, pt_j.z],
             frame.angle_deg,
         );
-        let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
-        let di = rz * frame.end_offset_i;
-        let dj = rz * frame.end_offset_j;
-        let lf = (length - di - dj).max(1e-6 * length);
-
-        let mut k_loc = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
+        let zones = rigid_zones(frame, length);
+        
+        let mut k_loc = compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
         let p_ax = frame_axial
             .get(fname)
             .copied()
             .unwrap_or(frame.pdelta_force);
         if p_ax.abs() > 1e-18 {
-            let kg_loc = compute_local_geometric_stiffness(p_ax, lf);
+            let kg_loc = compute_zoned_geometric_stiffness(p_ax, &zones);
             for r in 0..12 {
                 for c in 0..12 {
                     k_loc[r][c] += kg_loc[r][c];
@@ -2956,13 +3122,14 @@ fn assemble_static_loads(
         }
 
         let mut fef_total = [0.0f64; 12];
+        let mut fef_arms = [0.0f64; 12];
         for (pat_name, sf) in case_loads {
             let self_wt_mult = model
                 .load_patterns
                 .get(pat_name)
                 .map(|lp| lp.self_wt_multiplier)
                 .unwrap_or(0.0);
-            let fef_pat = compute_flexible_fef_for_pattern(
+            let fef_pat = compute_zoned_fef_for_pattern(
                 model,
                 frame,
                 sec,
@@ -2970,18 +3137,26 @@ fn assemble_static_loads(
                 pt_i,
                 pt_j,
                 &e_axes,
-                lf,
+                &zones,
                 pat_name,
                 self_wt_mult,
                 *sf,
             );
             for m in 0..12 {
-                fef_total[m] += fef_pat[m];
+                fef_total[m] += fef_pat.flexible[m];
+                fef_arms[m] += fef_pat.arms[m];
             }
         }
 
         condense_releases_and_springs(&mut k_loc, &mut fef_total, frame);
-        apply_rigid_offsets(&mut k_loc, &mut fef_total, di, dj);
+        apply_zoned_rigid_offsets(&mut k_loc, &mut fef_total, &zones);
+        if zones.has_arms() {
+            // Loads on the rigid arms go straight to the joints (after the release).
+            for m in 0..12 {
+                fef_total[m] += fef_arms[m];
+            }
+        }
+        add_rigid_arm_geometric_stiffness(&mut k_loc, p_ax, &zones);
         let insertion = frame_insertion_offset(model, frame)?;
         apply_insertion_offset(&mut k_loc, &mut fef_total, insertion);
         let p0 = 0.5 * (fef_total[6] - fef_total[0]);
@@ -3032,7 +3207,7 @@ fn assemble_static_loads(
             node_indices.push(idx);
             coords.push([pt.x, pt.y, pt.z]);
         }
-        let (e_axes, _, local_xy) = area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
+        let (e_axes, _, local_xy) = area_local_system(&coords, crate::area::area_axes_angle(area, sec));
 
         for (pat_name, sf) in case_loads {
             let self_wt_mult = model
@@ -3438,7 +3613,7 @@ fn recover_static_results(
             node_indices.push(idx);
             coords.push([pt.x, pt.y, pt.z]);
         }
-        let (e_axes, _, local_xy) = area_local_system(&coords, area.angle_deg + sec.mat_angle_deg);
+        let (e_axes, _, local_xy) = area_local_system(&coords, crate::area::area_axes_angle(area, sec));
 
         let mut u_loc = vec![0.0f64; 6 * n_nodes];
         for (a, &pt_idx) in node_indices.iter().enumerate() {
@@ -3481,6 +3656,7 @@ fn recover_static_results(
                     avg.s11_top += r.s11_top / count;
                     avg.s22_top += r.s22_top / count;
                     avg.s12_top += r.s12_top / count;
+                    avg.s33 += r.s33 / count;
                 }
             }
             // The von Mises value is not linear: take it from the averaged components.
@@ -3929,7 +4105,7 @@ fn run_response_spectrum_case(
                     )))
                 }
             };
-            let sa = eval_dynamic_function(model, func_name, t_sec);
+            let sa = spectrum_value(model, &lc.name, func_name, t_sec)?;
             q_m += mode.participation_factors[dir_idx] * sa * (*sf) / (omega * omega);
         }
 
@@ -4150,19 +4326,17 @@ fn assemble_static_pattern_rhs(
             [pt_j.x, pt_j.y, pt_j.z],
             frame.angle_deg,
         );
-        let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
-        let di = rz * frame.end_offset_i;
-        let dj = rz * frame.end_offset_j;
-        let lf = (length - di - dj).max(1e-6 * length);
-        let mut k_loc = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
+        let zones = rigid_zones(frame, length);
+                let mut k_loc = compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
         let mut fef_total = [0.0f64; 12];
+        let mut fef_arms = [0.0f64; 12];
         for (pat_name, sf) in case_loads {
             let self_wt_mult = model
                 .load_patterns
                 .get(pat_name)
                 .map(|lp| lp.self_wt_multiplier)
                 .unwrap_or(0.0);
-            let fef_pat = compute_flexible_fef_for_pattern(
+            let fef_pat = compute_zoned_fef_for_pattern(
                 model,
                 frame,
                 sec,
@@ -4170,17 +4344,24 @@ fn assemble_static_pattern_rhs(
                 pt_i,
                 pt_j,
                 &e_axes,
-                lf,
+                &zones,
                 pat_name,
                 self_wt_mult,
                 *sf,
             );
             for m in 0..12 {
-                fef_total[m] += fef_pat[m];
+                fef_total[m] += fef_pat.flexible[m];
+                fef_arms[m] += fef_pat.arms[m];
             }
         }
         condense_releases_and_springs(&mut k_loc, &mut fef_total, frame);
-        apply_rigid_offsets(&mut k_loc, &mut fef_total, di, dj);
+        apply_zoned_rigid_offsets(&mut k_loc, &mut fef_total, &zones);
+        if zones.has_arms() {
+            // Loads on the rigid arms go straight to the joints (after the release).
+            for m in 0..12 {
+                fef_total[m] += fef_arms[m];
+            }
+        }
         let insertion = frame_insertion_offset(model, frame)?;
         apply_insertion_offset(&mut k_loc, &mut fef_total, insertion);
         let ti = mat3_mul(&e_axes, &joint_rot[idx_i]);
@@ -4231,8 +4412,18 @@ fn run_time_history_case(
     }
 
     // Precompute spatial load vectors for each history_loads entry
-    let mut spatial_loads: Vec<(String, Vec<f64>)> = Vec::new();
+    let mut spatial_loads: Vec<(&[(f64, f64)], Vec<f64>)> = Vec::new();
     for (func_name, pat_or_acc, sf) in &lc.history_loads {
+        let points = model
+            .functions
+            .get(func_name)
+            .map(|f| f.points.as_slice())
+            .ok_or_else(|| {
+                SolverError::InvalidInput(format!(
+                    "case '{}' references missing function '{func_name}'",
+                    lc.name
+                ))
+            })?;
         let mut f_vec = vec![0.0f64; ndof];
         let upper = pat_or_acc.trim().to_ascii_uppercase();
         if matches!(
@@ -4261,7 +4452,7 @@ fn run_time_history_case(
                 ndof,
             )?;
         }
-        spatial_loads.push((func_name.clone(), f_vec));
+        spatial_loads.push((points, f_vec));
     }
 
     let f_base_init = if let Some(init_name) = &lc.initial_case {
@@ -4294,17 +4485,21 @@ fn run_time_history_case(
         vec![0.0; ndof]
     };
 
+    // One rule for every time function (D23): zero before the first point,
+    // constant after the last, right-continuous, times within `function_tol` of a
+    // point count as that point.
+    let function_tol = 1e-9 * dt;
     let load_at = |t: f64, derivative: bool| {
         let mut force = if derivative {
             vec![0.0; ndof]
         } else {
             f_base_init.clone()
         };
-        for (function, spatial) in &spatial_loads {
+        for (points, spatial) in &spatial_loads {
             let value = if derivative {
-                eval_dynamic_function_slope(model, function, t)
+                function_slope(points, t, function_tol)
             } else {
-                eval_dynamic_function(model, function, t)
+                time_function_value(points, t, function_tol)
             };
             for i in 0..ndof {
                 force[i] += value * spatial[i];
@@ -4760,15 +4955,12 @@ fn recover_results_from_displacement_vector(
             [pt_j.x, pt_j.y, pt_j.z],
             frame.angle_deg,
         );
-        let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
-        let di = rz * frame.end_offset_i;
-        let dj = rz * frame.end_offset_j;
-        let lf = (length - di - dj).max(1e-6 * length);
-
-        let mut k_loc = compute_flexible_local_stiffness(model, frame, sec, mat, lf);
+        let zones = rigid_zones(frame, length);
+        
+        let mut k_loc = compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
         let mut dummy_fef = [0.0; 12];
         condense_releases_and_springs(&mut k_loc, &mut dummy_fef, frame);
-        apply_rigid_offsets(&mut k_loc, &mut dummy_fef, di, dj);
+        apply_zoned_rigid_offsets(&mut k_loc, &mut dummy_fef, &zones);
         // This path serves history and spectrum cases, which validation
         // refuses for a frame with an offset insertion point, so the offset
         // is zero here.
@@ -4822,35 +5014,39 @@ fn recover_results_from_displacement_vector(
     }
 }
 
-/// Right derivative of the piecewise-linear load function. The function is
-/// constant outside its samples, matching eval_dynamic_function's convention.
-fn eval_dynamic_function_slope(model: &SapModel, func_name: &str, x: f64) -> f64 {
-    let Some(func) = model.functions.get(func_name) else {
-        return 0.0;
-    };
-    for window in func.points.windows(2) {
+/// Right derivative of the piecewise-linear time function: zero before the
+/// first point and from the last point on (the function is constant there, see
+/// [`time_function_value`]). Times within `tol` of a point count as that point.
+fn function_slope(points: &[(f64, f64)], t: f64, tol: f64) -> f64 {
+    for window in points.windows(2) {
         let (x0, y0) = window[0];
         let (x1, y1) = window[1];
-        if x >= x0 && x < x1 {
+        if t >= x0 - tol && t < x1 - tol {
             return (y1 - y0) / (x1 - x0);
         }
     }
     0.0
 }
 
-fn eval_dynamic_function(model: &SapModel, func_name: &str, x: f64) -> f64 {
-    let Some(func) = model.functions.get(func_name) else {
-        return 1.0;
-    };
-    let pts = &func.points;
+/// Ordinate of a response-spectrum function at the period `x`: the first
+/// ordinate below the first period, the last one above the last, linear in
+/// between. (A spectrum is read at periods, not at times, so the time-function
+/// rule that is zero before the first point does not apply to it.)
+fn spectrum_value(model: &SapModel, case: &str, func_name: &str, x: f64) -> Result<f64, SolverError> {
+    let function = model.functions.get(func_name).ok_or_else(|| {
+        SolverError::InvalidInput(format!(
+            "case '{case}' references missing function '{func_name}'"
+        ))
+    })?;
+    let pts = &function.points;
     if pts.is_empty() {
-        return 0.0;
+        return Ok(0.0);
     }
     if x <= pts[0].0 {
-        return pts[0].1;
+        return Ok(pts[0].1);
     }
     if x >= pts[pts.len() - 1].0 {
-        return pts[pts.len() - 1].1;
+        return Ok(pts[pts.len() - 1].1);
     }
     for w in pts.windows(2) {
         let (x0, y0) = w[0];
@@ -4858,351 +5054,12 @@ fn eval_dynamic_function(model: &SapModel, func_name: &str, x: f64) -> f64 {
         if x >= x0 && x <= x1 {
             let dx = x1 - x0;
             if dx.abs() <= 1e-18 {
-                return y0;
+                return Ok(y0);
             }
-            return y0 + (y1 - y0) * ((x - x0) / dx);
+            return Ok(y0 + (y1 - y0) * ((x - x0) / dx));
         }
     }
-    pts[pts.len() - 1].1
-}
-
-/// Evaluates all `LoadCombo`s in `model.load_combos` in topological order and stores
-/// combined `CaseResults` in `model.case_results` (safely skipping cyclic or empty combos).
-fn evaluate_load_combos(model: &mut SapModel) {
-    let n_combos = model.load_combos.len();
-    if n_combos == 0 {
-        return;
-    }
-    let combo_idx_map: IndexMap<String, usize> = model
-        .load_combos
-        .keys()
-        .enumerate()
-        .map(|(idx, name)| (name.clone(), idx))
-        .collect();
-    let mut in_degree = vec![0usize; n_combos];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n_combos];
-    for (idx, combo) in model.load_combos.values().enumerate() {
-        let mut seen_deps = std::collections::BTreeSet::new();
-        for (src_name, _) in &combo.cases {
-            if model.case_results.contains_key(src_name) {
-                continue;
-            }
-            if let Some(&dep_idx) = combo_idx_map.get(src_name) {
-                if seen_deps.insert(dep_idx) {
-                    in_degree[idx] += 1;
-                    if dep_idx != idx {
-                        dependents[dep_idx].push(idx);
-                    }
-                }
-            }
-        }
-    }
-
-    let mut ready = std::collections::BinaryHeap::new();
-    for (idx, &deg) in in_degree.iter().enumerate() {
-        if deg == 0 {
-            ready.push(std::cmp::Reverse(idx));
-        }
-    }
-    let mut topo_order = Vec::with_capacity(n_combos);
-    while let Some(std::cmp::Reverse(idx)) = ready.pop() {
-        topo_order.push(idx);
-        for &next in &dependents[idx] {
-            in_degree[next] -= 1;
-            if in_degree[next] == 0 {
-                ready.push(std::cmp::Reverse(next));
-            }
-        }
-    }
-
-    for combo_idx in topo_order {
-        let combo = model.load_combos[combo_idx].clone();
-        let mut comb_res = CaseResults {
-            case_name: combo.name.clone(),
-            ..Default::default()
-        };
-
-        let combine_op = |acc: f64, val: f64, sf: f64, is_first: bool| -> f64 {
-            match combo.combo_type {
-                ComboType::LinearAdd | ComboType::RangeAdd => acc + val * sf,
-                ComboType::AbsAdd => acc + (val * sf).abs(),
-                ComboType::Srss => acc + (val * sf).powi(2),
-                ComboType::Envelope => {
-                    let v = val * sf;
-                    if is_first || v.abs() > acc.abs() {
-                        v
-                    } else {
-                        acc
-                    }
-                }
-            }
-        };
-        let finalize_op = |acc: f64| -> f64 {
-            if combo.combo_type == ComboType::Srss {
-                acc.max(0.0).sqrt()
-            } else {
-                acc
-            }
-        };
-
-        let combine_stress = |dst: &mut SolidStress, src: &SolidStress, sf: f64, is_first: bool| {
-            dst.s11 = combine_op(dst.s11, src.s11, sf, is_first);
-            dst.s22 = combine_op(dst.s22, src.s22, sf, is_first);
-            dst.s33 = combine_op(dst.s33, src.s33, sf, is_first);
-            dst.s12 = combine_op(dst.s12, src.s12, sf, is_first);
-            dst.s13 = combine_op(dst.s13, src.s13, sf, is_first);
-            dst.s23 = combine_op(dst.s23, src.s23, sf, is_first);
-            dst.s_max = combine_op(dst.s_max, src.s_max, sf, is_first);
-            dst.s_mid = combine_op(dst.s_mid, src.s_mid, sf, is_first);
-            dst.s_min = combine_op(dst.s_min, src.s_min, sf, is_first);
-            dst.von_mises = combine_op(dst.von_mises, src.von_mises, sf, is_first);
-        };
-        let finalize_stress = |dst: &mut SolidStress| {
-            dst.s11 = finalize_op(dst.s11);
-            dst.s22 = finalize_op(dst.s22);
-            dst.s33 = finalize_op(dst.s33);
-            dst.s12 = finalize_op(dst.s12);
-            dst.s13 = finalize_op(dst.s13);
-            dst.s23 = finalize_op(dst.s23);
-            dst.s_max = finalize_op(dst.s_max);
-            dst.s_mid = finalize_op(dst.s_mid);
-            dst.s_min = finalize_op(dst.s_min);
-            dst.von_mises = finalize_op(dst.von_mises);
-        };
-
-        // A combination reports an area, solid or link result for an object only if
-        // every contributing case reports one; otherwise the sum would silently be
-        // that of a subset of the cases (a response-spectrum, modal or buckling case,
-        // for example, carries no area, solid or link results).
-        let contributing: Vec<&CaseResults> = combo
-            .cases
-            .iter()
-            .filter_map(|(name, _)| model.case_results.get(name))
-            .collect();
-        let in_all = |has: &dyn Fn(&CaseResults) -> bool| contributing.iter().all(|c| has(c));
-
-        let mut contributed = 0usize;
-        for (src_name, sf) in &combo.cases {
-            let Some(src) = model.case_results.get(src_name).cloned() else {
-                continue;
-            };
-            let is_first = contributed == 0;
-            contributed += 1;
-
-            for (pname, d) in &src.joint_displacements {
-                let key_first = is_first || !comb_res.joint_displacements.contains_key(pname);
-                let entry = comb_res
-                    .joint_displacements
-                    .entry(pname.clone())
-                    .or_insert([0.0; 6]);
-                for k in 0..6 {
-                    entry[k] = combine_op(entry[k], d[k], *sf, key_first);
-                }
-            }
-
-            for (pname, r) in &src.joint_reactions {
-                let key_first = is_first || !comb_res.joint_reactions.contains_key(pname);
-                let entry = comb_res
-                    .joint_reactions
-                    .entry(pname.clone())
-                    .or_insert([0.0; 6]);
-                for k in 0..6 {
-                    entry[k] = combine_op(entry[k], r[k], *sf, key_first);
-                }
-            }
-
-            for k in 0..6 {
-                comb_res.base_reactions[k] = combine_op(
-                    comb_res.base_reactions[k],
-                    src.base_reactions[k],
-                    *sf,
-                    is_first,
-                );
-            }
-
-            for (fname, stations) in &src.frame_forces {
-                let key_first = is_first || !comb_res.frame_forces.contains_key(fname);
-                let entry = comb_res
-                    .frame_forces
-                    .entry(fname.clone())
-                    .or_insert_with(|| {
-                        stations
-                            .iter()
-                            .map(|s| FrameStationResult {
-                                station: s.station,
-                                rel_dist: s.rel_dist,
-                                ..Default::default()
-                            })
-                            .collect()
-                    });
-                for (dst_s, src_s) in entry.iter_mut().zip(stations.iter()) {
-                    dst_s.p = combine_op(dst_s.p, src_s.p, *sf, key_first);
-                    dst_s.v2 = combine_op(dst_s.v2, src_s.v2, *sf, key_first);
-                    dst_s.v3 = combine_op(dst_s.v3, src_s.v3, *sf, key_first);
-                    dst_s.t = combine_op(dst_s.t, src_s.t, *sf, key_first);
-                    dst_s.m2 = combine_op(dst_s.m2, src_s.m2, *sf, key_first);
-                    dst_s.m3 = combine_op(dst_s.m3, src_s.m3, *sf, key_first);
-                    for k in 0..3 {
-                        dst_s.local_disp[k] =
-                            combine_op(dst_s.local_disp[k], src_s.local_disp[k], *sf, key_first);
-                    }
-                }
-            }
-
-            for (aname, ar) in &src.area_results {
-                if !in_all(&|c| c.area_results.contains_key(aname)) {
-                    continue;
-                }
-                let key_first = is_first || !comb_res.area_results.contains_key(aname);
-                let entry = comb_res.area_results.entry(aname.clone()).or_default();
-                entry.f11 = combine_op(entry.f11, ar.f11, *sf, key_first);
-                entry.f22 = combine_op(entry.f22, ar.f22, *sf, key_first);
-                entry.f12 = combine_op(entry.f12, ar.f12, *sf, key_first);
-                entry.m11 = combine_op(entry.m11, ar.m11, *sf, key_first);
-                entry.m22 = combine_op(entry.m22, ar.m22, *sf, key_first);
-                entry.m12 = combine_op(entry.m12, ar.m12, *sf, key_first);
-                entry.v13 = combine_op(entry.v13, ar.v13, *sf, key_first);
-                entry.v23 = combine_op(entry.v23, ar.v23, *sf, key_first);
-                entry.s11_top = combine_op(entry.s11_top, ar.s11_top, *sf, key_first);
-                entry.s22_top = combine_op(entry.s22_top, ar.s22_top, *sf, key_first);
-                entry.s12_top = combine_op(entry.s12_top, ar.s12_top, *sf, key_first);
-                entry.svm_top = combine_op(entry.svm_top, ar.svm_top, *sf, key_first);
-            }
-
-            for (sname, sr) in &src.solid_results {
-                if !in_all(&|c| c.solid_results.contains_key(sname)) {
-                    continue;
-                }
-                let key_first = is_first || !comb_res.solid_results.contains_key(sname);
-                let entry = comb_res.solid_results.entry(sname.clone()).or_default();
-                combine_stress(&mut entry.center_stress, &sr.center_stress, *sf, key_first);
-                for g in 0..8 {
-                    combine_stress(
-                        &mut entry.gauss_stresses[g],
-                        &sr.gauss_stresses[g],
-                        *sf,
-                        key_first,
-                    );
-                    combine_stress(
-                        &mut entry.nodal_stresses[g],
-                        &sr.nodal_stresses[g],
-                        *sf,
-                        key_first,
-                    );
-                }
-                for k in 0..8 {
-                    for d in 0..3 {
-                        entry.nodal_forces[k][d] = combine_op(
-                            entry.nodal_forces[k][d],
-                            sr.nodal_forces[k][d],
-                            *sf,
-                            key_first,
-                        );
-                    }
-                }
-            }
-
-            for (lname, lf) in &src.link_forces {
-                if !in_all(&|c| c.link_forces.contains_key(lname)) {
-                    continue;
-                }
-                let key_first = is_first || !comb_res.link_forces.contains_key(lname);
-                let entry = comb_res
-                    .link_forces
-                    .entry(lname.clone())
-                    .or_insert([0.0; 6]);
-                for k in 0..6 {
-                    entry[k] = combine_op(entry[k], lf[k], *sf, key_first);
-                }
-            }
-        }
-
-        if contributed == 0 {
-            continue;
-        }
-
-        if combo.combo_type == ComboType::Srss {
-            for d in comb_res.joint_displacements.values_mut() {
-                for v in d {
-                    *v = finalize_op(*v);
-                }
-            }
-            for r in comb_res.joint_reactions.values_mut() {
-                for v in r {
-                    *v = finalize_op(*v);
-                }
-            }
-            for v in &mut comb_res.base_reactions {
-                *v = finalize_op(*v);
-            }
-            for stations in comb_res.frame_forces.values_mut() {
-                for s in stations {
-                    s.p = finalize_op(s.p);
-                    s.v2 = finalize_op(s.v2);
-                    s.v3 = finalize_op(s.v3);
-                    s.t = finalize_op(s.t);
-                    s.m2 = finalize_op(s.m2);
-                    s.m3 = finalize_op(s.m3);
-                    for v in &mut s.local_disp {
-                        *v = finalize_op(*v);
-                    }
-                }
-            }
-            for ar in comb_res.area_results.values_mut() {
-                ar.f11 = finalize_op(ar.f11);
-                ar.f22 = finalize_op(ar.f22);
-                ar.f12 = finalize_op(ar.f12);
-                ar.m11 = finalize_op(ar.m11);
-                ar.m22 = finalize_op(ar.m22);
-                ar.m12 = finalize_op(ar.m12);
-                ar.v13 = finalize_op(ar.v13);
-                ar.v23 = finalize_op(ar.v23);
-                ar.s11_top = finalize_op(ar.s11_top);
-                ar.s22_top = finalize_op(ar.s22_top);
-                ar.s12_top = finalize_op(ar.s12_top);
-                ar.svm_top = finalize_op(ar.svm_top);
-            }
-            for sr in comb_res.solid_results.values_mut() {
-                finalize_stress(&mut sr.center_stress);
-                for g in 0..8 {
-                    finalize_stress(&mut sr.gauss_stresses[g]);
-                    finalize_stress(&mut sr.nodal_stresses[g]);
-                }
-                for nf in &mut sr.nodal_forces {
-                    for v in nf {
-                        *v = finalize_op(*v);
-                    }
-                }
-            }
-            for lf in comb_res.link_forces.values_mut() {
-                for v in lf {
-                    *v = finalize_op(*v);
-                }
-            }
-        }
-
-        // Von Mises and principal values are not linear in the stress components.
-        // For the linear sums, take them from the combined components. The envelope
-        // keeps the largest-magnitude value of each field, and SRSS and AbsAdd combine
-        // each field by its own rule; those are left as they are.
-        if matches!(combo.combo_type, ComboType::LinearAdd | ComboType::RangeAdd) {
-            for ar in comb_res.area_results.values_mut() {
-                ar.svm_top = crate::area::plane_von_mises(ar.s11_top, ar.s22_top, ar.s12_top);
-            }
-            let rederive = |st: &mut SolidStress| {
-                *st = solid_stress_from_components([st.s11, st.s22, st.s33, st.s12, st.s13, st.s23]);
-            };
-            for sr in comb_res.solid_results.values_mut() {
-                rederive(&mut sr.center_stress);
-                for g in 0..8 {
-                    rederive(&mut sr.gauss_stresses[g]);
-                    rederive(&mut sr.nodal_stresses[g]);
-                }
-            }
-        }
-
-        model.case_results.insert(combo.name.clone(), comb_res);
-    }
+    Ok(pts[pts.len() - 1].1)
 }
 
 #[cfg(test)]

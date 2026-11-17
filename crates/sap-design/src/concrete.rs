@@ -1,9 +1,11 @@
 use crate::{
     error::validate_demands,
-    steel::{collect_design_combo_forces, frame_clear_length},
+    steel::{collect_design_combo_forces, design_entries, frame_clear_length, interacting},
     DesignError,
 };
-use sap_model::{ConcreteDesignResult, FrameObj, FramePropType, FrameSection, MatType, SapModel};
+use sap_model::{
+    ConcreteDesignResult, FrameObj, FramePropType, FrameSection, MatType, Material, SapModel,
+};
 use sap_units::Units;
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
@@ -217,6 +219,20 @@ pub struct PmCurvePoint {
 
 /// Generates a 1D rebar layer distribution `(depth_from_top, bar_area)` for a concrete column
 /// bent about either the major (3-axis, depth $h = t_3$, width $b = t_2$) or minor (2-axis, depth $b = t_2$, width $h = t_3$).
+/// The first and the last output station of a member's state, its ends for design; none for
+/// a list of fewer than two stations (a single station is not the end of a member).
+fn state_ends(
+    state: &[sap_model::FrameStationResult],
+) -> (
+    Option<&sap_model::FrameStationResult>,
+    Option<&sap_model::FrameStationResult>,
+) {
+    if state.len() < 2 {
+        return (None, None);
+    }
+    (state.first(), state.last())
+}
+
 fn build_column_rebar_layers(
     sec: &FrameSection,
     major_axis: bool,
@@ -550,14 +566,56 @@ pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> 
                 .is_some_and(|material| material.mat_type == MatType::Concrete)
         },
     )?;
+    check_rebar_yield(model)?;
     run_concrete_design_validated(model, code, combo_forces);
+    Ok(())
+}
+
+/// The longitudinal rebar yield stress of a concrete member: that of the
+/// rebar material the section names when it is positive, else the concrete
+/// material's own `fy`. `None` when neither is positive (no value is assumed).
+fn resolve_rebar_fy(model: &SapModel, sec: &FrameSection, mat: &Material) -> Option<f64> {
+    let named = sec
+        .concrete_rebar
+        .as_ref()
+        .and_then(|cfg| model.materials.get(&cfg.rebar_mat_long))
+        .map(|rmat| rmat.fy)
+        .filter(|fy| *fy > 0.0);
+    named.or((mat.fy > 0.0).then_some(mat.fy))
+}
+
+/// Refuses a concrete member whose rebar yield stress is not given anywhere
+/// (a library concrete carries no `fy`; the section must name a rebar
+/// material with a positive yield stress). Earlier versions assumed 60 ksi.
+fn check_rebar_yield(model: &SapModel) -> Result<(), DesignError> {
+    for (frame_name, frame) in &model.frames {
+        let Some(sec) = model.frame_sections.get(&frame.section) else {
+            continue;
+        };
+        let Some(mat) = model.materials.get(&sec.material) else {
+            continue;
+        };
+        if mat.mat_type != MatType::Concrete || resolve_rebar_fy(model, sec, mat).is_some() {
+            continue;
+        }
+        // The material that lacks the yield stress: the named rebar material, else the concrete.
+        let material = sec
+            .concrete_rebar
+            .as_ref()
+            .map_or_else(|| mat.name.clone(), |cfg| cfg.rebar_mat_long.clone());
+        return Err(DesignError::MissingRebarYield {
+            frame: frame_name.clone(),
+            section: sec.name.clone(),
+            material,
+        });
+    }
     Ok(())
 }
 
 fn run_concrete_design_validated(
     model: &mut SapModel,
     code: ConcreteCode,
-    combo_forces: Vec<(String, Vec<(String, Vec<sap_model::FrameStationResult>)>)>,
+    combo_forces: crate::steel::ComboForces,
 ) {
     let units = model.present_units;
 
@@ -578,20 +636,17 @@ fn run_concrete_design_validated(
             continue;
         }
 
-        // Resolve longitudinal and confinement rebar yield stresses fy, fyt
-        let mut fy = if mat.fy > 0.0 {
-            mat.fy
-        } else {
-            60.0 * Units::KipInF.stress_factor_to(units)
+        // Resolve longitudinal and confinement rebar yield stresses fy, fyt.
+        // `check_rebar_yield` has refused a member without a yield stress, so
+        // no default value is ever assumed here.
+        let Some(fy) = resolve_rebar_fy(model, sec, mat) else {
+            continue;
         };
         let mut fyt = if mat.fys > 0.0 { mat.fys } else { fy };
         let mut es = es_default;
 
         if let Some(cfg) = &sec.concrete_rebar {
             if let Some(rmat) = model.materials.get(&cfg.rebar_mat_long) {
-                if rmat.fy > 0.0 {
-                    fy = rmat.fy;
-                }
                 if (rmat.mat_type == MatType::Rebar || rmat.mat_type == MatType::Steel)
                     && rmat.e > 0.0
                 {
@@ -674,12 +729,27 @@ fn run_concrete_design_validated(
             };
 
             let mut buckled = false;
-            for (combo_name, frame_map) in &combo_forces {
-                let Some((_, stations)) = frame_map.iter().find(|(fn_k, _)| fn_k == frame_name)
-                else {
-                    continue;
-                };
-                for st in stations {
+            // Every state of a combination is a design entry of its own; a multi-valued
+            // combination adds the sub-combinations of the maxima and minima of P, M2 and M3,
+            // the forces the P-M-M check combines (ACI 318-14 manual, section 2.1: "...multiple
+            // sub combinations using maxima/minima permutations of interacting quantities").
+            // The shears are checked alone (the state entries reach their largest absolute
+            // value), so they are not permuted. See `design_entries`.
+            let column_mask = interacting::P | interacting::M2 | interacting::M3;
+            for (combo_name, stations) in combo_forces
+                .iter()
+                .filter_map(|(c, fm)| {
+                    fm.iter()
+                        .find(|(fn_k, _)| fn_k == frame_name)
+                        .map(|(_, s)| (c, s))
+                })
+                .flat_map(|(c, s)| {
+                    design_entries(s, column_mask)
+                        .into_iter()
+                        .map(move |e| (c, e))
+                })
+            {
+                for st in stations.iter() {
                     // SAP2000 sign convention: st.p < 0 is compression, st.p > 0 is tension
                     let pu_comp = -st.p;
                     if kl_over_r > 34.0 && pu_comp > 0.0 && pu_comp >= 0.75 * pc_euler {
@@ -808,11 +878,23 @@ fn run_concrete_design_validated(
                 }
             };
 
-            for (combo_name, frame_map) in &combo_forces {
-                let Some((_, stations)) = frame_map.iter().find(|(fn_k, _)| fn_k == frame_name)
-                else {
-                    continue;
-                };
+            // Beam checks: flexure about 3 (top and bottom steel) from M3 alone, side flexure
+            // from M2 alone, shear from V2 and V3 alone; no check combines two forces, so no
+            // maxima/minima permutation is formed (ACI 318-14 manual section 2.1 permutes the
+            // "interacting quantities"; P is not used in beam design) and each state is
+            // designed as its own entry, where its extreme M3, M2, V2 and V3 occur.
+            for (combo_name, state, st) in combo_forces
+                .iter()
+                .filter_map(|(c, fm)| {
+                    fm.iter()
+                        .find(|(fn_k, _)| fn_k == frame_name)
+                        .map(|(_, s)| (c, s))
+                })
+                .flat_map(|(c, s)| {
+                    s.iter()
+                        .flat_map(move |state| state.iter().map(move |st| (c, state, st)))
+                })
+            {
                 // Moment-strength floors of the framing type (ACI only): the
                 // positive strength at each end is at least a fraction of
                 // the negative strength there, and both strengths at every
@@ -830,16 +912,29 @@ fn run_concrete_design_validated(
                 let end_positive = |st: &sap_model::FrameStationResult| {
                     st.m3.max(0.0).max(end_fraction * (-st.m3).max(0.0))
                 };
-                // The ends are the stations at the two ends of the member.
+                // The ends of the member for design are its first and its last output station.
+                // Without end offsets these are at the joints (relative position 0 and 1); with
+                // end offsets they are the faces of the supports, at `ioff` and `L - joff`, and
+                // no station lies at 0 or 1. The manual takes the end moments "at any end
+                // (support) of the beam" and from "any of the beam end (support) stations"
+                // (CSI Concrete Frame Design ACI 318-14, section 3.5.1, special and
+                // intermediate moment frames, ACI 18.6.3.2, 18.4.2.2).
+                let (first_end, last_end) = state_ends(state);
                 let is_end = |st: &sap_model::FrameStationResult| {
-                    st.rel_dist <= 1e-6 || st.rel_dist >= 1.0 - 1e-6
+                    st.rel_dist <= 1e-6
+                        || st.rel_dist >= 1.0 - 1e-6
+                        || first_end.is_some_and(|e| std::ptr::eq(st, e))
+                        || last_end.is_some_and(|e| std::ptr::eq(st, e))
                 };
-                let largest_end = stations
+                // The strength floors read the end moments of the state itself (each state is a
+                // design entry of its own; a floor from the end of another state would pair
+                // the forces of two states, and cannot change the largest steel areas).
+                let largest_end = state
                     .iter()
                     .filter(|st| is_end(st))
                     .map(|st| end_positive(st).max((-st.m3).max(0.0)))
                     .fold(0.0_f64, f64::max);
-                for st in stations {
+                {
                     // Positive M3 -> bottom tension; Negative M3 -> top tension
                     let at_end = is_end(st);
                     let m_pos = if at_end { end_positive(st) } else { st.m3.max(0.0) }

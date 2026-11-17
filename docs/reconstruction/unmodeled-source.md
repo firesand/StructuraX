@@ -42,10 +42,13 @@ that the model cannot represent.
 
 ## What native import records
 
-Fifty of the 336 corpus files carry at least one entry (83 before frame
-auto-subdivision was modeled, 51 before joint offsets were read; see
-[frame-auto-mesh.md](frame-auto-mesh.md) and
-[frame-insertion-point.md](frame-insertion-point.md)).
+Fifty-one of the 336 corpus files carry at least one entry (83 before frame
+auto-subdivision was modeled, 51 before joint offsets were read, 50 after;
+see [frame-auto-mesh.md](frame-auto-mesh.md) and
+[frame-insertion-point.md](frame-insertion-point.md)). The fifty-first is
+Example 6-005a since 2026-11-17 (see below). That figure is fifty plus that
+one file, as the constants of the corpus round-trip test and the scan named
+below imply; the corpus was not recounted file by file.
 
 | Source data | Detection | Scope | Corpus files |
 | --- | --- | --- | --- |
@@ -56,6 +59,7 @@ auto-subdivision was modeled, 51 before joint offsets were read; see
 | Tendon objects | line object type 3 | `AllCases` | 9 |
 | Tendon prestress loads (`PTLoad`) | live records, by pattern | `LoadPattern` | 9 (the same files) |
 | Per-mode or interpolated modal damping | `m_numberMDs > 0` or `m_numberFDs > 0` on case types 5 and 6 | `Case` | 5 (6 cases) |
+| Ritz starting load of a Modal case that is neither a load pattern nor an acceleration (the vendor's "all link element nonlinear degrees of freedom") | load-assignment record of a native Modal case with `m_ltype` other than 1 or 2 and a nonzero `m_load`; the corpus has type 4 with load −1 | `Case` | 5 (Examples 6-006, 6-007, 6-010, 6-011a, 6-011b; since 2026-11-17) |
 | Area springs (`ShSpring`) | live records | `AllCases` | 4 |
 | Solid surface springs (`SSpring`) | live records | `AllCases` | 4 |
 | Frame line springs (`FSpring`) | live records | `AllCases` | 3 |
@@ -91,6 +95,38 @@ Three of these were worse than a dropped assignment:
 
 Area added mass and per-object area modifiers are no longer recorded: they are
 imported (`area-import.md`).
+
+Since 2026-11-17 (fifth wave of the tutorial-video work,
+[tutorial-video-wave5.md](tutorial-video-wave5.md)):
+
+- **Ritz starting loads.** A native Modal case lists its starting loads as
+  load-assignment records. Patterns (type 1) and accelerations (type 2) are
+  imported; any other record used to be dropped, which silently changed the
+  Ritz subspace. It is now recorded for that case, with the type and the load
+  in the text. The five corpus files that have one all carry the vendor's
+  starting vectors for the link degrees of freedom, which the solver does not
+  have. Their Modal cases are therefore refused as imported, and the periods
+  that Examples 6-006 and 6-007 used to give (−1.6 %, −3.5 % and +0.6 % from
+  the published ones) are no longer reported. A record with load index 0 is
+  an empty row and is not recorded. Tests:
+  `crates/sap-format/tests/wave5_p10_formats.rs` (synthetic records) and,
+  opt-in, `vendor_sdb_example_6_006_modal_case_is_refused_for_its_link_starting_vectors`
+  in `wave4_vendor_regressions.rs`.
+- The same wave records three more things for a modal history case (native
+  types 5 and 6), each with scope `Case`: a nonlinear modal (FNA) history, a
+  periodic motion type or one that is not known, and a modal-case index that
+  does not name a Modal case. They are described in the wave document, not in
+  the table above. In the corpus the first occurs in Example 6-005a
+  (NLMHIST1) and the second in Example 1-015 (MHIST1); no file has the
+  third.
+- **Counts.** Each of the five files of the Ritz row already carried an
+  entry on another case (by the repairing package's scan of the five files
+  before and after), so that row adds no file and no refusal of native
+  synthesis. Example 1-015 already carried an entry too (frame added mass).
+  Example 6-005a carries its first entry (FNA) since the same wave: it is
+  the fifty-first file with an entry, and native synthesis now refuses it,
+  so the corpus round-trip test expects 45 unmodeled-source refusals and 282
+  native round trips (44 and 283 before).
 
 How the section records are read: every record of these sections has an
 `m_alive` flag (deleted records are skipped), and load records carry a
@@ -193,8 +229,10 @@ roundtrips, 5 incomplete-link-law refusals, **46 unmodeled-source refusals**,
 and 250 / 5 / 79 before frame auto-subdivision was modeled. The 46 were
 previously written without the recorded data. Since 2026-11-16 the two
 Example 1-026 files are no longer among them: their hinges are imported, and
-native synthesis refuses them for the hinge data instead (283 / 5 / 44 / 2). Four more files carry entries
-but are counted under their incomplete link law.
+native synthesis refuses them for the hinge data instead (283 / 5 / 44 / 2).
+Since 2026-11-17 Example 6-005a is refused for its nonlinear modal history
+(282 / 5 / 45 / 2). Four more files carry entries but are counted under
+their incomplete link law.
 
 No test that existed before these records analyzes any of the affected files or
 checks their values (the whole-corpus roundtrip tests load them), so no earlier
@@ -219,9 +257,15 @@ passing check depended on the dropped data.
   Example 2-006 (only the case using the gravity pattern is refused, the other
   two analyze), 1-015 (modal refused, static runs), 1-009a (tendon), 2-016a
   (auto-mesh options), 1-013a (line springs).
-- The corpus roundtrip test asserts the split (283 / 5 / 44, plus the two
+- The corpus roundtrip test asserts the split (282 / 5 / 45, plus the two
   Example 1-026 files refused for hinge data) and one refused
   file per kind of recorded data.
+- `crates/sap-format/tests/wave5_p10_formats.rs` and the unit test
+  `native_modal_history_import_branches` in `crates/sap-format/src/sdb.rs`:
+  the Ritz starting-load records and the modal-history records of
+  2026-11-17 on synthetic records; opt-in
+  `crates/sap-solver/tests/wave5_vendor_history.rs` for Examples 1-015 and
+  6-005a.
 
 The GUI list and discard button have no automated test.
 

@@ -935,7 +935,7 @@ impl SapGuiApp {
         initialize_material(&mut state, &self.model);
         let mut open = state.open;
         if open {
-            egui::Window::new("Model Workflows").open(&mut open).default_width(680.0).vscroll(true).show(ctx,|ui| {
+            egui::Window::new("Model Workflows").open(&mut open).default_size([680.0,560.0]).max_height((ctx.screen_rect().height()-60.0).max(200.0)).vscroll(true).show(ctx,|ui| {
             ui.horizontal_wrapped(|ui| {for (i,title) in ["Geometry","Loads","Areas","Releases / T-C / Cable","Combinations","Materials","Links"].iter().enumerate() {ui.selectable_value(&mut state.tab,i,*title);}});
             ui.label(format!("Units: {}. Selected: {} joints, {} frames, {} areas, {} solids, {} links.",self.model.present_units.s2k_label(),self.model.points.values().filter(|p|p.selected).count(),self.model.frames.values().filter(|p|p.selected).count(),self.model.areas.values().filter(|p|p.selected).count(),self.model.solids.values().filter(|s|s.selected).count(),self.model.links.values().filter(|l|l.selected).count()));
             if self.model.is_locked {ui.colored_label(Color32::YELLOW,"Unlock the model from the Edit menu before applying changes.");}

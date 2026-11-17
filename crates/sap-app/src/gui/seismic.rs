@@ -7,7 +7,7 @@
 
 use eframe::egui;
 use sap_model::seismic::{AutoSeismicAsce710, AutoSeismicReport, SeismicDirection, SeismicPeriod};
-use sap_model::{LoadPatternType, SapModel};
+use sap_model::{ConstraintAxis, ConstraintType, LoadPatternType, SapModel};
 
 #[derive(Clone, Copy, PartialEq)]
 enum PeriodKind {
@@ -35,6 +35,8 @@ pub(super) struct State {
     use_z_max: bool,
     z_min: f64,
     z_max: f64,
+    ecc_diaphragm: String,
+    ecc_distance: f64,
 }
 
 impl Default for State {
@@ -57,6 +59,8 @@ impl Default for State {
             use_z_max: false,
             z_min: 0.0,
             z_max: 0.0,
+            ecc_diaphragm: String::new(),
+            ecc_distance: 0.0,
         }
     }
 }
@@ -213,11 +217,95 @@ pub(super) fn define_auto_seismic(
     ))
 }
 
+/// Overwrites the eccentricity of one diaphragm for an automatic lateral load
+/// with a distance (Lateral Loads Manual, section 2.2.3): the eccentric moment
+/// is then distance times the lateral force on the diaphragm instead of ratio
+/// times width times force. The distance is in the model length unit, measured
+/// perpendicular to the load.
+pub(super) fn set_eccentricity_overwrite(
+    model: &mut SapModel,
+    pattern: &str,
+    diaphragm: &str,
+    distance: f64,
+) -> Result<String, String> {
+    locked(model)?;
+    if !model.auto_seismic.contains_key(pattern) {
+        return Err(format!("'{pattern}' has no automatic lateral definition."));
+    }
+    let Some(constraint) = model.constraints.get(diaphragm) else {
+        return Err(format!("Constraint '{diaphragm}' does not exist."));
+    };
+    if constraint.constraint_type != ConstraintType::Diaphragm
+        || constraint.axis != ConstraintAxis::Z
+    {
+        return Err(format!(
+            "'{diaphragm}' is not a diaphragm constraint about the Z axis; eccentricities apply to those only."
+        ));
+    }
+    if !distance.is_finite() {
+        return Err("The eccentricity distance must be a finite number.".into());
+    }
+    model
+        .auto_seismic_eccentricity
+        .entry(pattern.to_string())
+        .or_default()
+        .insert(diaphragm.to_string(), distance);
+    Ok(format!(
+        "Eccentricity of diaphragm '{diaphragm}' in '{pattern}' is overwritten with {distance}."
+    ))
+}
+
+/// Removes an eccentricity overwrite.
+pub(super) fn remove_eccentricity_overwrite(
+    model: &mut SapModel,
+    pattern: &str,
+    diaphragm: &str,
+) -> Result<String, String> {
+    locked(model)?;
+    let removed = model
+        .auto_seismic_eccentricity
+        .get_mut(pattern)
+        .and_then(|t| t.shift_remove(diaphragm))
+        .is_some();
+    if !removed {
+        return Err(format!(
+            "Diaphragm '{diaphragm}' has no eccentricity overwrite in '{pattern}'."
+        ));
+    }
+    if model.auto_seismic_eccentricity[pattern].is_empty() {
+        model.auto_seismic_eccentricity.shift_remove(pattern);
+    }
+    Ok(format!(
+        "Eccentricity of diaphragm '{diaphragm}' in '{pattern}' is no longer overwritten."
+    ))
+}
+
+/// The lines that show the eccentric moments of a computed report.
+pub(super) fn moment_lines(report: &AutoSeismicReport) -> Vec<String> {
+    report
+        .diaphragm_moments
+        .iter()
+        .map(|m| {
+            format!(
+                "Diaphragm {}: F = {}, width = {}, e = {}{}, Mz = {} at joint {}",
+                m.diaphragm,
+                super::view::quantity_text(m.force),
+                super::view::quantity_text(m.width),
+                super::view::quantity_text(m.eccentricity),
+                if m.overwritten { " (overwrite)" } else { "" },
+                super::view::quantity_text(m.moment_z),
+                m.joint
+            )
+        })
+        .collect()
+}
+
 pub(super) fn remove_auto_seismic(model: &mut SapModel, pattern: &str) -> Result<String, String> {
     locked(model)?;
     if model.auto_seismic.shift_remove(pattern).is_none() {
         return Err(format!("'{pattern}' has no automatic lateral definition."));
     }
+    model.auto_seismic_eccentricity.shift_remove(pattern);
     Ok(format!("'{pattern}' is no longer an automatic lateral load."))
 }
 
@@ -332,6 +420,7 @@ fn auto_tab(ui: &mut egui::Ui, state: &mut State, model: &mut SapModel) -> Optio
         ui.label("Eccentricity ratio");
         ui.add(egui::DragValue::new(&mut state.draft.eccentricity_ratio).speed(0.01));
     });
+    ui.label("Where a Z diaphragm carries load, a moment about Z of ratio x width x force is applied (none without diaphragms). Sign: the manual does not state it; by the project's choice a positive eccentricity moves the force toward +Y for an X load and +X for a Y load, giving -e F about Z for X and +e F for Y.");
     ui.horizontal(|ui| {
         ui.label("Period");
         ui.selectable_value(&mut state.period_kind, PeriodKind::Approximate, "Approximate");
@@ -403,6 +492,52 @@ fn auto_tab(ui: &mut egui::Ui, state: &mut State, model: &mut SapModel) -> Optio
         ui.colored_label(egui::Color32::YELLOW, "The model is locked; unlock it to edit.");
     }
     ui.separator();
+    ui.label("Eccentricity overwrite: a distance (model length unit, perpendicular to the load) instead of the ratio, per Z diaphragm.");
+    let rows: Vec<(String, f64)> = model
+        .auto_seismic_eccentricity
+        .get(&state.auto_pattern)
+        .map(|t| t.iter().map(|(d, v)| (d.clone(), *v)).collect())
+        .unwrap_or_default();
+    for (diaphragm, distance) in rows {
+        ui.horizontal(|ui| {
+            ui.label(format!("{diaphragm}: e = {distance}"));
+            if ui.button("Remove overwrite").clicked() {
+                outcome = Some(remove_eccentricity_overwrite(model, &state.auto_pattern, &diaphragm));
+            }
+        });
+    }
+    let diaphragms: Vec<String> = model
+        .constraints
+        .iter()
+        .filter(|(_, c)| c.constraint_type == ConstraintType::Diaphragm && c.axis == ConstraintAxis::Z)
+        .map(|(n, _)| n.clone())
+        .collect();
+    if diaphragms.is_empty() {
+        ui.label("The model has no Z diaphragm constraint, so eccentricities do not apply.");
+    } else {
+        if !diaphragms.contains(&state.ecc_diaphragm) {
+            state.ecc_diaphragm = diaphragms[0].clone();
+        }
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("as_ecc_diaphragm")
+                .selected_text(state.ecc_diaphragm.as_str())
+                .show_ui(ui, |ui| {
+                    for name in &diaphragms {
+                        ui.selectable_value(&mut state.ecc_diaphragm, name.clone(), name);
+                    }
+                });
+            ui.add(egui::DragValue::new(&mut state.ecc_distance).speed(0.05));
+            if ui.button("Set overwrite").clicked() {
+                outcome = Some(set_eccentricity_overwrite(
+                    model,
+                    &state.auto_pattern,
+                    &state.ecc_diaphragm,
+                    state.ecc_distance,
+                ));
+            }
+        });
+    }
+    ui.separator();
     let units = model.present_units.s2k_label();
     match first_report(model, &state.auto_pattern) {
         None => {
@@ -418,6 +553,9 @@ fn auto_tab(ui: &mut egui::Ui, state: &mut State, model: &mut SapModel) -> Optio
                 "Cs = {:.6} (Eqn. {}), W = {:.6}, V = {:.6}",
                 r.cs, r.governing_equation, r.weight, r.base_shear
             ));
+            for line in moment_lines(r) {
+                ui.label(line);
+            }
             egui::Grid::new("as_forces").show(ui, |ui| {
                 for h in ["Joint", "z", "Weight", "Force"] {
                     ui.strong(h);
@@ -425,9 +563,9 @@ fn auto_tab(ui: &mut egui::Ui, state: &mut State, model: &mut SapModel) -> Optio
                 ui.end_row();
                 for f in &r.joint_forces {
                     ui.label(&f.joint);
-                    ui.label(format!("{:.4}", f.z));
-                    ui.label(format!("{:.4}", f.weight));
-                    ui.label(format!("{:.4}", f.force));
+                    ui.label(super::view::quantity_text(f.z));
+                    ui.label(super::view::quantity_text(f.weight));
+                    ui.label(super::view::quantity_text(f.force));
                     ui.end_row();
                 }
             });
@@ -435,6 +573,10 @@ fn auto_tab(ui: &mut egui::Ui, state: &mut State, model: &mut SapModel) -> Optio
     }
     outcome
 }
+
+/// Height the window opens with: it fits a 900 px screen, and the content
+/// scrolls inside it, so that every control is reachable.
+const WINDOW_HEIGHT: f32 = 600.0;
 
 /// Draws the window when it is open. Returns the outcome of a command the
 /// user ran in this frame: a status message, or why it was refused.
@@ -450,7 +592,8 @@ pub(super) fn render(
     let mut outcome = None;
     egui::Window::new("Mass Source and Auto Seismic Loads")
         .open(&mut open)
-        .default_width(560.0)
+        .default_size([560.0, WINDOW_HEIGHT])
+        .max_height((ctx.screen_rect().height() - 60.0).max(200.0))
         .vscroll(true)
         .show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -550,6 +693,63 @@ mod tests {
         assert!(define_auto_seismic(&mut other, "EQX", definition()).is_err());
         remove_auto_seismic(&mut m, "EQX").unwrap();
         assert!(remove_auto_seismic(&mut m, "EQX").is_err());
+    }
+
+    #[test]
+    fn eccentricity_overwrite_commands_validate_and_clean_up() {
+        use sap_model::ConstraintDef;
+        let mut m = model();
+        let make = |name: &str, kind, axis| ConstraintDef {
+            name: name.into(),
+            constraint_type: kind,
+            axis,
+            dofs: [true, true, false, false, false, true],
+        };
+        m.constraints.insert("D1".into(), make("D1", ConstraintType::Diaphragm, ConstraintAxis::Z));
+        m.constraints.insert("D2".into(), make("D2", ConstraintType::Diaphragm, ConstraintAxis::X));
+        m.constraints.insert("B1".into(), make("B1", ConstraintType::Body, ConstraintAxis::Z));
+        // No automatic definition yet.
+        assert!(set_eccentricity_overwrite(&mut m, "EQX", "D1", 0.4).is_err());
+        define_auto_seismic(&mut m, "EQX", definition()).unwrap();
+        for (name, distance) in [("GHOST", 1.0), ("D2", 1.0), ("B1", 1.0), ("D1", f64::NAN)] {
+            assert!(set_eccentricity_overwrite(&mut m, "EQX", name, distance).is_err(), "{name}");
+            assert!(m.auto_seismic_eccentricity.is_empty());
+        }
+        set_eccentricity_overwrite(&mut m, "EQX", "D1", 0.4).unwrap();
+        assert_eq!(m.auto_seismic_eccentricity["EQX"]["D1"], 0.4);
+        assert!(remove_eccentricity_overwrite(&mut m, "EQX", "D2").is_err());
+        remove_eccentricity_overwrite(&mut m, "EQX", "D1").unwrap();
+        assert!(m.auto_seismic_eccentricity.is_empty());
+        // Removing the definition removes its overwrites; a locked model refuses.
+        set_eccentricity_overwrite(&mut m, "EQX", "D1", 0.4).unwrap();
+        m.is_locked = true;
+        assert!(set_eccentricity_overwrite(&mut m, "EQX", "D1", 0.5).is_err());
+        assert!(remove_eccentricity_overwrite(&mut m, "EQX", "D1").is_err());
+        m.is_locked = false;
+        remove_auto_seismic(&mut m, "EQX").unwrap();
+        assert!(m.auto_seismic_eccentricity.is_empty());
+    }
+
+    #[test]
+    fn moment_lines_show_every_number_of_the_report() {
+        use sap_model::seismic::AutoSeismicDiaphragmMoment;
+        let report = AutoSeismicReport {
+            diaphragm_moments: vec![AutoSeismicDiaphragmMoment {
+                diaphragm: "D1".into(),
+                force: 100.0,
+                width: 6.0,
+                eccentricity: 0.3,
+                overwritten: true,
+                moment_z: -30.0,
+                joint: "2".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            moment_lines(&report),
+            vec!["Diaphragm D1: F = 100, width = 6, e = 0.3 (overwrite), Mz = -30 at joint 2"]
+        );
+        assert!(moment_lines(&AutoSeismicReport::default()).is_empty());
     }
 
     #[test]

@@ -186,22 +186,51 @@ fn linear_combinations_recompute_von_mises_from_combined_components() {
     combo(&mut m, "ENV", ComboType::Envelope, &[("D", 1.0), ("L", 1.0)]);
     analyze_model(&mut m).unwrap();
     for name in ["A0", "A3"] {
+        // ULT (1.2 D + 1.6 L, additive of single-valued cases) is single valued:
         // 1.2 * 1750 - 1.6 * 1500 = -300; the old linear sum of von Mises values
         // would give 1.2 * 1750 + 1.6 * 1500 = 4500.
-        for c in ["ULT", "RNG"] {
-            let a = &m.case_results[c].area_results[name];
-            close("s11_top", a.s11_top, -300.0, 1e-8);
-            close("svm_top", a.svm_top, 300.0, 1e-8);
-            close("F11", a.f11, 60.0, 1e-8);
-            close("M11", a.m11, -12.0 + 16.0, 1e-8);
-        }
+        let a = &m.case_results["ULT"].area_results[name];
+        close("s11_top", a.s11_top, -300.0, 1e-8);
+        close("svm_top", a.svm_top, 300.0, 1e-8);
+        close("F11", a.f11, 60.0, 1e-8);
+        close("M11", a.m11, -12.0 + 16.0, 1e-8);
+        assert!(m.case_results["ULT"].combo_min.is_none());
+        // RNG is a range combination: multi-valued (Analysis Reference p. 351-352),
+        // maximum = sum of the positive maximum values of the scaled contributions,
+        // minimum = sum of the negative minimum values (the old test asserted that
+        // RNG equalled ULT; that is the single-valued rule, replaced here).
+        // Scaled D: s11_top 2100, F11 60, M11 -12. Scaled L: s11_top -2400, F11 0,
+        // M11 +16 (each at 1e-8 of the nominal hand values of the comment above).
+        //   s11_top: max 2100 + 0 = 2100, min 0 + (-2400) = -2400
+        //   F11:     max 60 + 0 = 60,     min 0
+        //   M11:     max 0 + 16 = 16,     min -12 + 0 = -12
+        let r = &m.case_results["RNG"];
+        let (hi, lo) = (&r.area_results[name], &r.combo_min.as_ref().unwrap().area_results[name]);
+        close("rng s11_top max", hi.s11_top, 2100.0, 1e-8);
+        close("rng s11_top min", lo.s11_top, -2400.0, 1e-8);
+        close("rng F11 max", hi.f11, 60.0, 1e-8);
+        assert!(lo.f11.abs() <= 1e-8 * 60.0, "rng F11 min {}", lo.f11);
+        close("rng M11 max", hi.m11, 16.0, 1e-8);
+        close("rng M11 min", lo.m11, -12.0, 1e-8);
+        // Derived fields are not combined (p. 213): zero in both rows.
+        assert!(!sap_model::results::is_single_valued(&m, "RNG"));
+        assert_eq!((hi.svm_top, lo.svm_top), (0.0, 0.0));
         // D + L: s11 = 250, so von Mises = 250 (old value 3250).
         let a = &m.case_results["SUM"].area_results[name];
         close("svm_top", a.svm_top, 250.0, 1e-8);
-        // The envelope keeps each field's largest-magnitude value (unchanged rule).
-        let a = &m.case_results["ENV"].area_results[name];
-        close("env s11_top", a.s11_top, 1750.0, 1e-8);
-        close("env svm_top", a.svm_top, 1750.0, 1e-8);
+        // Envelope (p. 352): maximum of the maxima, minimum of the minima, field by
+        // field: s11_top max(1750, -1500) = 1750, min -1500; F11 max(50, 0) = 50,
+        // min 0; M11 max(-10, 10) = 10, min -10. (Old rule: largest magnitude.)
+        let e = &m.case_results["ENV"];
+        let (hi, lo) = (&e.area_results[name], &e.combo_min.as_ref().unwrap().area_results[name]);
+        close("env s11_top max", hi.s11_top, 1750.0, 1e-8);
+        close("env s11_top min", lo.s11_top, -1500.0, 1e-8);
+        close("env F11 max", hi.f11, 50.0, 1e-8);
+        assert!(lo.f11.abs() <= 1e-8 * 50.0, "env F11 min {}", lo.f11);
+        close("env M11 max", hi.m11, 10.0, 1e-8);
+        close("env M11 min", lo.m11, -10.0, 1e-8);
+        assert!(!sap_model::results::is_single_valued(&m, "ENV"));
+        assert_eq!((hi.svm_top, lo.svm_top), (0.0, 0.0));
     }
 }
 
@@ -287,7 +316,7 @@ fn solid_combinations_recompute_principal_and_von_mises_values() {
             comb(|x| x.s23),
         ]
     };
-    for c in ["SUM", "RNG"] {
+    for c in ["SUM"] {
         let r = &m.case_results[c].solid_results["S"];
         let want = solid_stress_from_components(pick(&d.center_stress, &l.center_stress));
         let got = &r.center_stress;
@@ -307,6 +336,26 @@ fn solid_combinations_recompute_principal_and_von_mises_values() {
                 solid_stress_from_components(pick(&d.nodal_stresses[g], &l.nodal_stresses[g]));
             close("nodal vm", r.nodal_stresses[g].von_mises, want.von_mises, 1e-9);
         }
+    }
+    // RNG is multi-valued (pp. 351-352): each stress component takes the sum of the
+    // positive maxima (maximum row) and of the negative minima (minimum row) of the
+    // scaled contributions, 1.2 D and 1.6 L; derived values (principal, von Mises)
+    // are not combined and read 0 in both rows (the old test asserted RNG equal to
+    // SUM through the single-valued re-derivation).
+    let rng = &m.case_results["RNG"];
+    let (hi, lo) = (&rng.solid_results["S"], &rng.combo_min.as_ref().unwrap().solid_results["S"]);
+    for (f, name) in [
+        (&(|x: &SolidStress| x.s11) as &dyn Fn(&SolidStress) -> f64, "s11"),
+        (&|x: &SolidStress| x.s33, "s33"),
+        (&|x: &SolidStress| x.s13, "s13"),
+    ] {
+        let (a, b) = (1.2 * f(&d.center_stress), 1.6 * f(&l.center_stress));
+        close(name, f(&hi.center_stress), a.max(0.0) + b.max(0.0), 1e-12);
+        close(name, f(&lo.center_stress), a.min(0.0) + b.min(0.0), 1e-12);
+    }
+    for row in [hi, lo] {
+        let s = &row.center_stress;
+        assert_eq!((s.s_max, s.s_mid, s.s_min, s.von_mises), (0.0, 0.0, 0.0, 0.0));
     }
 }
 

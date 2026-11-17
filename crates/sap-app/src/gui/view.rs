@@ -7,7 +7,7 @@
 //! plane). Only the front face of a plane is shown.
 
 use super::ViewProjection;
-use eframe::egui::Pos2;
+use eframe::egui::{Color32, Pos2, Shape, Stroke};
 use sap_model::SapModel;
 use std::collections::BTreeSet;
 
@@ -82,9 +82,97 @@ impl PlaneView {
         format!(
             "{a}-{b} Plane @ {}={}",
             self.normal.label(),
-            self.coordinate
+            number_text(self.coordinate)
         )
     }
+}
+
+/// Significant digits of a plane coordinate or a converted length in a title
+/// or a text field (the sums of a grid spacing, `3.2 * 3`, carry roundoff).
+pub(super) const NUMBER_DIGITS: i32 = 10;
+
+/// `v` with at most [`NUMBER_DIGITS`] significant digits and no trailing zeros:
+/// `9.600000000000001` is `9.6`, `6` is `6`, `-0.0` is `0`.
+pub(super) fn number_text(v: f64) -> String {
+    significant_text(v, NUMBER_DIGITS)
+}
+
+/// A quantity of the explorer, the tables and the labels of the drawing: at
+/// least [`QUANTITY_DECIMALS`] decimals and at least [`QUANTITY_DIGITS`]
+/// significant digits, no trailing zeros. A fixed number of decimals makes a
+/// number meaningless after a change of units: the same section reads
+/// `I33=0.0` in kN, m and `I33=7931.0` in kip, in.
+pub(super) fn quantity_text(v: f64) -> String {
+    decimals_or_digits(v, QUANTITY_DECIMALS, QUANTITY_DIGITS)
+}
+
+/// Decimals every printed quantity keeps (a value of the size of a force in
+/// kN or a length in m has its habitual digits).
+pub(super) const QUANTITY_DECIMALS: i32 = 4;
+/// Significant digits every printed quantity keeps (a small value in a large
+/// unit: a moment of inertia in m4, a load in MN).
+pub(super) const QUANTITY_DIGITS: i32 = 5;
+
+/// `v` with at least `min_decimals` decimals and at least `min_digits`
+/// significant digits, no trailing zeros; scientific notation (with
+/// `min_digits` digits) for a magnitude below 1e-6 or from 1e15.
+pub(super) fn decimals_or_digits(v: f64, min_decimals: i32, min_digits: i32) -> String {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    if v == 0.0 {
+        return "0".into();
+    }
+    let magnitude = v.abs().log10().floor() as i32;
+    if !(-6..15).contains(&magnitude) {
+        return significant_text(v, min_digits);
+    }
+    let decimals = min_decimals.max(min_digits - 1 - magnitude) as usize;
+    let text = format!("{v:.decimals$}");
+    let text = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    };
+    if text == "-0" { "0".into() } else { text }
+}
+
+/// `v`, or zero when it is below a billionth of `peak` (the roundoff of a
+/// quantity that is exactly zero, such as the V3 of a plane frame).
+pub(super) fn without_roundoff(v: f64, peak: f64) -> f64 {
+    if v.abs() < 1e-9 * peak { 0.0 } else { v }
+}
+
+/// `v` with at most `digits` significant digits and no trailing zeros; a value
+/// whose magnitude is below 1e-6 or at least `10^(digits + 2)` is written in
+/// scientific notation (`1.5e-9`).
+pub(super) fn significant_text(v: f64, digits: i32) -> String {
+    if !v.is_finite() {
+        return v.to_string();
+    }
+    if v == 0.0 {
+        return "0".into();
+    }
+    let magnitude = v.abs().log10().floor() as i32;
+    if !(-6..digits + 2).contains(&magnitude) {
+        let text = format!("{:.*e}", (digits - 1) as usize, v);
+        // "1.500000000e7" -> "1.5e7"
+        let (mantissa, exponent) = text.split_once('e').unwrap_or((&text, "0"));
+        let mantissa = if mantissa.contains('.') {
+            mantissa.trim_end_matches('0').trim_end_matches('.')
+        } else {
+            mantissa
+        };
+        return format!("{mantissa}e{exponent}");
+    }
+    let decimals = (digits - 1 - magnitude).max(0) as usize;
+    let text = format!("{v:.decimals$}");
+    let text = if text.contains('.') {
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        text
+    };
+    if text == "-0" { "0".into() } else { text }
 }
 
 /// The projection of one viewport pane in one frame.
@@ -199,6 +287,29 @@ pub(super) fn plane_levels(model: &SapModel, axis: PlaneAxis) -> Vec<f64> {
         .map(|p| [p.x, p.y, p.z][axis.index()])
         .collect();
     sorted_distinct(values, plane_tolerance(model))
+}
+
+/// The global plane that holds every joint of the model, when there is one:
+/// X-Z at the common Y first, then X-Y at the common Z, then Y-Z at the common
+/// X. `None` for a model with fewer than two joints or joints in no one plane.
+pub(super) fn joint_plane(model: &SapModel) -> Option<PlaneView> {
+    if model.points.len() < 2 {
+        return None;
+    }
+    let tol = plane_tolerance(model);
+    for normal in [PlaneAxis::Y, PlaneAxis::Z, PlaneAxis::X] {
+        let k = normal.index();
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for p in model.points.values() {
+            let c = [p.x, p.y, p.z][k];
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        if hi - lo <= tol {
+            return Some(PlaneView { normal, coordinate: lo });
+        }
+    }
+    None
 }
 
 /// The next plane above (`up`) or below `current` in `levels` (increasing).
@@ -412,6 +523,64 @@ impl PlaneAxis {
             Self::X => ViewProjection::ElevationYZ,
         }
     }
+}
+
+/// A filled polygon with an outline, as shapes that cannot spike.
+///
+/// `Shape::convex_polygon` strokes a closed path with mitred corners and
+/// feathers its fill along corner normals; both grow without limit where an
+/// edge turns back on itself, which a foreshortened or deformed sliver of an
+/// area does (a quadrilateral seen edge-on). The tessellated stroke then
+/// reaches across the whole view (D41). Here the fill is a plain fan without
+/// outline and every edge is a segment of its own; a corner is a butt join.
+/// A polygon with fewer than three corners draws its edges only.
+pub(super) fn outlined_polygon(points: &[Pos2], fill: Color32, stroke: Stroke) -> Vec<Shape> {
+    let mut shapes = Vec::with_capacity(points.len() + 1);
+    let finite = |p: &Pos2| p.x.is_finite() && p.y.is_finite();
+    if points.len() >= 3 && fill.a() > 0 && points.iter().all(finite) {
+        shapes.push(Shape::Mesh(fan(points, fill)));
+    }
+    if stroke.width > 0.0 && stroke.color.a() > 0 && points.len() >= 2 {
+        let edges = if points.len() == 2 { 1 } else { points.len() };
+        for k in 0..edges {
+            let (a, b) = (points[k], points[(k + 1) % points.len()]);
+            if a != b && finite(&a) && finite(&b) {
+                shapes.push(Shape::line_segment([a, b], stroke));
+            }
+        }
+    }
+    shapes
+}
+
+/// The triangle fan of a polygon from its first corner (exact for a convex
+/// polygon, the fill the viewport always used for areas). No anti-aliasing
+/// fringe: that is what grows spikes.
+fn fan(points: &[Pos2], fill: Color32) -> eframe::egui::epaint::Mesh {
+    let mut mesh = eframe::egui::epaint::Mesh::default();
+    for p in points {
+        mesh.colored_vertex(*p, fill);
+    }
+    for k in 1..points.len() as u32 - 1 {
+        mesh.add_triangle(0, k, k + 1);
+    }
+    mesh
+}
+
+/// The fill colour of a shape made by `outlined_polygon` for its fill (a
+/// fan of one colour from the first corner), for the tests that read the
+/// drawn shapes.
+#[cfg(test)]
+pub(super) fn polygon_fill_of(shape: &Shape) -> Option<Color32> {
+    let Shape::Mesh(m) = shape else {
+        return None;
+    };
+    let first = m.vertices.first()?;
+    let n = m.vertices.len();
+    let fan_like = n >= 3
+        && m.indices.len() == 3 * (n - 2)
+        && m.indices.chunks(3).all(|t| t[0] == 0)
+        && m.vertices.iter().all(|v| v.color == first.color);
+    fan_like.then_some(first.color)
 }
 
 #[cfg(test)]
@@ -631,4 +800,72 @@ mod tests {
         assert_eq!(m.frames, BTreeSet::from(["B".to_string(), "Y".to_string()]));
         assert!(m.areas.is_empty());
     }
+
+    use eframe::egui;
+
+    fn tessellated_vertices(shapes: Vec<Shape>) -> Vec<Pos2> {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |_| {});
+        let clip = egui::Rect::from_min_max(Pos2::new(-5000.0, -5000.0), Pos2::new(5000.0, 5000.0));
+        let clipped = shapes
+            .into_iter()
+            .map(|shape| egui::epaint::ClippedShape { clip_rect: clip, shape })
+            .collect();
+        ctx.tessellate(clipped, 1.0)
+            .iter()
+            .filter_map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => Some(m.vertices.iter().map(|v| v.pos).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// D41: edge-on quadrilaterals (the shell dome's top rings seen from the
+    /// side, or a deformed sliver) draw inside their own bounding box.
+    #[test]
+    fn an_outlined_polygon_stays_inside_its_corners_even_when_an_edge_turns_back() {
+        let slivers: [&[Pos2]; 3] = [
+            // The quad of the dome's first ring in the 3D pane (pixels).
+            &[Pos2::new(634.2, 452.2), Pos2::new(649.4, 456.8), Pos2::new(579.4, 435.0), Pos2::new(577.3, 434.6)],
+            // A triangle whose third corner lies on the first edge.
+            &[Pos2::new(100.0, 100.0), Pos2::new(200.0, 120.0), Pos2::new(150.0, 110.0)],
+            // Coincident corners.
+            &[Pos2::new(10.0, 10.0), Pos2::new(10.0, 10.0), Pos2::new(60.0, 10.5), Pos2::new(60.0, 10.5)],
+        ];
+        for poly in slivers {
+            let (mut lo, mut hi) = (Pos2::new(f32::MAX, f32::MAX), Pos2::new(f32::MIN, f32::MIN));
+            for p in poly {
+                lo = Pos2::new(lo.x.min(p.x), lo.y.min(p.y));
+                hi = Pos2::new(hi.x.max(p.x), hi.y.max(p.y));
+            }
+            let shapes = outlined_polygon(poly, Color32::from_rgba_unmultiplied(60, 120, 180, 55), Stroke::new(1.2_f32, Color32::WHITE));
+            let vertices = tessellated_vertices(shapes);
+            assert!(!vertices.is_empty());
+            for v in &vertices {
+                assert!(
+                    v.x >= lo.x - 1.5 && v.x <= hi.x + 1.5 && v.y >= lo.y - 1.5 && v.y <= hi.y + 1.5,
+                    "{v:?} outside {lo:?}..{hi:?} of {poly:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_outlined_polygon_has_a_fill_fan_and_one_segment_per_distinct_edge() {
+        let sq = [Pos2::new(0.0, 0.0), Pos2::new(10.0, 0.0), Pos2::new(10.0, 10.0), Pos2::new(0.0, 10.0)];
+        let shapes = outlined_polygon(&sq, Color32::RED, Stroke::new(1.0_f32, Color32::WHITE));
+        assert_eq!(shapes.iter().filter(|s| matches!(s, Shape::Mesh(m) if m.indices.len() == 6)).count(), 1);
+        assert_eq!(shapes.iter().filter(|s| matches!(s, Shape::LineSegment { .. })).count(), 4);
+        // No fill: outline only; no stroke: fill only; fewer than three corners: edges only.
+        let outline = outlined_polygon(&sq, Color32::TRANSPARENT, Stroke::new(1.0_f32, Color32::WHITE));
+        assert!(outline.iter().all(|s| matches!(s, Shape::LineSegment { .. })) && outline.len() == 4);
+        assert_eq!(outlined_polygon(&sq, Color32::RED, Stroke::NONE).len(), 1);
+        assert_eq!(outlined_polygon(&sq[..2], Color32::RED, Stroke::new(1.0_f32, Color32::WHITE)).len(), 1);
+        // A corner that is not finite draws no fill and no edge through it.
+        let bad = [Pos2::new(0.0, 0.0), Pos2::new(f32::NAN, 0.0), Pos2::new(5.0, 5.0)];
+        let drawn = outlined_polygon(&bad, Color32::RED, Stroke::new(1.0_f32, Color32::WHITE));
+        assert!(drawn.iter().all(|s| matches!(s, Shape::LineSegment { points, .. } if points.iter().all(|p| p.x.is_finite()))));
+    }
+
 }

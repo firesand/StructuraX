@@ -370,11 +370,20 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         }
         // Reconstruction data with no native record written here; a
         // synthesized file would drop it and the case would change meaning.
-        if case.modal_case.is_some() {
-            return Err(unsupported(
-                format!("load_cases.{name}.modal_case"),
-                "mode superposition for a history case is not written natively; use S2K",
-            ));
+        // The one reference the native writer carries (`m_modalcase`): a linear history
+        // whose modal case exists and is a Modal case.
+        if let Some(modal) = &case.modal_case {
+            let carried = case.case_type == sap_model::LoadCaseType::LinearHistory
+                && model
+                    .load_cases
+                    .get(modal)
+                    .is_some_and(|m| m.case_type == sap_model::LoadCaseType::Modal);
+            if !carried {
+                return Err(unsupported(
+                    format!("load_cases.{name}.modal_case"),
+                    "mode superposition is written natively only for a linear history case that names an existing Modal case; use S2K",
+                ));
+            }
         }
         if !case.ritz_controls.is_empty() {
             return Err(unsupported(
@@ -459,6 +468,12 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         return Err(unsupported(
             format!("auto_seismic.{pattern}"),
             "automatic seismic loads are not written natively; use S2K",
+        ));
+    }
+    if let Some(pattern) = model.auto_seismic_eccentricity.keys().next() {
+        return Err(unsupported(
+            format!("auto_seismic_eccentricity.{pattern}"),
+            "seismic diaphragm eccentricity overwrites are not written natively; use S2K",
         ));
     }
     if !model.steel_design_prefs.is_default() {
@@ -764,4 +779,75 @@ pub(super) fn verify_projection(
         return Err(unsupported(field,"native serialization/projection would change represented model data; no file was written"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sap_model::{LoadCase, LoadCaseType};
+
+    fn with_cases(history_type: LoadCaseType, modal_type: LoadCaseType) -> SapModel {
+        let mut m = SapModel::default();
+        m.load_cases.clear();
+        let mut modal = LoadCase::linear_static("MODES", "DEAD", 1.0);
+        modal.case_type = modal_type;
+        modal.loads.clear();
+        m.load_cases.insert("MODES".into(), modal);
+        let mut history = LoadCase::linear_static("HIST", "DEAD", 1.0);
+        history.case_type = history_type;
+        history.loads.clear();
+        history.modal_case = Some("MODES".into());
+        m.load_cases.insert("HIST".into(), history);
+        m
+    }
+
+    fn refused_field(m: &SapModel) -> String {
+        match validate(m) {
+            Err(FormatError::UnsupportedNativeExport { field, .. }) => field,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The one combination the native writer carries (`m_modalcase`): a linear history that
+    /// names an existing Modal case.
+    #[test]
+    fn a_linear_history_naming_an_existing_modal_case_passes() {
+        validate(&with_cases(LoadCaseType::LinearHistory, LoadCaseType::Modal)).unwrap();
+    }
+
+    #[test]
+    fn every_other_use_of_modal_case_is_refused_naming_the_case() {
+        // A modal case that is not a Modal case, or does not exist.
+        let m = with_cases(LoadCaseType::LinearHistory, LoadCaseType::LinearStatic);
+        assert_eq!(refused_field(&m), "load_cases.HIST.modal_case");
+        let mut m = with_cases(LoadCaseType::LinearHistory, LoadCaseType::Modal);
+        m.load_cases.get_mut("HIST").unwrap().modal_case = Some("NOSUCH".into());
+        assert_eq!(refused_field(&m), "load_cases.HIST.modal_case");
+        // Any other case type that carries the reference, each with a real Modal case.
+        for case_type in [
+            LoadCaseType::LinearStatic,
+            LoadCaseType::NonlinearStatic,
+            LoadCaseType::Modal,
+            LoadCaseType::ResponseSpectrum,
+            LoadCaseType::NonlinearHistory,
+            LoadCaseType::LinearDynamic,
+            LoadCaseType::NonlinearDynamic,
+            LoadCaseType::Buckling,
+        ] {
+            let m = with_cases(case_type, LoadCaseType::Modal);
+            assert_eq!(refused_field(&m), "load_cases.HIST.modal_case", "{case_type:?}");
+        }
+    }
+
+    #[test]
+    fn seismic_eccentricity_overwrites_are_refused_naming_the_pattern() {
+        let mut m = SapModel::default();
+        m.auto_seismic_eccentricity
+            .entry("EQ".into())
+            .or_default()
+            .insert("D1".into(), 0.4);
+        assert_eq!(refused_field(&m), "auto_seismic_eccentricity.EQ");
+        m.auto_seismic_eccentricity.clear();
+        validate(&m).unwrap();
+    }
 }

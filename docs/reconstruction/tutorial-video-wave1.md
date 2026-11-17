@@ -287,6 +287,12 @@ Each refusal named above has a negative test.
 
 ## Not done (later waves)
 
+Eccentric diaphragm moments, video export and the native import of a modal
+history's modal case are since done, and most of the residual of Examples
+6-006 and 6-007 is explained (see
+[tutorial-video-wave5.md](tutorial-video-wave5.md)); the current list is
+[tutorial-video-progress.md](tutorial-video-progress.md).
+
 - **Pushover** (the video's second model; since done in part, see
   [tutorial-video-wave2.md](tutorial-video-wave2.md)): frame hinges, hinge states and the
   pushover curve, pushover loads from a mode or an acceleration, results saved

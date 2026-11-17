@@ -429,15 +429,15 @@ fn the_contour_follows_the_display_mode_and_the_applied_form() {
 }
 
 #[test]
-fn the_deformed_form_is_validated_without_touching_the_model() {
+fn the_deformed_form_is_validated_and_the_model_is_only_read() {
     let mut m = plate();
     let mut f = DeformedForm::default();
     f.open_with("S", 10.0, Units::NMmC);
+    f.auto = false;
     f.contour = true;
     f.component = DisplacementComponent::Area2;
     f.min = "-1".into();
     f.max = "3".into();
-    let before = m.clone();
     let a = f.apply(&m).unwrap();
     assert_eq!(
         a,
@@ -446,6 +446,7 @@ fn the_deformed_form_is_validated_without_touching_the_model() {
             mode_idx: 0,
             use_step: false,
             step_idx: 0,
+            auto: false,
             scale: 10.0,
             contour: Contour::Displacement { component: DisplacementComponent::Area2, range: (-1.0, 3.0), units: Units::NMmC },
             units: Units::NMmC,
@@ -482,10 +483,17 @@ fn the_deformed_form_is_validated_without_touching_the_model() {
     assert!(a.use_step && a.step_idx == 2);
     f.step = 3;
     assert!(f.apply(&m).unwrap_err().contains("steps 0 to 2"));
-    // Nothing was changed by any of it.
-    let mut m2 = before.clone();
-    m2.case_results.get_mut("S").unwrap().time_steps.clear();
-    assert_eq!(before.case_results["S"].joint_displacements, m2.case_results["S"].joint_displacements);
+    // `apply` takes the model by shared reference, so that it changes nothing is
+    // a property of the signature; the model is compared with a copy taken after
+    // the edits above only to show that the validation did not need one. What the
+    // application does with a refused form is tested by
+    // `the_deformed_form_refuses_a_bad_range_and_keeps_the_application_unchanged`.
+    let snapshot = m.clone();
+    for mode in [0, 1, 99] {
+        f.mode = mode;
+        let _ = f.apply(&m);
+    }
+    assert_eq!(m, snapshot);
 }
 
 #[test]
@@ -689,11 +697,12 @@ fn texts(out: &egui::FullOutput) -> Vec<(String, Rect)> {
         .collect()
 }
 
+/// The contour meshes (not the one-colour fans of the polygon fills).
 fn meshes(out: &egui::FullOutput) -> Vec<Vec<egui::epaint::Vertex>> {
     flat(out)
         .into_iter()
         .filter_map(|s| match s {
-            Shape::Mesh(m) => Some(m.vertices.clone()),
+            Shape::Mesh(m) if super::super::view::polygon_fill_of(&Shape::Mesh(m.clone())).is_none() => Some(m.vertices.clone()),
             _ => None,
         })
         .collect()
@@ -817,7 +826,9 @@ fn the_deformed_shape_form_draws_a_displacement_contour_and_its_legend() {
     // Display units: pick N, mm, C in the combo box.
     run.click_text("kN, m, C");
     run.click_text("N, mm, C");
+    run.app.results.deformed.auto = false; // a user-defined factor
     run.app.results.deformed.scale = 100.0;
+    run.settle(); // the form is one row shorter without the Auto note
     assert_eq!(run.app.results.deformed.max, "1.5");
     run.click_text("OK");
     let st = &run.app;
@@ -902,7 +913,7 @@ fn a_corner_without_result_leaves_its_area_uncoloured_and_the_legend_says_so() {
         .into_iter()
         .filter_map(|s| match s {
             Shape::Path(p) if p.closed => Some(p.fill),
-            _ => None,
+            other => super::super::view::polygon_fill_of(&other),
         })
         .collect();
     assert!(fills.contains(&no_contour_fill()), "{fills:?}");
@@ -933,7 +944,7 @@ fn the_shell_form_draws_the_visible_face_in_plan_and_the_legend_shows_a_refusal(
         .into_iter()
         .filter_map(|s| match s {
             Shape::Path(p) if p.closed && p.fill != Color32::TRANSPARENT => Some(p.fill),
-            _ => None,
+            other => super::super::view::polygon_fill_of(&other),
         })
         .collect();
     let lo = contours::value_color(-130.0, -130.0, 230.0, CONTOUR_ALPHA);
@@ -953,6 +964,10 @@ fn the_shell_form_draws_the_visible_face_in_plan_and_the_legend_shows_a_refusal(
                 Shape::Path(pa) if pa.closed && pa.fill != Color32::TRANSPARENT => {
                     let r = Rect::from_points(&pa.points);
                     r.contains(at).then_some(pa.fill)
+                }
+                Shape::Mesh(m) => {
+                    let pts: Vec<Pos2> = m.vertices.iter().map(|v| v.pos).collect();
+                    super::super::view::polygon_fill_of(&Shape::Mesh(m)).filter(|_| Rect::from_points(&pts).contains(at))
                 }
                 _ => None,
             })
@@ -1048,13 +1063,22 @@ fn a_right_click_on_a_joint_of_the_deformed_shape_opens_the_read_out_and_a_frame
     run.right_click(near_joint1);
     assert_eq!(run.app.results.readout_joint.as_deref(), Some("1"));
     assert!(run.app.inspected_frame.is_none());
-    // Outside the deformed display a right-click near a joint is the frame's again.
+    // In a result display other than the deformed shape a right-click near a
+    // joint is the frame's again.
     run.app.results.readout_joint = None;
-    run.app.display_mode = DisplayMode::Undeformed;
+    run.app.display_mode = DisplayMode::Reactions;
     run.settle();
     run.right_click(run.screen([0.0, 0.0, 0.0]) + Vec2::new(6.0, 0.0));
     assert!(run.app.results.readout_joint.is_none());
     assert_eq!(run.app.inspected_frame.as_deref(), Some("F1"));
+    // In the undeformed display it opens the Object Information window of the
+    // joint (wave 5, G07) and not the frame inspector.
+    run.app.inspected_frame = None;
+    run.app.display_mode = DisplayMode::Undeformed;
+    run.settle();
+    run.right_click(run.screen([0.0, 0.0, 0.0]) + Vec2::new(6.0, 0.0));
+    assert!(run.app.inspected_frame.is_none());
+    assert!(run.has_text("Joint 1 - Loads"));
 }
 
 #[test]
@@ -1178,4 +1202,95 @@ fn the_forms_reset_with_the_model() {
     run.app.model.points.shift_remove("3");
     run.app.sync_active_case();
     assert!(run.app.results.readout_joint.is_none());
+}
+
+// ---------------------------------------------------- D34: reopened forms
+
+fn modal3() -> SapModel {
+    let mut m = plate();
+    let cr = m.case_results.get_mut("S").unwrap();
+    let shape = cr.joint_displacements.clone();
+    cr.modes = (1..=3)
+        .map(|k| ModalModeResult { mode_num: k, mode_shape: shape.clone(), ..Default::default() })
+        .collect();
+    m
+}
+
+#[test]
+fn ok_in_the_deformed_form_keeps_the_mode_shown() {
+    let mut run = Run::new(modal3());
+    run.app.display_mode = DisplayMode::Deformed;
+    run.app.active_mode_idx = 2; // mode 3 picked in the explorer
+    run.settle();
+    run.open_deformed_form_from_the_menu();
+    assert_eq!(run.app.results.deformed.mode, 3, "the form opens with the mode on screen");
+    run.click_text("OK");
+    assert_eq!(run.app.active_mode_idx, 2, "OK on an untouched form changed the mode");
+}
+
+#[test]
+fn ok_in_the_deformed_form_keeps_the_step_shown_and_the_final_state_is_the_last_step() {
+    // (use_step, step on screen) -> (use_step, step after an untouched OK)
+    for ((use_step, idx), want) in [((true, 1usize), (true, 1usize)), ((false, 0), (true, 2))] {
+        let mut run = Run::new(stepped());
+        run.app.display_mode = DisplayMode::Deformed;
+        run.app.use_time_step = use_step;
+        run.app.active_step_idx = idx;
+        run.settle();
+        run.open_deformed_form_from_the_menu();
+        assert_eq!(run.app.results.deformed.step, want.1, "form step for {use_step}, {idx}");
+        run.click_text("OK");
+        assert_eq!((run.app.use_time_step, run.app.active_step_idx), want, "from ({use_step}, {idx})");
+    }
+}
+
+#[test]
+fn reopening_the_shell_form_keeps_range_and_units_together_and_the_status_names_the_face() {
+    let mut run = Run::new(plate());
+    run.app.open_shell_form();
+    {
+        let f = &mut run.app.results.shells;
+        f.kind = ShellKind::Stress;
+        f.units = Units::NMmC;
+        f.min = "-1".into();
+        f.max = "1".into();
+    }
+    let a = run.app.results.shells.apply(&run.app.model).unwrap();
+    run.app.apply_shells(a);
+    assert!(run.app.status_msg.contains("(Visible Face)"), "{}", run.app.status_msg);
+    assert!(!run.app.status_msg.contains("(Top)"), "{}", run.app.status_msg);
+    let applied = run.app.results.contour;
+    run.app.results.shells.open = false;
+    run.app.open_shell_form();
+    let f = run.app.results.shells.clone();
+    assert_eq!((f.units, f.min.as_str(), f.max.as_str()), (Units::NMmC, "-1", "1"));
+    assert_eq!(f.apply(&run.app.model).unwrap().contour, applied, "reopen + OK changed the applied range");
+    // Without an applied shell contour the range text goes with the units reset.
+    run.app.results.contour = Contour::Off;
+    run.app.results.shells.open = false;
+    run.app.open_shell_form();
+    let f = &run.app.results.shells;
+    assert_eq!((f.units, f.min.as_str(), f.max.as_str()), (Units::KnMC, "", ""));
+}
+
+#[test]
+fn reopening_the_deformed_form_after_a_shell_contour_does_not_keep_a_stale_displacement_range() {
+    let mut run = Run::new(plate());
+    run.app.open_deformed_form();
+    {
+        let f = &mut run.app.results.deformed;
+        f.contour = true;
+        f.units = Units::NMmC;
+        f.min = "-5".into();
+        f.max = "5".into();
+    }
+    let a = run.app.results.deformed.apply(&run.app.model).unwrap();
+    run.app.apply_deformed(a);
+    // A shell contour replaces the displacement contour.
+    run.app.results.contour = Contour::Shell { visible: false, range: (0.0, 0.0), units: Units::KnMC };
+    run.app.results.deformed.open = false;
+    run.app.open_deformed_form();
+    let f = &run.app.results.deformed;
+    assert!(!f.contour && f.min.is_empty() && f.max.is_empty(), "{f:?}");
+    assert_eq!(f.units, Units::KnMC);
 }

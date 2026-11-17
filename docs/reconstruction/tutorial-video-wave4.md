@@ -325,6 +325,12 @@ synthetic pointer and key input. **Nobody has used them by hand.**
 
 ## Not done
 
+Video export, the load read-out, the plot window's speed, the stored von
+Mises of multi-valued combinations, the material angle, the plane-strain
+recovery and the naming of the unstable joint are since done (see
+[tutorial-video-wave5.md](tutorial-video-wave5.md)); the current list is
+[tutorial-video-progress.md](tutorial-video-progress.md).
+
 - **2016 code editions** (AISC 360-16, ASCE 7-16): absent from the corpus.
   Seismic design category, framing type and second-order method preferences of
   steel design: described in the vendor manual, exercised by no verification

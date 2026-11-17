@@ -897,6 +897,69 @@ fn native_flags(object: &HashMap<String, SdbVal>, key: &str) -> [bool; 6] {
     }
     values
 }
+/// The modal case and the motion type of a native modal-history case record (native case type 5,
+/// linear modal; or 6, nonlinear modal, FNA). Returns the modal case to superpose (`None` for
+/// no modal case) and the unmodeled-source entries the case needs.
+///
+/// * `m_modalcase` is the 1-based index of the Modal case (native type 3) whose modes are
+///   superposed. An index that is out of range, names a deleted case or a case that is not a
+///   Modal case is an unmodeled entry naming the index. Index 0 is "no modal case", the
+///   representation of this program's direct-integration history (what the native writer
+///   writes for one); no vendor file has it.
+/// * `m_MotionType` 1 is a transient history and imports; 2 is a periodic history (Example
+///   1-015 "Periodic time history using 5 modes"), which is not implemented. Other values are
+///   not known and are refused too. An absent field is a transient history.
+/// * Native type 6 (nonlinear modal, FNA) is not implemented: it used to be integrated directly
+///   over all degrees of freedom, a different method.
+fn native_history_modal_import(
+    name: &str,
+    ctype_code: i32,
+    ac: &HashMap<String, SdbVal>,
+    raw_analysis_cases: &[HashMap<String, SdbVal>],
+    ac_names: &[String],
+) -> (Option<String>, Vec<UnmodeledSourceData>) {
+    let case_entry = |description: String| UnmodeledSourceData {
+        scope: UnmodeledScope::Case(name.to_string()),
+        description,
+    };
+    let mut entries = Vec::new();
+    let mut modal_case = None;
+    let index = ac.get("m_modalcase").and_then(SdbVal::as_i32).unwrap_or(0);
+    if index != 0 {
+        let target = usize::try_from(index)
+            .ok()
+            .and_then(|i| i.checked_sub(1).map(|j| (i, raw_analysis_cases.get(j))))
+            .and_then(|(i, raw)| raw.map(|raw| (i, raw)));
+        match target {
+            Some((i, raw))
+                if native_alive(raw)
+                    && raw.get("m_casetype").and_then(SdbVal::as_i32) == Some(3) =>
+            {
+                modal_case = Some(ac_names[i].clone());
+            }
+            _ => entries.push(case_entry(format!(
+                "modal case index {index} of modal history case '{name}' does not name a Modal case (not imported)"
+            ))),
+        }
+    }
+    if ctype_code == 6 {
+        entries.push(case_entry(format!(
+            "nonlinear modal (FNA) time history of case '{name}' is not implemented"
+        )));
+        // The modes of a nonlinear modal history are not superposed here either.
+        modal_case = None;
+    }
+    match ac.get("m_MotionType").and_then(SdbVal::as_i32) {
+        None | Some(1) => {}
+        Some(2) => entries.push(case_entry(format!(
+            "periodic modal history of case '{name}' is not implemented"
+        ))),
+        Some(other) => entries.push(case_entry(format!(
+            "motion type {other} of modal history case '{name}' is not known and is not implemented"
+        ))),
+    }
+    (modal_case, entries)
+}
 fn native_case_type(code: i32) -> Result<LoadCaseType, FormatError> {
     Ok(match code {
         1 => LoadCaseType::LinearStatic,
@@ -2622,6 +2685,26 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                         ),
                     });
                 }
+                // A Modal case reads load patterns (type 1) and accelerations (type 2) as
+                // starting loads. Any other record would be dropped, which silently changes
+                // the Ritz subspace. Type 4 with `m_load` -1 is the vendor's "all link element
+                // nonlinear degrees of freedom" starting vector set (Examples 6-006, 6-007,
+                // 6-010, 6-011a, 6-011b); this solver has no such vector. A record naming no
+                // load (index 0) is an empty row, as in the nonlinear static case above.
+                if ctype_code == 3 && !matches!(load_type, 1 | 2) && load_idx != 0 {
+                    let load = la.get("m_load").and_then(SdbVal::as_i32).unwrap_or(0);
+                    let meaning = if load_type == 4 && load == -1 {
+                        " (all link element nonlinear degrees of freedom: Ritz starting load vectors this solver does not have)"
+                    } else {
+                        ""
+                    };
+                    model.unmodeled_source.push(UnmodeledSourceData {
+                        scope: UnmodeledScope::Case(name.clone()),
+                        description: format!(
+                            "Ritz starting load of type {load_type} (load {load}){meaning} in modal case '{name}' (not imported)"
+                        ),
+                    });
+                }
                 let function = function_names
                     .get(function_idx)
                     .filter(|n| model.functions.contains_key(*n));
@@ -2663,6 +2746,12 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     ),
                 });
             }
+        }
+        if matches!(ctype_code, 5 | 6) {
+            let (modal_case, entries) =
+                native_history_modal_import(&name, ctype_code, ac, &raw_analysis_cases, &ac_names);
+            lc.modal_case = modal_case;
+            model.unmodeled_source.extend(entries);
         }
         lc.modal_combo = match ac.get("m_modc").and_then(SdbVal::as_i32).unwrap_or(1) {
             2 => ModalComboMethod::Srss,
@@ -3581,6 +3670,77 @@ mod tests {
             ));
             assert!(native::inspect_native_sdb(&source).is_ok());
         }
+    }
+
+    fn raw_case(casetype: i32, modalcase: i32, motion: Option<i32>, alive: bool) -> HashMap<String, SdbVal> {
+        let mut raw = HashMap::from([
+            ("m_casetype".to_string(), SdbVal::I32(casetype)),
+            ("m_modalcase".to_string(), SdbVal::I32(modalcase)),
+            ("m_alive".to_string(), SdbVal::Bool(alive)),
+        ]);
+        if let Some(motion) = motion {
+            raw.insert("m_MotionType".into(), SdbVal::I32(motion));
+        }
+        raw
+    }
+
+    /// Branches of the native modal-history import on synthetic case maps (the record layout is
+    /// the one of the scan of `sdb_schemas.txt`: 1-based `m_modalcase`, type 3 = Modal).
+    #[test]
+    fn native_modal_history_import_branches() {
+        // Case 1: DEAD (type 1), 2: MODAL (type 3), 3: a deleted modal case, 4: history.
+        let raws = vec![
+            raw_case(1, 0, None, true),
+            raw_case(3, 0, None, true),
+            raw_case(3, 0, None, false),
+            raw_case(5, 2, Some(1), true),
+        ];
+        let names: Vec<String> = ["", "DEAD", "MODAL", "OLD", "H"].map(String::from).into();
+        let run = |ctype: i32, modalcase: i32, motion: Option<i32>| {
+            let ac = raw_case(ctype, modalcase, motion, true);
+            native_history_modal_import("H", ctype, &ac, &raws, &names)
+        };
+        let case = |text: &str| UnmodeledSourceData {
+            scope: UnmodeledScope::Case("H".into()),
+            description: text.to_string(),
+        };
+
+        // A transient history of the Modal case imports; an absent motion type is transient.
+        assert_eq!(run(5, 2, Some(1)), (Some("MODAL".into()), vec![]));
+        assert_eq!(run(5, 2, None), (Some("MODAL".into()), vec![]));
+        // Index 0 is no modal case: this program's own direct-integration history.
+        assert_eq!(run(5, 0, Some(1)), (None, vec![]));
+        // Out of range, negative, a deleted case and a case that is not a Modal case.
+        for index in [9, -1, 3, 1] {
+            let (modal, entries) = run(5, index, Some(1));
+            assert_eq!(modal, None, "index {index}");
+            assert_eq!(
+                entries,
+                vec![case(&format!(
+                    "modal case index {index} of modal history case 'H' does not name a Modal case (not imported)"
+                ))]
+            );
+        }
+        // A periodic history is refused but keeps its modal case; unknown motion types too.
+        assert_eq!(
+            run(5, 2, Some(2)),
+            (
+                Some("MODAL".into()),
+                vec![case("periodic modal history of case 'H' is not implemented")]
+            )
+        );
+        assert_eq!(
+            run(5, 2, Some(7)).1,
+            vec![case("motion type 7 of modal history case 'H' is not known and is not implemented")]
+        );
+        // Nonlinear modal (FNA): refused, no modal case superposed.
+        assert_eq!(
+            run(6, 2, Some(1)),
+            (
+                None,
+                vec![case("nonlinear modal (FNA) time history of case 'H' is not implemented")]
+            )
+        );
     }
 
     #[test]

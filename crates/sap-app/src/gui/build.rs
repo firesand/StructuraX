@@ -161,6 +161,10 @@ struct GridEditInput {
     text: String,
     /// Coordinate of the first line in [`GridEditMode::Spacings`].
     origin: f64,
+    /// The direction whose lines the text was loaded for; `None` until the
+    /// window has loaded them (it loads when it opens and when the direction
+    /// changes).
+    loaded: Option<GridAxis>,
 }
 
 impl Default for GridEditInput {
@@ -170,6 +174,7 @@ impl Default for GridEditInput {
             mode: GridEditMode::Lines,
             text: String::new(),
             origin: 0.0,
+            loaded: None,
         }
     }
 }
@@ -220,6 +225,20 @@ pub(super) fn parse_lengths(text: &str) -> Result<Vec<f64>, String> {
     Ok(lengths)
 }
 
+/// The lengths of a text typed in the template forms (`parse_lengths`) in
+/// another length unit: each number times `factor`, printed with a bounded
+/// number of significant digits. A token that is not a number stays as typed.
+pub(super) fn scale_lengths_text(text: &str, factor: f64) -> String {
+    text.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .map(|t| match t.parse::<f64>() {
+            Ok(v) if v.is_finite() => super::view::number_text(v * factor),
+            _ => t.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Grid coordinates from an origin and spacings: `origin`, then one more
 /// coordinate per spacing.
 pub(super) fn cumulative(origin: f64, spacings: &[f64]) -> Vec<f64> {
@@ -256,31 +275,46 @@ fn made_up_id(axis: GridAxis, i: usize) -> String {
 }
 
 /// Grid lines typed as one `id coordinate` per line (blank lines are
-/// skipped; blanks, tabs and commas separate the two values).
+/// skipped). The coordinate is the last blank- or comma-separated token of the
+/// line and the id is everything before it, so an id with a blank (`Grid 1`)
+/// can be read back; separators at the ends of the id are dropped.
 fn parse_grid_lines(text: &str) -> Result<Vec<(String, f64)>, String> {
+    let sep = |c: char| c == ',' || c.is_whitespace();
     let mut lines = Vec::new();
     for (n, line) in text.lines().enumerate() {
-        let tokens: Vec<&str> = line
-            .split(|c: char| c == ',' || c.is_whitespace())
-            .filter(|t| !t.is_empty())
-            .collect();
-        match tokens.as_slice() {
-            [] => {}
-            [id, coordinate] => {
-                let value: f64 = coordinate.parse().map_err(|_| {
-                    format!("line {}: '{coordinate}' is not a number", n + 1)
-                })?;
-                lines.push(((*id).to_string(), value));
-            }
-            _ => {
-                return Err(format!(
-                    "line {}: expected an id and a coordinate, e.g. 'A 0'",
-                    n + 1
-                ))
-            }
+        let line = line.trim_matches(sep);
+        if line.is_empty() {
+            continue;
         }
+        let Some(at) = line.rfind(sep) else {
+            return Err(format!("line {}: expected an id and a coordinate, e.g. 'A 0'", n + 1));
+        };
+        let coordinate = &line[at + 1..];
+        let id = line[..at].trim_matches(sep);
+        if id.is_empty() {
+            return Err(format!("line {}: expected an id and a coordinate, e.g. 'A 0'", n + 1));
+        }
+        let value: f64 = coordinate
+            .parse()
+            .map_err(|_| format!("line {}: '{coordinate}' is not a number", n + 1))?;
+        lines.push((id.to_string(), value));
     }
     Ok(lines)
+}
+
+/// Loads the current lines of the chosen direction into the editor when the
+/// window has not yet done so for it: on opening and when the direction
+/// changes. In the spacings mode a change of direction empties the text (the
+/// spacings typed belong to the other direction).
+fn sync_grid_editor(g: &mut GridEditInput, model: &SapModel) {
+    if g.loaded == Some(g.axis) {
+        return;
+    }
+    g.loaded = Some(g.axis);
+    g.text = match g.mode {
+        GridEditMode::Lines => grid_lines_text(model, g.axis),
+        GridEditMode::Spacings => String::new(),
+    };
 }
 
 /// The grid lines of one direction as the editor's text.
@@ -531,6 +565,7 @@ pub(super) fn render(
     model: &mut SapModel,
 ) -> Option<Result<String, String>> {
     if !state.open {
+        state.grid_edit.loaded = None;
         return None;
     }
     let frame_names: Vec<String> = model.frame_sections.keys().cloned().collect();
@@ -598,6 +633,7 @@ pub(super) fn render(
                         ui.selectable_value(&mut g.mode, GridEditMode::Lines, "Ids and coordinates");
                         ui.selectable_value(&mut g.mode, GridEditMode::Spacings, "Spacings");
                     });
+                    sync_grid_editor(g, model);
                     match g.mode {
                         GridEditMode::Lines => {
                             ui.label("One line per grid line: id, then coordinate (e.g. 'A 0'). An empty list removes the direction.");
@@ -994,6 +1030,7 @@ mod tests {
             mode: GridEditMode::Spacings,
             text: "4 6, 1".into(),
             origin: 1.0,
+            loaded: None,
         };
         assert_eq!(apply_grid_lines(&mut m, &spacings).unwrap(), "Defined 4 Y grid lines.");
         let y: Vec<_> = m.coord_systems["GLOBAL"].grids.iter().filter(|g| g.axis == "Y").map(|g| (g.id.clone(), g.coordinate)).collect();
@@ -1017,7 +1054,6 @@ mod tests {
             ("A 0\nA 5", GridEditMode::Lines, "twice"),
             ("A 0\nB 0", GridEditMode::Lines, "same coordinate"),
             ("A 0\nB", GridEditMode::Lines, "line 2: expected an id and a coordinate"),
-            ("A 0 7", GridEditMode::Lines, "line 1: expected"),
             ("A zero", GridEditMode::Lines, "line 1: 'zero' is not a number"),
             ("A NaN", GridEditMode::Lines, "nonfinite"),
             ("4, 0", GridEditMode::Spacings, "not a positive"),
@@ -1049,7 +1085,6 @@ mod tests {
     fn grid_tab_renders_the_editor_and_apply_defines_the_typed_lines() {
         let mut state = State::default();
         state.show_tab(TAB_GRID);
-        state.grid_edit.text = "A 0\nB 3\nC 9\n".into();
         let mut model = SapModel::default();
         let ctx = egui::Context::default();
         let mut time = 1.0;
@@ -1059,6 +1094,8 @@ mod tests {
                 render(ctx, &mut state, &mut model);
             });
         }
+        // The window has loaded the (empty) lines when it opened; the user types.
+        state.grid_edit.text = "A 0\nB 3\nC 9\n".into();
         let out = ctx.run(input(time + 1.0), |ctx| {
             render(ctx, &mut state, &mut model);
         });
@@ -1083,5 +1120,72 @@ mod tests {
         assert_eq!(outcome, Some(Ok("Defined 3 X grid lines.".to_string())));
         let x: Vec<_> = model.coord_systems["GLOBAL"].grids.iter().map(|g| (g.id.clone(), g.coordinate)).collect();
         assert_eq!(x, vec![("A".to_string(), 0.0), ("B".to_string(), 3.0), ("C".to_string(), 9.0)]);
+    }
+
+    /// D34 (review item 6): "Read current lines" then "Apply" round-trips an
+    /// id with a blank or a comma.
+    #[test]
+    fn read_current_lines_then_apply_round_trips_ids_with_blanks_and_commas() {
+        let mut m = SapModel::default();
+        let lines = vec![
+            ("Grid 1".to_string(), 0.0),
+            ("Grid 2".to_string(), 4.5),
+            ("a,b".to_string(), 9.0),
+            ("C".to_string(), 12.0),
+        ];
+        m.set_grid_lines(GridAxis::X, &lines).unwrap();
+        let text = grid_lines_text(&m, GridAxis::X);
+        let input = GridEditInput { text, ..Default::default() };
+        assert_eq!(apply_grid_lines(&mut m, &input), Ok("Defined 4 X grid lines.".to_string()));
+        let x: Vec<_> = m.coord_systems["GLOBAL"].grids.iter().map(|g| (g.id.clone(), g.coordinate)).collect();
+        assert_eq!(x, lines);
+        // Typed by hand: separators of any kind between id and coordinate.
+        assert_eq!(
+            parse_grid_lines("A, 0\n\nB\t3,\n  Axis 4   6.5 \n"),
+            Ok(vec![("A".into(), 0.0), ("B".into(), 3.0), ("Axis 4".into(), 6.5)])
+        );
+        assert!(parse_grid_lines("A").unwrap_err().contains("line 1"));
+        assert!(parse_grid_lines("A 0\nB x").unwrap_err().contains("line 2"));
+        assert!(parse_grid_lines("3").is_err());
+    }
+
+    /// D34 (decision): the editor loads the current lines of the chosen
+    /// direction when the window opens and when the direction changes, so
+    /// "Apply" on the untouched text keeps the model.
+    #[test]
+    fn the_grid_editor_loads_the_current_lines_on_open_and_when_the_axis_changes() {
+        let mut model = SapModel::default();
+        model.quick_grid([3, 2, 2], [6.0, 5.0, 4.0], [0.0; 3]).unwrap();
+        let x = grid_lines_text(&model, GridAxis::X);
+        let y = grid_lines_text(&model, GridAxis::Y);
+        assert!(!x.is_empty() && !y.is_empty() && x != y);
+        let mut state = State::default();
+        state.show_tab(TAB_GRID);
+        let ctx = egui::Context::default();
+        let mut time = 1.0;
+        let mut run = |state: &mut State, model: &mut SapModel| {
+            time += 1.0;
+            for _ in 0..2 {
+                let _ = ctx.run(input(time), |ctx| {
+                    render(ctx, state, model);
+                });
+            }
+        };
+        run(&mut state, &mut model);
+        assert_eq!(state.grid_edit.text, x, "loaded when the window opened");
+        state.grid_edit.axis = GridAxis::Y;
+        run(&mut state, &mut model);
+        assert_eq!(state.grid_edit.text, y, "loaded when the axis changed");
+        // Applying the untouched text leaves the lines of the model as they are.
+        let before = model.clone();
+        assert!(apply_grid_lines(&mut model, &state.grid_edit).is_ok());
+        assert_eq!(model, before);
+        // Closed and opened again: loaded again, also after the model changed.
+        state.open = false;
+        run(&mut state, &mut model);
+        model.set_grid_lines(GridAxis::Y, &[("P".to_string(), 1.0)]).unwrap();
+        state.show_tab(TAB_GRID);
+        run(&mut state, &mut model);
+        assert_eq!(state.grid_edit.text, "P 1\n");
     }
 }

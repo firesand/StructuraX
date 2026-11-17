@@ -9,6 +9,11 @@ pub enum LinalgError {
     DimensionMismatch { expected: usize, actual: usize },
     #[error("Singular matrix encountered at pivot index {0}")]
     SingularMatrix(usize),
+    /// A singular pivot of a dense auxiliary or reduced matrix (an element
+    /// matrix, a free-DOF block, a shifted matrix): its index is not a global
+    /// degree of freedom and must never be reported as a joint.
+    #[error("Singular matrix encountered at pivot index {0} of a reduced or auxiliary matrix")]
+    SingularReduced(usize),
     #[error("Eigenvalue solver failed to converge within {0} sweeps")]
     EigenConvergence(usize),
     #[error("Nonfinite value encountered in {0}")]
@@ -296,6 +301,106 @@ impl SymmetricLdlt {
     }
 }
 
+/// Maps the pivot index of a failure in a sub-matrix to the index in the full
+/// matrix: `dofs[i]` is the global index of row `i` of the sub-matrix. Only
+/// `SingularMatrix` carries an index of that kind.
+pub fn remap_singular_index(error: LinalgError, dofs: &[usize]) -> LinalgError {
+    match error {
+        LinalgError::SingularMatrix(i) => match dofs.get(i) {
+            Some(&global) => LinalgError::SingularMatrix(global),
+            None => LinalgError::SingularReduced(i),
+        },
+        other => other,
+    }
+}
+
+/// Result of [`scaled_stiffness_minimum`].
+#[derive(Debug, Clone, Copy)]
+pub struct ScaledMinimum {
+    /// Rayleigh quotient `z^T S z` of the last unit vector `z`, with
+    /// `S = D^{-1/2} K D^{-1/2}`: close to the smallest eigenvalue of `S`.
+    pub mu: f64,
+    /// Index of the entry of `z` with the largest magnitude.
+    pub worst: usize,
+}
+
+/// Inverse iteration on the diagonally scaled matrix `S = D^{-1/2} K D^{-1/2}`
+/// (three solves with the existing factor `ldlt` of `k`), used after a
+/// successful factorization to detect a mechanism whose pivots stayed above the
+/// pivot test. `D_j` is `reference[j]` where that is positive (the structural
+/// diagonal, the reference of the pivot test) and `k[j][j]` otherwise;
+/// `excluded` (restrained DOFs) and the zero DOFs of the factor are left out.
+/// Returns `None` when no free DOF with a positive scale remains.
+///
+/// Not called by the analysis in wave 5: measured on mechanisms and sound
+/// models, `mu` separates them without penalty constraints (largest mechanism
+/// 1.7e-16, smallest sound model 1.7e-12) but not with them (a Diaphragm
+/// constraint raised the mechanism's `mu` to between -1.6e-8 and +4.5e-7), see
+/// the wave 5 report of D03. It is kept, with its closed-form test, for the
+/// wave that removes the penalty constraints.
+pub fn scaled_stiffness_minimum(
+    k: &[f64],
+    n: usize,
+    ldlt: &SymmetricLdlt,
+    reference: Option<&[f64]>,
+    excluded: &[bool],
+) -> Result<Option<ScaledMinimum>, LinalgError> {
+    if k.len() != n * n || ldlt.n != n || excluded.len() != n {
+        return Err(LinalgError::DimensionMismatch {
+            expected: n,
+            actual: excluded.len(),
+        });
+    }
+    let root: Vec<f64> = (0..n)
+        .map(|j| {
+            let structural = reference.map_or(0.0, |r| r[j]);
+            let scale = if structural > 0.0 { structural } else { k[j * n + j] };
+            if excluded[j] || ldlt.zero_dof[j] || !scale.is_finite() || scale <= 0.0 {
+                0.0
+            } else {
+                scale.sqrt()
+            }
+        })
+        .collect();
+    let free: Vec<usize> = (0..n).filter(|&j| root[j] > 0.0).collect();
+    if free.is_empty() {
+        return Ok(None);
+    }
+    let mut z = vec![0.0; n];
+    let norm = (free.len() as f64).sqrt();
+    for &j in &free {
+        z[j] = 1.0 / norm;
+    }
+    for _ in 0..3 {
+        let b: Vec<f64> = (0..n).map(|j| root[j] * z[j]).collect();
+        let x = ldlt.solve(&b)?;
+        let mut y: Vec<f64> = (0..n).map(|j| root[j] * x[j]).collect();
+        let len = y.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if !len.is_finite() || len <= 0.0 {
+            return Err(LinalgError::NonFinite("mechanism check"));
+        }
+        for v in &mut y {
+            *v /= len;
+        }
+        z = y;
+    }
+    let w: Vec<f64> = (0..n)
+        .map(|j| if root[j] > 0.0 { z[j] / root[j] } else { 0.0 })
+        .collect();
+    let mut mu = 0.0;
+    for &i in &free {
+        let row = &k[i * n..(i + 1) * n];
+        let kw: f64 = free.iter().map(|&j| row[j] * w[j]).sum();
+        mu += w[i] * kw;
+    }
+    let worst = free
+        .iter()
+        .copied()
+        .max_by(|&a, &b| z[a].abs().total_cmp(&z[b].abs()))
+        .unwrap_or(0);
+    Ok(Some(ScaledMinimum { mu, worst }))
+}
+
 /// Solves a dense linear system $\mathbf{A} \mathbf{x} = \mathbf{b}$ via Gaussian elimination with partial pivoting.
 pub fn solve_lu(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, LinalgError> {
     if a.len() != n * n || b.len() != n {
@@ -319,7 +424,7 @@ pub fn solve_lu(a: &[f64], b: &[f64], n: usize) -> Result<Vec<f64>, LinalgError>
         }
 
         if max_val < 1e-18 {
-            return Err(LinalgError::SingularMatrix(k));
+            return Err(LinalgError::SingularReduced(k));
         }
 
         if max_row != k {
@@ -986,7 +1091,7 @@ fn finish_subspace(
             }
         }
     }
-    let negative = negative.ok_or(LinalgError::SingularMatrix(0))?;
+    let negative = negative.ok_or(LinalgError::SingularReduced(0))?;
     let below = lambda.iter().filter(|&&v| v < sigma).count();
     if negative != below {
         return Err(LinalgError::EigenSturmMismatch { negative, below });
@@ -1295,6 +1400,59 @@ mod tests {
             penalty,
         ];
         (k, vec![bar + ground_spring, bar, 0.0])
+    }
+
+    #[test]
+    fn a_sub_matrix_pivot_index_is_mapped_or_never_a_global_index() {
+        // Rows 0, 1, 2 of a sub-matrix are the global DOFs 7, 12, 30.
+        let dofs = [7usize, 12, 30];
+        assert!(matches!(
+            remap_singular_index(LinalgError::SingularMatrix(1), &dofs),
+            LinalgError::SingularMatrix(12)
+        ));
+        // An index outside the list cannot be a DOF of the full matrix.
+        assert!(matches!(
+            remap_singular_index(LinalgError::SingularMatrix(3), &dofs),
+            LinalgError::SingularReduced(3)
+        ));
+        // Other errors pass through unchanged.
+        assert!(matches!(
+            remap_singular_index(LinalgError::NonFinite("x"), &dofs),
+            LinalgError::NonFinite("x")
+        ));
+        // The dense solver of auxiliary matrices reports `SingularReduced`, so
+        // its index is never taken for a joint DOF.
+        let singular = [1.0, 1.0, 1.0, 1.0];
+        assert!(matches!(
+            solve_lu(&singular, &[1.0, 2.0], 2),
+            Err(LinalgError::SingularReduced(_))
+        ));
+        // A massless-DOF block whose second row is a rigid-body mode: the
+        // factorization failure is reported at the global DOF 12.
+        let block = [1.0, -1.0, -1.0, 1.0];
+        let error = SymmetricLdlt::factorize(&block, 2)
+            .map_err(|e| remap_singular_index(e, &[7, 12]))
+            .unwrap_err();
+        assert!(matches!(error, LinalgError::SingularMatrix(12)), "{error}");
+    }
+
+    /// K = [[2, -1], [-1, 2]] has D = (2, 2), S = K / 2 with the eigenpairs
+    /// 1/2 for (1, 1)/sqrt2 and 3/2 for (1, -1)/sqrt2. The start vector is
+    /// the lowest eigenvector, so mu = 1/2 exactly; the free-DOF mask leaves
+    /// the third DOF (restrained, unit diagonal) out.
+    #[test]
+    fn scaled_stiffness_minimum_of_a_two_dof_chain_is_one_half() {
+        let k = [2.0, -1.0, 0.0, -1.0, 2.0, 0.0, 0.0, 0.0, 1.0];
+        let ldlt = SymmetricLdlt::factorize(&k, 3).unwrap();
+        let found = scaled_stiffness_minimum(&k, 3, &ldlt, None, &[false, false, true])
+            .unwrap()
+            .unwrap();
+        assert!((found.mu - 0.5).abs() < 1e-14, "{}", found.mu);
+        assert!(found.worst < 2);
+        // Nothing free: no result.
+        assert!(scaled_stiffness_minimum(&k, 3, &ldlt, None, &[true; 3])
+            .unwrap()
+            .is_none());
     }
 
     #[test]

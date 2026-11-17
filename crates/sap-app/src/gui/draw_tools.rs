@@ -45,6 +45,24 @@ pub(super) struct State {
     context: Option<(ToolMode, Option<PlaneView>, ViewProjection)>,
 }
 
+impl State {
+    /// The tool and view in which points are waiting, if any are.
+    pub(super) fn picked_in(&self) -> Option<(ToolMode, Option<PlaneView>, ViewProjection)> {
+        if self.pending.is_empty() {
+            None
+        } else {
+            self.context
+        }
+    }
+
+    /// Forget the points picked so far (their coordinates are in other units
+    /// after a change of units).
+    pub(super) fn clear_pending(&mut self) {
+        self.pending.clear();
+        self.context = None;
+    }
+}
+
 impl Default for State {
     fn default() -> Self {
         Self {

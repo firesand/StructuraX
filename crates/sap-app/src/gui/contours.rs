@@ -133,9 +133,9 @@ fn corner_count(area: &AreaObj) -> usize {
 }
 
 /// Local axes of an area as rows `[e1, e2, e3]` in global components: the
-/// solver's own system, `area_local_system` with the area's angle plus the
-/// material angle of its section (as `analyze_model` and `recover_area_result`
-/// call it).
+/// solver's own system, `area_local_system` with the area's angle (the
+/// section's material angle turns the material, not these axes; Analysis
+/// Reference p. 193).
 pub(super) fn area_local_axes(model: &SapModel, area: &str) -> Result<[[f64; 3]; 3], String> {
     let a = model
         .areas
@@ -156,7 +156,7 @@ pub(super) fn area_local_axes(model: &SapModel, area: &str) -> Result<[[f64; 3];
             .ok_or_else(|| format!("area '{area}' refers to the missing joint '{p}'"))?;
         coords.push([pt.x, pt.y, pt.z]);
     }
-    let (axes, _, _) = area_local_system(&coords, a.angle_deg + sec.mat_angle_deg);
+    let (axes, _, _) = area_local_system(&coords, sap_solver::area::area_axes_angle(a, sec));
     Ok(axes)
 }
 

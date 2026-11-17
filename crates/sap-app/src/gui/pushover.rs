@@ -119,8 +119,35 @@ pub(super) fn curve_xy(points: &[PushoverPoint]) -> Vec<(f64, f64)> {
         .collect()
 }
 
-fn draw_plot(ui: &mut egui::Ui, xy: &[(f64, f64)]) {
-    let size = egui::vec2(ui.available_width().clamp(240.0, 720.0), 220.0);
+/// Tick values of an axis from `lo` to `hi`: multiples of 1, 2 or 5 times a
+/// power of ten, about `target` of them, all inside the range. Each is
+/// `k * step` for an integer `k`, so that no sum of steps carries roundoff.
+pub(super) fn nice_ticks(lo: f64, hi: f64, target: usize) -> Vec<f64> {
+    if !(lo.is_finite() && hi.is_finite() && hi > lo && target > 0) {
+        return Vec::new();
+    }
+    let raw = (hi - lo) / target as f64;
+    let power = 10f64.powf(raw.log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0]
+        .iter()
+        .map(|m| m * power)
+        .find(|s| *s >= raw)
+        .unwrap_or(10.0 * power);
+    let first = (lo / step).ceil() as i64;
+    let last = (hi / step).floor() as i64;
+    (first..=last)
+        .map(|k| k as f64 * step)
+        .map(|v| if v == 0.0 { 0.0 } else { v })
+        .collect()
+}
+
+/// A tick value as the axis prints it: four significant digits.
+pub(super) fn tick_text(v: f64) -> String {
+    super::view::significant_text(v, 4)
+}
+
+pub(super) fn draw_plot(ui: &mut egui::Ui, xy: &[(f64, f64)]) {
+    let size = egui::vec2(ui.available_width().clamp(300.0, 720.0), 220.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(16, 20, 28));
@@ -142,28 +169,52 @@ fn draw_plot(ui: &mut egui::Ui, xy: &[(f64, f64)]) {
     if x1 - x0 <= 0.0 || y1 - y0 <= 0.0 {
         return;
     }
-    let margin = 14.0f32;
-    let inner = rect.shrink(margin);
+    // Room for the tick labels on the left and at the bottom, and for the
+    // axis names at the top and the bottom.
+    let inner = egui::Rect::from_min_max(
+        rect.min + egui::vec2(66.0, 24.0),
+        rect.max - egui::vec2(18.0, 38.0),
+    );
     let to_screen = |(x, y): (f64, f64)| {
         egui::pos2(
             inner.left() + ((x - x0) / (x1 - x0)) as f32 * inner.width(),
             inner.bottom() - ((y - y0) / (y1 - y0)) as f32 * inner.height(),
         )
     };
-    let axis = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(90));
+    let text_color = egui::Color32::from_gray(200);
+    let font = egui::FontId::monospace(11.0);
+    let grid = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(40));
+    for v in nice_ticks(x0, x1, 5) {
+        let x = to_screen((v, 0.0)).x;
+        painter.line_segment([egui::pos2(x, inner.top()), egui::pos2(x, inner.bottom())], grid);
+        painter.text(
+            egui::pos2(x, inner.bottom() + 3.0),
+            egui::Align2::CENTER_TOP,
+            tick_text(v),
+            font.clone(),
+            text_color,
+        );
+    }
+    for v in nice_ticks(y0, y1, 5) {
+        let y = to_screen((0.0, v)).y;
+        painter.line_segment([egui::pos2(inner.left(), y), egui::pos2(inner.right(), y)], grid);
+        painter.text(
+            egui::pos2(inner.left() - 4.0, y),
+            egui::Align2::RIGHT_CENTER,
+            tick_text(v),
+            font.clone(),
+            text_color,
+        );
+    }
+    // The axes through zero.
+    let axis = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(110));
     let origin = to_screen((0.0, 0.0));
     painter.line_segment(
-        [
-            egui::pos2(inner.left(), origin.y),
-            egui::pos2(inner.right(), origin.y),
-        ],
+        [egui::pos2(inner.left(), origin.y), egui::pos2(inner.right(), origin.y)],
         axis,
     );
     painter.line_segment(
-        [
-            egui::pos2(origin.x, inner.top()),
-            egui::pos2(origin.x, inner.bottom()),
-        ],
+        [egui::pos2(origin.x, inner.top()), egui::pos2(origin.x, inner.bottom())],
         axis,
     );
     let line: Vec<egui::Pos2> = finite.iter().copied().map(to_screen).collect();
@@ -174,35 +225,20 @@ fn draw_plot(ui: &mut egui::Ui, xy: &[(f64, f64)]) {
     for p in line {
         painter.circle_filled(p, 2.5, egui::Color32::from_rgb(255, 230, 120));
     }
-    // The extreme values of each axis, in the units of the model.
-    let label = |pos: egui::Pos2, anchor: egui::Align2, text: String| {
-        painter.text(
-            pos,
-            anchor,
-            text,
-            egui::FontId::monospace(10.0),
-            egui::Color32::from_gray(190),
-        );
-    };
-    let extreme = |lo: f64, hi: f64| if hi.abs() >= lo.abs() { hi } else { lo };
-    let (x_ext, y_ext) = (extreme(x0, x1), extreme(y0, y1));
-    label(
-        egui::pos2(to_screen((x_ext, 0.0)).x, origin.y + 2.0),
-        if x_ext > 0.0 {
-            egui::Align2::RIGHT_TOP
-        } else {
-            egui::Align2::LEFT_TOP
-        },
-        format!("displacement {x_ext:.5}"),
+    // The axis names, inside the plot rectangle whatever the signs of the data.
+    painter.text(
+        egui::pos2(inner.center().x, rect.bottom() - 4.0),
+        egui::Align2::CENTER_BOTTOM,
+        "monitored displacement (model length units)",
+        font.clone(),
+        text_color,
     );
-    label(
-        egui::pos2(origin.x + 3.0, to_screen((0.0, y_ext)).y),
-        if y_ext > 0.0 {
-            egui::Align2::LEFT_TOP
-        } else {
-            egui::Align2::LEFT_BOTTOM
-        },
-        format!("base shear {y_ext:.4}"),
+    painter.text(
+        egui::pos2(rect.left() + 6.0, rect.top() + 4.0),
+        egui::Align2::LEFT_TOP,
+        "base shear (model force units)",
+        font,
+        text_color,
     );
 }
 
@@ -255,10 +291,16 @@ pub(super) fn render(
                     ui.strong(h);
                 }
                 ui.end_row();
+                // The base shear of the first state is roundoff (5e-15 of
+                // 600): a value below a billionth of the largest is printed 0.
+                let peak = points.iter().map(|p| p.base_shear.abs()).fold(0.0_f64, f64::max);
                 for p in &points {
                     ui.label(p.step.to_string());
-                    ui.label(format!("{:.5}", p.displacement));
-                    ui.label(format!("{:.4}", p.base_shear + 0.0));
+                    ui.label(super::view::quantity_text(p.displacement));
+                    ui.label(super::view::quantity_text(super::view::without_roundoff(
+                        p.base_shear,
+                        peak,
+                    )));
                     for n in [
                         p.a_to_b,
                         p.b_to_c,
@@ -508,9 +550,15 @@ mod tests {
             );
         }
         // Rows of the first saved states (the window scrolls the rest): point 1, 2.
-        assert!(t.iter().any(|s| s == "0.01850"), "{t:?}");
-        assert!(t.iter().any(|s| s == "60.0000") && t.iter().any(|s| s == "80.0000"));
-        assert!(!t.iter().any(|s| s == "-0.0000"));
+        // The cells print the value with at least five significant digits
+        // (they were rounded to 5 and 4 decimals before): compare as numbers,
+        // with the resolution of those decimals.
+        let has = |want: f64, tol: f64| {
+            t.iter().any(|s| s.parse::<f64>().is_ok_and(|v| (v - want).abs() <= tol))
+        };
+        assert!(has(0.0185, 5e-6), "{t:?}");
+        assert!(has(60.0, 5e-5) && has(80.0, 5e-5), "{t:?}");
+        assert!(!t.iter().any(|s| s.starts_with("-0") && s.parse::<f64>() == Ok(0.0)));
         assert_eq!(state.case, "PUSH");
         assert_eq!(model, before, "the window must not edit the model");
     }

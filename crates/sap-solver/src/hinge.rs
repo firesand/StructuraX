@@ -1215,6 +1215,38 @@ fn dislocation(dof: HingeDof, length: f64, x: f64) -> [f64; 12] {
     j
 }
 
+/// Adds to the station displacements of an element the deflection of a
+/// flexural hinge of plastic rotation `q` at distance `x_h` from end I of an
+/// element of length `length`.
+///
+/// The recovered stations hold the chord between the element-end displacements
+/// plus the integral of the elastic curvature. A hinge adds a rotation `q`
+/// (slope jump, `dislocation`: the part beyond the hinge moves by `q (L - x_h)`
+/// at end J) that the elastic curvature does not contain; with the end values
+/// kept, the missing deflection is `q (max(0, x - x_h) - (L - x_h) x / L)`,
+/// in local 2 for M3 and in local 3 for M2 (whose dislocation carries the
+/// opposite sense of rotation about local 2, see `Site::sign`).
+fn add_hinge_kink(
+    stations: &mut [sap_model::FrameStationResult],
+    dof: HingeDof,
+    q: f64,
+    x_h: f64,
+    length: f64,
+) {
+    let axis = match dof {
+        HingeDof::M3 => 1,
+        HingeDof::M2 => 2,
+        _ => return,
+    };
+    if q == 0.0 || length <= 0.0 {
+        return;
+    }
+    for s in stations {
+        let x = s.station;
+        s.local_disp[axis] += q * ((x - x_h).max(0.0) - (length - x_h) * x / length);
+    }
+}
+
 fn unsupported(msg: String) -> SolverError {
     SolverError::UnsupportedInput(msg)
 }
@@ -1380,10 +1412,11 @@ fn hinge_result(
 /// forces. A case that cannot reach its target returns an error and keeps no
 /// partial results.
 ///
-/// Limitation: the `local_disp` of the stations of a frame object is
-/// integrated from the elastic curvature between its end values and has no
-/// jump at an interior hinge; joint displacements, reactions and station
-/// forces are exact.
+/// The `local_disp` of the stations of an element with a flexural (M2 or M3)
+/// hinge carries the slope jump of the hinge (see [`add_hinge_kink`]). Limit:
+/// the jumps of axial, shear and torsion hinges are not added to the station
+/// displacements (the joint displacements, reactions and station forces are
+/// exact for all of them).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_case(
     model: &SapModel,
@@ -1879,7 +1912,7 @@ pub(crate) fn run_case(
             }
             scatter(&eigen, e, &mut sl.f_fef_joint);
         }
-        let results = crate::recover_static_results(
+        let mut results = crate::recover_static_results(
             model,
             &lc.name,
             &case_loads,
@@ -1894,6 +1927,14 @@ pub(crate) fn run_case(
             None,
             None,
         )?;
+        // The station deflections of the recovery integrate the elastic
+        // curvature only: add the kink of every flexural hinge.
+        for (h, site) in sites.iter().enumerate() {
+            let e = &elems[site.elem];
+            if let Some(stations) = results.frame_forces.get_mut(&e.name) {
+                add_hinge_kink(stations, site.dof, st.q[h], site.rel * e.length, e.length);
+            }
+        }
         let forces = problem.forces(st);
         let hinges = sites
             .iter()

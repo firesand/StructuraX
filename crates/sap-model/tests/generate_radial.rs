@@ -1152,7 +1152,9 @@ fn radial_copies_of_areas_rotate_local_axes_with_the_geometry() {
     let axes_of = |m: &SapModel, n: &str| {
         let a = &m.areas[n];
         let cs: Vec<[f64; 3]> = a.points.iter().map(|p| pt(m, p)).collect();
-        area_axes(&cs, a.angle_deg + 5.0)
+        // the element axes are the area's angle alone; the section's 5 degree material
+        // angle turns the material, not the axes (Analysis Reference p. 193)
+        area_axes(&cs, a.angle_deg)
     };
     assert_eq!(axes_of(&src, "A0")[2], [0.0, 0.0, 1.0]);
     assert_eq!(axes_of(&src, "A1")[2], [0.0, 0.0, -1.0]);
@@ -1684,7 +1686,8 @@ fn orientations() -> Vec<([[f64; 3]; 4], f64, f64)> {
 fn axes_of_area(m: &SapModel) -> [[f64; 3]; 3] {
     let a = &m.areas["A"];
     let cs: Vec<[f64; 3]> = a.points.iter().map(|p| pt(m, p)).collect();
-    area_axes(&cs, a.angle_deg + m.area_sections[&a.section].mat_angle_deg)
+    // the material angle of the section does not turn the element axes
+    area_axes(&cs, a.angle_deg)
 }
 
 fn vec_of_uniform(a: &sap_model::AreaObj, e: &[[f64; 3]; 3]) -> [f64; 3] {
@@ -1755,7 +1758,7 @@ fn reverse_same_global_keeps_every_physical_load() {
                                                  // temperature: gradient flips sign, uniform unchanged
         let t = &m.areas["A"].loads_temp;
         assert_eq!((t[0].val, t[1].val), (7.0, -3.0));
-        // the angle: total angle becomes 180 - a (tilted) or -a (vertical normal)
+        // the angle: the area angle becomes 180 - a (tilted) or -a (vertical normal)
         assert!(m.areas["A"].selected);
     }
 }
@@ -2499,4 +2502,39 @@ fn bad_grid_definitions_are_refused_by_quick_draw() {
     let mut m = grid_model(3, 3, 2);
     m.coord_systems.get_mut("GLOBAL").unwrap().grids[0].coordinate = f64::NAN;
     assert!(m.quick_draw_columns(region, "FSEC1").is_err());
+}
+
+/// An orthotropic material with a nonzero material angle would mirror under a reversal of
+/// local 3 (the material 1 axis turns about the new local 3), so the command is refused and
+/// the model is left as it was; with a zero material angle, or an isotropic material, it is
+/// accepted and the section keeps its material angle.
+#[test]
+fn reverse_refuses_an_orthotropic_material_with_a_material_angle() {
+    let quad = orientations()[1].0;
+    let ortho = |angle: f64| {
+        let mut m = reversible(quad, 25.0, angle);
+        let sec = m.area_sections["ASEC1"].material.clone();
+        let mat = m.materials.get_mut(&sec).unwrap();
+        mat.e_ortho = Some([30000.0, 15000.0, 15000.0]);
+        mat.u_ortho = Some([0.2, 0.2, 0.2]);
+        mat.g_ortho = Some([6600.0, 6600.0, 6600.0]);
+        m
+    };
+    let mut m = ortho(30.0);
+    let before = m.clone();
+    match m.reverse_area_local_3(ReverseKeep::SameGlobalLoads) {
+        Err(EditError::Unsupported(msg)) => {
+            assert!(msg.contains("A") && msg.contains("material angle"), "{msg}")
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert_eq!(m, before);
+    // zero material angle: accepted, the material angle stays zero
+    let mut m = ortho(0.0);
+    assert_eq!(m.reverse_area_local_3(ReverseKeep::SameGlobalLoads), Ok(1));
+    assert_eq!(m.area_sections["ASEC1"].mat_angle_deg, 0.0);
+    // isotropic material with a material angle: accepted and the section is untouched
+    let mut m = reversible(quad, 25.0, 30.0);
+    assert_eq!(m.reverse_area_local_3(ReverseKeep::SameGlobalLoads), Ok(1));
+    assert_eq!(m.area_sections["ASEC1"].mat_angle_deg, 30.0);
 }

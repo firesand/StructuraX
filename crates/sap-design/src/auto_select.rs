@@ -17,7 +17,7 @@
 use crate::steel::{design_frame_with_section, SteelCode, SteelMemberOverwrite};
 use crate::DesignError;
 use sap_model::auto_select::{self as list, is_auto_list};
-use sap_model::{FrameObj, FrameSection, FrameStationResult, SapModel, SteelDesignResult};
+use sap_model::{FrameObj, FrameSection, SapModel, SteelDesignResult};
 use std::collections::HashMap;
 
 /// A frame section that is an Auto Select list with members. A list without
@@ -74,7 +74,7 @@ pub(crate) fn design_frame_from_list(
     list_name: &str,
     overwrites: &HashMap<String, SteelMemberOverwrite>,
     code: SteelCode,
-    combo_forces: &[(String, Vec<(String, Vec<FrameStationResult>)>)],
+    combo_forces: &[(String, Vec<(String, crate::steel::FrameStates)>)],
     dc_limit: f64,
 ) -> Result<Option<(SteelDesignResult, String)>, DesignError> {
     let candidates = list::members_by_weight(model, list_name)

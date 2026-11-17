@@ -207,12 +207,13 @@ fn area_axes_of_a_tilted_area_match_hand_values_and_the_solver() {
             assert!((e[i][k] - want[i][k]).abs() < 1e-15, "{i}{k}: {}", e[i][k]);
         }
     }
-    // Angle: the solver rotates by area.angle_deg + section material angle (here
-    // 30 + 20 = 50): e1 = cos50 e1_0 + sin50 e2_0, e2 = -sin50 e1_0 + cos50 e2_0.
+    // Angle: the element axes turn by area.angle_deg alone (here 30); the section's material
+    // angle (20) turns the material inside the element, not these axes (Analysis Reference
+    // p. 193): e1 = cos30 e1_0 + sin30 e2_0, e2 = -sin30 e1_0 + cos30 e2_0.
     m.areas.get_mut("T").unwrap().angle_deg = 30.0;
     m.area_sections.get_mut("S").unwrap().mat_angle_deg = 20.0;
     let e = area_local_axes(&m, "T").unwrap();
-    let (s, c) = 50f64.to_radians().sin_cos();
+    let (s, c) = 30f64.to_radians().sin_cos();
     let want = [[c, s * r, s * r], [-s, c * r, c * r], [0.0, -r, r]];
     for i in 0..3 {
         for k in 0..3 {
@@ -221,7 +222,7 @@ fn area_axes_of_a_tilted_area_match_hand_values_and_the_solver() {
     }
     // The solver's own function with the same inputs.
     let coords = [[0., 0., 0.], [1., 0., 0.], [1., 1., 1.], [0., 1., 1.]];
-    assert_eq!(e, area_local_system(&coords, 50.0).0);
+    assert_eq!(e, area_local_system(&coords, 30.0).0);
     // Rows are orthonormal and right-handed.
     for i in 0..3 {
         for k in 0..3 {

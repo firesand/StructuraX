@@ -10,10 +10,13 @@ mod display_units;
 mod draw_tools;
 mod file_browser;
 mod hinges;
+mod i_section;
 mod materials;
+mod messages;
 mod modal_tables;
 mod pushover;
 mod result_display;
+mod result_tables;
 mod section_import;
 mod seismic;
 mod selection;
@@ -22,8 +25,25 @@ mod steel_design;
 mod time_history;
 #[cfg(test)]
 mod video_drawing_e2e;
+mod video_export;
+mod video_menu;
+mod object_info;
 #[cfg(test)]
 mod video_results_e2e;
+#[cfg(test)]
+mod video_wave5_e2e;
+#[cfg(test)]
+mod p16_messages_tests;
+#[cfg(test)]
+mod p16_misc_tests;
+#[cfg(test)]
+mod p16_offset_tests;
+#[cfg(test)]
+mod p16_open_tests;
+#[cfg(test)]
+mod wave5_hand_check_tests;
+#[cfg(test)]
+mod wave5_windows_tests;
 mod view;
 mod workflows;
 
@@ -213,7 +233,22 @@ pub struct SapGuiApp {
     pub active_mode_idx: usize,
     pub active_step_idx: usize,
     pub use_time_step: bool,
+    /// Scale factor of the deformed shape in use. With `deform_auto` it is set
+    /// every frame from the model and the result (`result_display::scaling`).
     pub deform_scale: f32,
+    /// "Scaling: Auto" of the Show Deformed Shape form. A change of
+    /// `deform_scale` that the automatic scale did not make (the slider, a
+    /// typed value) is a user-defined factor and turns this off.
+    pub deform_auto: bool,
+    /// Window of the right-click on an object of the undeformed display.
+    object_info: object_info::State,
+    /// Form of File > Create Video.
+    video_form: video_export::VideoForm,
+    /// Counter that every analysis, unlock and model replacement increments;
+    /// cached traces of the plot window are valid for one value of it.
+    pub results_revision: u64,
+    /// The value the automatic scale last set (or found) in `deform_scale`.
+    deform_auto_written: Option<f32>,
     pub animate_deformed: bool,
     pub anim_phase: f32,
     /// Result forms, contour and joint read-out (see `result_display`).
@@ -295,7 +330,15 @@ pub struct SapGuiApp {
     pub custom_sec_b: f64,
     pub custom_sec_tf: f64,
     pub custom_sec_tw: f64,
+    /// Bottom flange of an I-section (width t2b and thickness tfb); equal to
+    /// the top flange while `custom_sec_symmetric`.
+    pub custom_sec_bb: f64,
+    pub custom_sec_tfb: f64,
+    pub custom_sec_symmetric: bool,
     pub custom_sec_rebar_enabled: bool,
+    /// Rebar material of the longitudinal and the confinement bars of a custom
+    /// section (a model material with a yield stress).
+    pub custom_sec_rebar_material: String,
     pub custom_sec_is_column: bool,
     pub custom_sec_cover: f64,
     pub custom_sec_rebar_area: f64,
@@ -314,6 +357,8 @@ pub struct SapGuiApp {
     panel_seismic: seismic::State,
     panel_steel_design: steel_design::State,
     panel_time_history: time_history::State,
+    /// The status messages of the session (the Messages window).
+    messages: messages::State,
 
     // Verification suite cache
     pub verification_rows: Vec<BenchmarkVerificationRow>,
@@ -423,6 +468,11 @@ impl SapGuiApp {
             active_step_idx: 0,
             use_time_step: false,
             deform_scale: 25.0,
+            deform_auto: true,
+            video_form: video_export::VideoForm::default(),
+            object_info: object_info::State::default(),
+            results_revision: 0,
+            deform_auto_written: Some(25.0),
             animate_deformed: false,
             anim_phase: 0.0,
             results: result_display::State::default(),
@@ -484,7 +534,11 @@ impl SapGuiApp {
             custom_sec_b: 9.0,
             custom_sec_tf: 0.68,
             custom_sec_tw: 0.44,
+            custom_sec_bb: 9.0,
+            custom_sec_tfb: 0.68,
+            custom_sec_symmetric: true,
             custom_sec_rebar_enabled: false,
+            custom_sec_rebar_material: String::new(),
             custom_sec_is_column: false,
             custom_sec_cover: 2.5,
             custom_sec_rebar_area: 4.0,
@@ -502,6 +556,7 @@ impl SapGuiApp {
             panel_seismic: seismic::State::default(),
             panel_steel_design: steel_design::State::default(),
             panel_time_history: time_history::State::default(),
+            messages: messages::State::default(),
             verification_rows: Vec::new(),
         };
         if app.model.present_units != Units::KipInF {
@@ -566,6 +621,7 @@ impl SapGuiApp {
     fn replace_model(&mut self, new_model: SapModel, status: String, import_warnings: Vec<String>) {
         let old_u = self.model.present_units;
         let new_u = new_model.present_units;
+        self.results_revision += 1;
         self.model = new_model;
         if old_u != new_u {
             self.scale_gui_cached_units(old_u, new_u);
@@ -582,10 +638,17 @@ impl SapGuiApp {
         self.file_browser = file_browser::State::default();
         self.panel_materials = materials::State::default();
         self.panel_section_import = section_import::State::default();
-        self.left_plane = None;
-        self.right_plane = None;
+        // A plane view stays where the new model has that plane; a model whose
+        // joints all lie in one global plane opens its 2D panes on it.
+        self.fit_planes_to_model();
         self.last_view = [None; 2];
         self.pane_drag = None;
+        self.active_pane = 0;
+        // The view fits the pane to the bounds of the model (`render_viewport`)
+        // at zoom 1 and no pan: a new model starts there, not at the zoom and
+        // pan the old one was looked at with ("Reset Camera / Fit View").
+        self.zoom = 1.0;
+        self.pan = Vec2::ZERO;
         self.set_2d.open = false;
         if draw_tools::is_draw_tool(self.tool_mode) {
             self.tool_mode = ToolMode::Select;
@@ -597,6 +660,20 @@ impl SapGuiApp {
         self.panel_steel_design = steel_design::State::default();
         self.panel_time_history = time_history::State::default();
         self.results = result_display::State::default();
+        self.object_info = object_info::State::default();
+        // Nothing of the old model's results or of the way they were shown
+        // outlives it: a file has no results (an S2K or a template is
+        // unlocked in the undeformed display), and a result display of the old
+        // model (a shell stress, a mode of the deformed shape) would show "no
+        // results" for the new one.
+        if self.model.case_results.is_empty() {
+            self.model.is_locked = false;
+        }
+        self.display_mode = DisplayMode::Undeformed;
+        self.deform_auto = true;
+        self.deform_auto_written = None;
+        self.animate_deformed = false;
+        self.anim_phase = 0.0;
         self.import_warnings = import_warnings;
         self.export_warnings.clear();
         self.draw_first_point = None;
@@ -607,6 +684,78 @@ impl SapGuiApp {
         self.use_time_step = false;
         self.status_msg = status;
         self.sync_active_case();
+    }
+
+    /// File > Open: reads the model at `path` (an S2K or an SDB) and replaces
+    /// the current one (`replace_model`). Returns whether the file was opened;
+    /// a file that cannot be read leaves the model and the display unchanged.
+    fn open_model_file(&mut self, path: &str) -> bool {
+        match load_model_with_report(path) {
+            Ok(m) => {
+                let mut status = format!("Opened {path}");
+                if !m.warnings.is_empty() {
+                    status.push_str(&format!(" — Import warnings: {}", m.warnings.join("; ")));
+                }
+                self.replace_model(m.model, status, m.warnings);
+                true
+            }
+            Err(e) => {
+                self.status_msg = format!("Open error: {e}");
+                false
+            }
+        }
+    }
+
+    /// Keeps the plane of each 2D pane whose coordinate is a plane of the
+    /// current model (a grid line, or a joint coordinate where the axis has no
+    /// grid) and shows the whole model in the others. A model whose joints all
+    /// lie in one global plane (a 2D frame, a truss, a slab) puts every 2D pane
+    /// on that plane.
+    fn fit_planes_to_model(&mut self) {
+        let tol = view::plane_tolerance(&self.model);
+        let coplanar = view::joint_plane(&self.model);
+        let panes = if self.dual_pane { 2 } else { 1 };
+        for pane in 0..panes {
+            let (proj, plane) = if pane == 0 {
+                (&mut self.left_proj, &mut self.left_plane)
+            } else {
+                (&mut self.right_proj, &mut self.right_plane)
+            };
+            if *proj == ViewProjection::Perspective3D {
+                *plane = None;
+                continue;
+            }
+            if let Some(joint_plane) = coplanar {
+                *proj = joint_plane.normal.projection();
+                *plane = Some(joint_plane.coordinate);
+                continue;
+            }
+            *plane = PlaneView::of(*proj, *plane).filter(|old| {
+                view::plane_levels(&self.model, old.normal)
+                    .iter()
+                    .any(|level| (level - old.coordinate).abs() <= tol)
+            }).map(|old| old.coordinate);
+        }
+        if !self.dual_pane {
+            self.right_plane = None;
+        }
+    }
+
+    /// The units selector: converts the model and every length the window
+    /// state holds (see `scale_gui_cached_units`). Refused on a locked model.
+    fn change_units(&mut self, u: Units) {
+        if u == self.model.present_units || !self.ensure_unlocked() {
+            return;
+        }
+        let old_u = self.model.present_units;
+        self.scale_gui_cached_units(old_u, u);
+        self.model.convert_units_in_place(u);
+        self.workflows.scale_for_units(old_u, u, &self.model);
+        self.sync_active_case();
+        self.status_msg = format!(
+            "Converted model units to {}; results cleared, run analysis again.",
+            u.s2k_label()
+        );
     }
 
     fn scale_gui_cached_units(&mut self, from: Units, to: Units) {
@@ -624,8 +773,20 @@ impl SapGuiApp {
         self.custom_sec_b *= fl;
         self.custom_sec_tf *= fl;
         self.custom_sec_tw *= fl;
+        self.custom_sec_bb *= fl;
+        self.custom_sec_tfb *= fl;
         self.custom_sec_cover *= fl;
         self.custom_sec_rebar_area *= fl * fl;
+        // Plane views are at a coordinate in the old units; points picked by
+        // the draw tools and the typed coordinate of Set 2D View too.
+        self.left_plane = self.left_plane.map(|c| c * fl);
+        self.right_plane = self.right_plane.map(|c| c * fl);
+        self.draw_tools.clear_pending();
+        self.set_2d.coordinate_text.clear();
+        self.draw_first_point = None;
+        self.draw_area_points.clear();
+        self.tpl_bays_text = build::scale_lengths_text(&self.tpl_bays_text, fl);
+        self.tpl_storeys_text = build::scale_lengths_text(&self.tpl_storeys_text, fl);
     }
 
     fn ensure_unlocked(&mut self) -> bool {
@@ -640,6 +801,7 @@ impl SapGuiApp {
     }
 
     fn invalidate_results(&mut self) {
+        self.results_revision += 1;
         self.model.is_locked = false;
         self.model.case_results.clear();
         self.model.steel_design_results.clear();
@@ -678,6 +840,7 @@ impl SapGuiApp {
     }
 
     fn execute_analysis(&mut self) -> bool {
+        self.results_revision += 1;
         match analyze_model(&mut self.model) {
             Ok(()) => {
                 self.sync_active_case();
@@ -809,7 +972,21 @@ impl SapGuiApp {
     /// Send Enter or Escape to the active draw tool, in the view the pointer
     /// was last in. Without a drawn frame there is no view to give.
     fn route_draw_key(&mut self, event: draw_tools::PointerEvent) {
-        let Some((view, plane)) = self.last_view[self.active_pane.min(1)] else {
+        // Points picked in one pane are discarded by an event of another
+        // view, so the key goes to the pane they were picked in, when that
+        // pane is drawn; otherwise to the pane the pointer was last in.
+        let first = self.active_pane.min(1);
+        let picked_in = self.draw_tools.picked_in();
+        let pane = [first, 1 - first]
+            .into_iter()
+            .find(|p| {
+                picked_in.is_some_and(|(tool, plane, proj)| {
+                    tool == self.tool_mode
+                        && self.last_view[*p].is_some_and(|(v, pl)| v.proj == proj && pl == plane)
+                })
+            })
+            .unwrap_or(first);
+        let Some((view, plane)) = self.last_view[pane] else {
             return;
         };
         let outcome = draw_tools::on_event(
@@ -922,7 +1099,7 @@ impl SapGuiApp {
         }
         self.set_2d.pane = pane;
         if let Some(c) = self.pane_plane(pane) {
-            self.set_2d.coordinate_text = c.to_string();
+            self.set_2d.coordinate_text = view::number_text(c);
         }
         self.set_2d.open = true;
     }
@@ -966,8 +1143,8 @@ impl SapGuiApp {
                             .selected_text("grid")
                             .show_ui(ui, |ui| {
                                 for l in &levels {
-                                    if ui.selectable_label(false, l.to_string()).clicked() {
-                                        self.set_2d.coordinate_text = l.to_string();
+                                    if ui.selectable_label(false, view::number_text(*l)).clicked() {
+                                        self.set_2d.coordinate_text = view::number_text(*l);
                                     }
                                 }
                             });
@@ -1089,6 +1266,16 @@ impl SapGuiApp {
                     );
                     ui.close_menu();
                 }
+                ui.menu_button("Create Video", |ui| {
+                    if ui.button("Multi-Step Animation Video...").clicked() {
+                        self.video_form.open(&self.model, false);
+                        ui.close_menu();
+                    }
+                    if ui.button("Cyclic Animation Video...").clicked() {
+                        self.video_form.open(&self.model, true);
+                        ui.close_menu();
+                    }
+                });
                 ui.separator();
                 if ui
                     .button("Open / Save Model (.s2k / .sdb)... (Ctrl+O)")
@@ -1531,6 +1718,10 @@ impl SapGuiApp {
                     self.show_verification_modal = true;
                     ui.close_menu();
                 }
+                if ui.button("Messages...").clicked() {
+                    self.messages.open = true;
+                    ui.close_menu();
+                }
             });
         });
 
@@ -1688,7 +1879,12 @@ impl SapGuiApp {
                 .default_open(false)
                 .show(ui, |ui| {
                     for (id, pt) in &mut self.model.points {
-                        let lbl = format!("Jt {id}: ({:.1}, {:.1}, {:.1})", pt.x, pt.y, pt.z);
+                        let lbl = format!(
+                            "Jt {id}: ({}, {}, {})",
+                            view::quantity_text(pt.x),
+                            view::quantity_text(pt.y),
+                            view::quantity_text(pt.z)
+                        );
                         ui.checkbox(&mut pt.selected, lbl);
                     }
                 });
@@ -1764,8 +1960,10 @@ impl SapGuiApp {
             .show(ui, |ui| {
                 for (name, sec) in &self.model.frame_sections {
                     ui.label(format!(
-                        "• {name} ({:?}): A={:.2}, I33={:.1}",
-                        sec.prop_type, sec.area, sec.i33
+                        "• {name} ({:?}): A={}, I33={}",
+                        sec.prop_type,
+                        view::quantity_text(sec.area),
+                        view::quantity_text(sec.i33)
                     ));
                 }
             });
@@ -1949,8 +2147,10 @@ impl SapGuiApp {
                             format!("Col PMM = {:.3} [{}]", res.pmm_ratio, res.status)
                         } else {
                             format!(
-                                "Beam As = {:.2}/{:.2} [{}]",
-                                res.as_top, res.as_bot, res.status
+                                "Beam As = {}/{} [{}]",
+                                view::quantity_text(res.as_top),
+                                view::quantity_text(res.as_bot),
+                                res.status
                             )
                         };
                         ui.colored_label(col, format!("Fr {fid} ({}): {detail}", res.section_name));
@@ -2116,6 +2316,7 @@ impl SapGuiApp {
             active_pat_scales.insert(self.active_case.clone(), 1.0);
         }
 
+        self.update_deform_scale();
         // Animation phase & deformed displacement scale
         let anim_mult = if self.animate_deformed && !self.results.stepping {
             self.anim_phase.sin() as f64
@@ -2135,6 +2336,10 @@ impl SapGuiApp {
             use_step: use_time_step,
             step_idx: active_step_idx,
         };
+        // What of the result the view shows, for its title (D33).
+        let subtitle = case_res
+            .filter(|_| self.display_mode == DisplayMode::Deformed)
+            .and_then(|cr| result_display::scaling::view_subtitle(cr, step_sel));
         let model_ref = &self.model;
         let displaced_point = |pid: &str, base: [f64; 3]| -> [f64; 3] {
             result_display::displaced_point(model_ref, case_res, pid, base, def_scale, step_sel)
@@ -2286,8 +2491,9 @@ impl SapGuiApp {
                     .map(|p| project([p.x, p.y, p.z]))
                     .collect();
                 if face.len() == 4 {
-                    painter.add(Shape::closed_line(
-                        face,
+                    painter.extend(view::outlined_polygon(
+                        &face,
+                        Color32::TRANSPARENT,
                         Stroke::new(1.0_f32, Color32::from_rgb(130, 175, 225)),
                     ));
                 }
@@ -2350,8 +2556,8 @@ impl SapGuiApp {
                     project(corners[face[2]]),
                     project(corners[face[3]]),
                 ];
-                painter.add(Shape::convex_polygon(
-                    fpoly,
+                painter.extend(view::outlined_polygon(
+                    &fpoly,
                     fill_col,
                     Stroke::new(1.0_f32, stroke_col),
                 ));
@@ -2394,8 +2600,8 @@ impl SapGuiApp {
             }
             if poly_undef.len() >= 3 {
                 if self.display_mode == DisplayMode::Deformed {
-                    painter.add(Shape::convex_polygon(
-                        poly_undef.clone(),
+                    painter.extend(view::outlined_polygon(
+                        &poly_undef,
                         Color32::TRANSPARENT,
                         Stroke::new(1.0_f32, Color32::from_rgba_unmultiplied(95, 115, 140, 90)),
                     ));
@@ -2432,8 +2638,8 @@ impl SapGuiApp {
                 if let result_display::AreaFill::Mesh(mesh) = contour_fill {
                     painter.add(Shape::mesh(mesh));
                 }
-                painter.add(Shape::convex_polygon(
-                    active_poly.clone(),
+                painter.extend(view::outlined_polygon(
+                    active_poly,
                     fill_col,
                     Stroke::new(1.2_f32, edge_col),
                 ));
@@ -2575,7 +2781,12 @@ impl SapGuiApp {
         let mut max_diag_val = 1e-6f64;
         if let DisplayMode::FrameDiagram(comp) = self.display_mode {
             if let Some(cr) = case_res {
-                for stations in cr.frame_forces.values() {
+                // A multi-valued combination draws its maximum and its minimum
+                // on one scale.
+                for stations in result_tables::max_min_results(cr)
+                    .into_iter()
+                    .flat_map(|(_, r)| r.frame_forces.values())
+                {
                     for st in stations {
                         let v = match comp {
                             FrameForceComponent::AxialP => st.p.abs(),
@@ -2679,8 +2890,8 @@ impl SapGuiApp {
                     p2[1] - 0.5 * sec_d * e2[1],
                     p2[2] - 0.5 * sec_d * e2[2],
                 ]);
-                painter.add(Shape::convex_polygon(
-                    vec![top_i, top_j, bot_j, bot_i],
+                painter.extend(view::outlined_polygon(
+                    &[top_i, top_j, bot_j, bot_i],
                     Color32::from_rgba_unmultiplied(100, 180, 240, 65),
                     Stroke::new(1.5_f32, line_col),
                 ));
@@ -2723,9 +2934,18 @@ impl SapGuiApp {
                             format!("PMM {:.3} ({})", res.pmm_ratio, res.status)
                         }
                     } else if res.status == "OK" {
-                        format!("As {:.2}/{:.2}", res.as_top, res.as_bot)
+                        format!(
+                            "As {}/{}",
+                            view::quantity_text(res.as_top),
+                            view::quantity_text(res.as_bot)
+                        )
                     } else {
-                        format!("As {:.2}/{:.2} ({})", res.as_top, res.as_bot, res.status)
+                        format!(
+                            "As {}/{} ({})",
+                            view::quantity_text(res.as_top),
+                            view::quantity_text(res.as_bot),
+                            res.status
+                        )
                     };
                     painter.text(
                         mid_s + Vec2::new(0.0, -6.0),
@@ -2815,6 +3035,16 @@ impl SapGuiApp {
                                     base[2] + def_scale * dg[2],
                                 ]));
                             }
+                            // With end offsets the stations start at the support
+                            // faces: the rigid arms are straight segments from
+                            // the displaced joints to the first and the last
+                            // station (D56).
+                            if stations.first().is_some_and(|st| st.rel_dist > 1e-9) {
+                                pts.insert(0, project(displaced_point(&frame.point_i, p1)));
+                            }
+                            if stations.last().is_some_and(|st| st.rel_dist < 1.0 - 1e-9) {
+                                pts.push(project(displaced_point(&frame.point_j, p2)));
+                            }
                             for w in pts.windows(2) {
                                 painter.line_segment(
                                     [w[0], w[1]],
@@ -2849,7 +3079,27 @@ impl SapGuiApp {
             // Internal Force / Moment Diagram along Frame (NaN-safe)
             if let DisplayMode::FrameDiagram(comp) = self.display_mode {
                 if let Some(cr) = case_res {
-                    if let Some(stations) = cr.frame_forces.get(fid) {
+                    for (tag, res) in result_tables::max_min_results(cr) {
+                        let Some(stations) = res.frame_forces.get(fid) else {
+                            continue;
+                        };
+                        // The minimum of a multi-valued combination has its own colours.
+                        let is_min = tag == "Min";
+                        let (pos_fill, neg_fill, pos_line, neg_line) = if is_min {
+                            (
+                                Color32::from_rgba_unmultiplied(90, 190, 255, 160),
+                                Color32::from_rgba_unmultiplied(190, 130, 255, 160),
+                                Color32::from_rgb(110, 200, 255),
+                                Color32::from_rgb(200, 150, 255),
+                            )
+                        } else {
+                            (
+                                Color32::from_rgba_unmultiplied(255, 190, 60, 160),
+                                Color32::from_rgba_unmultiplied(255, 95, 95, 160),
+                                Color32::from_rgb(255, 200, 70),
+                                Color32::from_rgb(255, 100, 100),
+                            )
+                        };
                         let (_, e_axes) = frame_local_axes(p1, p2, frame.angle_deg);
                         let dir_3d = match comp {
                             FrameForceComponent::MomentM2 | FrameForceComponent::ShearV3 => {
@@ -2885,20 +3135,12 @@ impl SapGuiApp {
                             ];
                             let b_scr = project(base);
                             let o_scr = project(offset_pt);
-                            let col = if val >= 0.0 {
-                                Color32::from_rgba_unmultiplied(255, 190, 60, 160)
-                            } else {
-                                Color32::from_rgba_unmultiplied(255, 95, 95, 160)
-                            };
+                            let col = if val >= 0.0 { pos_fill } else { neg_fill };
                             painter.line_segment([b_scr, o_scr], Stroke::new(1.2_f32, col));
                             outline.push((o_scr, val));
                         }
                         for w in outline.windows(2) {
-                            let col = if w[0].1 >= 0.0 {
-                                Color32::from_rgb(255, 200, 70)
-                            } else {
-                                Color32::from_rgb(255, 100, 100)
-                            };
+                            let col = if w[0].1 >= 0.0 { pos_line } else { neg_line };
                             painter.line_segment([w[0].0, w[1].0], Stroke::new(2.0_f32, col));
                         }
                         if let Some((peak_pos, peak_val)) = outline
@@ -2912,7 +3154,11 @@ impl SapGuiApp {
                                 painter.text(
                                     *peak_pos,
                                     egui::Align2::CENTER_BOTTOM,
-                                    format!("{:.2}", peak_val.abs()),
+                                    if tag.is_empty() {
+                                        view::quantity_text(peak_val.abs())
+                                    } else {
+                                        format!("{tag} {}", view::quantity_text(*peak_val))
+                                    },
                                     FontId::proportional(10.5),
                                     Color32::from_rgb(255, 235, 150),
                                 );
@@ -2964,6 +3210,9 @@ impl SapGuiApp {
                 };
                 painter.circle_filled(sp_def, 3.8, pt_col);
             } else {
+                if right_click_pos.is_some() {
+                    joint_screen.push((pid.clone(), sp));
+                }
                 let pt_col = if pt.selected {
                     Color32::from_rgb(255, 230, 50)
                 } else {
@@ -3040,11 +3289,14 @@ impl SapGuiApp {
                 if let Some(cr) = case_res {
                     if let Some(r) = cr.joint_reactions.get(pid) {
                         let names = ["Fx", "Fy", "Fz", "Mx", "My", "Mz"];
+                        // Components below a millionth of the largest are
+                        // roundoff, whatever the units.
+                        let rmax = r.iter().filter(|v| v.is_finite()).fold(0.0_f64, |a, v| a.max(v.abs()));
                         let parts: Vec<String> = names
                             .iter()
                             .zip(r.iter())
-                            .filter(|(_, v)| v.is_finite() && v.abs() > 1e-4)
-                            .map(|(n, v)| format!("{n}={v:.2}"))
+                            .filter(|(_, v)| v.is_finite() && v.abs() > 1e-6 * rmax)
+                            .map(|(n, v)| format!("{n}={}", view::quantity_text(*v)))
                             .collect();
                         if !parts.is_empty() {
                             let fmag = r[0].hypot(r[1]).hypot(r[2]);
@@ -3106,6 +3358,16 @@ impl SapGuiApp {
                 Ok(()) => format!("Joint {jid}: displacements shown."),
                 Err(refused) => refused,
             };
+        } else if let Some(rcp) = right_click_pos.filter(|_| self.display_mode == DisplayMode::Undeformed) {
+            // The undeformed display: the Object Information window of the
+            // joint, frame or area under the pointer (G07).
+            self.results.readout_joint = None;
+            if let Some(obj) =
+                object_info::pick(&joint_screen, &frame_screen_segs, &area_screen_polys, rcp)
+            {
+                self.status_msg = format!("{} {}: loads shown.", obj.kind(), obj.name());
+                self.object_info.target = Some(obj);
+            }
         } else if let Some(rcp) = right_click_pos {
             self.results.readout_joint = None;
             if let Some((fid, _)) = frame_screen_segs
@@ -3366,11 +3628,17 @@ impl SapGuiApp {
 
         // Viewport header overlay: the plane of a plane view names the pane.
         let title = plane.map_or_else(|| title.to_string(), |pl| pl.title());
-        painter.text(
-            rect.left_top() + Vec2::new(10.0, 8.0),
-            egui::Align2::LEFT_TOP,
-            format!("{title}  [Result: {}]", self.active_case),
+        // A title wider than the pane (a narrow pane, a small video frame)
+        // wraps onto further lines instead of running past the edge.
+        let header = painter.layout(
+            result_display::scaling::view_title(&title, &self.active_case, subtitle),
             FontId::proportional(12.5),
+            Color32::from_rgb(200, 220, 255),
+            (rect.width() - 20.0).max(40.0),
+        );
+        painter.galley(
+            rect.left_top() + Vec2::new(10.0, 8.0),
+            header,
             Color32::from_rgb(200, 220, 255),
         );
         // Coordinates under the pointer in a plane view.
@@ -3389,8 +3657,50 @@ impl SapGuiApp {
         }
     }
 
+    /// New Model > Grid Only (G36): a blank model in the current units and the
+    /// Quick Grid Lines form of the Build window.
+    fn start_grid_only(&mut self) {
+        let u = self.model.present_units;
+        self.replace_model(
+            SapModel::new(u),
+            format!("Grid Only: blank model in {}; define the grid lines.", u.s2k_label()),
+            Vec::new(),
+        );
+        self.panel_build.show_tab(build::TAB_GRID);
+    }
+
     fn compute_bounds(&self) -> ([f64; 3], [f64; 3]) {
         view::model_bounds(&self.model)
+    }
+
+    /// Sets `deform_scale` from the model and the shown result while the
+    /// automatic scale is on and a deformed shape is shown (D32). A factor that
+    /// is not the one set here was changed by the user: the scale is then
+    /// user-defined.
+    fn update_deform_scale(&mut self) {
+        if !self.deform_auto {
+            return;
+        }
+        if self.deform_auto_written.is_some_and(|w| w != self.deform_scale) {
+            self.deform_auto = false;
+            return;
+        }
+        if self.display_mode != DisplayMode::Deformed {
+            return;
+        }
+        let Some(cr) = self.model.case_results.get(&self.active_case) else {
+            return;
+        };
+        let sel = contours::StepSelection {
+            mode_idx: self.active_mode_idx,
+            use_step: self.use_time_step,
+            step_idx: self.active_step_idx,
+        };
+        let (min, max) = self.compute_bounds();
+        let f = result_display::scaling::auto_scale_for(&self.model, cr, sel, min, max);
+        let f = (f as f32).clamp(f32::MIN_POSITIVE, f32::MAX / 4.0);
+        self.deform_scale = f;
+        self.deform_auto_written = Some(f);
     }
 
     fn load_benchmark_1_001(&mut self) {
@@ -3819,6 +4129,13 @@ impl SapGuiApp {
                             TemplateChoice::SphericalDome,
                             "🌐 Shell Dome",
                         );
+                        // The help: "selecting the Grid Only button will access the
+                        // Quick Grid Lines form. Use this option to 'start a model
+                        // from scratch.'"
+                        if ui.button("▦ Grid Only").clicked() {
+                            self.start_grid_only();
+                            close_tpl = true;
+                        }
                     });
                     ui.separator();
 
@@ -4091,15 +4408,25 @@ impl SapGuiApp {
                                         ui.strong("M3 (Major)");
                                         ui.strong("u2 (Defl)");
                                         ui.end_row();
+                                        // The forces of a plane frame that are
+                                        // exactly zero carry roundoff: a value
+                                        // below a billionth of the largest of
+                                        // its table is printed 0.
+                                        let peak = stations
+                                            .iter()
+                                            .flat_map(|st| [st.p, st.v2, st.v3, st.t, st.m2, st.m3])
+                                            .filter(|v| v.is_finite())
+                                            .fold(0.0_f64, |a, v| a.max(v.abs()));
+                                        let q = |v: f64| view::quantity_text(view::without_roundoff(v, peak));
                                         for st in stations {
-                                            ui.monospace(format!("{:.2}", st.station));
-                                            ui.monospace(format!("{:.3}", st.p));
-                                            ui.monospace(format!("{:.3}", st.v2));
-                                            ui.monospace(format!("{:.3}", st.v3));
-                                            ui.monospace(format!("{:.3}", st.t));
-                                            ui.monospace(format!("{:.3}", st.m2));
-                                            ui.monospace(format!("{:.3}", st.m3));
-                                            ui.monospace(format!("{:.5}", st.local_disp[1]));
+                                            ui.monospace(view::quantity_text(st.station));
+                                            ui.monospace(q(st.p));
+                                            ui.monospace(q(st.v2));
+                                            ui.monospace(q(st.v3));
+                                            ui.monospace(q(st.t));
+                                            ui.monospace(q(st.m2));
+                                            ui.monospace(q(st.m3));
+                                            ui.monospace(view::quantity_text(st.local_disp[1]));
                                             ui.end_row();
                                         }
                                     });
@@ -4178,7 +4505,7 @@ impl SapGuiApp {
                                             ui.label(&res.section_name);
                                             ui.label(&res.design_code);
                                             ui.label(&res.governing_combo);
-                                            ui.monospace(format!("{:.2}", res.governing_station));
+                                            ui.monospace(view::quantity_text(res.governing_station));
                                             ui.monospace(format!("{:.4}", res.total_ratio));
                                             ui.monospace(format!("{:.4}", res.pr_ratio));
                                             ui.monospace(format!("{:.4}", res.mr_major_ratio));
@@ -4221,10 +4548,10 @@ impl SapGuiApp {
                                             ui.label(if res.is_column { "Column" } else { "Beam" });
                                             ui.label(&res.design_code);
                                             ui.label(&res.governing_combo);
-                                            ui.monospace(format!("{:.4}", res.as_top));
-                                            ui.monospace(format!("{:.4}", res.as_bot));
-                                            ui.monospace(format!("{:.4}", res.as_side));
-                                            ui.monospace(format!("{:.5}", res.av_over_s));
+                                            ui.monospace(view::quantity_text(res.as_top));
+                                            ui.monospace(view::quantity_text(res.as_bot));
+                                            ui.monospace(view::quantity_text(res.as_side));
+                                            ui.monospace(view::quantity_text(res.av_over_s));
                                             ui.monospace(if res.is_column {
                                                 format!("{:.4}", res.pmm_ratio)
                                             } else {
@@ -4240,256 +4567,38 @@ impl SapGuiApp {
                             }
                         }
                         other_tab => {
-                            let Some(cr) = self.model.case_results.get(&self.active_case) else {
+                            // Every cell comes from `result_tables::table_text`.
+                            let Some(table) =
+                                result_tables::table_text(&self.model, &self.active_case, other_tab)
+                            else {
                                 ui.label("No analysis results for active case/combo — press F5 to run analysis.");
                                 return;
                             };
-                            match other_tab {
-                                TableTab::JointDisplacements => {
-                                    egui::Grid::new("disp_tbl")
-                                        .striped(true)
-                                        .spacing([14.0, 4.0])
-                                        .show(ui, |ui| {
-                                            for h in [
-                                                "Joint", "U1", "U2", "U3", "R1 (rad)", "R2 (rad)",
-                                                "R3 (rad)",
-                                            ] {
-                                                ui.strong(h);
-                                            }
-                                            ui.end_row();
-                                            for (jid, u) in &cr.joint_displacements {
-                                                ui.label(jid);
-                                                for v in u {
-                                                    ui.monospace(format!("{v:.5}"));
-                                                }
-                                                ui.end_row();
-                                            }
-                                        });
-                                }
-                                TableTab::JointReactions => {
-                                    egui::Grid::new("react_tbl")
-                                        .striped(true)
-                                        .spacing([14.0, 4.0])
-                                        .show(ui, |ui| {
-                                            for h in ["Joint", "F1", "F2", "F3", "M1", "M2", "M3"]
-                                            {
-                                                ui.strong(h);
-                                            }
-                                            ui.end_row();
-                                            for (jid, r) in &cr.joint_reactions {
-                                                ui.label(jid);
-                                                for v in r {
-                                                    ui.monospace(format!("{v:.4}"));
-                                                }
-                                                ui.end_row();
-                                            }
-                                        });
-                                }
-                                TableTab::BaseReactions => {
-                                    egui::Grid::new("base_react_tbl")
-                                        .striped(true)
-                                        .spacing([16.0, 4.0])
-                                        .show(ui, |ui| {
-                                            for h in [
-                                                "Case/Combo",
-                                                "Global FX",
-                                                "Global FY",
-                                                "Global FZ",
-                                                "Global MX",
-                                                "Global MY",
-                                                "Global MZ",
-                                            ] {
-                                                ui.strong(h);
-                                            }
-                                            ui.end_row();
-                                            ui.label(&self.active_case);
-                                            for v in &cr.base_reactions {
-                                                ui.monospace(format!("{v:.4}"));
-                                            }
-                                            ui.end_row();
-                                        });
-                                }
-                                TableTab::FrameForces => {
-                                    if cr.frame_forces.is_empty() {
-                                        ui.label("No frame forces recorded for this case.");
-                                    } else {
-                                        egui::Grid::new("frame_force_tbl")
-                                            .striped(true)
-                                            .spacing([12.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for h in [
-                                                    "Frame", "Station", "P", "V2", "V3", "T", "M2",
-                                                    "M3",
-                                                ] {
-                                                    ui.strong(h);
-                                                }
-                                                ui.end_row();
-                                                for (fid, stations) in &cr.frame_forces {
-                                                    for st in stations {
-                                                        ui.label(fid);
-                                                        ui.monospace(format!("{:.2}", st.station));
-                                                        ui.monospace(format!("{:.3}", st.p));
-                                                        ui.monospace(format!("{:.3}", st.v2));
-                                                        ui.monospace(format!("{:.3}", st.v3));
-                                                        ui.monospace(format!("{:.3}", st.t));
-                                                        ui.monospace(format!("{:.3}", st.m2));
-                                                        ui.monospace(format!("{:.3}", st.m3));
-                                                        ui.end_row();
-                                                    }
-                                                }
-                                            });
-                                    }
-                                }
-                                TableTab::AreaResults => {
-                                    if cr.area_results.is_empty() {
-                                        ui.label("No area/shell results recorded for this case.");
-                                    } else {
-                                        egui::Grid::new("area_res_tbl")
-                                            .striped(true)
-                                            .spacing([12.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for h in [
-                                                    "Area", "F11", "F22", "F12", "M11", "M22",
-                                                    "M12", "V13", "V23", "SVM Top",
-                                                ] {
-                                                    ui.strong(h);
-                                                }
-                                                ui.end_row();
-                                                for (aid, ar) in &cr.area_results {
-                                                    ui.label(aid);
-                                                    for v in [
-                                                        ar.f11, ar.f22, ar.f12, ar.m11, ar.m22,
-                                                        ar.m12, ar.v13, ar.v23, ar.svm_top,
-                                                    ] {
-                                                        ui.monospace(format!("{v:.4}"));
-                                                    }
-                                                    ui.end_row();
-                                                }
-                                            });
-                                    }
-                                }
-                                TableTab::SolidStresses => {
-                                    if cr.solid_results.is_empty() {
-                                        ui.label("No 3D solid stresses recorded for this case.");
-                                    } else {
-                                        egui::Grid::new("solid_res_tbl")
-                                            .striped(true)
-                                            .spacing([12.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for h in [
-                                                    "Solid", "S11", "S22", "S33", "S12", "S13",
-                                                    "S23", "Von Mises",
-                                                ] {
-                                                    ui.strong(h);
-                                                }
-                                                ui.end_row();
-                                                for (sid, sr) in &cr.solid_results {
-                                                    let s = &sr.center_stress;
-                                                    ui.label(sid);
-                                                    for v in [
-                                                        s.s11,
-                                                        s.s22,
-                                                        s.s33,
-                                                        s.s12,
-                                                        s.s13,
-                                                        s.s23,
-                                                        s.von_mises,
-                                                    ] {
-                                                        ui.monospace(format!("{v:.4}"));
-                                                    }
-                                                    ui.end_row();
-                                                }
-                                            });
-                                    }
-                                }
-                                TableTab::LinkForces => {
-                                    if cr.link_forces.is_empty() {
-                                        ui.label("No link forces recorded for this case.");
-                                    } else {
-                                        egui::Grid::new("link_force_tbl")
-                                            .striped(true)
-                                            .spacing([14.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for h in ["Link", "P", "V2", "V3", "T", "M2", "M3"]
-                                                {
-                                                    ui.strong(h);
-                                                }
-                                                ui.end_row();
-                                                for (lid, lf) in &cr.link_forces {
-                                                    ui.label(lid);
-                                                    for v in lf {
-                                                        ui.monospace(format!("{v:.4}"));
-                                                    }
-                                                    ui.end_row();
-                                                }
-                                            });
-                                    }
-                                }
-                                TableTab::ModalPeriods => {
-                                    if cr.modes.is_empty() {
-                                        ui.label("Active case is not a Modal case (or has 0 solved modes).");
-                                    } else {
-                                        egui::Grid::new("modal_tbl")
-                                            .striped(true)
-                                            .spacing([14.0, 4.0])
-                                            .show(ui, |ui| {
-                                                for h in [
-                                                    "Mode",
-                                                    "Period (s)",
-                                                    "Freq (Hz)",
-                                                    "Eigenvalue",
-                                                    "Mass UX",
-                                                    "Mass UY",
-                                                    "Mass UZ",
-                                                ] {
-                                                    ui.strong(h);
-                                                }
-                                                ui.end_row();
-                                                for m in &cr.modes {
-                                                    ui.monospace(format!("{}", m.mode_num));
-                                                    ui.monospace(format!("{:.5}", m.period_sec));
-                                                    ui.monospace(format!("{:.4}", m.freq_hz));
-                                                    ui.monospace(format!("{:.4}", m.eigenvalue));
-                                                    ui.monospace(format!(
-                                                        "{:.4}",
-                                                        m.modal_mass_ratios[0]
-                                                    ));
-                                                    ui.monospace(format!(
-                                                        "{:.4}",
-                                                        m.modal_mass_ratios[1]
-                                                    ));
-                                                    ui.monospace(format!(
-                                                        "{:.4}",
-                                                        m.modal_mass_ratios[2]
-                                                    ));
-                                                    ui.end_row();
-                                                }
-                                            });
-                                    }
-                                }
-                                TableTab::BucklingFactors => {
-                                    if cr.buckling_factors.is_empty() {
-                                        ui.label("Active case is not a Buckling case (or has 0 buckling modes).");
-                                    } else {
-                                        egui::Grid::new("buckling_tbl")
-                                            .striped(true)
-                                            .spacing([16.0, 4.0])
-                                            .show(ui, |ui| {
-                                                ui.strong("Buckling Mode");
-                                                ui.strong("Critical Factor λ");
-                                                ui.end_row();
-                                                for (idx, factor) in
-                                                    cr.buckling_factors.iter().enumerate()
-                                                {
-                                                    ui.monospace(format!("{}", idx + 1));
-                                                    ui.monospace(format!("{factor:.6}"));
-                                                    ui.end_row();
-                                                }
-                                            });
-                                    }
-                                }
-                                TableTab::SteelDesign | TableTab::ConcreteDesign => unreachable!(),
+                            if let Some(message) = &table.empty {
+                                ui.label(message);
+                                return;
                             }
+                            egui::Grid::new(table.grid)
+                                .striped(true)
+                                .spacing([14.0, 4.0])
+                                .show(ui, |ui| {
+                                    for h in &table.headers {
+                                        ui.strong(h);
+                                    }
+                                    ui.end_row();
+                                    for row in &table.rows {
+                                        for (c, cell) in row.iter().enumerate() {
+                                            if (c == 0 && !table.first_is_number)
+                                                || table.headers[c] == result_tables::STEP_TYPE
+                                            {
+                                                ui.label(cell);
+                                            } else {
+                                                ui.monospace(cell);
+                                            }
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
                         }
                     });
             });
@@ -4636,7 +4745,57 @@ impl SapGuiApp {
                             ui.end_row();
 
                             match self.custom_sec_shape {
-                                CustomSectionShape::WideFlangeI | CustomSectionShape::BoxTube => {
+                                CustomSectionShape::WideFlangeI => {
+                                    ui.label("Depth t3:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.custom_sec_d)
+                                            .range(1e-4..=1e6),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Top flange width t2:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.custom_sec_b)
+                                            .range(1e-4..=1e6),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Top flange thickness tf:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.custom_sec_tf)
+                                            .range(1e-4..=1e6),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Bottom flange:");
+                                    ui.checkbox(
+                                        &mut self.custom_sec_symmetric,
+                                        "Same as the top flange",
+                                    );
+                                    ui.end_row();
+                                    if self.custom_sec_symmetric {
+                                        self.custom_sec_bb = self.custom_sec_b;
+                                        self.custom_sec_tfb = self.custom_sec_tf;
+                                    }
+                                    ui.label("Bottom flange width t2b:");
+                                    ui.add_enabled(
+                                        !self.custom_sec_symmetric,
+                                        egui::DragValue::new(&mut self.custom_sec_bb)
+                                            .range(1e-4..=1e6),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Bottom flange thickness tfb:");
+                                    ui.add_enabled(
+                                        !self.custom_sec_symmetric,
+                                        egui::DragValue::new(&mut self.custom_sec_tfb)
+                                            .range(1e-4..=1e6),
+                                    );
+                                    ui.end_row();
+                                    ui.label("Web thickness tw:");
+                                    ui.add(
+                                        egui::DragValue::new(&mut self.custom_sec_tw)
+                                            .range(1e-4..=1e6),
+                                    );
+                                    ui.end_row();
+                                }
+                                CustomSectionShape::BoxTube => {
                                     ui.label("Depth t3:");
                                     ui.add(
                                         egui::DragValue::new(&mut self.custom_sec_d)
@@ -4717,6 +4876,32 @@ impl SapGuiApp {
                             "Include Concrete Reinforcement Metadata",
                         );
                         if self.custom_sec_rebar_enabled {
+                            let candidates = rebar_materials(&self.model);
+                            if candidates.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::YELLOW,
+                                    "The model has no material with a yield stress to use as rebar. Add one from the material library (Define > Materials from Library...).",
+                                );
+                            } else {
+                                if !candidates.contains(&self.custom_sec_rebar_material) {
+                                    self.custom_sec_rebar_material =
+                                        default_rebar_material(&self.model, &candidates);
+                                }
+                                ui.horizontal(|ui| {
+                                    ui.label("Rebar Material (longitudinal and confinement):");
+                                    egui::ComboBox::from_id_salt("sec_rebar_mat_combo")
+                                        .selected_text(&self.custom_sec_rebar_material)
+                                        .show_ui(ui, |ui| {
+                                            for mname in &candidates {
+                                                ui.selectable_value(
+                                                    &mut self.custom_sec_rebar_material,
+                                                    mname.clone(),
+                                                    mname,
+                                                );
+                                            }
+                                        });
+                                });
+                            }
                             ui.horizontal(|ui| {
                                 ui.checkbox(&mut self.custom_sec_is_column, "Column (PMM)");
                                 ui.label("Cover:");
@@ -4745,25 +4930,27 @@ impl SapGuiApp {
                         let b = self.custom_sec_b;
                         let tf = self.custom_sec_tf;
                         let tw = self.custom_sec_tw;
-                        let geom_err = if name.is_empty() {
+                        let i_dims = i_section::IDimensions {
+                            d,
+                            bt: b,
+                            tt: tf,
+                            bb: self.custom_sec_bb,
+                            tb: self.custom_sec_tfb,
+                            tw,
+                        };
+                        let i_err = (self.custom_sec_shape == CustomSectionShape::WideFlangeI)
+                            .then(|| i_section::validate(&i_dims).err())
+                            .flatten();
+                        let geom_err = if let Some(e) = i_err.as_deref() {
+                            Some(e)
+                        } else if name.is_empty() {
                             Some("Section name cannot be empty.")
                         } else if !self.model.materials.contains_key(&self.custom_sec_material) {
                             Some("Select an existing material before creating a section.")
                         } else {
                             match self.custom_sec_shape {
-                                CustomSectionShape::WideFlangeI => {
-                                    if !(d > 0.0
-                                        && b > 0.0
-                                        && tf > 0.0
-                                        && tw > 0.0
-                                        && 2.0 * tf < d
-                                        && tw < b)
-                                    {
-                                        Some("Invalid I-section dimensions: require 2*tf < t3 and tw < t2.")
-                                    } else {
-                                        None
-                                    }
-                                }
+                                // Checked, with the field named, by `i_section::validate`.
+                                CustomSectionShape::WideFlangeI => None,
                                 CustomSectionShape::BoxTube => {
                                     if !(d > 0.0
                                         && b > 0.0
@@ -4802,26 +4989,26 @@ impl SapGuiApp {
                         };
                         let rebar_err = if geom_err.is_none() && self.custom_sec_rebar_enabled {
                             if !(self.custom_sec_cover > 0.0 && 2.0 * self.custom_sec_cover < d) {
-                                Some("Concrete cover must satisfy 0 < 2*cover < depth.")
+                                Some("Concrete cover must satisfy 0 < 2*cover < depth.".to_string())
                             } else if self.custom_sec_is_column
                                 && (!self.custom_sec_rebar_area.is_finite()
                                     || self.custom_sec_rebar_area <= 0.0)
                             {
-                                Some("Column longitudinal rebar area must be positive.")
+                                Some("Column longitudinal rebar area must be positive.".to_string())
                             } else {
-                                None
+                                rebar_material_error(&self.model, &self.custom_sec_rebar_material)
                             }
                         } else {
                             None
                         };
 
-                        if let Some(err) = geom_err.or(rebar_err) {
-                            self.status_msg = err.to_string();
+                        if let Some(err) = geom_err.map(str::to_string).or(rebar_err) {
+                            self.status_msg = err;
                         } else {
                             let mat = self.custom_sec_material.clone();
                             let mut sec = match self.custom_sec_shape {
                                 CustomSectionShape::WideFlangeI => {
-                                    make_i_section(&name, &mat, d, b, tf, tw, b, tf)
+                                    make_i_section(&name, &mat, d, b, tf, tw, i_dims.bb, i_dims.tb)
                                 }
                                 CustomSectionShape::Rectangular => {
                                     make_rectangular(&name, &mat, d, b)
@@ -4835,8 +5022,8 @@ impl SapGuiApp {
                             if self.custom_sec_rebar_enabled {
                                 sec.concrete_rebar = Some(ConcreteRebarConfig {
                                     is_column: self.custom_sec_is_column,
-                                    rebar_mat_long: mat.clone(),
-                                    rebar_mat_confine: mat.clone(),
+                                    rebar_mat_long: self.custom_sec_rebar_material.clone(),
+                                    rebar_mat_confine: self.custom_sec_rebar_material.clone(),
                                     cover_top: self.custom_sec_cover,
                                     cover_bot: self.custom_sec_cover,
                                     num_bars_3dir: 3,
@@ -4856,8 +5043,13 @@ impl SapGuiApp {
                                 assigned += 1;
                             }
                             self.status_msg = format!(
-                                "Added section {name} ({}, {mat}) and assigned to {assigned} selected frames.",
-                                self.custom_sec_shape.label()
+                                "Added section {name} ({}, {mat}{}) and assigned to {assigned} selected frames.",
+                                self.custom_sec_shape.label(),
+                                if self.custom_sec_rebar_enabled {
+                                    format!(", rebar {}", self.custom_sec_rebar_material)
+                                } else {
+                                    String::new()
+                                }
                             );
                         }
                     }
@@ -4895,22 +5087,8 @@ impl SapGuiApp {
                     }
                     ui.horizontal(|ui| {
                         if ui.button("📂 Open Model").clicked() {
-                            match load_model_with_report(&self.file_path_input) {
-                                Ok(m) => {
-                                    let mut status = format!("Opened {}", self.file_path_input);
-                                    if !m.warnings.is_empty() {
-                                        status.push_str(&format!(
-                                            " — Import warnings: {}",
-                                            m.warnings.join("; ")
-                                        ));
-                                    }
-                                    self.replace_model(m.model, status, m.warnings);
-                                    close_file = true;
-                                }
-                                Err(e) => {
-                                    self.status_msg = format!("Open error: {e}");
-                                }
-                            }
+                            let path = self.file_path_input.clone();
+                            close_file = self.open_model_file(&path);
                         }
                         if ui.button("💾 Save as .S2K").clicked() {
                             self.export_warnings.clear();
@@ -4986,6 +5164,7 @@ impl SapGuiApp {
     /// the user ran in it; a panel that changes the model definition refuses
     /// while the model is locked, so no result can outlive its model.
     fn render_panels(&mut self, ctx: &egui::Context) {
+        self.panel_time_history.revision = self.results_revision;
         let outcomes = [
             build::render(ctx, &mut self.panel_build, &mut self.model),
             seismic::render(ctx, &mut self.panel_seismic, &mut self.model),
@@ -5068,7 +5247,18 @@ impl SapGuiApp {
                 };
                 ui.label(RichText::new(lock_txt).strong());
                 ui.separator();
-                ui.label(&self.status_msg);
+                // The status line stops where the scale controls and the units
+                // selector on the right begin (a long message overlapped them).
+                let room = (ui.available_width() - STATUS_RIGHT_CONTROLS_WIDTH).max(120.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(room, ui.spacing().interact_size.y),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        // A label cut to the line shows the whole text as its
+                        // tooltip; the Messages window (Help) lists the session's.
+                        ui.add(egui::Label::new(self.status_msg.as_str()).truncate());
+                    },
+                );
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     // Bottom-Right Live Units Selector (1..=16)
@@ -5078,27 +5268,20 @@ impl SapGuiApp {
                         .show_ui(ui, |ui| {
                             for code in 1..=16 {
                                 if let Ok(u) = Units::from_code(code) {
-                                    if ui.selectable_value(&mut cur_u, u, u.s2k_label()).clicked()
-                                        && u != self.model.present_units
-                                        && self.ensure_unlocked()
-                                    {
-                                        let old_u = self.model.present_units;
-                                        self.scale_gui_cached_units(old_u, u);
-                                        self.model.convert_units_in_place(u);
-                                        self.workflows.scale_for_units(old_u, u, &self.model);
-                                        self.sync_active_case();
-                                        self.status_msg = format!(
-                                            "Converted model units to {}; results cleared, run analysis again.",
-                                            u.s2k_label()
-                                        );
+                                    if ui.selectable_value(&mut cur_u, u, u.s2k_label()).clicked() {
+                                        self.change_units(u);
                                     }
                                 }
                             }
                         });
                     ui.separator();
                     ui.checkbox(&mut self.animate_deformed, "Animate");
+                    if ui.checkbox(&mut self.deform_auto, "Auto scale").changed() {
+                        self.deform_auto_written = Some(self.deform_scale);
+                    }
                     ui.add(
-                        egui::Slider::new(&mut self.deform_scale, 1.0..=500.0)
+                        egui::Slider::new(&mut self.deform_scale, 1e-3..=1e6)
+                            .logarithmic(true)
                             .text("Deform Scale"),
                     );
                     ui.add(
@@ -5131,7 +5314,11 @@ impl SapGuiApp {
 
         self.render_modals(ctx);
         self.render_result_forms(ctx);
+        object_info::window(ctx, &mut self.object_info, &self.model);
+        self.render_video_form(ctx);
         self.render_set_2d_view(ctx);
+        self.messages.observe(&self.status_msg);
+        messages::window(ctx, &mut self.messages);
     }
 }
 
@@ -5140,6 +5327,9 @@ impl eframe::App for SapGuiApp {
         self.render_ui(ctx);
     }
 }
+
+/// Width the status bar keeps free for the controls on its right.
+const STATUS_RIGHT_CONTROLS_WIDTH: f32 = 780.0;
 
 fn resolve_pro_database_path(pro_name: &str) -> Option<PathBuf> {
     let direct = PathBuf::from(pro_name);
@@ -5192,6 +5382,45 @@ fn steel_result_color(res: &SteelDesignResult) -> Color32 {
         Color32::from_rgb(255, 65, 65)
     } else {
         dc_ratio_color(res.total_ratio)
+    }
+}
+
+/// The model materials that can be named as the rebar of a section: those
+/// with a positive yield stress (concrete design refuses a section whose rebar
+/// material has none and whose concrete has none).
+pub(super) fn rebar_materials(model: &SapModel) -> Vec<String> {
+    model
+        .materials
+        .iter()
+        .filter(|(_, m)| m.fy.is_finite() && m.fy > 0.0)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
+/// The rebar material a dialog offers first: one of rebar type, else the first.
+fn default_rebar_material(model: &SapModel, candidates: &[String]) -> String {
+    candidates
+        .iter()
+        .find(|n| model.materials.get(*n).is_some_and(|m| m.mat_type == MatType::Rebar))
+        .or_else(|| candidates.first())
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// Why `name` cannot be the rebar material of a section, if it cannot.
+fn rebar_material_error(model: &SapModel, name: &str) -> Option<String> {
+    if rebar_materials(model).is_empty() {
+        return Some(
+            "The model has no material with a yield stress to use as rebar; add one from the material library (Define > Materials from Library...)."
+                .to_string(),
+        );
+    }
+    match model.materials.get(name) {
+        None => Some("Select an existing rebar material for the reinforcement.".to_string()),
+        Some(m) if !(m.fy.is_finite() && m.fy > 0.0) => {
+            Some(format!("Rebar material '{name}' has no yield stress."))
+        }
+        Some(_) => None,
     }
 }
 
@@ -6192,55 +6421,105 @@ mod tests {
         frame_with(&mut app, &ctx, &mut t, vec![button(ok, egui::PointerButton::Primary, false, none)], none);
         assert!(app.status_msg.contains("not a coordinate"), "{}", app.status_msg);
         assert_eq!(app.left_plane, None);
+        // A valid coordinate is applied: the plane, the pane's projection, the
+        // status line and the closed dialog.
+        assert!(app.set_2d.open);
+        app.set_2d.coordinate_text = " 6.4 ".into();
+        let ok = texts(&frame_with(&mut app, &ctx, &mut t, vec![], none))
+            .into_iter()
+            .find(|(t, _)| t == "OK")
+            .map(|(_, p)| p + Vec2::new(6.0, 6.0))
+            .expect("OK button");
+        frame_with(&mut app, &ctx, &mut t, vec![egui::Event::PointerMoved(ok)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![button(ok, egui::PointerButton::Primary, true, none)], none);
+        frame_with(&mut app, &ctx, &mut t, vec![button(ok, egui::PointerButton::Primary, false, none)], none);
+        assert_eq!(app.left_plane, Some(6.4), "{}", app.status_msg);
+        assert_eq!(app.left_proj, ViewProjection::PlanXY);
+        assert_eq!(app.status_msg, "X-Y Plane @ Z=6.4");
+        assert!(!app.set_2d.open);
+        // And the pane now draws the frames of that plane only (the 38 of the
+        // second storey level of the model).
+        let plane = PlaneView::of(app.left_proj, app.left_plane).unwrap();
+        let members = view::plane_members(&app.model, plane, view::plane_tolerance(&app.model));
+        assert_eq!(members.frames.len(), 38);
     }
 
     #[test]
     fn escape_returns_to_select_and_enter_is_routed_while_a_draw_tool_is_active() {
+        // Poly Area acts on Enter: three picked points become an area. Enter that
+        // was not routed to the tool would leave the model alone.
         let mut app = blank_app();
-        app.model = portal_model();
-        one_pane(&mut app, ViewProjection::ElevationXZ, Some(0.0));
-        app.tool_mode = ToolMode::QuickFrame;
+        app.model = SapModel::new(Units::KnMC);
+        app.model.quick_grid([3, 3, 2], [6.0, 5.0, 3.2], [0.0; 3]).unwrap();
+        one_pane(&mut app, ViewProjection::PlanXY, Some(0.0));
+        app.tool_mode = ToolMode::PolyArea;
         let ctx = egui::Context::default();
         let mut t = 0.0;
         let none = egui::Modifiers::NONE;
-        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
-        let key = |key| egui::Event::Key {
-            key,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: none,
-        };
-        // Enter reaches the tool (the stub does nothing) and keeps the tool.
-        let frames_before = app.model.frames.len();
-        let _ = frame_with(&mut app, &ctx, &mut t, vec![key(egui::Key::Enter)], none);
-        assert_eq!(app.tool_mode, ToolMode::QuickFrame);
-        assert_eq!(app.model.frames.len(), frames_before);
-        let _ = frame_with(&mut app, &ctx, &mut t, vec![key(egui::Key::Escape)], none);
+        for _ in 0..3 {
+            let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        }
+        let (v, _) = pane0(&app);
+        for p in [[0.0, 0.0, 0.0], [6.0, 0.0, 0.0], [6.0, 5.0, 0.0]] {
+            click_at_pos(&mut app, &ctx, &mut t, v.project(p));
+        }
+        assert!(app.model.areas.is_empty());
+        press_key(&mut app, &ctx, &mut t, egui::Key::Enter);
+        assert_eq!(app.model.areas.len(), 1, "Enter closes the polygon: {}", app.status_msg);
+        assert_eq!(app.tool_mode, ToolMode::PolyArea, "Enter keeps the tool");
+        // Escape ends a sequence in progress without drawing it, then returns to Select.
+        for p in [[0.0, 0.0, 0.0], [12.0, 0.0, 0.0], [12.0, 10.0, 0.0]] {
+            click_at_pos(&mut app, &ctx, &mut t, v.project(p));
+        }
+        press_key(&mut app, &ctx, &mut t, egui::Key::Escape);
         assert_eq!(app.tool_mode, ToolMode::Select);
+        assert_eq!(app.model.areas.len(), 1, "the picked points were discarded, not drawn");
+        press_key(&mut app, &ctx, &mut t, egui::Key::Enter);
+        assert_eq!(app.model.areas.len(), 1, "Enter without a draw tool draws nothing");
     }
 
     #[test]
     fn a_draw_tool_window_is_routed_and_the_old_draw_tools_ignore_windows() {
+        // A grid of 3 x 3 lines at z = 0 and no frames: a Quick Frame window over
+        // all of it draws its 12 segments; the old tools do nothing with a window.
         let mut app = blank_app();
-        app.model = portal_model();
-        one_pane(&mut app, ViewProjection::ElevationXZ, Some(0.0));
+        app.model = SapModel::new(Units::KnMC);
+        app.model.quick_grid([3, 3, 1], [6.0, 5.0, 3.2], [0.0; 3]).unwrap();
+        one_pane(&mut app, ViewProjection::PlanXY, Some(0.0));
         let ctx = egui::Context::default();
         let mut t = 0.0;
         let none = egui::Modifiers::NONE;
-        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
-        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        for _ in 0..3 {
+            let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        }
         let (v, _) = pane0(&app);
-        let a = v.project([-1.0, 0.0, 5.0]);
-        let b = v.project([9.0, 0.0, -1.0]);
+        let a = v.project([-1.0, -1.0, 0.0]);
+        let b = v.project([13.0, 11.0, 0.0]);
         let before = app.pan;
-        for tool in [ToolMode::QuickFrame, ToolMode::RectArea, ToolMode::DrawFrame] {
+        // The old tools: no frames, no selection, no pan.
+        for tool in [ToolMode::DrawFrame, ToolMode::DrawArea] {
             app.tool_mode = tool;
             let _ = drag(&mut app, &ctx, &mut t, a, b, egui::PointerButton::Primary, none);
             assert_eq!(app.pan, before);
             assert!(selection::snapshot(&app.model).is_empty(), "{tool:?} must not select");
-            assert_eq!(app.model.frames.len(), 5);
+            assert!(app.model.frames.is_empty() && app.model.areas.is_empty(), "{tool:?}");
         }
+        // Rectangle Area: a window is not a rectangle.
+        app.tool_mode = ToolMode::RectArea;
+        let _ = drag(&mut app, &ctx, &mut t, a, b, egui::PointerButton::Primary, none);
+        assert!(selection::snapshot(&app.model).is_empty());
+        assert!(app.model.frames.is_empty() && app.model.areas.is_empty());
+        // Quick Frame: the window is routed to the tool and draws the segments
+        // that lie inside it, and neither selects nor pans.
+        app.tool_mode = ToolMode::QuickFrame;
+        let _ = drag(&mut app, &ctx, &mut t, a, b, egui::PointerButton::Primary, none);
+        assert_eq!(app.pan, before);
+        assert!(selection::snapshot(&app.model).is_empty(), "a draw tool window must not select");
+        assert_eq!(app.model.frames.len(), 12, "{}", app.status_msg);
+        // Quick Area: four cells.
+        app.tool_mode = ToolMode::QuickArea;
+        let _ = drag(&mut app, &ctx, &mut t, a, b, egui::PointerButton::Primary, none);
+        assert_eq!(app.model.areas.len(), 4, "{}", app.status_msg);
     }
 
     #[test]
@@ -6268,6 +6547,380 @@ mod tests {
             // The grid is centred in the pane, not in the old +-100 box.
             let c = v.project([15.0, 7.5, 0.0]);
             assert!((c - v.screen_center).length() < 1.0);
+        }
+    }
+
+    // ------------------------------------------------------------ D34
+
+    #[test]
+    fn the_custom_grid_text_follows_the_units() {
+        let mut app = blank_app();
+        app.replace_model(SapModel::new(Units::KnMC), "x".into(), Vec::new());
+        // The kip-in defaults 240 in and 144 in, in metres (1 in = 0.0254 m).
+        assert!((app.tpl_span_or_bay_len - 6.096).abs() < 1e-9, "{}", app.tpl_span_or_bay_len);
+        let bays = build::parse_lengths(&app.tpl_bays_text).unwrap();
+        let storeys = build::parse_lengths(&app.tpl_storeys_text).unwrap();
+        assert_eq!(bays.len(), 3);
+        assert!(bays.iter().all(|b| (b - 6.096).abs() < 1e-9), "{bays:?}");
+        assert!(storeys.iter().all(|s| (s - 3.6576).abs() < 1e-9), "{storeys:?}");
+        assert_eq!(app.tpl_bays_text, "6.096, 6.096, 6.096");
+    }
+
+    #[test]
+    fn the_plane_title_of_the_fourth_level_is_not_printed_with_roundoff() {
+        let mut m = SapModel::new(Units::KnMC);
+        m.quick_grid([2, 2, 7], [6.0, 5.0, 3.2], [0.0; 3]).unwrap();
+        let levels = view::plane_levels(&m, view::PlaneAxis::Z);
+        let title = PlaneView::of(ViewProjection::PlanXY, Some(levels[3])).unwrap().title();
+        assert_eq!(title, "X-Y Plane @ Z=9.6");
+        assert_eq!(view::number_text(0.1 + 0.2), "0.3");
+        assert_eq!(view::number_text(-0.0), "0");
+        assert_eq!(view::number_text(6.0), "6");
+        assert_eq!(view::number_text(1234.5678), "1234.5678");
+        assert_eq!(view::number_text(1.5e-9), "1.5e-9");
+        assert_eq!(view::number_text(1.5e15), "1.5e15");
+        assert_eq!(view::number_text(f64::INFINITY), "inf");
+    }
+
+    #[test]
+    fn a_plane_view_and_picked_points_survive_a_unit_change() {
+        let mut app = blank_app();
+        app.model = part1_model();
+        one_pane(&mut app, ViewProjection::PlanXY, Some(2.0 * 3.2));
+        let count = |app: &SapGuiApp| {
+            let plane = PlaneView::of(app.left_proj, app.left_plane).unwrap();
+            (plane.title(), view::plane_members(&app.model, plane, view::plane_tolerance(&app.model)).frames.len())
+        };
+        assert_eq!(count(&app), ("X-Y Plane @ Z=6.4".to_string(), 38));
+        // A Poly Frame point waits in this plane, and a typed coordinate in Set 2D View.
+        app.tool_mode = ToolMode::PolyFrame;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+        let (v, _) = pane0(&app);
+        let p = v.project([0.0, 0.0, 6.4]);
+        for ev in [vec![egui::Event::PointerMoved(p)], vec![button(p, egui::PointerButton::Primary, true, none)], vec![button(p, egui::PointerButton::Primary, false, none)]] {
+            let _ = frame_with(&mut app, &ctx, &mut t, ev, none);
+        }
+        assert!(app.draw_tools.picked_in().is_some(), "{}", app.status_msg);
+        app.set_2d.coordinate_text = "6.4".into();
+        app.change_units(Units::NMmC);
+        // 6.4 m = 6400 mm; the same 38 frames lie in it, and nothing waits.
+        assert_eq!(count(&app), ("X-Y Plane @ Z=6400".to_string(), 38));
+        assert!(app.draw_tools.picked_in().is_none());
+        assert!(app.set_2d.coordinate_text.is_empty());
+        // And back.
+        app.change_units(Units::KnMC);
+        assert_eq!(count(&app), ("X-Y Plane @ Z=6.4".to_string(), 38));
+        // A locked model keeps everything.
+        app.model.is_locked = true;
+        app.change_units(Units::NMmC);
+        assert_eq!(app.model.present_units, Units::KnMC);
+        assert_eq!(app.left_plane, Some(6.4));
+    }
+
+    fn poly_area_app() -> (SapGuiApp, egui::Context, f64) {
+        let mut app = blank_app();
+        app.model = SapModel::new(Units::KnMC);
+        app.model.quick_grid([3, 3, 2], [6.0, 5.0, 3.2], [0.0; 3]).unwrap();
+        app.dual_pane = true;
+        app.left_proj = ViewProjection::Perspective3D;
+        app.right_proj = ViewProjection::PlanXY;
+        app.right_plane = Some(0.0);
+        app.tool_mode = ToolMode::PolyArea;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        for _ in 0..3 {
+            let _ = frame_with(&mut app, &ctx, &mut t, vec![], egui::Modifiers::NONE);
+        }
+        (app, ctx, t)
+    }
+
+    fn click_at_pos(app: &mut SapGuiApp, ctx: &egui::Context, t: &mut f64, at: Pos2) {
+        let none = egui::Modifiers::NONE;
+        let _ = frame_with(app, ctx, t, vec![egui::Event::PointerMoved(at)], none);
+        let _ = frame_with(app, ctx, t, vec![button(at, egui::PointerButton::Primary, true, none)], none);
+        let _ = frame_with(app, ctx, t, vec![button(at, egui::PointerButton::Primary, false, none)], none);
+        *t += 1.0;
+        let _ = frame_with(app, ctx, t, vec![], none);
+    }
+
+    fn press_key(app: &mut SapGuiApp, ctx: &egui::Context, t: &mut f64, key: egui::Key) {
+        let none = egui::Modifiers::NONE;
+        let ev = egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: none };
+        let _ = frame_with(app, ctx, t, vec![ev], none);
+    }
+
+    /// D34 (review item 5): Enter closes the polygon wherever the pointer is.
+    #[test]
+    fn enter_closes_the_polygon_in_the_pane_it_was_picked_in_wherever_the_pointer_is() {
+        for move_to_other_pane in [false, true] {
+            let (mut app, ctx, mut t) = poly_area_app();
+            let (v, plane) = app.last_view[1].expect("right pane drawn");
+            assert!(plane.is_some());
+            for p in [[0.0, 0.0, 0.0], [6.0, 0.0, 0.0], [6.0, 5.0, 0.0]] {
+                click_at_pos(&mut app, &ctx, &mut t, v.project(p));
+            }
+            if move_to_other_pane {
+                let (v0, _) = app.last_view[0].expect("left pane drawn");
+                let none = egui::Modifiers::NONE;
+                let _ = frame_with(&mut app, &ctx, &mut t, vec![egui::Event::PointerMoved(v0.screen_center)], none);
+                let _ = frame_with(&mut app, &ctx, &mut t, vec![], none);
+                assert_eq!(app.active_pane, 0, "the pointer is over the 3D pane");
+            }
+            press_key(&mut app, &ctx, &mut t, egui::Key::Enter);
+            assert_eq!(app.model.areas.len(), 1, "pointer moved to the other pane: {move_to_other_pane}: {}", app.status_msg);
+            let area = app.model.areas.values().next().unwrap();
+            assert_eq!(area.points.len(), 3);
+        }
+    }
+
+    // ------------------------------------------------------------ D40
+
+    /// Clicks the first text equal to `label` of the last frame; returns the
+    /// output of the frame after the click.
+    fn click_label(app: &mut SapGuiApp, ctx: &egui::Context, t: &mut f64, label: &str) -> egui::FullOutput {
+        let none = egui::Modifiers::NONE;
+        let out = frame_with(app, ctx, t, vec![], none);
+        let at = texts(&out)
+            .into_iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, p)| p + Vec2::new(6.0, 6.0))
+            .unwrap_or_else(|| panic!("no text '{label}'"));
+        let _ = frame_with(app, ctx, t, vec![egui::Event::PointerMoved(at)], none);
+        let _ = frame_with(app, ctx, t, vec![button(at, egui::PointerButton::Primary, true, none)], none);
+        let _ = frame_with(app, ctx, t, vec![button(at, egui::PointerButton::Primary, false, none)], none);
+        *t += 1.0;
+        frame_with(app, ctx, t, vec![], none)
+    }
+
+    const ADD_SECTION: &str = "Add Custom Section (& Assign to Selected Frames)";
+
+    /// A cantilever column of a library-like concrete (fc, no fy) in kip-in,
+    /// a rebar material named A615 and a second steel; the section dialog open
+    /// for a rectangular section, all frames selected.
+    fn concrete_dialog_app() -> (SapGuiApp, egui::Context, f64) {
+        let mut app = blank_app();
+        app.model.generate_beam(2, 120.0, true, "FSEC1");
+        let mut concrete = Material::default_concrete_kip_in();
+        concrete.name = "C4".into();
+        concrete.fy = 0.0;
+        concrete.fys = 0.0;
+        let mut rebar = Material::default_steel_kip_in();
+        rebar.name = "A615".into();
+        rebar.mat_type = MatType::Rebar;
+        rebar.fy = 60.0;
+        app.model.materials.insert("C4".into(), concrete);
+        app.model.materials.insert("A615".into(), rebar);
+        for f in app.model.frames.values_mut() {
+            f.selected = true;
+        }
+        app.show_section_modal = true;
+        app.custom_sec_shape = CustomSectionShape::Rectangular;
+        app.custom_sec_material = "C4".into();
+        app.custom_sec_name = "RC1".into();
+        app.custom_sec_d = 24.0;
+        app.custom_sec_b = 12.0;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        for _ in 0..3 {
+            let _ = frame_with(&mut app, &ctx, &mut t, vec![], egui::Modifiers::NONE);
+        }
+        (app, ctx, t)
+    }
+
+    #[test]
+    fn the_rebar_materials_are_the_model_materials_with_a_yield_stress() {
+        let (app, _, _) = concrete_dialog_app();
+        // A992Fy50 (fy 50), the default concrete (fy 60) and A615; the library-like
+        // concrete C4 has none.
+        let names = rebar_materials(&app.model);
+        assert!(names.contains(&"A615".to_string()) && !names.contains(&"C4".to_string()), "{names:?}");
+        assert_eq!(default_rebar_material(&app.model, &names), "A615", "a rebar type comes first");
+        assert!(rebar_material_error(&app.model, "A615").is_none());
+        assert!(rebar_material_error(&app.model, "C4").unwrap().contains("no yield stress"));
+        assert!(rebar_material_error(&app.model, "NOPE").unwrap().contains("existing rebar material"));
+        let mut none = app.model.clone();
+        none.materials.retain(|_, m| m.fy == 0.0);
+        assert!(rebar_material_error(&none, "C4").unwrap().contains("material library"));
+    }
+
+    #[test]
+    fn a_section_made_in_the_dialog_with_a_rebar_material_is_designed_and_one_without_is_refused() {
+        // With: a library-like concrete (fy 0) and the rebar material chosen in the dialog.
+        let (mut app, ctx, mut t) = concrete_dialog_app();
+        let _ = click_label(&mut app, &ctx, &mut t, "Include Concrete Reinforcement Metadata");
+        assert!(app.custom_sec_rebar_enabled);
+        let out = frame_with(&mut app, &ctx, &mut t, vec![], egui::Modifiers::NONE);
+        assert!(texts(&out).iter().any(|(l, _)| l.starts_with("Rebar Material")));
+        // The combo opens on a click and offers the materials with a yield stress.
+        let _ = click_label(&mut app, &ctx, &mut t, "A615");
+        let out = frame_with(&mut app, &ctx, &mut t, vec![], egui::Modifiers::NONE);
+        let shown: Vec<String> = texts(&out).into_iter().map(|(l, _)| l).collect();
+        assert!(shown.iter().any(|l| l == "A992Fy50"), "{shown:?}");
+        let _ = click_label(&mut app, &ctx, &mut t, "A992Fy50");
+        assert_eq!(app.custom_sec_rebar_material, "A992Fy50");
+        let _ = click_label(&mut app, &ctx, &mut t, "A992Fy50");
+        let _ = click_label(&mut app, &ctx, &mut t, "A615");
+        assert_eq!(app.custom_sec_rebar_material, "A615");
+        let _ = click_label(&mut app, &ctx, &mut t, ADD_SECTION);
+        assert!(app.status_msg.contains("Added section RC1") && app.status_msg.contains("rebar A615"), "{}", app.status_msg);
+        let cfg = app.model.frame_sections["RC1"].concrete_rebar.clone().expect("reinforcement");
+        assert_eq!((cfg.rebar_mat_long.as_str(), cfg.rebar_mat_confine.as_str()), ("A615", "A615"));
+        assert!(app.model.frames.values().all(|f| f.section == "RC1"));
+        app.execute_design(false);
+        assert!(app.status_msg.starts_with("Concrete design"), "{}", app.status_msg);
+        assert!(!app.model.concrete_design_results.is_empty());
+
+        // Without reinforcement metadata the same section is refused at design,
+        // naming the frame, the section and the concrete.
+        let (mut app, ctx, mut t) = concrete_dialog_app();
+        let _ = click_label(&mut app, &ctx, &mut t, ADD_SECTION);
+        assert!(app.status_msg.contains("Added section RC1"), "{}", app.status_msg);
+        assert!(app.model.frame_sections["RC1"].concrete_rebar.is_none());
+        let frame = app.model.frames.keys().next().unwrap().clone();
+        app.execute_design(false);
+        let msg = app.status_msg.clone();
+        assert!(msg.starts_with("Design Error"), "{msg}");
+        assert!(msg.contains(&format!("frame '{frame}'")) && msg.contains("section 'RC1'") && msg.contains("material 'C4'"), "{msg}");
+        assert!(app.model.concrete_design_results.is_empty());
+    }
+
+    #[test]
+    fn the_dialog_says_when_the_model_has_no_rebar_material_and_refuses_the_section() {
+        let (mut app, ctx, mut t) = concrete_dialog_app();
+        app.model.materials.retain(|_, m| m.fy == 0.0);
+        let _ = click_label(&mut app, &ctx, &mut t, "Include Concrete Reinforcement Metadata");
+        let out = frame_with(&mut app, &ctx, &mut t, vec![], egui::Modifiers::NONE);
+        let shown: Vec<String> = texts(&out).into_iter().map(|(l, _)| l).collect();
+        assert!(shown.iter().any(|l| l.contains("no material with a yield stress") && l.contains("material library")), "{shown:?}");
+        let _ = click_label(&mut app, &ctx, &mut t, ADD_SECTION);
+        assert!(app.status_msg.contains("material library"), "{}", app.status_msg);
+        assert!(!app.model.frame_sections.contains_key("RC1"));
+    }
+
+    /// Frames of the real window size (the dome spikes showed at 1440 x 900).
+    fn window_frame(app: &mut SapGuiApp, ctx: &egui::Context, t: &mut f64) -> egui::FullOutput {
+        *t += 0.05;
+        let input = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1440.0, 900.0))),
+            time: Some(*t),
+            ..Default::default()
+        };
+        ctx.run(input, |ctx| app.render_ui(ctx))
+    }
+
+    /// Tessellated vertices of everything in the central panel that is not text.
+    fn central_vertices(ctx: &egui::Context, out: &egui::FullOutput) -> Vec<Pos2> {
+        fn walk(s: &egui::epaint::Shape, clip: Rect, into: &mut Vec<egui::epaint::ClippedShape>) {
+            match s {
+                egui::epaint::Shape::Vec(v) => v.iter().for_each(|x| walk(x, clip, into)),
+                // The pane's own frame and the labels are not what is looked for.
+                egui::epaint::Shape::Text(_) | egui::epaint::Shape::Rect(_) => {}
+                o => into.push(egui::epaint::ClippedShape { clip_rect: clip, shape: o.clone() }),
+            }
+        }
+        let mut singles = Vec::new();
+        for c in &out.shapes {
+            if c.clip_rect.left() > 270.0 && c.clip_rect.top() > 60.0 {
+                walk(&c.shape, c.clip_rect, &mut singles);
+            }
+        }
+        ctx.tessellate(singles, 1.0)
+            .iter()
+            .filter_map(|p| match &p.primitive {
+                egui::epaint::Primitive::Mesh(m) => Some(m.vertices.iter().map(|v| v.pos).collect::<Vec<_>>()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// D41: the first mode of the Shell Dome template (3 x 8 divisions, R = 240
+    /// in) shows its areas, deformed and not, inside the box of its joints. A
+    /// ring quadrilateral seen edge-on, or a deformed sliver, used to be
+    /// stroked with a mitre that ran across the whole view, from the apex.
+    #[test]
+    fn the_shell_dome_draws_no_spikes_in_the_undeformed_and_the_modal_views() {
+        let mut app = blank_app();
+        app.tpl_choice = TemplateChoice::SphericalDome;
+        let mut m = SapModel::new(app.model.present_units);
+        let (span, storey, bay) = (app.tpl_span_or_bay_len, app.tpl_story_height, app.tpl_bay_width_y);
+        app.generate_template(&mut m, span, storey, bay);
+        app.replace_model(m, "dome".into(), Vec::new());
+        assert!(app.execute_analysis(), "{}", app.status_msg);
+        app.dual_pane = false;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        for deformed in [false, true] {
+            if deformed {
+                app.active_case = "MODAL".into();
+                app.sync_active_case();
+                app.display_mode = DisplayMode::Deformed;
+            }
+            for _ in 0..4 {
+                let _ = window_frame(&mut app, &ctx, &mut t);
+            }
+            let out = window_frame(&mut app, &ctx, &mut t);
+            let (v, _) = pane0(&app);
+            let case = app.model.case_results.get(&app.active_case);
+            let sel = contours::StepSelection { mode_idx: app.active_mode_idx, use_step: false, step_idx: 0 };
+            let (mut lo, mut hi) = (Pos2::new(f32::MAX, f32::MAX), Pos2::new(f32::MIN, f32::MIN));
+            for (pid, pt) in &app.model.points {
+                let base = [pt.x, pt.y, pt.z];
+                let shown = result_display::displaced_point(&app.model, case, pid, base, f64::from(app.deform_scale), sel);
+                for q in [v.project(base), v.project(if deformed { shown } else { base })] {
+                    lo = Pos2::new(lo.x.min(q.x), lo.y.min(q.y));
+                    hi = Pos2::new(hi.x.max(q.x), hi.y.max(q.y));
+                }
+            }
+            // Joint circles, supports and the like reach a few tens of pixels.
+            let margin = 40.0;
+            let vertices = central_vertices(&ctx, &out);
+            assert!(vertices.len() > 500, "the dome is drawn: {}", vertices.len());
+            let outside: Vec<&Pos2> = vertices
+                .iter()
+                .filter(|p| p.x < lo.x - margin || p.x > hi.x + margin || p.y < lo.y - margin || p.y > hi.y + margin)
+                .collect();
+            assert!(
+                outside.is_empty(),
+                "deformed {deformed}: {} vertices outside {lo:?}..{hi:?}, first {:?}",
+                outside.len(),
+                outside.first()
+            );
+        }
+    }
+
+    /// Follow-up of the windows package: a new or replaced model is shown fitted
+    /// to its pane (zoom 1, no pan), the camera angle stays.
+    #[test]
+    fn a_replaced_model_is_fitted_to_its_pane() {
+        let mut app = blank_app();
+        app.zoom = 4.5;
+        app.pan = Vec2::new(120.0, -80.0);
+        app.yaw_rad = 0.3;
+        app.replace_model(SapModel::new(Units::KnMC), "x".into(), Vec::new());
+        assert_eq!((app.zoom, app.pan), (1.0, Vec2::ZERO));
+        assert_eq!(app.yaw_rad, 0.3, "the angle of the camera is the user's");
+        // The pane then shows the model inside itself: the dome of the template
+        // has its whole bounding box inside the pane at zoom 1.
+        let mut m = SapModel::new(Units::KipInF);
+        m.generate_dome_shell(240.0, 45.0, 3, 8, true, "ASEC1");
+        app.replace_model(m, "dome".into(), Vec::new());
+        app.dual_pane = false;
+        let ctx = egui::Context::default();
+        let mut t = 0.0;
+        for _ in 0..3 {
+            let _ = window_frame(&mut app, &ctx, &mut t);
+        }
+        let (v, _) = pane0(&app);
+        let (lo, hi) = app.compute_bounds();
+        for z in [lo[2], hi[2]] {
+            for (x, y) in [(lo[0], lo[1]), (hi[0], hi[1]), (lo[0], hi[1]), (hi[0], lo[1])] {
+                let p = v.project([x, y, z]);
+                assert!(p.x > 283.0 && p.x < 1433.0 && p.y > 81.0 && p.y < 870.0, "{p:?} is outside the pane");
+            }
         }
     }
 }

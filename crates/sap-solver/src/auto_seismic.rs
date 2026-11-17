@@ -33,10 +33,21 @@
 //! * The occupancy factor `Ie`, and `Fa`, `Fv` are entered directly; the
 //!   vendor derives them from the occupancy category and site class
 //!   (Tables 1.5-2, 11.4-1, 11.4-2), which are not implemented.
-//! * Eccentricity: the vendor ignores it where there is no diaphragm and
-//!   applies a moment about the diaphragm center of mass where there is one.
-//!   The sign convention of that moment is not evidenced, so a nonzero ratio
-//!   on a loaded joint that belongs to a diaphragm constraint is refused.
+//! * Eccentricity (section 2.2.3): the vendor ignores it where there is no
+//!   diaphragm. For each diaphragm constraint (type Diaphragm, axis Z) that
+//!   carries load, the width is the maximum minus the minimum coordinate
+//!   perpendicular to the load over all its joints, and a moment of
+//!   `ratio * width * F` is applied, `F` being the total lateral force of the
+//!   pattern on the diaphragm's joints; an overwrite distance replaces
+//!   `ratio * width`. The manual applies it "about the diaphragm center of
+//!   mass": a couple, so it is added as a global moment about Z at the first
+//!   joint of the diaphragm whose rotation about Z is free (the diaphragm ties
+//!   the rotations). **The sign of a positive eccentricity is not stated in
+//!   the manual** (it prints both "+5%" and "-5%" patterns). Project choice:
+//!   a positive eccentricity offsets the line of action of the force toward
+//!   the positive perpendicular axis (+Y for an X load, +X for a Y load), so
+//!   the couple about Z is `-e F` for an X load and `+e F` for a Y load; a
+//!   negative eccentricity reverses it.
 //!
 //! The forces are added as GLOBAL joint loads to the pattern, after the mass
 //! is final, so every case that applies the pattern sees them.
@@ -44,9 +55,12 @@
 use crate::SolverError;
 use indexmap::IndexMap;
 use sap_model::seismic::{
-    AutoSeismicAsce710, AutoSeismicJointForce, AutoSeismicReport, SeismicPeriod,
+    AutoSeismicAsce710, AutoSeismicDiaphragmMoment, AutoSeismicJointForce, AutoSeismicReport,
+    SeismicPeriod,
 };
-use sap_model::{ConstraintType, LoadPatternType, PointLoadForce, PointObj, SapModel};
+use sap_model::{
+    ConstraintAxis, ConstraintType, LoadPatternType, PointLoadForce, PointObj, SapModel,
+};
 
 const METERS_PER_FOOT: f64 = 0.3048;
 
@@ -109,6 +123,25 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
         }
         if !def.eccentricity_ratio.is_finite() {
             return Err(bad(pattern, "the eccentricity ratio is not finite"));
+        }
+        if let Some(table) = model.auto_seismic_eccentricity.get(pattern) {
+            for (diaphragm, distance) in table {
+                let ok = model.constraints.get(diaphragm).is_some_and(|c| {
+                    c.constraint_type == ConstraintType::Diaphragm && c.axis == ConstraintAxis::Z
+                });
+                if !ok {
+                    return Err(bad(
+                        pattern,
+                        &format!("the eccentricity overwrite names '{diaphragm}', which is not a diaphragm constraint about the Z axis"),
+                    ));
+                }
+                if !distance.is_finite() {
+                    return Err(bad(
+                        pattern,
+                        &format!("the eccentricity overwrite of diaphragm '{diaphragm}' is not finite"),
+                    ));
+                }
+            }
         }
         for (name, v) in [("Fa", def.fa), ("Fv", def.fv)] {
             match v {
@@ -184,6 +217,96 @@ fn is_identity(r: &[[f64; 3]; 3]) -> bool {
     (0..3).all(|i| (0..3).all(|j| (r[i][j] - if i == j { 1.0 } else { 0.0 }).abs() <= 1e-12))
 }
 
+/// The eccentric moments of one pattern: one couple about global Z per diaphragm
+/// that carries load, added to `work_points` (see the module comment).
+/// `applied` holds the joint index and force of every loaded joint.
+fn eccentric_moments(
+    model: &SapModel,
+    pattern: &str,
+    def: &AutoSeismicAsce710,
+    work_points: &mut IndexMap<String, PointObj>,
+    applied: &[(usize, f64)],
+) -> Result<Vec<AutoSeismicDiaphragmMoment>, SolverError> {
+    let overwrites = model.auto_seismic_eccentricity.get(pattern);
+    let mut moments = Vec::new();
+    if def.eccentricity_ratio == 0.0 && overwrites.is_none_or(|t| t.is_empty()) {
+        return Ok(moments);
+    }
+    let dir = def.direction.index();
+    // Sense of the couple about +Z per unit of eccentricity: see the module comment.
+    let sense = if dir == 0 { -1.0 } else { 1.0 };
+    for (name, constraint) in &model.constraints {
+        if constraint.constraint_type != ConstraintType::Diaphragm {
+            continue;
+        }
+        let members: Vec<usize> = work_points
+            .values()
+            .enumerate()
+            .filter(|(_, p)| p.constraints.iter().any(|c| c == name))
+            .map(|(i, _)| i)
+            .collect();
+        let force: f64 = applied
+            .iter()
+            .filter(|(i, _)| members.contains(i))
+            .map(|(_, f)| f)
+            .sum();
+        if members.is_empty() || !applied.iter().any(|(i, _)| members.contains(i)) {
+            continue;
+        }
+        let overwrite = overwrites.and_then(|t| t.get(name)).copied();
+        if constraint.axis != ConstraintAxis::Z {
+            return Err(unsupported(
+                pattern,
+                &format!("diaphragm '{name}' is not about the Z axis, so its eccentric moment is not implemented; set the eccentricity ratio to 0"),
+            ));
+        }
+        let coordinate = |i: usize| {
+            let p = &work_points[i];
+            if dir == 0 {
+                p.y
+            } else {
+                p.x
+            }
+        };
+        let lo = members.iter().map(|&i| coordinate(i)).fold(f64::INFINITY, f64::min);
+        let hi = members.iter().map(|&i| coordinate(i)).fold(f64::NEG_INFINITY, f64::max);
+        let width = hi - lo;
+        let eccentricity = overwrite.unwrap_or(def.eccentricity_ratio * width);
+        let moment = sense * eccentricity * force;
+        if moment == 0.0 {
+            continue;
+        }
+        if !model.active_dofs[5] {
+            return Err(unsupported(
+                pattern,
+                &format!("diaphragm '{name}' needs an eccentric moment about Z but the rotation about Z is not an active degree of freedom"),
+            ));
+        }
+        let at = members
+            .iter()
+            .copied()
+            .find(|&i| !work_points[i].restraint[5])
+            .unwrap_or(members[0]);
+        let mut f = [0.0; 6];
+        f[5] = moment;
+        work_points[at].loads_force.push(PointLoadForce {
+            load_pat: pattern.to_string(),
+            csys: "GLOBAL".into(),
+            force: f,
+        });
+        moments.push(AutoSeismicDiaphragmMoment {
+            diaphragm: name.clone(),
+            force,
+            width,
+            eccentricity,
+            overwritten: overwrite.is_some(),
+            moment_z: moment,
+            joint: work_points[at].name.clone(),
+        });
+    }
+    Ok(moments)
+}
+
 /// Computes every automatic lateral load and adds its forces, as GLOBAL joint
 /// loads of the pattern, to `work_points`. Returns one report per pattern.
 pub(crate) fn apply(
@@ -250,22 +373,6 @@ pub(crate) fn apply(
             if m_dir <= 1e-18 {
                 continue;
             }
-            if def.eccentricity_ratio != 0.0
-                && pt.constraints.iter().any(|c| {
-                    model
-                        .constraints
-                        .get(c)
-                        .is_some_and(|d| d.constraint_type == ConstraintType::Diaphragm)
-                })
-            {
-                return Err(unsupported(
-                    pattern,
-                    &format!(
-                        "joint '{}' belongs to a diaphragm and the eccentricity ratio is {}; the sign convention of the eccentric moment is not implemented, set the ratio to 0",
-                        pt.name, def.eccentricity_ratio
-                    ),
-                ));
-            }
             joints.push((pt.name.clone(), pt.z, m_dir * g));
             order.push(idx);
         }
@@ -279,6 +386,7 @@ pub(crate) fn apply(
         let base_shear = cs * weight;
         let denom: f64 = joints.iter().map(|j| j.2 * (j.1 - z_min).powf(k)).sum();
         let mut joint_forces = Vec::with_capacity(joints.len());
+        let mut applied: Vec<(usize, f64)> = Vec::with_capacity(joints.len());
         for ((name, z, w), idx) in joints.into_iter().zip(order) {
             let force = base_shear * w * (z - z_min).powf(k) / denom;
             let mut f = [0.0; 6];
@@ -288,6 +396,7 @@ pub(crate) fn apply(
                 csys: "GLOBAL".into(),
                 force: f,
             });
+            applied.push((idx, force));
             joint_forces.push(AutoSeismicJointForce {
                 joint: name,
                 z,
@@ -295,6 +404,7 @@ pub(crate) fn apply(
                 force,
             });
         }
+        let diaphragm_moments = eccentric_moments(model, pattern, def, work_points, &applied)?;
         reports.push(AutoSeismicReport {
             pattern: pattern.clone(),
             direction: def.direction,
@@ -308,6 +418,7 @@ pub(crate) fn apply(
             weight,
             base_shear,
             joint_forces,
+            diaphragm_moments,
         });
     }
     Ok(reports)

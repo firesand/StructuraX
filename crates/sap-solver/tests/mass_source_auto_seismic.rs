@@ -815,10 +815,13 @@ fn auto_seismic_refusals() {
     for j in ["2", "3"] {
         m.points.get_mut(j).unwrap().constraints.push("D1".into());
     }
-    refused(&mut m, "diaphragm");
-    // With zero eccentricity the same model is analysed.
-    m.auto_seismic.get_mut("EQX").unwrap().eccentricity_ratio = 0.0;
+    // Wave 5 (G24): a diaphragm with eccentricity is analysed; on this stick
+    // every joint is on the Z axis, so the width, and with it the moment, is 0
+    // (the magnitude and sense are tested in `wave5_eccentricity.rs`).
     analyze_model(&mut m).unwrap();
+    assert!(m.case_results["EQ"].auto_lateral[0]
+        .diaphragm_moments
+        .is_empty());
     // A pattern that is not Quake.
     let mut m = with(&|_| {});
     m.load_patterns.get_mut("EQX").unwrap().pat_type = LoadPatternType::Wind;

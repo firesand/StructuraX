@@ -1,4 +1,4 @@
-use sap_model::{FrameStationResult, SapModel};
+use sap_model::{SapModel};
 use thiserror::Error;
 
 /// Failures that prevent a design run from producing an adequacy result.
@@ -56,6 +56,15 @@ pub enum DesignError {
     /// design combinations, verification); the text names the offending item.
     #[error("steel design workflow: {0}")]
     Workflow(String),
+    /// A concrete member whose rebar yield stress is given nowhere. `material` is the material
+    /// that should carry `fy`: the rebar material the section names, or the concrete itself when
+    /// the section names none.
+    #[error("concrete design of frame '{frame}': section '{section}' has no longitudinal rebar yield stress, because material '{material}' has no positive fy; give that material a positive fy, or name a rebar material with a positive fy in the section's reinforcement")]
+    MissingRebarYield {
+        frame: String,
+        section: String,
+        material: String,
+    },
     #[error("{discipline} design found nonfinite {component} demand/station data on member '{frame}' ({value})")]
     NonFiniteDemand {
         discipline: &'static str,
@@ -67,7 +76,7 @@ pub enum DesignError {
 
 pub(crate) fn validate_demands<F>(
     model: &SapModel,
-    combo_forces: &[(String, Vec<(String, Vec<FrameStationResult>)>)],
+    combo_forces: &[(String, Vec<(String, crate::steel::FrameStates)>)],
     discipline: &'static str,
     allow_minor_shear: bool,
     mut is_designable: F,
@@ -82,7 +91,10 @@ where
     {
         let mut has_demand = false;
         for (_, frames) in combo_forces {
-            for (name, stations) in frames {
+            for (name, stations) in frames
+                .iter()
+                .flat_map(|(n, states)| states.iter().map(move |s| (n, s)))
+            {
                 if name != frame_name || stations.is_empty() {
                     continue;
                 }

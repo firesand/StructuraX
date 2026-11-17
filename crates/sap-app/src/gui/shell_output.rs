@@ -17,7 +17,9 @@
 //! shell output at all.
 
 use super::display_units::Dimension;
-use sap_model::{AreaPropType, AreaResult, ComboType, LoadCaseType, PlaneType, SapModel};
+use sap_model::{AreaPropType, AreaResult, LoadCaseType, PlaneType, SapModel};
+#[cfg(test)]
+use sap_model::ComboType; // the tests reach it through `super::*`
 use sap_solver::area::{plane_von_mises, section_behaviours};
 
 /// Resultant forces per unit length of the midsurface.
@@ -367,7 +369,9 @@ fn stress_on_face(ar: &AreaResult, b: &AreaBasis, s: ShellStress, bottom: bool) 
 /// Stored resultants are returned as they are; stresses on the bottom face
 /// are `F/tm + 6M/tb^2` with the thicknesses the solver recovers with; the
 /// derived values (principal, von Mises, face extremes) need a single-valued
-/// result.
+/// result. A multi-valued combination (`CaseResults::combo_min` set) shows the
+/// maximum or the minimum, whichever has the larger magnitude (the maximum on a
+/// tie), as the vendor's form does for shell output (Show Forces/Stresses Shells).
 pub(super) fn area_value(
     model: &SapModel,
     result: &str,
@@ -401,7 +405,8 @@ pub(super) fn area_value(
             ));
         }
     }
-    Ok(match q {
+    let value_of = |ar: &AreaResult| -> f64 {
+    match q {
         ShellQuantity::Resultant(r) => match r {
             ShellResultant::F11 => ar.f11,
             ShellResultant::F22 => ar.f22,
@@ -440,6 +445,22 @@ pub(super) fn area_value(
                 }
             }
         }
+    }
+    };
+    // A multi-valued result has a maximum and a minimum row; the form shows the value of
+    // larger magnitude with its sign, and a tie (SRSS and Absolute always have min = -max)
+    // goes to the maximum. The quantity is evaluated on each row, then compared.
+    let minimum = cr.combo_min.as_deref().and_then(|m| m.area_results.get(area));
+    Ok(match minimum {
+        Some(lo) => {
+            let (high, low) = (value_of(ar), value_of(lo));
+            if low.abs() > high.abs() {
+                low
+            } else {
+                high
+            }
+        }
+        None => value_of(ar),
     })
 }
 
@@ -451,32 +472,7 @@ pub(super) fn area_value(
 /// the vendor reports its range), and so is a name that is neither a case nor
 /// a combination.
 pub(super) fn is_single_valued(model: &SapModel, result: &str) -> bool {
-    single_valued_inner(model, result, 0)
-}
-
-fn single_valued_inner(model: &SapModel, name: &str, depth: usize) -> bool {
-    if depth > model.load_combos.len() {
-        return false; // a cycle
-    }
-    if let Some(combo) = model.load_combos.get(name) {
-        return combo.combo_type == ComboType::LinearAdd
-            && combo
-                .cases
-                .iter()
-                .all(|(item, _)| single_valued_inner(model, item, depth + 1));
-    }
-    match model.load_cases.get(name) {
-        // Response-spectrum, moving-load, steady-state and power-spectral-density
-        // results are ranges, not single states.
-        Some(case) => !matches!(
-            case.case_type,
-            LoadCaseType::ResponseSpectrum
-                | LoadCaseType::MovingLoad
-                | LoadCaseType::SteadyState
-                | LoadCaseType::PowerSpectralDensity
-        ),
-        None => false,
-    }
+    sap_model::results::is_single_valued(model, result)
 }
 
 /// When `result` has no results of `kind` because of the cases behind it, the

@@ -803,9 +803,19 @@ mod tests {
         set_control(&mut case, "UX", 0, 0.0).unwrap();
         assert!(case.ritz_controls.is_empty());
         set_control(&mut case, "LAT", 1, 0.0).unwrap();
+        // One cycle is a control; no target and no cycle limit is none.
+        assert_eq!(control_of(&case.ritz_controls, "LAT"), (1, 0.0));
+        assert_eq!(case.ritz_controls.len(), 1);
+        assert_eq!(case.loads.len(), 2, "a control is not a starting load");
         remove_starting_load(&mut case, 1);
+        // Removing a load removes its control and only that load.
         assert!(case.ritz_controls.is_empty());
         assert_eq!(case.loads.len(), 1);
+        assert_eq!(case.loads[0].load_name, "UX");
+        // An index past the list changes nothing.
+        let before = case.clone();
+        remove_starting_load(&mut case, 7);
+        assert_eq!(case, before);
     }
 
     #[test]
@@ -851,11 +861,49 @@ mod tests {
         add_starting_load(&model, &mut case, "UX").unwrap();
         set_control(&mut case, "UX", 2, 80.0).unwrap();
         let ctx = egui::Context::default();
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| ritz_load_controls(ui, &model, &mut case));
-        });
-        assert!(!out.shapes.is_empty());
+        let mut time = 0.0;
+        let mut frame = |case: &mut LoadCase, events: Vec<egui::Event>| {
+            time += 0.5;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::new(900.0, 400.0))),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| ritz_load_controls(ui, &model, case));
+                },
+            )
+        };
+        let _ = frame(&mut case, vec![]);
+        let out = frame(&mut case, vec![]);
+        // The row of the starting load shows its name, the control's cycles (2) and
+        // target (80 %), as DragValues print them, and a Remove button.
+        let shown = shape_texts(&out);
+        for want in ["UX", "scale", "cycles", "target %", "Remove", "2", "80"] {
+            assert!(shown.iter().any(|t| t == want), "{want} is drawn: {shown:?}");
+        }
         assert_eq!(case.ritz_controls.len(), 1);
+        // A click on Remove removes the load and its control.
+        let at = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "Remove" => Some(t.pos + t.galley.size() * 0.5),
+                _ => None,
+            })
+            .expect("Remove button");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let _ = frame(&mut case, vec![egui::Event::PointerMoved(at), button(true)]);
+        let _ = frame(&mut case, vec![button(false)]);
+        assert!(case.loads.is_empty(), "{:?}", case.loads);
+        assert!(case.ritz_controls.is_empty());
     }
 
     fn shape_texts(out: &egui::FullOutput) -> Vec<String> {

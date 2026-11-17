@@ -237,12 +237,22 @@ fn a_record_read_through_the_window_is_stored_as_the_function_of_the_file() {
         assert!((t - k as f64 * DT).abs() <= 1e-12, "time {k}: {t}");
         assert_eq!(*v, values[k], "value {k}");
     }
-    // A name that is used is refused with a message and the model is unchanged.
-    let before = run.app.model.functions.len();
-    let path = write_record("function2", &values);
-    let _ = add_function_from_file_again(&mut run, &path, "GM1");
+    // A name that is used is refused with a message naming it, and the stored
+    // function keeps the values of the first file. The second file has other
+    // values: a silent overwrite would change them.
+    let before = run.app.model.functions.clone();
+    let other: Vec<f64> = values.iter().map(|v| round6(v + 1.0)).collect();
+    assert_ne!(other, values);
+    let path = write_record("function2", &other);
+    let summary = add_function_from_file_again(&mut run, &path, "GM1");
     let _ = std::fs::remove_file(&path);
-    assert_eq!(run.app.model.functions.len(), before);
+    assert!(summary.starts_with("3000 points"), "the second file was read: {summary}");
+    assert_eq!(run.app.model.functions, before, "the function of the first file was replaced");
+    assert!(
+        run.app.status_msg.contains("GM1") && run.app.status_msg.contains("already exists"),
+        "{}",
+        run.app.status_msg
+    );
 }
 
 /// The window is open and has read a file already: read another with the same name.

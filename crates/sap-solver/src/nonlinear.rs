@@ -481,11 +481,9 @@ impl System {
                         [pt_j.x, pt_j.y, pt_j.z],
                         frame.angle_deg,
                     );
-                    let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
-                    let lf = (length - rz * (frame.end_offset_i + frame.end_offset_j))
-                        .max(1e-6 * length);
+                    let zones = crate::frame::rigid_zones(frame, length);
                     let k_loc =
-                        crate::frame::compute_flexible_local_stiffness(model, frame, sec, mat, lf);
+                        crate::frame::compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
                     let ea_over_l = k_loc[0][0];
                     let ti = crate::frame::mat3_mul(&e_axes, &rotations[idx_i]);
                     let tj = crate::frame::mat3_mul(&e_axes, &rotations[idx_j]);

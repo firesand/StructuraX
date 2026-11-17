@@ -244,6 +244,757 @@ pub(crate) fn resolve_non_prismatic_segments(
     out
 }
 
+/// Rigid end zones of a frame (Analysis Reference pp. 129-131): the rigid
+/// length at each end and the flexible length left between them, for axial and
+/// torsional behaviour (`di`, `dj`, `lf`: the offset times the rigid-zone
+/// factor) and for each bending plane (`arm_i`, `arm_j`, `flex`).
+///
+/// "If a moment or shear release is specified in either bending plane at
+/// either end of the element, the end offset is assumed to be rigid for
+/// bending and shear in that plane at that end (i.e., it acts as if
+/// rigid = 1)" (p. 131). Plane 0 is the 1-2 plane (U2, R3) and plane 1 the 1-3
+/// plane (U3, R2). A partial-fixity spring is not a release in that sense: the
+/// manual says nothing about it, so such an end keeps the rigid-zone factor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RigidZones {
+    /// Length of the element between its joints.
+    pub length: f64,
+    /// Rigid-zone length `rz * offset` at end I and at end J.
+    pub di: f64,
+    pub dj: f64,
+    /// Flexible length `length - di - dj` (at least `1e-6 * length`).
+    pub lf: f64,
+    /// The end offsets themselves and the clear length between them,
+    /// `length - off_i - off_j` (at least `1e-6 * length`): the properties of a
+    /// non-prismatic section vary over the clear length whatever the rigid-end
+    /// factor (pp. 120 and 130).
+    pub off_i: f64,
+    pub off_j: f64,
+    pub lc: f64,
+    /// Rigid length at end I and end J in each bending plane.
+    pub arm_i: [f64; 2],
+    pub arm_j: [f64; 2],
+    /// Flexible length in each bending plane.
+    pub flex: [f64; 2],
+}
+
+/// Whether the end has a full (no partial-fixity spring) release of `dof`.
+fn full_release(released: &[bool; 6], spring: &[f64; 6], dof: usize) -> bool {
+    released[dof] && spring[dof].max(0.0) == 0.0
+}
+
+/// The rigid zones of `frame`, whose joints are `length` apart.
+pub fn rigid_zones(frame: &FrameObj, length: f64) -> RigidZones {
+    let rz = frame.rigid_zone_factor.clamp(0.0, 1.0);
+    let di = rz * frame.end_offset_i;
+    let dj = rz * frame.end_offset_j;
+    let lf = (length - di - dj).max(1e-6 * length);
+    let mut arm_i = [di; 2];
+    let mut arm_j = [dj; 2];
+    let mut flex = [lf; 2];
+    for (plane, (shear, moment)) in [(1usize, 5usize), (2, 4)].into_iter().enumerate() {
+        let rigid_i = full_release(&frame.release_i, &frame.start_spring, shear)
+            || full_release(&frame.release_i, &frame.start_spring, moment);
+        let rigid_j = full_release(&frame.release_j, &frame.end_spring, shear)
+            || full_release(&frame.release_j, &frame.end_spring, moment);
+        if rigid_i {
+            arm_i[plane] = frame.end_offset_i;
+        }
+        if rigid_j {
+            arm_j[plane] = frame.end_offset_j;
+        }
+        if rigid_i || rigid_j {
+            flex[plane] = (length - arm_i[plane] - arm_j[plane]).max(1e-6 * length);
+        }
+    }
+    RigidZones {
+        length,
+        di,
+        dj,
+        lf,
+        off_i: frame.end_offset_i,
+        off_j: frame.end_offset_j,
+        lc: (length - frame.end_offset_i - frame.end_offset_j).max(1e-6 * length),
+        arm_i,
+        arm_j,
+        flex,
+    }
+}
+
+/// `base` with the entries of each bending plane taken from `plane[p]` where the
+/// flexible length of that plane differs from `zones.lf`. Entry `(a, b)` belongs
+/// to plane 0 when both indices are in {1, 5, 7, 11} and to plane 1 when both are
+/// in {2, 4, 8, 10}; a bending plane never couples to the other plane.
+fn merge_planes(
+    mut base: [[f64; 12]; 12],
+    zones: &RigidZones,
+    plane: impl Fn(usize) -> [[f64; 12]; 12],
+) -> [[f64; 12]; 12] {
+    const PLANE_DOFS: [[usize; 4]; 2] = [[1, 5, 7, 11], [2, 4, 8, 10]];
+    for p in 0..2 {
+        if zones.flex[p] == zones.lf {
+            continue;
+        }
+        let source = plane(p);
+        for &a in &PLANE_DOFS[p] {
+            for &b in &PLANE_DOFS[p] {
+                base[a][b] = source[a][b];
+            }
+        }
+    }
+    base
+}
+
+/// Geometric stiffness of the flexible length of each bending plane (see
+/// [`compute_local_geometric_stiffness`]): bending only, so the axial force
+/// acts on the plane's own flexible length.
+pub fn compute_zoned_geometric_stiffness(p_axial: f64, zones: &RigidZones) -> [[f64; 12]; 12] {
+    merge_planes(
+        compute_local_geometric_stiffness(p_axial, zones.lf),
+        zones,
+        |p| compute_local_geometric_stiffness(p_axial, zones.flex[p]),
+    )
+}
+
+impl RigidZones {
+    /// Whether any bending plane has a rigid arm at either end.
+    pub fn has_arms(&self) -> bool {
+        self.arm_i.iter().chain(self.arm_j.iter()).any(|a| *a != 0.0)
+    }
+
+    /// Whether the frame has an end offset at either end.
+    pub fn has_offsets(&self) -> bool {
+        self.off_i != 0.0 || self.off_j != 0.0
+    }
+}
+
+/// The section properties along a frame with end offsets, measured from joint I.
+///
+/// "Section properties vary only along the clear length of the element between
+/// support faces. This is not affected by the value of the rigid-end factor"
+/// (Analysis Reference p. 130), and "Section properties within end offset ioff
+/// are constant using the starting Section of the first segment. Section
+/// properties within end offset joff are constant using the ending Section of
+/// the last segment" (p. 123). The segment lengths are those of the clear length
+/// (p. 120). A member without offsets has its sections over the whole length.
+struct Layout<'a> {
+    model: &'a SapModel,
+    frame: &'a FrameObj,
+    sec: &'a FrameSection,
+    mat: &'a Material,
+    zones: &'a RigidZones,
+}
+
+impl Layout<'_> {
+    fn non_prismatic(&self) -> bool {
+        self.sec.prop_type == FramePropType::Variable && !self.sec.non_prismatic.is_empty()
+    }
+
+    /// Section properties at the distance `x` from joint I.
+    fn props_at(&self, x: f64) -> SectionPropsAtStation {
+        let z = self.zones;
+        if !z.has_offsets() {
+            return eval_section_props_at(
+                self.model, self.frame, self.sec, self.mat, x / z.length, z.length,
+            );
+        }
+        let along = (x - z.off_i).clamp(0.0, z.lc);
+        eval_section_props_at(self.model, self.frame, self.sec, self.mat, along / z.lc, z.lc)
+    }
+
+    /// `lo` and `hi` and the distances between them where the properties of a
+    /// non-prismatic section change their law (the support faces and the
+    /// segment ends): every piece between two of them is integrated on its own.
+    fn breaks(&self, lo: f64, hi: f64) -> Vec<f64> {
+        let z = self.zones;
+        let mut points = vec![lo, hi];
+        if self.non_prismatic() {
+            let mut inside = |x: f64| {
+                if x > lo && x < hi {
+                    points.push(x);
+                }
+            };
+            let mut at = z.off_i;
+            inside(at);
+            for (_, length) in resolve_non_prismatic_segments(&self.sec.non_prismatic, z.lc) {
+                at += length;
+                inside(at);
+            }
+            inside(z.length - z.off_j);
+        }
+        points.sort_by(f64::total_cmp);
+        points.dedup();
+        points
+    }
+}
+
+/// The $12 \times 12$ stiffness of the flexible part of a non-prismatic frame
+/// with end offsets, before releases, rigid arms and insertion.
+///
+/// Axial and torsional deformation use the full length between the joints (p.
+/// 130): their flexibilities are the sums of the lengths over `E A` and `G J` of
+/// the section at each place, the end zones included. Bending and shear in each
+/// plane use the flexible part of that plane, from the rigid arm at I to the
+/// rigid arm at J; the part of an offset that is not rigid, `(1 - rz) x offset`,
+/// is flexible with the section of that end. Every piece on which the section
+/// law is one of the segments or one of the constant end zones is integrated
+/// with 5-point Gauss-Legendre quadrature.
+fn zoned_non_prismatic_stiffness(layout: &Layout) -> [[f64; 12]; 12] {
+    let z = layout.zones;
+    let e = layout.mat.e;
+    let g = if layout.mat.g > 1e-12 {
+        layout.mat.g
+    } else {
+        layout.mat.e / (2.0 * (1.0 + layout.mat.u))
+    };
+    let mut k = [[0.0f64; 12]; 12];
+
+    let (mut f_ax, mut f_tor) = (0.0, 0.0);
+    for piece in layout.breaks(0.0, z.length).windows(2) {
+        for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+            let x = piece[0] + node * (piece[1] - piece[0]);
+            let dx = weight * (piece[1] - piece[0]);
+            let p = layout.props_at(x);
+            if e * p.area > 1e-18 {
+                f_ax += dx / (e * p.area);
+            }
+            if g * p.j > 1e-18 {
+                f_tor += dx / (g * p.j);
+            }
+        }
+    }
+    if f_ax > 1e-18 {
+        let ka = 1.0 / f_ax;
+        k[0][0] = ka;
+        k[0][6] = -ka;
+        k[6][0] = -ka;
+        k[6][6] = ka;
+    }
+    if f_tor > 1e-18 {
+        let kt = 1.0 / f_tor;
+        k[3][3] = kt;
+        k[3][9] = -kt;
+        k[9][3] = -kt;
+        k[9][9] = kt;
+    }
+
+    // Plane 0 is the 1-2 plane (U2, R3), plane 1 the 1-3 plane (U3, R2, with
+    // r2 = -du3/dx: the coupling terms change sign).
+    for plane in 0..2 {
+        let sign = if plane == 0 { 1.0 } else { -1.0 };
+        let x0 = z.arm_i[plane];
+        let lw = z.flex[plane];
+        let xe = x0 + lw;
+        // Flexibility at the J end of the flexible part: [u, r].
+        let mut f = [[0.0f64; 2]; 2];
+        for piece in layout.breaks(x0, xe).windows(2) {
+            for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+                let x = piece[0] + node * (piece[1] - piece[0]);
+                let dx = weight * (piece[1] - piece[0]);
+                let arm = xe - x;
+                let p = layout.props_at(x);
+                let (ei, gas) = if plane == 0 {
+                    (e * p.i33, g * p.as2)
+                } else {
+                    (e * p.i22, g * p.as3)
+                };
+                if ei > 1e-18 {
+                    let inv_ei = 1.0 / ei;
+                    let inv_gas = if gas > 1e-14 { 1.0 / gas } else { 0.0 };
+                    f[0][0] += (arm * arm * inv_ei + inv_gas) * dx;
+                    f[0][1] += sign * arm * inv_ei * dx;
+                    f[1][0] += sign * arm * inv_ei * dx;
+                    f[1][1] += inv_ei * dx;
+                }
+            }
+        }
+        let det = f[0][0] * f[1][1] - f[0][1] * f[1][0];
+        if det.abs() > 1e-24 {
+            let kjj = [
+                [f[1][1] / det, -f[0][1] / det],
+                [-f[1][0] / det, f[0][0] / det],
+            ];
+            let tij = [[-1.0, 0.0], [-sign * lw, -1.0]];
+            let dofs = if plane == 0 { [1usize, 5, 7, 11] } else { [2usize, 4, 8, 10] };
+            assemble_plane_from_kjj(&mut k, dofs, &kjj, &tij);
+        }
+    }
+    k
+}
+
+/// The fixed-end forces of one load pattern on a frame with rigid end zones,
+/// in two parts that are combined in different places of the assembly.
+///
+/// Loads act on the whole length between the joints: "For non-prismatic
+/// elements, the self-weight varies linearly over each non-prismatic segment of
+/// the element, and is constant within the end offsets" (Analysis Reference
+/// p. 135), and the distances of span loads are measured along the full length.
+/// The part of a load that lies on a rigid arm is carried by the arm to the
+/// joint at that end: a force and the moment of that force about the joint. The
+/// flexible part carries the rest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ZonedFef {
+    /// Fixed-end forces of the loads on the flexible part of each bending plane,
+    /// in the degrees of freedom of its faces and before releases and rigid
+    /// arms (a release acts on these).
+    pub flexible: [f64; 12],
+    /// Fixed-end forces of the loads on the rigid arms, already at the joints:
+    /// they are added after the releases and the rigid arms were applied (a
+    /// rigid arm is not released, and with the joints held it loads no part of
+    /// the member).
+    pub arms: [f64; 12],
+}
+
+/// Adds the fixed-end forces of a concentrated force or moment on a
+/// non-prismatic member with end offsets, for one deformation group whose
+/// flexible part runs from `x0` to `xe` (distances from joint I): the member is
+/// released at the far end of that part, the load is carried to the near end by
+/// statics, the free motion of the far end follows from the unit-load integrals
+/// of the section along the part (the flexibilities the stiffness is built
+/// from), and `stiffness` restrains it. `x` is the position of the load; only
+/// the components of `local_vec` that belong to the group may be non-zero.
+#[allow(clippy::too_many_arguments)]
+fn add_point_load_fef_window(
+    fef: &mut [f64; 12],
+    layout: &Layout,
+    stiffness: &[[f64; 12]; 12],
+    my_type: i32,
+    local_vec: [f64; 3],
+    x: f64,
+    x0: f64,
+    xe: f64,
+) {
+    let a = (x - x0).clamp(0.0, xe - x0);
+    let (force, moment) = match my_type {
+        1 => (local_vec, [0.0; 3]),
+        2 => ([0.0; 3], local_vec),
+        _ => return,
+    };
+    let e = layout.mat.e;
+    let g = if layout.mat.g > 1e-12 {
+        layout.mat.g
+    } else {
+        layout.mat.e / (2.0 * (1.0 + layout.mat.u))
+    };
+
+    // Free motion of the far end: [u1, u2, u3, r1, r2, r3].
+    let mut free = [0.0f64; 6];
+    for piece in layout.breaks(x0, x0 + a).windows(2) {
+        for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+            let at = piece[0] + node * (piece[1] - piece[0]);
+            let dx = weight * (piece[1] - piece[0]);
+            let props = layout.props_at(at);
+            // Section resultants of the load beyond `at`, about the section.
+            let m3 = (x0 + a - at) * force[1] + moment[2];
+            let m2 = -(x0 + a - at) * force[2] + moment[1];
+            let arm = xe - at;
+            if e * props.area > 1e-18 {
+                free[0] += force[0] / (e * props.area) * dx;
+            }
+            if g * props.j > 1e-18 {
+                free[3] += moment[0] / (g * props.j) * dx;
+            }
+            if e * props.i33 > 1e-18 {
+                free[1] += m3 * arm / (e * props.i33) * dx;
+                free[5] += m3 / (e * props.i33) * dx;
+                if g * props.as2 > 1e-14 {
+                    free[1] += force[1] / (g * props.as2) * dx;
+                }
+            }
+            if e * props.i22 > 1e-18 {
+                free[2] -= m2 * arm / (e * props.i22) * dx;
+                free[4] += m2 / (e * props.i22) * dx;
+                if g * props.as3 > 1e-14 {
+                    free[2] += force[2] / (g * props.as3) * dx;
+                }
+            }
+        }
+    }
+
+    // Force of the near end on the member with the far end free: minus the
+    // load carried to it.
+    let at_i = [
+        -force[0],
+        -force[1],
+        -force[2],
+        -moment[0],
+        -(moment[1] - a * force[2]),
+        -(moment[2] + a * force[1]),
+    ];
+    for row in 0..6 {
+        fef[row] += at_i[row];
+    }
+    for row in 0..12 {
+        fef[row] -= (0..6).map(|c| stiffness[row][6 + c] * free[c]).sum::<f64>();
+    }
+}
+
+/// Fixed-end forces of one load pattern on a frame with rigid end zones (see
+/// [`ZonedFef`]).
+#[allow(clippy::too_many_arguments)]
+pub fn compute_zoned_fef_for_pattern(
+    model: &SapModel,
+    frame: &FrameObj,
+    sec: &FrameSection,
+    mat: &Material,
+    pt_i: &PointObj,
+    pt_j: &PointObj,
+    e_axes: &[[f64; 3]; 3],
+    zones: &RigidZones,
+    pat_name: &str,
+    self_wt_mult: f64,
+    sf: f64,
+) -> ZonedFef {
+    let layout = Layout {
+        model,
+        frame,
+        sec,
+        mat,
+        zones,
+    };
+    let non_prismatic = layout.non_prismatic();
+    if !zones.has_arms() && !(non_prismatic && zones.has_offsets()) {
+        // Nothing lies on a rigid arm and the sections are laid over the whole
+        // length, so the flexible part is the whole length and the closed forms
+        // apply as they are.
+        return ZonedFef {
+            flexible: compute_flexible_fef_for_pattern(
+                model, frame, sec, mat, pt_i, pt_j, e_axes, zones.lf, pat_name, self_wt_mult, sf,
+            ),
+            arms: [0.0; 12],
+        };
+    }
+    let mut out = ZonedFef {
+        flexible: [0.0; 12],
+        arms: [0.0; 12],
+    };
+    if sf.abs() <= 1e-18 {
+        return out;
+    }
+    let length = zones.length;
+    let e = mat.e;
+    let g = if mat.g > 1e-12 {
+        mat.g
+    } else {
+        mat.e / (2.0 * (1.0 + mat.u))
+    };
+    // A prismatic section has closed forms; a varying one is integrated and
+    // restrained with the stiffness of the element.
+    let varying_stiffness =
+        non_prismatic.then(|| compute_zoned_local_stiffness(model, frame, sec, mat, zones));
+    let props = eval_section_props_at(model, frame, sec, mat, 0.5, zones.lf);
+    // Timoshenko shear parameter of the flexible part of each bending plane.
+    let phi = |plane: usize| {
+        let (ei, gas) = if plane == 0 {
+            (e * props.i33, g * props.as2)
+        } else {
+            (e * props.i22, g * props.as3)
+        };
+        if gas > 1e-14 {
+            12.0 * ei / (gas * zones.flex[plane] * zones.flex[plane])
+        } else {
+            0.0
+        }
+    };
+    let (phi2, phi3) = (phi(0), phi(1));
+    // The flexible part of plane `p` runs from `start[p]` to `end[p]`, measured
+    // from joint I.
+    let start = zones.arm_i;
+    let end = [start[0] + zones.flex[0], start[1] + zones.flex[1]];
+
+    // Adds the load of one deformation group to the flexible part: `window` is
+    // the part, `s` the load position along it.
+    let group = |out: &mut [f64; 12],
+                     my_type: i32,
+                     masked: [f64; 3],
+                     x: f64,
+                     window: (f64, f64),
+                     phis: (f64, f64)| {
+        let lw = window.1 - window.0;
+        match &varying_stiffness {
+            Some(stiffness) => add_point_load_fef_window(
+                out, &layout, stiffness, my_type, masked, x, window.0, window.1,
+            ),
+            None => {
+                let mut part = [0.0f64; 12];
+                add_point_load_fef(&mut part, my_type, masked, (x - window.0) / lw, lw, phis.0, phis.1);
+                for (total, add) in out.iter_mut().zip(part) {
+                    *total += add;
+                }
+            }
+        }
+    };
+
+    // Hands a concentrated force or moment at distance `x` from joint I to the
+    // flexible part or the arm that carries it.
+    let mut deliver = |x: f64, my_type: i32, v: [f64; 3]| {
+        // Axial and torsional deformation use the full length (p. 130).
+        match my_type {
+            1 if v[0] != 0.0 => group(
+                &mut out.flexible, 1, [v[0], 0.0, 0.0], x, (0.0, length), (0.0, 0.0),
+            ),
+            2 if v[0] != 0.0 => group(
+                &mut out.flexible, 2, [v[0], 0.0, 0.0], x, (0.0, length), (0.0, 0.0),
+            ),
+            1 | 2 => {}
+            _ => return,
+        }
+        for plane in 0..2 {
+            // The component that bends this plane: the 1-2 plane takes the
+            // force along 2 and the moment about 3, the 1-3 plane the force
+            // along 3 and the moment about 2.
+            let (masked, value) = match (my_type, plane) {
+                (1, 0) => ([0.0, v[1], 0.0], v[1]),
+                (1, _) => ([0.0, 0.0, v[2]], v[2]),
+                (_, 0) => ([0.0, 0.0, v[2]], v[2]),
+                (_, _) => ([0.0, v[1], 0.0], v[1]),
+            };
+            if value == 0.0 {
+                continue;
+            }
+            if x < start[plane] {
+                // On the arm at I: the joint gets the force and its moment.
+                let arm = &mut out.arms;
+                match (my_type, plane) {
+                    (1, 0) => {
+                        arm[1] -= value;
+                        arm[5] -= x * value;
+                    }
+                    (1, _) => {
+                        arm[2] -= value;
+                        arm[4] += x * value;
+                    }
+                    (_, 0) => arm[5] -= value,
+                    (_, _) => arm[4] -= value,
+                }
+            } else if x > end[plane] {
+                // On the arm at J, at distance `d` from the joint.
+                let d = length - x;
+                let arm = &mut out.arms;
+                match (my_type, plane) {
+                    (1, 0) => {
+                        arm[7] -= value;
+                        arm[11] += d * value;
+                    }
+                    (1, _) => {
+                        arm[8] -= value;
+                        arm[10] -= d * value;
+                    }
+                    (_, 0) => arm[11] -= value,
+                    (_, _) => arm[10] -= value,
+                }
+            } else {
+                group(
+                    &mut out.flexible,
+                    my_type,
+                    masked,
+                    x,
+                    (start[plane], end[plane]),
+                    (phi2, phi3),
+                );
+            }
+        }
+    };
+
+    // Positions that cut a load into pieces on which every kernel is smooth:
+    // the faces of the flexible part of both planes and, for a varying section,
+    // the places where its law changes.
+    let cuts = |lo: f64, hi: f64| {
+        let mut points = layout.breaks(lo, hi);
+        for x in [start[0], end[0], start[1], end[1]] {
+            if x > lo && x < hi {
+                points.push(x);
+            }
+        }
+        points.sort_by(f64::total_cmp);
+        points.dedup();
+        points
+    };
+
+    // 1. Self-weight (downward -Z) and Gravity multipliers
+    let mut grav_mult = [0.0, 0.0, -self_wt_mult];
+    if let Some(gm) = frame.loads_gravity.get(pat_name) {
+        grav_mult[0] += gm[0];
+        grav_mult[1] += gm[1];
+        grav_mult[2] += gm[2];
+    }
+    if grav_mult[0].abs() > 1e-15 || grav_mult[1].abs() > 1e-15 || grav_mult[2].abs() > 1e-15 {
+        let local_g_unit = global_vec_to_local(grav_mult, e_axes);
+        for piece in cuts(0.0, length).windows(2) {
+            for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+                let x = piece[0] + node * (piece[1] - piece[0]);
+                let d_len = weight * (piece[1] - piece[0]);
+                let w_len = layout.props_at(x).weight_per_len * sf;
+                let dp = [
+                    local_g_unit[0] * w_len * d_len,
+                    local_g_unit[1] * w_len * d_len,
+                    local_g_unit[2] * w_len * d_len,
+                ];
+                deliver(x, 1, dp);
+            }
+        }
+    }
+
+    // 2. Distributed and trapezoidal loads
+    for ld in &frame.loads_dist {
+        if ld.load_pat != pat_name {
+            continue;
+        }
+        let s1 = ld.rel_dist1.clamp(0.0, 1.0);
+        let s2 = ld.rel_dist2.clamp(0.0, 1.0);
+        if s2 <= s1 + 1e-12 {
+            continue;
+        }
+        let (x1, x2) = (s1 * length, s2 * length);
+        for piece in cuts(x1, x2).windows(2) {
+            for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+                let x = piece[0] + node * (piece[1] - piece[0]);
+                let d_len = weight * (piece[1] - piece[0]);
+                let q_val = (ld.val1 + (ld.val2 - ld.val1) * ((x - x1) / (x2 - x1))) * sf;
+                let q_local = distributed_load_dir_to_local(ld.dir, q_val * d_len, e_axes, ld.my_type);
+                deliver(x, ld.my_type, q_local);
+            }
+        }
+    }
+
+    // 3. Point span loads
+    for lp in &frame.loads_point {
+        if lp.load_pat != pat_name {
+            continue;
+        }
+        let p_local = resolve_load_dir_to_local(lp.dir, lp.val * sf, e_axes, false);
+        deliver(lp.rel_dist.clamp(0.0, 1.0) * length, lp.my_type, p_local);
+    }
+
+    // 4. Thermal eigenstrains. The stress-free motion of the faces of each flexible
+    // part is restrained with the stiffness of the element, which has the full
+    // length for axial deformation (p. 130). The temperature of a joint pattern
+    // varies linearly between the joints.
+    let mut thermal_free = [0.0f64; 12];
+    for lt in &frame.loads_temp {
+        if lt.load_pat != pat_name {
+            continue;
+        }
+        let (pat_i, pat_j) = if let Some(pname) = &lt.pattern_name {
+            (
+                pt_i.pattern_values.get(pname).copied().unwrap_or(1.0),
+                pt_j.pattern_values.get(pname).copied().unwrap_or(1.0),
+            )
+        } else {
+            (1.0, 1.0)
+        };
+        let strain_i = mat.a * lt.val * pat_i * sf;
+        let strain_j = mat.a * lt.val * pat_j * sf;
+        let strain_at = |x: f64| strain_i + (strain_j - strain_i) * (x / length);
+        match lt.my_type {
+            1 => thermal_free[6] += 0.5 * length * (strain_i + strain_j),
+            2 | 3 => {
+                let plane = lt.my_type as usize - 2;
+                let lw = zones.flex[plane];
+                let (sa, sb) = (strain_at(start[plane]), strain_at(end[plane]));
+                let rotation = 0.5 * lw * (sa + sb);
+                let transverse = -lw * lw * (2.0 * sa + sb) / 6.0;
+                if plane == 0 {
+                    thermal_free[7] += transverse;
+                    thermal_free[11] -= rotation;
+                } else {
+                    thermal_free[8] += transverse;
+                    thermal_free[10] += rotation;
+                }
+            }
+            _ => {}
+        }
+    }
+    if thermal_free.iter().any(|x| *x != 0.0) {
+        let stiffness = compute_zoned_local_stiffness(model, frame, sec, mat, zones);
+        for row in 0..12 {
+            out.flexible[row] -= (0..12)
+                .map(|col| stiffness[row][col] * thermal_free[col])
+                .sum::<f64>();
+        }
+    }
+    out
+}
+
+/// [`apply_rigid_offsets`] with the rigid arm of each bending plane.
+pub fn apply_zoned_rigid_offsets(k: &mut [[f64; 12]; 12], fef: &mut [f64; 12], zones: &RigidZones) {
+    apply_rigid_offsets_planes(k, fef, zones.arm_i, zones.arm_j);
+}
+
+/// Adds the geometric stiffness of the rigid arms to `k`, which is already at the
+/// joints (after releases and rigid arms). A rigid arm of length `a` turns with
+/// the joint, so the axial force `p_axial` acts through the slope `r` of the arm
+/// over the length `a`: the energy `P a r^2 / 2` adds `P a` to the stiffness of
+/// the rotation of that end in each bending plane. The flexible part carries its
+/// own geometric stiffness ([`compute_zoned_geometric_stiffness`]); a release
+/// acts on that part only, because the arm is attached to the joint.
+pub fn add_rigid_arm_geometric_stiffness(
+    k: &mut [[f64; 12]; 12],
+    p_axial: f64,
+    zones: &RigidZones,
+) {
+    if p_axial == 0.0 || !zones.has_arms() {
+        return;
+    }
+    k[5][5] += p_axial * zones.arm_i[0];
+    k[4][4] += p_axial * zones.arm_i[1];
+    k[11][11] += p_axial * zones.arm_j[0];
+    k[10][10] += p_axial * zones.arm_j[1];
+}
+
+/// The $12 \times 12$ local stiffness of the flexible part of a frame with rigid
+/// end zones, before releases, rigid arms and insertion. Bending and shear are
+/// those of the flexible length. Axial and torsional stiffness are those of the
+/// full length: "The rigid-zone offsets never affect axial and torsional
+/// deformation. The full element length is assumed to be flexible for these
+/// deformations" (Analysis Reference p. 130). A non-prismatic section with end
+/// offsets has its segments over the clear length and the section of the end
+/// segment within each offset (pp. 120, 123 and 130): see
+/// [`zoned_non_prismatic_stiffness`].
+pub fn compute_zoned_local_stiffness(
+    model: &SapModel,
+    frame: &FrameObj,
+    sec: &FrameSection,
+    mat: &Material,
+    zones: &RigidZones,
+) -> [[f64; 12]; 12] {
+    let layout = Layout {
+        model,
+        frame,
+        sec,
+        mat,
+        zones,
+    };
+    if layout.non_prismatic() && zones.has_offsets() {
+        return zoned_non_prismatic_stiffness(&layout);
+    }
+    let mut k = merge_planes(
+        compute_flexible_local_stiffness(model, frame, sec, mat, zones.lf),
+        zones,
+        |p| compute_flexible_local_stiffness(model, frame, sec, mat, zones.flex[p]),
+    );
+    if zones.di.abs() < 1e-14 && zones.dj.abs() < 1e-14 {
+        return k;
+    }
+    let e = mat.e;
+    let g = if mat.g > 1e-12 {
+        mat.g
+    } else {
+        mat.e / (2.0 * (1.0 + mat.u))
+    };
+    let p = eval_section_props_at(model, frame, sec, mat, 0.5, zones.lf);
+    let (ka, kt) = (e * p.area / zones.length, g * p.j / zones.length);
+    k[0][0] = ka;
+    k[0][6] = -ka;
+    k[6][0] = -ka;
+    k[6][6] = ka;
+    k[3][3] = kt;
+    k[3][9] = -kt;
+    k[9][3] = -kt;
+    k[9][9] = kt;
+    k
+}
+
 /// Computes the $12 \times 12$ flexible local stiffness matrix $\mathbf{K}_f$ (before releases and rigid offsets).
 pub fn compute_flexible_local_stiffness(
     model: &SapModel,
@@ -539,7 +1290,19 @@ pub fn condense_releases_and_springs(
 /// Applies rigid end-zone offset transformation $\mathbf{T}_{\text{rigid}}$ ($d_I = r_z a_I, d_J = r_z a_J$)
 /// to both the $12 \times 12$ stiffness matrix and $12 \times 1$ fixed-end force vector.
 pub fn apply_rigid_offsets(k: &mut [[f64; 12]; 12], fef: &mut [f64; 12], di: f64, dj: f64) {
-    if di.abs() < 1e-14 && dj.abs() < 1e-14 {
+    apply_rigid_offsets_planes(k, fef, [di; 2], [dj; 2]);
+}
+
+/// As [`apply_rigid_offsets`], with the rigid arm at each end given per bending
+/// plane: `arm_i[0]`, `arm_j[0]` in the 1-2 plane (u2, r3) and `arm_i[1]`,
+/// `arm_j[1]` in the 1-3 plane (u3, r2).
+pub fn apply_rigid_offsets_planes(
+    k: &mut [[f64; 12]; 12],
+    fef: &mut [f64; 12],
+    arm_i: [f64; 2],
+    arm_j: [f64; 2],
+) {
+    if arm_i.iter().chain(arm_j.iter()).all(|a| a.abs() < 1e-14) {
         return;
     }
     let mut t = [[0.0f64; 12]; 12];
@@ -547,11 +1310,11 @@ pub fn apply_rigid_offsets(k: &mut [[f64; 12]; 12], fef: &mut [f64; 12], di: f64
         t[i][i] = 1.0;
     }
     // At I-end: u2_fI = u2_I + di * r3_I, u3_fI = u3_I - di * r2_I
-    t[1][5] = di;
-    t[2][4] = -di;
+    t[1][5] = arm_i[0];
+    t[2][4] = -arm_i[1];
     // At J-end: u2_fJ = u2_J - dj * r3_J, u3_fJ = u3_J + dj * r2_J
-    t[7][11] = -dj;
-    t[8][10] = dj;
+    t[7][11] = -arm_j[0];
+    t[8][10] = arm_j[1];
 
     // fef_new = T^T * fef
     let old_fef = *fef;
@@ -1258,21 +2021,45 @@ fn section_force_evaluator<'a>(
     let m3_0 = -f_end_local[5];
     let m2_j = f_end_local[10];
     let m3_j = f_end_local[11];
-    let property_breaks = property_break_fractions(sec, length);
+    // The section laws change at the same places as in the fixed-end forces:
+    // over the clear length of a member with end offsets (pp. 120 and 130).
+    let zones = rigid_zones(frame, length);
+    let property_breaks: Vec<f64> = if zones.has_offsets() {
+        Layout {
+            model,
+            frame,
+            sec,
+            mat,
+            zones: &zones,
+        }
+        .breaks(0.0, length)
+    } else {
+        property_break_fractions(sec, length)
+            .into_iter()
+            .map(|fraction| fraction * length)
+            .collect()
+    };
     // Use identical segment-aware gravity quadrature for partial and full-span
     // force/moment integrals. Midpoint weight gives the wrong first moment for
     // tapered sections and cannot be used for the end-equilibrium correction.
     let gravity_integrals = move |x: f64, direction: [f64; 3], scale: f64| {
         let mut sum = [0.; 5]; // axial, shear2, shear3, moment2, moment3
         for span in property_breaks.windows(2) {
-            let lo = span[0] * length;
-            let hi = (span[1] * length).min(x);
+            let lo = span[0];
+            let hi = span[1].min(x);
             if hi <= lo {
                 continue;
             }
             for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
                 let at = lo + node * (hi - lo);
-                let props = eval_section_props_at(model, frame, sec, mat, at / length, length);
+                let props = Layout {
+                    model,
+                    frame,
+                    sec,
+                    mat,
+                    zones: &zones,
+                }
+                .props_at(at);
                 let dw = props.weight_per_len * weight * (hi - lo) * scale;
                 for d in 0..3 {
                     sum[d] += direction[d] * dw;
@@ -1605,28 +2392,27 @@ pub fn recover_frame_stations(
         }
         integral
     };
-    // Rigid-zone kinematics need a separate mapping from flexible-face output
-    // stations to joint locations; retain previous interpolation for that path.
-    let integrate_deflection = frame.end_offset_i == 0. && frame.end_offset_j == 0.;
-    let full = if integrate_deflection {
-        integrate(1.)
-    } else {
-        [0.; 3]
-    };
+    let zones = rigid_zones(frame, length);
+    if zones.has_offsets() {
+        return recover_stations_with_offsets(
+            model,
+            frame,
+            sec,
+            mat,
+            &zones,
+            u_local,
+            &section_forces,
+            &thermal_at,
+            n_sta,
+        );
+    }
+    let full = integrate(1.);
 
     for idx in 0..n_sta {
         let s = (idx as f64) / ((n_sta - 1) as f64);
         let x = s * length;
         let [p, v2, v3, t, m2, m3] = section_forces(s);
-        // Hermite interpolation of local displacements [u1, u2, u3]
-        let n1 = 1.0 - 3.0 * s * s + 2.0 * s * s * s;
-        let n2 = length * (s - 2.0 * s * s + s * s * s);
-        let n3 = 3.0 * s * s - 2.0 * s * s * s;
-        let n4 = length * (-s * s + s * s * s);
-
-        let u1_s = (1.0 - s) * u_local[0] + s * u_local[6];
-        let u2_s = n1 * u_local[1] + n2 * u_local[5] + n3 * u_local[7] + n4 * u_local[11];
-        let u3_s = n1 * u_local[2] - n2 * u_local[4] + n3 * u_local[8] - n4 * u_local[10];
+        let partial = integrate(s);
 
         stations.push(FrameStationResult {
             station: x,
@@ -1642,16 +2428,169 @@ pub fn recover_frame_stations(
             // M3 the two agree.
             m2: -m2,
             m3,
-            local_disp: if integrate_deflection {
-                let partial = integrate(s);
-                std::array::from_fn(|d| {
-                    (1. - s) * u_local[d] + s * u_local[6 + d] + partial[d] - s * full[d]
-                })
-            } else {
-                [u1_s, u2_s, u3_s]
-            },
+            local_disp: std::array::from_fn(|d| {
+                (1. - s) * u_local[d] + s * u_local[6 + d] + partial[d] - s * full[d]
+            }),
         });
     }
 
+    stations
+}
+
+/// The output stations of a frame with end offsets.
+///
+/// "All internal forces and moments are output at the faces of the supports and
+/// at other equally-spaced points within the clear length of the element. No
+/// output is produced within the end offset, which includes the joint. This is
+/// not affected by the value of the rigid-end factor" (Analysis Reference p.
+/// 130), and "Output will only be produced at joints I or j when the
+/// corresponding end offset is zero" (p. 144). The first station is therefore at
+/// the face of the support at I (the distance `off_i` from the joint), the last at
+/// the face at J (`length - off_j`), and the others are equally spaced between
+/// them. `station` is the distance from joint I and `rel_dist` that distance over
+/// the length between the joints (the scale on which the loads and hinges of the
+/// frame are located).
+///
+/// The section forces are those of the equilibrium of the part of the member
+/// before the station, with the joint forces and all span loads (those on the rigid
+/// arm included): a released end therefore has zero moment at its face. The
+/// deflections follow from the kinematics of the rigid arms and the integral of the
+/// curvature over the flexible part of each plane: the face displacements are the
+/// joint displacements plus the rotation of the joint times the rigid arm, and the
+/// deflection between the faces is their interpolation plus the particular
+/// deflection of the span loads and of the thermal strains relative to it.
+#[allow(clippy::too_many_arguments)]
+fn recover_stations_with_offsets(
+    model: &SapModel,
+    frame: &FrameObj,
+    sec: &FrameSection,
+    mat: &Material,
+    zones: &RigidZones,
+    u_local: &[f64; 12],
+    section_forces: &dyn Fn(f64) -> [f64; 6],
+    thermal_at: &dyn Fn(f64) -> [f64; 3],
+    n_sta: usize,
+) -> Vec<FrameStationResult> {
+    let length = zones.length;
+    let layout = Layout {
+        model,
+        frame,
+        sec,
+        mat,
+        zones,
+    };
+    let shear_modulus = if mat.g > 1e-12 {
+        mat.g
+    } else {
+        mat.e / (2. * (1. + mat.u))
+    };
+    // Deformation groups: axial over the whole length, then the 1-2 and the 1-3
+    // plane over their flexible parts.
+    let starts = [0.0, zones.arm_i[0], zones.arm_i[1]];
+    let ends = [
+        length,
+        zones.arm_i[0] + zones.flex[0],
+        zones.arm_i[1] + zones.flex[1],
+    ];
+    // Pieces on which the integrands are smooth.
+    let mut cuts = layout.breaks(0.0, length);
+    cuts.extend(starts);
+    cuts.extend(ends);
+    for load in &frame.loads_dist {
+        cuts.extend([
+            load.rel_dist1.clamp(0., 1.) * length,
+            load.rel_dist2.clamp(0., 1.) * length,
+        ]);
+    }
+    for load in &frame.loads_point {
+        cuts.push(load.rel_dist.clamp(0., 1.) * length);
+    }
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    // Particular deflection at `x`: the integrals of the curvature (and of the
+    // shear strain) of each group from the start of its flexible part to `x`.
+    let partial = |x: f64| {
+        let mut integral = [0.; 3];
+        for span in cuts.windows(2) {
+            let lo = span[0];
+            let hi = span[1].min(x);
+            if hi <= lo {
+                continue;
+            }
+            for (&node, &weight) in GL5_NODES.iter().zip(GL5_WEIGHTS.iter()) {
+                let at = lo + node * (hi - lo);
+                let ds = weight * (hi - lo);
+                let s_at = at / length;
+                let [p, v2, v3, _, m2, m3] = section_forces(s_at);
+                let props = layout.props_at(at);
+                let thermal = thermal_at(s_at);
+                let in_group = |d: usize| hi > starts[d] + 1e-12 * length;
+                if in_group(0) {
+                    if props.area > 0. {
+                        integral[0] += ds * p / (mat.e * props.area);
+                    }
+                    integral[0] += ds * thermal[0];
+                }
+                if in_group(1) {
+                    if props.i33 > 0. {
+                        integral[1] += ds * (x - at) * m3 / (mat.e * props.i33);
+                    }
+                    if props.as2 > 0. {
+                        integral[1] += ds * v2 / (shear_modulus * props.as2);
+                    }
+                    integral[1] += ds * (x - at) * thermal[1];
+                }
+                if in_group(2) {
+                    if props.i22 > 0. {
+                        integral[2] -= ds * (x - at) * m2 / (mat.e * props.i22);
+                    }
+                    if props.as3 > 0. {
+                        integral[2] += ds * v3 / (shear_modulus * props.as3);
+                    }
+                    integral[2] += ds * (x - at) * thermal[2];
+                }
+            }
+        }
+        integral
+    };
+    let full = [partial(ends[0])[0], partial(ends[1])[1], partial(ends[2])[2]];
+    // Displacements of the faces of each flexible part: the joint displacement
+    // plus the rotation of the joint times the rigid arm (the signs of
+    // `apply_rigid_offsets_planes`).
+    let face_i = [
+        u_local[0],
+        u_local[1] + zones.arm_i[0] * u_local[5],
+        u_local[2] - zones.arm_i[1] * u_local[4],
+    ];
+    let arm_j = [0.0, length - ends[1], length - ends[2]];
+    let face_j = [
+        u_local[6],
+        u_local[7] - arm_j[1] * u_local[11],
+        u_local[8] + arm_j[2] * u_local[10],
+    ];
+
+    let mut stations = Vec::with_capacity(n_sta);
+    for idx in 0..n_sta {
+        let t = (idx as f64) / ((n_sta - 1) as f64);
+        let x = zones.off_i + t * zones.lc;
+        let s = x / length;
+        let [p, v2, v3, torque, m2, m3] = section_forces(s);
+        let part = partial(x);
+        let local_disp = std::array::from_fn(|d| {
+            let w = (x - starts[d]) / (ends[d] - starts[d]);
+            (1. - w) * face_i[d] + w * face_j[d] + part[d] - w * full[d]
+        });
+        stations.push(FrameStationResult {
+            station: x,
+            rel_dist: s,
+            p,
+            v2,
+            v3,
+            t: torque,
+            m2: -m2,
+            m3,
+            local_disp,
+        });
+    }
     stations
 }

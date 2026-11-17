@@ -77,7 +77,8 @@ pub struct AutoSeismicAsce710 {
     /// Global direction of the load.
     pub direction: SeismicDirection,
     /// Diaphragm eccentricity ratio. The vendor ignores it where the model has
-    /// no diaphragm; a nonzero value on a loaded diaphragm joint is refused.
+    /// no diaphragm. Where a Z diaphragm carries load, a moment of ratio times
+    /// width times force is applied (see `AutoSeismicDiaphragmMoment`).
     pub eccentricity_ratio: f64,
     pub period: SeismicPeriod,
     /// Response modification factor R (Table 12.2-1).
@@ -160,6 +161,35 @@ pub struct AutoSeismicReport {
     /// Base shear `Cs * W`, force units.
     pub base_shear: f64,
     pub joint_forces: Vec<AutoSeismicJointForce>,
+    /// Eccentric moments applied at diaphragms (empty without diaphragms or
+    /// with a zero eccentricity).
+    #[serde(default)]
+    pub diaphragm_moments: Vec<AutoSeismicDiaphragmMoment>,
+}
+
+/// The eccentric moment of an automatic seismic load at one diaphragm
+/// (Lateral Loads Manual, section 2.2.3). Project sign convention: a positive
+/// eccentricity puts the line of action of the diaphragm's lateral force on the
+/// positive side of the center of mass along the perpendicular global axis (+Y
+/// for an X load, +X for a Y load), so the couple about global Z is
+/// `-e F` for an X load and `+e F` for a Y load. The sign is not stated by the
+/// manual.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct AutoSeismicDiaphragmMoment {
+    /// The diaphragm constraint.
+    pub diaphragm: String,
+    /// Total lateral force of the pattern on the diaphragm, force units.
+    pub force: f64,
+    /// Width of the diaphragm perpendicular to the load, length units.
+    pub width: f64,
+    /// Eccentricity distance used (ratio times width, or the overwrite).
+    pub eccentricity: f64,
+    /// Whether `eccentricity` is an overwrite.
+    pub overwritten: bool,
+    /// Moment about global Z (force times length units), as applied.
+    pub moment_z: f64,
+    /// The joint the moment is applied at.
+    pub joint: String,
 }
 
 /// Converts the dimensional values of the definitions in this module when the
@@ -170,6 +200,11 @@ pub fn scale_units(model: &mut SapModel, from: Units, to: Units) {
     for def in model.auto_seismic.values_mut() {
         for z in [&mut def.z_min, &mut def.z_max].into_iter().flatten() {
             *z *= fl;
+        }
+    }
+    for table in model.auto_seismic_eccentricity.values_mut() {
+        for distance in table.values_mut() {
+            *distance *= fl;
         }
     }
 }

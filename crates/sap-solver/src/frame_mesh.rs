@@ -55,6 +55,9 @@ pub(crate) struct FrameMesh {
     parents: IndexMap<String, (Vec<Piece>, f64)>,
     /// Joints created for the subdivision.
     internal_joints: HashSet<String>,
+    /// For each joint created for the subdivision, the frame object it lies on
+    /// and its position along it (relative to the object's length).
+    owners: IndexMap<String, (String, f64)>,
     /// Hinges of the frame objects, object by object in model order. Empty
     /// unless hinges were asked for.
     pub(crate) hinge_sites: Vec<HingeSite>,
@@ -329,6 +332,7 @@ pub(crate) fn expand(
                 new_points.push(created_point(frame, pi, pj, axis, &joint, t));
                 created.push((name.clone(), 1e-6 * length));
                 mesh.internal_joints.insert(joint.clone());
+                mesh.owners.insert(joint.clone(), (name.clone(), t));
                 joints.push((t, joint));
             }
         }
@@ -350,6 +354,7 @@ pub(crate) fn expand(
                 new_points.push(created_point(frame, pi, pj, axis, &joint, t));
                 created.push((name.clone(), 1e-6 * length));
                 mesh.internal_joints.insert(joint.clone());
+                mesh.owners.insert(joint.clone(), (name.clone(), t));
                 joints.push((t, joint));
             }
         }
@@ -602,6 +607,41 @@ fn clip_non_prismatic(
     (clipped, ends)
 }
 
+impl FrameMesh {
+    /// Where a joint created for the subdivision lies: the frame object, the
+    /// joints at its two ends and the one of them the joint is nearer to. `None`
+    /// for a joint of the model. `frames` are the (expanded) frames of the
+    /// working model.
+    pub(crate) fn locate_internal_joint(
+        &self,
+        joint: &str,
+        frames: &IndexMap<String, FrameObj>,
+    ) -> Option<InternalJoint> {
+        let (object, t) = self.owners.get(joint)?;
+        let (pieces, _) = self.parents.get(object)?;
+        let first = frames.get(&pieces.first()?.frame)?;
+        let last = frames.get(&pieces.last()?.frame)?;
+        let (from, to) = (first.point_i.clone(), last.point_j.clone());
+        let nearest = if *t <= 0.5 { from.clone() } else { to.clone() };
+        Some(InternalJoint {
+            frame: object.clone(),
+            from,
+            to,
+            nearest,
+        })
+    }
+}
+
+/// A joint created for the automatic subdivision of a frame object: the object
+/// and the joints at its two ends (see [`FrameMesh::locate_internal_joint`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InternalJoint {
+    pub frame: String,
+    pub from: String,
+    pub to: String,
+    pub nearest: String,
+}
+
 /// Folds the results of the elements back onto their frame objects and drops
 /// the joints created for the subdivision from every result container.
 pub(crate) fn collapse(results: &mut IndexMap<String, CaseResults>, mesh: &FrameMesh) {
@@ -624,41 +664,47 @@ pub(crate) fn collapse(results: &mut IndexMap<String, CaseResults>, mesh: &Frame
             }
         }
     };
-    for case in results.values_mut() {
-        fold(&mut case.frame_forces);
-        // Every saved state of a nonlinear static case, too.
-        for step in &mut case.static_steps {
-            fold(&mut step.frame_forces);
-            step.joint_displacements.retain(|joint, _| !internal.contains(joint));
-            step.joint_reactions.retain(|joint, _| !internal.contains(joint));
-        }
-        case.joint_displacements.retain(|joint, _| !internal.contains(joint));
-        case.joint_reactions.retain(|joint, _| !internal.contains(joint));
-        case.time_history_disp.retain(|joint, _| !internal.contains(joint));
-        case.time_history_accel.retain(|joint, _| !internal.contains(joint));
-        for mode in &mut case.modes {
-            mode.mode_shape.retain(|joint, _| !internal.contains(joint));
-        }
-        if let Some(state) = &mut case.transient_state {
-            let keep: Vec<bool> = state.point_order.iter().map(|p| !internal.contains(p)).collect();
-            let points = keep.len();
-            for vector in [
-                &mut state.u,
-                &mut state.v,
-                &mut state.a,
-                &mut state.previous_force,
-            ] {
-                if points > 0 && vector.len() % points == 0 {
-                    let per_point = vector.len() / points;
-                    let mut index = 0;
-                    vector.retain(|_| {
-                        let kept = keep[index / per_point];
-                        index += 1;
-                        kept
-                    });
-                }
+    let collapse_case = |case: &mut CaseResults| {
+            fold(&mut case.frame_forces);
+            // Every saved state of a nonlinear static case, too.
+            for step in &mut case.static_steps {
+                fold(&mut step.frame_forces);
+                step.joint_displacements.retain(|joint, _| !internal.contains(joint));
+                step.joint_reactions.retain(|joint, _| !internal.contains(joint));
             }
-            state.point_order.retain(|p| !internal.contains(p));
+            case.joint_displacements.retain(|joint, _| !internal.contains(joint));
+            case.joint_reactions.retain(|joint, _| !internal.contains(joint));
+            case.time_history_disp.retain(|joint, _| !internal.contains(joint));
+            case.time_history_accel.retain(|joint, _| !internal.contains(joint));
+            for mode in &mut case.modes {
+                mode.mode_shape.retain(|joint, _| !internal.contains(joint));
+            }
+            if let Some(state) = &mut case.transient_state {
+                let keep: Vec<bool> = state.point_order.iter().map(|p| !internal.contains(p)).collect();
+                let points = keep.len();
+                for vector in [
+                    &mut state.u,
+                    &mut state.v,
+                    &mut state.a,
+                    &mut state.previous_force,
+                ] {
+                    if points > 0 && vector.len() % points == 0 {
+                        let per_point = vector.len() / points;
+                        let mut index = 0;
+                        vector.retain(|_| {
+                            let kept = keep[index / per_point];
+                            index += 1;
+                            kept
+                        });
+                    }
+                }
+                state.point_order.retain(|p| !internal.contains(p));
+            }
+    };
+    for case in results.values_mut() {
+        collapse_case(case);
+        if let Some(minimum) = case.combo_min.as_deref_mut() {
+            collapse_case(minimum);
         }
     }
 }

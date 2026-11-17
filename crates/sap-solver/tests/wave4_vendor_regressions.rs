@@ -465,6 +465,17 @@ fn vendor_sdb_unmodeled_hinges_and_modal_damping_refuse_only_affected_cases() {
     }
 
     let mut model = load_sdb_file(dir.join("example_6_007.sdb")).expect("example_6_007");
+    // The Ritz case MODAL carries the link starting-vector entry (D36, wave 5); it is refused
+    // by name elsewhere and is removed here explicitly, to leave the per-mode damping entry.
+    let ritz = model
+        .unmodeled_source
+        .iter()
+        .position(|e| e.scope == UnmodeledScope::Case("MODAL".into()))
+        .expect("the Ritz starting-load entry of MODAL");
+    assert!(model.unmodeled_source[ritz]
+        .description
+        .contains("starting load of type 4"));
+    model.unmodeled_source.remove(ritz);
     assert_eq!(
         model.unmodeled_source[0].scope,
         UnmodeledScope::Case("NLMHIST1".into())
@@ -531,12 +542,11 @@ fn vendor_sdb_example_6_005_maxwell_damper_harmonic_history() {
     let dir = vendor_dir();
     let path = dir.join("example_6_005a.sdb");
     let mut model = load_sdb_file(&path).expect("load example_6_005a.sdb");
-    model.load_cases.retain(|_, lc| {
-        matches!(
-            lc.case_type,
-            LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
-        )
-    });
+    // NLMHIST1 is a nonlinear modal (FNA) history, which is refused since wave 5 (it used to
+    // be integrated directly, a different method); the published values are for NLDHIST1.
+    model
+        .load_cases
+        .retain(|_, lc| matches!(lc.case_type, LoadCaseType::NonlinearDynamic));
     analyze_model(&mut model).expect("solve example_6_005a.sdb");
 
     let res = &model.case_results["NLDHIST1"];
@@ -715,12 +725,19 @@ fn vendor_sdb_skipped_sections_are_recorded_and_scoped() {
 
     // Added mass: the modal case is refused, a static case is not.
     let mut model = load_sdb_file(dir.join("example_1_015.sdb")).expect("1_015");
+    // MHIST1 is a periodic modal history (wave 5: refused as such, besides the added mass).
     assert_eq!(
         entries(&model),
-        [(
-            UnmodeledScope::DynamicCases,
-            "2 frame added-mass assignments".to_string()
-        )]
+        [
+            (
+                UnmodeledScope::Case("MHIST1".into()),
+                "periodic modal history of case 'MHIST1' is not implemented".to_string()
+            ),
+            (
+                UnmodeledScope::DynamicCases,
+                "2 frame added-mass assignments".to_string()
+            )
+        ]
     );
     assert!(model.frames.values().all(|f| f.auto_mesh_segments == 120));
     only(&mut model, &["MODAL1"]);
@@ -1261,16 +1278,16 @@ fn vendor_sdb_example_1_010_end_offsets_match_the_published_deflections() {
     }
 }
 
-/// Examples 6-006 and 6-007 (three-storey frame with dampers, end offsets
-/// with a rigid zone factor of 0.6, a diaphragm per floor): the Ritz case of
-/// the file against the modal periods SAP2000 publishes, 0.438, 0.135 and
-/// 0.074 s. Measured on 2026-11-15: 0.4309, 0.1303 and 0.0745 s, that is
-/// -1.6 %, -3.5 % and +0.6 %. The residual is not explained; the tolerance
-/// below bounds it and is not a claim of agreement. With the offsets read as
-/// lengths instead of fractions of the member length, as before that date,
-/// the periods were 0.554, 0.169 and 0.098 s.
+/// Examples 6-006 and 6-007 (three-storey frame with dampers, end offsets with a rigid zone
+/// factor of 0.6, a diaphragm per floor). The Ritz case MODAL of each file has two starting load
+/// assignments: the Ux acceleration and the vendor's "all link element nonlinear degrees of
+/// freedom" (native type 4, load -1), for which this solver has no starting vectors. Wave 5
+/// (D36) records the second as unmodeled source data, so the Modal case is refused by name. The
+/// periods it used to give (0.4309, 0.1303 and 0.0745 s, that is -1.6 %, -3.5 % and +0.6 %
+/// against the published 0.438, 0.135 and 0.074 s) came from a different Ritz subspace and are
+/// no longer reported. The opt-in probe `wave5_d06_probe.rs` removes the entry explicitly.
 #[test]
-fn vendor_sdb_example_6_006_modal_periods_with_end_offsets_and_diaphragms() {
+fn vendor_sdb_example_6_006_modal_case_is_refused_for_its_link_starting_vectors() {
     let dir = vendor_dir();
     for fname in ["example_6_006.sdb", "example_6_007.sdb"] {
         let path = dir.join(fname);
@@ -1281,15 +1298,19 @@ fn vendor_sdb_example_6_006_modal_periods_with_end_offsets_and_diaphragms() {
         for case in model.load_cases.values_mut() {
             case.run_flag = case.case_type == LoadCaseType::Modal;
         }
-        analyze_model(&mut model).expect(fname);
-        let modes = &model.case_results["MODAL"].modes;
-        for (mode, expected) in modes.iter().zip([0.438, 0.135, 0.074]) {
-            assert!(
-                (mode.period_sec - expected).abs() < 0.04 * expected,
-                "{fname}: mode {} period {}, published {expected}",
-                mode.mode_num,
-                mode.period_sec
-            );
-        }
+        assert!(
+            model.unmodeled_source.iter().any(|entry| {
+                entry.scope == sap_model::UnmodeledScope::Case("MODAL".into())
+                    && entry.description.contains("starting load of type 4")
+            }),
+            "{fname}: {:?}",
+            model.unmodeled_source
+        );
+        let error = analyze_model(&mut model).unwrap_err().to_string();
+        assert!(
+            error.contains("'MODAL'") && error.contains("starting load of type 4"),
+            "{fname}: {error}"
+        );
+        assert!(model.case_results.is_empty(), "{fname}");
     }
 }
