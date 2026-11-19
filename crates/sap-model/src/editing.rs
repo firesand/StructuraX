@@ -127,6 +127,7 @@ impl SapModel {
     /// Clear stale analysis and design output after an accepted edit.
     pub fn invalidate_results(&mut self) {
         self.case_results.clear();
+        self.unavailable_results.clear();
         self.steel_design_results.clear();
         self.concrete_design_results.clear();
     }

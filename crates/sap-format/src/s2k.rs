@@ -2935,12 +2935,40 @@ pub(super) fn parse_s2k_internal(
                     get_str(&row, "Function"),
                     get_str(&row, "LoadName"),
                 ) {
+                    // The LoadType column (Load pattern or Accel, as in the static
+                    // table) says what LoadName is (D77). A table without it is a
+                    // legacy input: the kind stays unspecified and the analysis
+                    // refuses a name that could be either.
+                    let kind = match get_str(&row, "LoadType")
+                        .map(|t| t.trim().to_ascii_uppercase())
+                        .as_deref()
+                    {
+                        None => sap_model::HistoryLoadKind::Unspecified,
+                        Some("LOAD PATTERN" | "LOADPATTERN") => {
+                            sap_model::HistoryLoadKind::Pattern
+                        }
+                        Some("ACCEL") => {
+                            if sap_model::history_acceleration_direction(lname).is_none() {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS: Accel load '{lname}' of case '{cname}' is not U1, U2, U3, UX, UY, UZ, X, Y or Z"
+                                )));
+                            }
+                            sap_model::HistoryLoadKind::Acceleration
+                        }
+                        Some(_) => {
+                            return Err(FormatError::ParseS2k(format!(
+                                "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS: LoadType '{}' of case '{cname}' is not Load pattern or Accel",
+                                get_str(&row, "LoadType").unwrap_or("")
+                            )));
+                        }
+                    };
                     if let Some(lc) = model.load_cases.get_mut(cname) {
-                        lc.history_loads.push((
-                            func.to_string(),
-                            lname.to_string(),
+                        lc.push_history_load(
+                            func,
+                            lname,
+                            kind,
                             get_f64(&row, "SF").unwrap_or(1.0),
-                        ));
+                        );
                     }
                 }
             }
@@ -3058,6 +3086,16 @@ pub(super) fn parse_s2k_internal(
             source_text: input.into(),
             canonical_baseline: canonical,
         });
+    }
+    // D79: refuse a name that is both a load case and a load combination. The result of
+    // the case and that of the combination would share one entry, and a combination that
+    // lists the name would be ambiguous. Refusing the import (rather than importing and
+    // refusing the analysis) keeps an ambiguous model from reaching any consumer; the
+    // solver and the API refuse the same names for models that do not come from here.
+    if let Some(message) = sap_model::results::case_combo_collision_message(&model) {
+        return Err(FormatError::ParseS2k(format!(
+            "COMBINATION DEFINITIONS / LOAD CASE DEFINITIONS: {message}"
+        )));
     }
     Ok((ImportReport { model, warnings }, columns))
 }
@@ -4670,10 +4708,18 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
     if has_hist_loads {
         out.push_str("TABLE:  \"CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS\"\n");
         for lc in model.load_cases.values() {
-            for (func, lname, sf) in &lc.history_loads {
+            for (entry, (func, lname, sf)) in lc.history_loads.iter().enumerate() {
+                // The load type is written whenever it is known; a legacy
+                // entry without one stays without (D77).
+                let load_type = match lc.history_kind(entry) {
+                    sap_model::HistoryLoadKind::Pattern => "   LoadType=\"Load pattern\"",
+                    sap_model::HistoryLoadKind::Acceleration => "   LoadType=Accel",
+                    sap_model::HistoryLoadKind::Unspecified => "",
+                };
                 out.push_str(&format!(
-                    "   Case={}   Function={}   LoadName={}   SF={}\n",
+                    "   Case={}{}   Function={}   LoadName={}   SF={}\n",
                     format_val(&lc.name),
+                    load_type,
                     format_val(func),
                     format_val(lname),
                     sf,

@@ -1799,13 +1799,16 @@ fn routing_multiple_states_with_other_nonlinearity_and_no_hinges_keeps_the_final
 }
 
 #[test]
-fn routing_a_model_with_hinges_and_other_nonlinearity_is_refused() {
+fn routing_a_model_with_hinges_and_large_displacements_is_refused() {
+    // Wave 6 (S2b): P-Delta with hinges is implemented (see
+    // `wave6_pdelta_hinges.rs`; this test used to assert its refusal), large
+    // displacements stay refused.
     let mut m = cantilever(moment_1_026());
     let mut case = nl_case("PUSH", "P", 10.0, None);
-    case.nl_geom = NLGeomType::PDelta;
+    case.nl_geom = NLGeomType::LargeDisplacements;
     m.load_cases.insert("PUSH".into(), case);
     let e = refused(&mut m);
-    assert_unsupported(&e, "only nonlinearity is frame hinges");
+    assert_unsupported(&e, "requests large displacements");
 }
 
 #[test]
@@ -2145,8 +2148,11 @@ fn refuses_nonlinear_dynamic_and_continuation_of_linear_cases_and_unloading_opti
     let mut lin = LoadCase::linear_static("LIN", "P", 1.0);
     lin.initial_case = Some("PUSH".into());
     m.load_cases.insert("LIN".into(), lin);
+    // The push yields the hinge: the run-time rule of wave 6 names it and says it
+    // is on its backbone (before: refused in validation, "tangent stiffness").
     let e = refused(&mut m);
-    assert_unsupported(&e, "tangent stiffness");
+    assert_unsupported(&e, "yielded and is on its backbone");
+    assert_unsupported(&e, "1H1");
     assert_unsupported(&e, "PUSH");
     // Hinge unloading options other than "unload entire structure".
     for option in [
@@ -2186,46 +2192,65 @@ fn refuses_reversal_after_yield_with_the_hinge_named() {
     assert!(m.case_results.is_empty(), "no partial results are kept");
 }
 
+/// G16: the load-control cantilever of Example 1-026's geometry (EPP hinge of 1440 kip in,
+/// L = 24 in) cannot pass its limit load P = 1440 / 24 = 60 kip. The case keeps what it
+/// reached and is "not finished" (v19 help "Set Load Cases to Run": "unable to reach its
+/// requested final state"); a linear case of the model keeps its results. Before this
+/// stage the test asserted `NonConvergence` and "no partial results are kept".
 #[test]
-fn load_control_past_the_limit_load_is_refused_with_the_limit_named() {
+fn load_control_past_the_limit_load_is_not_finished_with_the_limit_named() {
     let mut prop = HingeProp::symmetric("Epp", HingeDof::M3, epp_curve(0.1, 0.2, 0.3));
     prop.force_sf = 1440.0;
     prop.force_sf_negative = 1440.0;
     let mut m = cantilever(prop);
-    // The hinge yields at P = 60; load control cannot pass it.
+    // The hinge yields at P = 60; load control cannot pass it (target P = 70).
     m.load_cases
         .insert("PUSH".into(), nl_case("PUSH", "P", 70.0, None));
-    match refused(&mut m) {
-        SolverError::NonConvergence { case, reason, .. } => {
-            assert_eq!(case, "PUSH");
+    m.load_cases
+        .insert("LIN".into(), LoadCase::linear_static("LIN", "P", 10.0));
+    analyze_model(&mut m).expect("a case that is not finished is not an error");
+    let push = &m.case_results["PUSH"];
+    match &push.status {
+        CaseStatus::NotFinished { reason, steps } => {
             assert!(reason.contains("limit"), "{reason}");
+            assert_eq!(*steps, push.static_steps.len());
         }
-        other => panic!("expected NonConvergence, got {other:?}"),
+        other => panic!("expected NotFinished, got {other:?}"),
     }
-    assert!(m.case_results.is_empty(), "no partial results are kept");
+    // Last state: load P = 60 kip (the case scale is 70), hinge force 1440 kip in.
+    let lambda = push.displacement_control_factor.expect("last state kept");
+    close(lambda * 70.0, 1440.0 / 24.0, 1e-9, "load P at the stop");
+    close(push.hinge_results[0].force, 1440.0, 1e-9, "hinge force at the stop");
+    close(
+        push.joint_displacements["2"][2],
+        60.0 * c_elastic(),
+        1e-9,
+        "tip Uz at the stop",
+    );
+    // The linear case elsewhere in the model keeps its results.
+    assert!(m.case_results["LIN"].status.is_finished());
+    close(
+        m.case_results["LIN"].joint_displacements["2"][2],
+        10.0 * c_elastic(),
+        1e-9,
+        "linear case Uz",
+    );
+    assert_eq!(sap_model::results::case_status_code(&m, "PUSH"), 3);
+    assert_eq!(sap_model::results::case_status_code(&m, "LIN"), 4);
+    let unfinished = sap_solver::unfinished_cases(&m);
+    assert_eq!(unfinished.len(), 1);
+    assert_eq!(unfinished[0].0, "PUSH");
 }
 
+/// G16 (negative): a case that is refused (not "not finished") keeps nothing: zero total
+/// steps and zero saved steps stay `InvalidInput`.
 #[test]
-fn step_budgets_are_honoured_and_fail_closed() {
-    let mut m = example_1_026(None, MULTI_6_10);
-    m.load_cases["PUSH"].nl_static.max_total_steps = 5;
-    match refused(&mut m) {
-        SolverError::NonConvergence {
-            case,
-            reason,
-            iterations,
-            ..
-        } => {
-            assert_eq!(case, "PUSH");
-            assert!(reason.contains("total steps"), "{reason}");
-            assert_eq!(iterations, 5);
-        }
-        other => panic!("expected NonConvergence, got {other:?}"),
-    }
-    assert!(m.case_results.is_empty());
+fn refusals_keep_no_partial_results_and_stay_errors() {
     let mut m = example_1_026(None, MULTI_6_10);
     m.load_cases["PUSH"].nl_static.max_total_steps = 0;
     assert!(matches!(refused(&mut m), SolverError::InvalidInput(_)));
+    assert!(m.case_results.is_empty());
+    assert!(m.unavailable_results.is_empty());
     let mut m = example_1_026(
         None,
         ResultsSaved::MultipleStates {
@@ -2235,6 +2260,246 @@ fn step_budgets_are_honoured_and_fail_closed() {
         },
     );
     assert!(matches!(refused(&mut m), SolverError::InvalidInput(_)));
+    assert!(m.case_results.is_empty());
+}
+
+/// The total-step budget of Example 1-026 model A: `max_total_steps = 5` ends the case
+/// early, with the states saved before the stop equal to the first saved states of the
+/// unlimited run (1e-12; published first point P = 60 at Uz = 0.0185021 in, CSI v19
+/// Example 1-026) and the last accepted state appended. Before this stage the test
+/// `step_budgets_are_honoured_and_fail_closed` asserted `NonConvergence`, iterations = 5 and
+/// no results.
+#[test]
+fn step_budgets_end_the_case_early_and_keep_the_states_reached() {
+    let mut full = example_1_026(None, MULTI_6_10);
+    analyze_model(&mut full).unwrap();
+    let full_steps = &full.case_results["PUSH"].static_steps;
+    assert_eq!(full.case_results["PUSH"].status, CaseStatus::Finished);
+
+    let mut m = example_1_026(None, MULTI_6_10);
+    m.load_cases["PUSH"].nl_static.max_total_steps = 5;
+    analyze_model(&mut m).expect("not finished is not an error");
+    let push = &m.case_results["PUSH"];
+    let CaseStatus::NotFinished { reason, steps } = &push.status else {
+        panic!("expected NotFinished, got {:?}", push.status);
+    };
+    assert!(reason.contains("total steps"), "{reason}");
+    assert_eq!(*steps, push.static_steps.len());
+    let n = push.static_steps.len();
+    assert!(n >= 2 && n < full_steps.len(), "{n} saved states");
+    // Every saved state but the appended last one is a saved state of the unlimited run.
+    for i in 0..n - 1 {
+        let (a, b) = (&push.static_steps[i], &full_steps[i]);
+        close_abs(a.load_factor, b.load_factor, 1e-12, "load factor");
+        for dof in [2, 4] {
+            close_abs(
+                a.joint_displacements["2"][dof],
+                b.joint_displacements["2"][dof],
+                1e-12,
+                "tip displacement",
+            );
+        }
+    }
+    // The appended state is the final state of the case, and the first yield (P = 60 at
+    // Uz = 0.0185021 in) was passed.
+    let last = &push.static_steps[n - 1];
+    close_abs(
+        last.joint_displacements["2"][2],
+        push.joint_displacements["2"][2],
+        1e-12,
+        "last saved state = final state",
+    );
+    assert!(push.joint_displacements["2"][2] > 0.0185021);
+    // The first published point (v19 Example 1-026): P = 60 kip at Uz = 0.0185021 in.
+    close_abs(push.static_steps[1].load_factor, 60.0, 1e-9, "P at point 1 (kip)");
+    close_abs(step_u(push, 1, "2", 2), 0.0185021, 5e-7, "Uz at point 1 (in)");
+    close_abs(
+        push.displacement_control_factor.unwrap(),
+        last.load_factor,
+        1e-12,
+        "factor",
+    );
+}
+
+/// The last accepted state is appended to the saved ones when the case stops, and only
+/// then. Example 1-026 model A with `min_saved = max_saved = 1` saves the start state only,
+/// so after `max_total_steps` steps the case holds two states: the start and the last
+/// accepted one. Step 1 is the first published point (P = 60 at Uz = 0.0185021 in), step 3
+/// the point P = 80 at Uz = 1.3846694 in, step 4 the point P = 20 at Uz = 1.7612291 in (CSI
+/// v19 Example 1-026, model A, the schedule also asserted by `hinge::tests`; +-5e-7).
+#[test]
+fn the_last_accepted_state_is_appended_once_to_the_saved_states() {
+    let saved = ResultsSaved::MultipleStates {
+        min_saved: 1,
+        max_saved: 1,
+        positive_only: false,
+    };
+    for (steps, p, uz) in [(1, 60.0, 0.0185021), (3, 80.0, 1.3846694), (4, 20.0, 1.7612291)] {
+        let mut m = example_1_026(None, saved);
+        m.load_cases["PUSH"].nl_static.max_total_steps = steps;
+        analyze_model(&mut m).unwrap();
+        let c = &m.case_results["PUSH"];
+        assert!(matches!(c.status, CaseStatus::NotFinished { steps: 2, .. }), "{:?}", c.status);
+        assert_eq!(c.static_steps.len(), 2, "start state and the appended last state");
+        close_abs(c.static_steps[0].load_factor, 0.0, 1e-12, "start state");
+        close_abs(c.static_steps[1].load_factor, p, 1e-9, "P after the last step (kip)");
+        close_abs(step_u(c, 1, "2", 2), uz, 5e-7, "Uz after the last step (in)");
+        close_abs(c.joint_displacements["2"][2], uz, 5e-7, "final state = appended state");
+    }
+    // With the full budget the case finishes with the start state and the final state.
+    let mut m = example_1_026(None, saved);
+    analyze_model(&mut m).unwrap();
+    assert!(m.case_results["PUSH"].status.is_finished());
+    assert_eq!(m.case_results["PUSH"].static_steps.len(), 2);
+    // A stop on a state that was just saved does not save it twice: load control past the
+    // limit load (P = 60 kip) with saved states keeps strictly distinct states.
+    let mut prop = HingeProp::symmetric("Epp", HingeDof::M3, epp_curve(0.1, 0.2, 0.3));
+    prop.force_sf = 1440.0;
+    prop.force_sf_negative = 1440.0;
+    let mut m = cantilever(prop);
+    let mut push = nl_case("PUSH", "P", 70.0, None);
+    push.nl_static.results_saved = MULTI_6_10;
+    m.load_cases.insert("PUSH".into(), push);
+    analyze_model(&mut m).unwrap();
+    let c = &m.case_results["PUSH"];
+    assert!(!c.status.is_finished());
+    assert!(c.static_steps.len() >= 2);
+    for pair in c.static_steps.windows(2) {
+        let (a, b) = (&pair[0], &pair[1]);
+        let same = a.load_factor == b.load_factor
+            && a.joint_displacements == b.joint_displacements
+            && a.hinges.iter().zip(&b.hinges).all(|(x, y)| x.force == y.force);
+        assert!(!same, "steps {} and {} are the same state", a.step, b.step);
+    }
+    let last = c.static_steps.last().unwrap();
+    close_abs(last.load_factor * 70.0, 60.0, 1e-9, "P of the last saved state (kip)");
+}
+
+/// A case that saves only its final state keeps that state when it stops (no saved steps).
+#[test]
+fn a_final_state_only_case_that_stops_keeps_its_last_state() {
+    let mut m = example_1_026(None, ResultsSaved::FinalState);
+    m.load_cases["PUSH"].nl_static.max_total_steps = 3;
+    analyze_model(&mut m).unwrap();
+    let push = &m.case_results["PUSH"];
+    assert!(matches!(push.status, CaseStatus::NotFinished { steps: 0, .. }));
+    assert!(push.static_steps.is_empty());
+    assert!(push.displacement_control_factor.is_some());
+    assert!(!push.hinge_results.is_empty());
+}
+
+/// G16: cases that depend on a case that is not finished could not start (v19 help "Could
+/// Not Start: ... a prerequisite case was not finished"): a case that continues from it, a
+/// modal case on its stiffness, a dependant of a dependant; a combination that contains it
+/// is not evaluated. They have no results and are listed with the reason; the other cases
+/// run.
+#[test]
+fn dependants_of_a_case_that_is_not_finished_could_not_start() {
+    let mut m = example_1_026(None, MULTI_6_10);
+    m.load_cases["PUSH"].nl_static.max_total_steps = 5;
+    m.load_cases
+        .insert("NEXT".into(), nl_case("NEXT", "P", 1.0, Some("PUSH")));
+    let mut modal = LoadCase::modal_eigen("MODAL", 1);
+    modal.initial_case = Some("PUSH".into());
+    m.load_cases.insert("MODAL".into(), modal);
+    m.load_cases
+        .insert("LATER".into(), nl_case("LATER", "P", 1.0, Some("NEXT")));
+    m.load_cases
+        .insert("LIN".into(), LoadCase::linear_static("LIN", "P", 10.0));
+    for (name, contributors) in [
+        ("WITH_PUSH", vec![("PUSH", 1.0), ("LIN", 1.0)]),
+        ("ONLY_LIN", vec![("LIN", 2.0)]),
+        ("NESTED", vec![("WITH_PUSH", 1.0)]),
+    ] {
+        m.load_combos.insert(
+            name.into(),
+            LoadCombo {
+                name: name.into(),
+                combo_type: ComboType::LinearAdd,
+                cases: contributors
+                    .into_iter()
+                    .map(|(c, f)| (c.to_string(), f))
+                    .collect(),
+            },
+        );
+    }
+    analyze_model(&mut m).expect("only unfinished and unavailable results");
+    assert!(!m.case_results["PUSH"].status.is_finished());
+    for name in ["NEXT", "MODAL", "LATER"] {
+        assert!(!m.case_results.contains_key(name), "{name} has no results");
+        let reason = &m.unavailable_results[name];
+        assert!(reason.starts_with("could not start:"), "{reason}");
+        assert_eq!(sap_model::results::case_status_code(&m, name), 2, "{name}");
+    }
+    assert!(m.unavailable_results["NEXT"].contains("'PUSH'"));
+    assert!(m.unavailable_results["MODAL"].contains("'PUSH'"));
+    assert!(m.unavailable_results["LATER"].contains("'NEXT'"));
+    let mut names: Vec<String> = sap_solver::could_not_start_cases(&m)
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    names.sort();
+    assert_eq!(names, ["LATER", "MODAL", "NEXT"]);
+    // A combination that names the case that is not finished, directly or through another
+    // combination, is not evaluated; one that does not is.
+    for name in ["WITH_PUSH", "NESTED"] {
+        assert!(!m.case_results.contains_key(name));
+        assert!(
+            m.unavailable_results[name].contains("'PUSH' is not finished"),
+            "{name}: {}",
+            m.unavailable_results[name]
+        );
+    }
+    close(
+        m.case_results["ONLY_LIN"].joint_displacements["2"][2],
+        20.0 * c_elastic(),
+        1e-9,
+        "combination without the unfinished case",
+    );
+    close(
+        m.case_results["LIN"].joint_displacements["2"][2],
+        10.0 * c_elastic(),
+        1e-9,
+        "linear case",
+    );
+}
+
+/// The v19 OAPI codes of `GetCaseStatus`: 1 not run, 2 could not start, 3 not finished,
+/// 4 finished.
+#[test]
+fn case_status_codes_follow_the_oapi() {
+    let mut m = example_1_026(None, MULTI_6_10);
+    m.load_cases["PUSH"].nl_static.max_total_steps = 5;
+    m.load_cases
+        .insert("NEXT".into(), nl_case("NEXT", "P", 1.0, Some("PUSH")));
+    let mut off = LoadCase::linear_static("OFF", "P", 1.0);
+    off.run_flag = false;
+    m.load_cases.insert("OFF".into(), off);
+    m.load_cases
+        .insert("LIN".into(), LoadCase::linear_static("LIN", "P", 1.0));
+    // Before the analysis nothing was run.
+    for name in ["PUSH", "NEXT", "OFF", "LIN"] {
+        assert_eq!(sap_model::results::case_status_code(&m, name), 1, "{name}");
+    }
+    analyze_model(&mut m).unwrap();
+    let codes: Vec<i32> = ["LIN", "PUSH", "NEXT", "OFF"]
+        .iter()
+        .map(|n| sap_model::results::case_status_code(&m, n))
+        .collect();
+    assert_eq!(codes, [4, 3, 2, 1]);
+    // A re-analysis after the budget is raised finishes the case and the dependant runs.
+    m.load_cases["PUSH"].nl_static.max_total_steps = 200;
+    analyze_model(&mut m).unwrap();
+    assert!(m.unavailable_results.is_empty());
+    assert_eq!(sap_model::results::case_status_code(&m, "PUSH"), 4);
+    // NEXT starts now (it has results, whatever it reaches: load control on a hinge that
+    // has softened can be not finished too).
+    // NEXT starts now (it has results and is no longer "could not start"). It is itself
+    // not finished: load control cannot go on past the limit load of the hinge that
+    // PUSH left on its plateau, so its code is 3 (observed, not a closed form).
+    assert!(m.case_results.contains_key("NEXT"));
+    assert_eq!(sap_model::results::case_status_code(&m, "NEXT"), 3);
+    assert!(m.unavailable_results.is_empty());
 }
 
 #[test]
@@ -2626,7 +2891,15 @@ fn refuses_modal_and_buckling_cases_that_continue_from_a_hinged_case_and_bad_ove
         next.initial_case = Some("PUSH".into());
         m.load_cases.insert("NEXT".into(), next);
         let e = refused(&mut m);
-        assert_unsupported(&e, "tangent stiffness");
+        if case_type == LoadCaseType::Modal {
+            // Wave 6: a Modal case is judged at run time by the hinge state at the
+            // end of PUSH (yielded, on its backbone). Before: refused in validation.
+            assert_unsupported(&e, "yielded and is on its backbone");
+            assert_unsupported(&e, "1H1");
+        } else {
+            // Buckling with a hinged initial case stays refused in validation.
+            assert_unsupported(&e, "tangent stiffness");
+        }
     }
     // A hinge that may not reach point E when the property does not say what follows it.
     let mut prop = HingeProp::symmetric("Open", HingeDof::M3, epp_curve(0.001, 0.002, 0.003));

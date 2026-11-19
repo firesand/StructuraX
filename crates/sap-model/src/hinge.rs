@@ -501,6 +501,74 @@ pub fn generated_name(frame: &str, hinge: usize) -> String {
     format!("{frame}H{hinge}")
 }
 
+/// One generated hinge property: the property the analysis actually uses for
+/// one assigned hinge (v19 Analysis Reference p. 158, "Hinge Properties":
+/// "It is the generated hinge properties that are actually used in the
+/// analysis. They can be viewed, but they can not be modified."). It is
+/// derived from the assignment on demand and stored nowhere; it takes part in
+/// no file format.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GeneratedHingeProp {
+    /// `<frame label>H<n>`, the name the solver gives the hinge in its results.
+    pub name: String,
+    pub frame: String,
+    /// Position in the frame's list of hinges, starting at 1 (the `n` of the name).
+    pub index: usize,
+    /// Name of the assigned user property it was generated from.
+    pub from: String,
+    pub dof: HingeDof,
+    pub behavior: HingeBehavior,
+    /// Relative distance from end I.
+    pub rel_dist: f64,
+}
+
+/// The generated hinge properties of the model, one per assigned hinge, in
+/// the order of the frames and, within a frame, of its hinge list. The name
+/// is `<frame label>H<n>` with `n` counted 1, 2, ... in the order of the
+/// frame's hinge list (v19 Analysis Reference p. 158: numbered "by one for
+/// each consecutive hinge applied", example "F23H2"). Project choice: when
+/// hinges are removed or reassigned the numbers are counted again from 1,
+/// because the names are derived, not stored.
+///
+/// A hinge that refers to an undefined property is skipped here; the analysis
+/// and the OAPI report it.
+pub fn generated_hinge_props(model: &SapModel) -> Vec<GeneratedHingeProp> {
+    let mut out = Vec::new();
+    for frame in model.frames.values() {
+        for (i, h) in frame.hinges.iter().enumerate() {
+            let Some(prop) = model.hinge_props.get(&h.prop) else {
+                continue;
+            };
+            out.push(GeneratedHingeProp {
+                name: generated_name(&frame.name, i + 1),
+                frame: frame.name.clone(),
+                index: i + 1,
+                from: h.prop.clone(),
+                dof: prop.dof,
+                behavior: prop.behavior,
+                rel_dist: h.rel_dist,
+            });
+        }
+    }
+    out
+}
+
+/// The label of a hinge in the view: `<generated name>(<property>)`. The form
+/// is a project choice, not stated by the manual.
+pub fn hinge_label(generated: &GeneratedHingeProp) -> String {
+    format!("{}({})", generated.name, generated.from)
+}
+
+/// True when `name` is the generated name of a hinge assigned in the model,
+/// whether or not its property is defined. A new user property with such a
+/// name is refused (project choice: the property list shows both kinds in one
+/// column, so the names must stay distinct).
+pub fn is_generated_name(model: &SapModel, name: &str) -> bool {
+    model.frames.values().any(|f| {
+        (1..=f.hinges.len()).any(|n| generated_name(&f.name, n) == name)
+    })
+}
+
 /// Converts the dimensional values of hinge properties and of the
 /// acceleration and modal loads of nonlinear static cases when the model
 /// changes units. Curve points and acceptance criteria are table values
@@ -705,5 +773,65 @@ mod tests {
         assert!(p.validate().unwrap_err().contains("scale factors"));
         p.force_sf_negative = 160.0;
         p.validate().unwrap();
+    }
+
+    fn two_frame_model() -> SapModel {
+        let mut m = SapModel::new(Units::KnMC);
+        m.add_point("1", 0.0, 0.0, 0.0);
+        m.add_point("2", 4.0, 0.0, 0.0);
+        m.add_point("3", 8.0, 0.0, 0.0);
+        m.add_frame("F23", "1", "2", "FSEC1");
+        m.add_frame("B", "2", "3", "FSEC1");
+        m.hinge_props.insert("PM".into(), valid());
+        let mut shear = valid();
+        shear.name = "PV".into();
+        shear.dof = HingeDof::V2;
+        m.hinge_props.insert("PV".into(), shear);
+        m
+    }
+
+    #[test]
+    fn generated_properties_are_named_label_h_n_in_hinge_order() {
+        // v19 Analysis Reference p. 158: frame "F23" with two hinges has the
+        // generated properties "F23H1" and "F23H2".
+        let mut m = two_frame_model();
+        let f = m.frames.get_mut("F23").unwrap();
+        f.hinges.push(FrameHinge { prop: "PM".into(), rel_dist: 0.25 });
+        f.hinges.push(FrameHinge { prop: "PV".into(), rel_dist: 0.75 });
+        m.frames.get_mut("B").unwrap().hinges.push(FrameHinge {
+            prop: "PM".into(),
+            rel_dist: 1.0,
+        });
+        let g = generated_hinge_props(&m);
+        let names: Vec<&str> = g.iter().map(|x| x.name.as_str()).collect();
+        assert_eq!(names, ["F23H1", "F23H2", "BH1"]);
+        assert_eq!((g[1].frame.as_str(), g[1].index, g[1].from.as_str()), ("F23", 2, "PV"));
+        assert_eq!((g[1].dof, g[1].rel_dist), (HingeDof::V2, 0.75));
+        assert_eq!(g[0].behavior, HingeBehavior::DeformationControlled);
+        assert_eq!(hinge_label(&g[1]), "F23H2(PV)");
+        // Project choice: removing the first hinge renumbers the rest.
+        m.frames.get_mut("F23").unwrap().hinges.remove(0);
+        let g = generated_hinge_props(&m);
+        assert_eq!(g[0].name, "F23H1");
+        assert_eq!(g[0].from, "PV");
+        assert_eq!(g.len(), 2);
+        // Negative: no hinges, no generated properties; an undefined
+        // property is skipped, not invented.
+        m.frames.get_mut("F23").unwrap().hinges[0].prop = "NOPE".into();
+        assert_eq!(generated_hinge_props(&m).len(), 1);
+        assert!(generated_hinge_props(&SapModel::new(Units::KnMC)).is_empty());
+    }
+
+    #[test]
+    fn generated_names_are_recognised_for_the_clash_check() {
+        let mut m = two_frame_model();
+        m.frames.get_mut("F23").unwrap().hinges.push(FrameHinge {
+            prop: "PM".into(),
+            rel_dist: 0.5,
+        });
+        assert!(is_generated_name(&m, "F23H1"));
+        assert!(!is_generated_name(&m, "F23H2"));
+        assert!(!is_generated_name(&m, "f23h1"));
+        assert!(!is_generated_name(&m, "PM"));
     }
 }

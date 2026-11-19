@@ -435,7 +435,12 @@ pub(crate) fn attach(model: &mut SapModel, reports: &[AutoSeismicReport]) {
                 || case
                     .history_loads
                     .iter()
-                    .any(|(_, p, s)| *p == report.pattern && *s != 0.0);
+                    .enumerate()
+                    .any(|(i, (_, p, s))| {
+                        *p == report.pattern
+                            && *s != 0.0
+                            && case.history_kind(i) != sap_model::HistoryLoadKind::Acceleration
+                    });
             if applies {
                 if let Some(results) = model.case_results.get_mut(name) {
                     results.auto_lateral.push(report.clone());

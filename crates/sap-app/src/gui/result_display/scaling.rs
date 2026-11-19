@@ -134,6 +134,14 @@ pub(in crate::gui) fn view_subtitle(cr: &CaseResults, sel: StepSelection) -> Opt
     None
 }
 
+/// The case as the view title names it: a case that stopped before its target says so (G16).
+pub(in crate::gui) fn case_label(model: &SapModel, case: &str) -> String {
+    match model.case_results.get(case).map(|r| &r.status) {
+        Some(sap_model::CaseStatus::NotFinished { .. }) => format!("{case} (not finished)"),
+        _ => case.to_string(),
+    }
+}
+
 /// The title of a viewport: its name, the case, and what of the case is shown.
 pub(in crate::gui) fn view_title(name: &str, case: &str, subtitle: Option<String>) -> String {
     match subtitle {

@@ -815,7 +815,7 @@ fn proportional_modal_history_damping_keeps_its_native_damping_type() {
     let mut history = LoadCase::linear_static("MHIST", "DEAD", 1.);
     history.loads.clear();
     history.case_type = LoadCaseType::LinearHistory;
-    history.history_loads = vec![("RAMP".into(), "DEAD".into(), 1.)];
+    history.push_history_load("RAMP", "DEAD", HistoryLoadKind::Pattern, 1.);
     history.modal_damping = 0.;
     history.rayleigh_damping = (0.0741, 0.0002);
     m.load_cases.insert("MHIST".into(), history);

@@ -77,8 +77,9 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             let mut patterns: Vec<String> = case
                 .history_loads
                 .iter()
-                .filter(|(_, _, sf)| *sf != 0.)
-                .map(|(_, p, _)| p.clone())
+                .enumerate()
+                .filter(|(i, (_, _, sf))| *sf != 0. && case.history_entry_is_pattern(model, *i))
+                .map(|(_, (_, p, _))| p.clone())
                 .collect();
             if let Some(initial) = case
                 .initial_case
@@ -86,7 +87,7 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
                 .and_then(|n| model.load_cases.get(n))
             {
                 patterns.extend(
-                    super::accumulated_nonlinear_static_loads(model, initial)
+                    super::accumulated_nonlinear_static_loads(model, initial)?
                         .into_iter()
                         .filter(|(_, sf)| *sf != 0.)
                         .map(|(p, _)| p),
@@ -138,7 +139,7 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             }) {
                 return Err(unsupported("cable-only analysis does not support joint springs, multipoint constraints or rotated joint axes".into()));
             }
-            let loads = super::accumulated_nonlinear_static_loads(model, case);
+            let loads = super::accumulated_nonlinear_static_loads(model, case)?;
             let active = |p: &str| loads.iter().any(|(name, sf)| name == p && *sf != 0.);
             for p in model.points.values() {
                 if p.loads_force

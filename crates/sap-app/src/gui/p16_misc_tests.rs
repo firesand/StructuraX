@@ -135,7 +135,7 @@ fn the_pushover_plot_has_readable_ticks_and_every_label_inside_the_plot() {
     let out = ctx.run(
         egui::RawInput { screen_rect: Some(screen), ..Default::default() },
         |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| pushover::draw_plot(ui, &xy));
+            egui::CentralPanel::default().show(ctx, |ui| pushover::draw_plot_untitled(ui, &xy));
         },
     );
     let all = texts(&out);

@@ -158,3 +158,47 @@ fn axisymmetric_and_incompatible_plane_sections_are_refused() {
     let forces = &m.case_results["LIN"].area_results["P"];
     assert!((forces.f11 - 0.5).abs() < 1e-6, "{}", forces.f11);
 }
+
+#[test]
+fn a_modal_case_after_a_nonlinear_case_without_p_delta_runs_on_an_area_model() {
+    // Sixth wave, D70: a Modal case on the stiffness at the end of a nonlinear
+    // static case takes a geometric stiffness only if that case considered
+    // geometric nonlinearity (v19 Analysis Reference p. 411). Without it the
+    // stiffness is the elastic one, so an area model no longer needs the
+    // geometric stiffness it does not have, and the period is the closed form
+    // of `area_added_mass_gives_the_closed_form_rigid_translation_period`:
+    // T = 2 pi sqrt(mu A / (4 k)), the same as a Modal case from zero.
+    let (spring, mu, area): (f64, f64, f64) = (50.0, 2.0e-4, 30.0 * 20.0);
+    let expected = 2.0 * std::f64::consts::PI * (mu * area / (4.0 * spring)).sqrt();
+    let build = |nl_geom: NLGeomType| {
+        let mut m = plate_on_springs(spring, mu);
+        m.points["A"].loads_force.push(PointLoadForce {
+            load_pat: "DEAD".into(),
+            csys: "GLOBAL".into(),
+            force: [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+        });
+        let mut pre = LoadCase::linear_static("PRE", "DEAD", 1.0);
+        pre.case_type = LoadCaseType::NonlinearStatic;
+        pre.nl_geom = nl_geom;
+        m.load_cases.insert("PRE".into(), pre);
+        m.load_cases["MODAL"].initial_case = Some("PRE".into());
+        m
+    };
+    let mut m = build(NLGeomType::None);
+    analyze_model(&mut m).unwrap();
+    let period = m.case_results["MODAL"].modes[0].period_sec;
+    assert!((period - expected).abs() < 1e-10 * expected, "{period} vs {expected}");
+    // The nonlinear case itself ran: four springs of 50 carry the unit load.
+    let down: f64 = ["A", "B", "C", "D"]
+        .iter()
+        .map(|j| spring * m.case_results["PRE"].joint_displacements[*j][2])
+        .sum();
+    assert!((down + 1.0).abs() < 1e-9, "spring forces sum to the load: {down}");
+
+    // With P-Delta in the nonlinear case the Modal case would need the
+    // geometric stiffness of the shell, which does not exist: still refused.
+    let mut m = build(NLGeomType::PDelta);
+    let e = format!("{:?}", analyze_model(&mut m).unwrap_err());
+    assert!(e.contains("area or solid"), "{e}");
+    assert!(m.case_results.is_empty());
+}

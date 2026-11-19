@@ -18,7 +18,7 @@ pub use definitions::{
     validate_case_definition, DefinitionError,
 };
 pub use hinges::{
-    get_hinge_assigns, get_hinge_unloading, pushover_curve, set_hinge_unloading, HingeAssigns,
+    get_hinge_assigns, get_hinge_unloading, pushover_curve, pushover_not_finished, set_hinge_unloading, HingeAssigns,
     PushoverPoint,
 };
 pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
@@ -173,13 +173,21 @@ impl cSapModel {
         OAPI_OK
     }
 
+    /// The first selected output case or combination that has no results after the last
+    /// analysis (D78; G16: a case that could not start), with its reason. A getter that can
+    /// return an error code returns it instead of silently leaving the name out of the rows.
+    fn selected_output_unavailable(&self) -> Option<(String, String)> {
+        self.selected_cases.iter().chain(self.selected_combos.iter()).find_map(|n| {
+            sap_model::results::unavailable_reason(&self.inner, n)
+                .map(|r| (n.clone(), r.to_string()))
+        })
+    }
+
     fn prepare_edit(&mut self) -> bool {
         if self.inner.is_locked {
             return false;
         }
-        self.inner.case_results.clear();
-        self.inner.steel_design_results.clear();
-        self.inner.concrete_design_results.clear();
+        self.inner.invalidate_results();
         true
     }
 
@@ -201,9 +209,12 @@ impl cSapModel {
 
     pub fn set_model_is_locked(&mut self, locked: bool) -> i32 {
         if !locked {
-            self.inner.case_results.clear();
-            self.inner.steel_design_results.clear();
-            self.inner.concrete_design_results.clear();
+            // D78: results and the reasons why some have none go together; locking again
+            // without running must not bring an old reason back.
+            self.inner.invalidate_results();
+        } else if !self.inner.is_locked {
+            // A lock that follows no analysis holds no results, hence no reasons either.
+            self.inner.unavailable_results.clear();
         }
         self.inner.is_locked = locked;
         OAPI_OK
@@ -2309,6 +2320,45 @@ impl cAnalyze<'_> {
         }
     }
 
+    /// The cases and combinations that have no results after the last analysis, with the
+    /// reason each (D78). Empty before an analysis and when every result exists.
+    pub fn unavailable_results(&self) -> Vec<(String, String)> {
+        if !self.api.inner.is_locked {
+            return Vec::new();
+        }
+        self.api
+            .inner
+            .unavailable_results
+            .iter()
+            .map(|(n, r)| (n.clone(), r.clone()))
+            .collect()
+    }
+
+    /// `Analyze.GetCaseStatus`: the status of every load case, v19 codes 1 not run, 2 could
+    /// not start, 3 not finished, 4 finished (G16). Every case is 1 before an analysis.
+    pub fn get_case_status(&self) -> Vec<(String, i32)> {
+        let model = &self.api.inner;
+        model
+            .load_cases
+            .keys()
+            .map(|name| (name.clone(), sap_model::results::case_status_code(model, name)))
+            .collect()
+    }
+
+    /// Why a case is not finished or could not start (project addition: the v19 call has
+    /// no reason); `None` for a case with another status.
+    pub fn case_status_reason(&self, name: &str) -> Option<String> {
+        let model = &self.api.inner;
+        match sap_model::results::case_status_code(model, name) {
+            3 => match &model.case_results.get(name)?.status {
+                sap_model::CaseStatus::NotFinished { reason, .. } => Some(reason.clone()),
+                sap_model::CaseStatus::Finished => None,
+            },
+            2 => model.unavailable_results.get(name).cloned(),
+            _ => None,
+        }
+    }
+
     pub fn set_run_case_flag(&mut self, name: &str, run: bool, all: bool) -> i32 {
         if self.api.inner.is_locked {
             return OAPI_ERR;
@@ -2358,7 +2408,32 @@ impl cAnalysisResults<'_> {
         OAPI_OK
     }
 
+    /// The selected cases and combinations that have no results after the last analysis,
+    /// each with its reason (D78). Empty when every selected name has results, and before
+    /// an analysis. While this is not empty, every getter below returns the error code or
+    /// no rows, and the database result tables return the error code: none returns the
+    /// rows of the other selected names only, as if the selection had been complete.
+    pub fn selected_unavailable(&self) -> Vec<(String, String)> {
+        self.api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+            .filter_map(|n| {
+                sap_model::results::unavailable_reason(&self.api.inner, n)
+                    .map(|r| (n.clone(), r.to_string()))
+            })
+            .collect()
+    }
+
     pub fn setup_set_case_selected_for_output(&mut self, name: &str, selected: bool) -> i32 {
+        if selected {
+            // G16: a case that could not start has no results; refuse it by name (the
+            // reason is in `unavailable_results`), as for a combination. A refused call
+            // leaves the selection as it was (D78).
+            if sap_model::results::unavailable_reason(&self.api.inner, name).is_some() {
+                return OAPI_ERR;
+            }
+        }
         self.api.selected_cases.retain(|c| c != name);
         if selected {
             self.api.selected_cases.push(name.to_string());
@@ -2367,6 +2442,14 @@ impl cAnalysisResults<'_> {
     }
 
     pub fn setup_set_combo_selected_for_output(&mut self, name: &str, selected: bool) -> i32 {
+        if selected {
+            // D78: an unavailable combination has no results; refuse it by name
+            // (the reason is in `unavailable_results`). A refused call leaves the
+            // selection as it was.
+            if sap_model::results::unavailable_reason(&self.api.inner, name).is_some() {
+                return OAPI_ERR;
+            }
+        }
         self.api.selected_combos.retain(|c| c != name);
         if selected {
             self.api.selected_combos.push(name.to_string());
@@ -2396,6 +2479,11 @@ impl cAnalysisResults<'_> {
         mut pick: impl FnMut(&CaseResults) -> Option<T>,
     ) -> Vec<(String, &'static str, T)> {
         let mut out = Vec::new();
+        // D78: a getter that returns rows only cannot carry an error; it returns none
+        // while the selection holds an unavailable name (see `selected_unavailable`).
+        if self.api.selected_output_unavailable().is_some() {
+            return out;
+        }
         for cname in self
             .api
             .selected_cases
@@ -2462,6 +2550,9 @@ impl cAnalysisResults<'_> {
     /// Queries modal periods and frequencies across selected modal cases (`cAnalysisResults.ModalPeriod`).
     pub fn modal_period(&self) -> Vec<(String, Vec<ModalModeResult>)> {
         let mut out = Vec::new();
+        if self.api.selected_output_unavailable().is_some() {
+            return out;
+        }
         for cname in &self.api.selected_cases {
             if let Some(cr) = self.api.inner.case_results.get(cname) {
                 if !cr.modes.is_empty() {
@@ -2497,7 +2588,10 @@ impl cAnalysisResults<'_> {
         &self,
         name: &str,
     ) -> (i32, Vec<(String, &'static str, sap_model::AreaResult)>) {
-        if self.api.inner.case_results.is_empty() || !self.api.inner.areas.contains_key(name) {
+        if self.api.inner.case_results.is_empty()
+            || !self.api.inner.areas.contains_key(name)
+            || self.api.selected_output_unavailable().is_some()
+        {
             return (OAPI_ERR, Vec::new());
         }
         (OAPI_OK, self.selected_rows(|cr| cr.area_results.get(name).cloned()))
@@ -2511,7 +2605,10 @@ impl cAnalysisResults<'_> {
 
     /// `LinkForce` with the Step Type of each row.
     pub fn link_force_step_type(&self, name: &str) -> (i32, Vec<(String, &'static str, [f64; 6])>) {
-        if self.api.inner.case_results.is_empty() || !self.api.inner.links.contains_key(name) {
+        if self.api.inner.case_results.is_empty()
+            || !self.api.inner.links.contains_key(name)
+            || self.api.selected_output_unavailable().is_some()
+        {
             return (OAPI_ERR, Vec::new());
         }
         (OAPI_OK, self.selected_rows(|cr| cr.link_forces.get(name).copied()))
@@ -2519,7 +2616,7 @@ impl cAnalysisResults<'_> {
 
     /// Queries buckling eigenvalues `(case_name, mode_num, factor)` across selected buckling cases (`cAnalysisResults.BucklingFactor`).
     pub fn buckling_factor(&self) -> (i32, Vec<(String, usize, f64)>) {
-        if self.api.inner.case_results.is_empty() {
+        if self.api.inner.case_results.is_empty() || self.api.selected_output_unavailable().is_some() {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2547,7 +2644,7 @@ impl cAnalysisResults<'_> {
 
     /// `BaseReact` with the Step Type of each row.
     pub fn base_react_step_type(&self) -> (i32, Vec<(String, &'static str, [f64; 6])>) {
-        if self.api.inner.case_results.is_empty() {
+        if self.api.inner.case_results.is_empty() || self.api.selected_output_unavailable().is_some() {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2573,7 +2670,7 @@ impl cAnalysisResults<'_> {
 
     /// Queries modal participating mass ratios across selected modal cases (`cAnalysisResults.ModalParticipatingMassRatios`).
     pub fn modal_participating_mass_ratios(&self) -> (i32, Vec<(String, ModalModeResult)>) {
-        if self.api.inner.case_results.is_empty() {
+        if self.api.inner.case_results.is_empty() || self.api.selected_output_unavailable().is_some() {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2592,7 +2689,10 @@ impl cAnalysisResults<'_> {
         &self,
         name: &str,
     ) -> (i32, Vec<(String, Vec<f64>, Vec<[f64; 6]>)>) {
-        if self.api.inner.case_results.is_empty() || !self.api.inner.points.contains_key(name) {
+        if self.api.inner.case_results.is_empty()
+            || !self.api.inner.points.contains_key(name)
+            || self.api.selected_output_unavailable().is_some()
+        {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();

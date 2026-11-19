@@ -53,18 +53,21 @@
 //! frequencies.
 
 use crate::{
-    assemble_static_pattern_rhs, link, recover_results_from_displacement_vector, SolverError,
+    assemble_static_pattern_rhs, link, recover_results_with_member_loads, SolverError,
 };
 use indexmap::IndexMap;
 use sap_model::{AreaObj, CaseResults, LoadCase, LoadCaseType, PointObj, SapModel};
 
-/// True for the history load names that mean a global ground acceleration.
-fn acceleration_direction(name: &str) -> Option<usize> {
-    match name.trim().to_ascii_uppercase().as_str() {
-        "U1" | "UX" | "X" => Some(0),
-        "U2" | "UY" | "Y" => Some(1),
-        "U3" | "UZ" | "Z" => Some(2),
-        _ => None,
+/// The ground-acceleration direction of history entry `i`, decided by the
+/// stored kind (D77), or `None` for a load pattern.
+fn acceleration_direction(
+    model: &SapModel,
+    lc: &LoadCase,
+    i: usize,
+) -> Result<Option<usize>, SolverError> {
+    match sap_model::resolve_history_load(model, lc, i).map_err(SolverError::InvalidInput)? {
+        sap_model::ResolvedHistoryLoad::Acceleration(dir) => Ok(Some(dir)),
+        sap_model::ResolvedHistoryLoad::Pattern => Ok(None),
     }
 }
 
@@ -270,7 +273,7 @@ pub fn ground_acceleration_trace(
         )));
     }
     let mut entries: Vec<(usize, f64, &[(f64, f64)])> = Vec::new();
-    for (function, target, sf) in &lc.history_loads {
+    for (entry, (function, _, sf)) in lc.history_loads.iter().enumerate() {
         let points = model
             .functions
             .get(function)
@@ -280,7 +283,7 @@ pub fn ground_acceleration_trace(
                     "case '{case}' references missing function '{function}'"
                 ))
             })?;
-        if let Some(dir) = acceleration_direction(target) {
+        if let Some(dir) = acceleration_direction(model, lc, entry)? {
             entries.push((dir, *sf, points));
         }
     }
@@ -295,6 +298,31 @@ pub fn ground_acceleration_trace(
             a
         })
         .collect())
+}
+
+/// Span loads `(pattern, scale)` that a history case applies at time `t`
+/// (D75): every entry that is not a ground acceleration contributes its
+/// pattern with the entry's scale factor times the value of its function. The
+/// result feeds the fixed-end forces and the span-load part of the section
+/// forces, like the loads of a static case.
+pub(crate) fn history_member_loads(
+    model: &SapModel,
+    lc: &LoadCase,
+    t: f64,
+    tol: f64,
+) -> Result<Vec<(String, f64)>, SolverError> {
+    let mut loads = Vec::new();
+    for (i, (function, target, sf)) in lc.history_loads.iter().enumerate() {
+        // The stored kind decides (D77): a pattern named like a direction is
+        // a pattern and carries its span loads.
+        if acceleration_direction(model, lc, i)?.is_some() {
+            continue;
+        }
+        if let Some(f) = model.functions.get(function) {
+            loads.push((target.clone(), sf * function_value(&f.points, t, tol)));
+        }
+    }
+    Ok(loads)
 }
 
 /// Time function value, zero before the first point and constant after the
@@ -446,8 +474,8 @@ pub(crate) fn run_case(
 
     // Spatial vectors, as run_time_history_case builds them.
     let mut spatial: Vec<Vec<f64>> = Vec::with_capacity(lc.history_loads.len());
-    for (_, pat_or_acc, sf) in &lc.history_loads {
-        let vector = if let Some(dir) = acceleration_direction(pat_or_acc) {
+    for (entry, (_, pat_or_acc, sf)) in lc.history_loads.iter().enumerate() {
+        let vector = if let Some(dir) = acceleration_direction(model, lc, entry)? {
             let mut f = vec![0.0f64; ndof];
             for idx in 0..work_points.len() {
                 for d in 0..3 {
@@ -593,7 +621,9 @@ pub(crate) fn run_case(
         }
     }
 
-    let mut res = recover_results_from_displacement_vector(
+    // Span loads in force at the step of the peak (D75).
+    let member_loads = history_member_loads(model, lc, t_peak, tol)?;
+    let (mut res, mut generated_reactions) = recover_results_with_member_loads(
         model,
         work_points,
         work_areas,
@@ -603,6 +633,7 @@ pub(crate) fn run_case(
         k_struct,
         &u_peak,
         ndof,
+        &member_loads,
     );
 
     // Reaction at a restrained degree of freedom: elastic force through the
@@ -618,7 +649,13 @@ pub(crate) fn run_case(
             applied_peak[i] += value * vector[i];
         }
     }
-    for (name, reaction) in &mut res.joint_reactions {
+    // Generated joints (D76) add their inertia and applied-load terms to the
+    // base reaction too; their elastic part is already in it.
+    for (name, reaction) in res
+        .joint_reactions
+        .iter_mut()
+        .chain(generated_reactions.iter_mut())
+    {
         let idx = pt_index[name];
         let point = &work_points[name];
         let mut delta = [0.0; 6];

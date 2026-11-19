@@ -652,6 +652,17 @@ impl<'a> cDatabaseTables<'a> {
             }
         }
 
+        // D78: a results table of a selection that holds an unavailable case or
+        // combination is not returned with the rows of the other selected names only.
+        if matches!(
+            t.key,
+            "JOINT DISPLACEMENTS" | "JOINT REACTIONS" | "BASE REACTIONS" | "ELEMENT FORCES - FRAMES"
+        ) && self.api.selected_output_unavailable().is_some()
+        {
+            fields_keys_included.clear();
+            return OAPI_ERR;
+        }
+
         if !matches_all {
             *number_records = 0;
             return OAPI_OK;
@@ -884,6 +895,17 @@ impl<'a> cDatabaseTables<'a> {
             let res = apply_single_table(&mut model_clone, staged, fill_import_log, import_log);
             if res != OAPI_OK {
                 *num_fatal_errors += 1;
+            }
+        }
+
+        // D79: an edit that makes one name both a load case and a load combination is
+        // refused as a whole; the model keeps its previous definitions.
+        if *num_fatal_errors == 0 {
+            if let Some(message) = sap_model::results::case_combo_collision_message(&model_clone) {
+                *num_fatal_errors += 1;
+                if fill_import_log {
+                    import_log.push_str(&format!("FATAL ERROR: {message}\n"));
+                }
             }
         }
 

@@ -942,6 +942,68 @@ pub(crate) type FrameStates = Vec<Vec<FrameStationResult>>;
 /// `(combo_or_case_name, [(frame_name, states)])`.
 pub(crate) type ComboForces = Vec<(String, Vec<(String, FrameStates)>)>;
 
+/// Refuses a design run when a combination of the model has no complete results (D78): a
+/// combination whose contributor has no results is neither designed from the contributors
+/// that exist nor skipped, because the envelope of the remaining combinations would then
+/// claim a check that was not made. Names the combination and the reason (its case).
+pub(crate) fn refuse_unavailable_combos(
+    model: &SapModel,
+    discipline: &'static str,
+) -> Result<(), crate::DesignError> {
+    // D79: a name that is both a case and a combination would let the result of the case
+    // pass for that of the combination (the check below skips a combination that has a
+    // stored result), so design refuses it by name before it looks at any result.
+    if let Some(name) = sap_model::results::case_combo_name_collisions(model).first() {
+        return Err(crate::DesignError::UnavailableCombination {
+            discipline,
+            combo: name.clone(),
+            reason: sap_model::results::case_combo_collision_message(model).unwrap_or_default(),
+        });
+    }
+    if model.case_results.is_empty() && model.unavailable_results.is_empty() {
+        return Ok(());
+    }
+    // G16: design never uses the states of a case that is not finished as if they were its
+    // response, and never skips a case that could not start. Without design combinations
+    // design takes every case with frame forces (below), so those are refused by name;
+    // with combinations, a contributor that is not finished makes the combination
+    // unavailable (`combo_gap`) and is refused through it.
+    if model.load_combos.is_empty() {
+        for (name, case) in &model.case_results {
+            if let sap_model::CaseStatus::NotFinished { reason, .. } = &case.status {
+                return Err(crate::DesignError::UnfinishedCase {
+                    discipline,
+                    case: name.clone(),
+                    reason: reason.clone(),
+                });
+            }
+        }
+        if let Some((name, reason)) = sap_model::results::could_not_start_cases(model).first() {
+            return Err(crate::DesignError::UnfinishedCase {
+                discipline,
+                case: name.clone(),
+                reason: reason.clone(),
+            });
+        }
+    }
+    for (name, combo) in &model.load_combos {
+        if model.case_results.contains_key(name) {
+            continue;
+        }
+        let reason = sap_model::results::unavailable_reason(model, name)
+            .map(str::to_string)
+            .or_else(|| sap_model::results::combo_gap(model, combo));
+        if let Some(reason) = reason {
+            return Err(crate::DesignError::UnavailableCombination {
+                discipline,
+                combo: name.clone(),
+                reason,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Resolves all design load combinations (or analysis cases if no combos are defined) into
 /// the states of every frame. The rows of a multi-valued combination are NOT stations of
 /// one member: its maximum row and its minimum row are two states (CSI Analysis Reference
@@ -1010,6 +1072,11 @@ pub(crate) fn collect_design_combo_forces(model: &SapModel) -> ComboForces {
     // If no combo forces were found, fall back to all case_results that have frame_forces
     if out.is_empty() {
         for (case_name, cr) in &model.case_results {
+            // G16: the states of a case that is not finished are never designed (a design
+            // run with no combinations refuses such a case by name before it gets here).
+            if !cr.status.is_finished() {
+                continue;
+            }
             if !cr.frame_forces.is_empty() {
                 // A response-spectrum, moving-load, steady-state or PSD case is a pair
                 // (+v, -v) (p. 351): both senses are two states.
@@ -1365,6 +1432,7 @@ pub fn try_run_steel_design_with_overwrites(
 ) -> Result<(), DesignError> {
     model.steel_design_results.clear();
     let code = SteelCode::try_from_code_str(&model.steel_design_code)?;
+    refuse_unavailable_combos(model, "steel")?;
     let combo_forces = collect_design_combo_forces(model);
     validate_demands(model, &combo_forces, "steel", true, |model, frame_name| {
         let Some(frame) = model.frames.get(frame_name) else {

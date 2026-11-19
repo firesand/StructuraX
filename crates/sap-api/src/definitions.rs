@@ -273,21 +273,43 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             // A spectrum case names its modal source here.
             LoadCaseType::ResponseSpectrum => {}
             LoadCaseType::NonlinearStatic => validate_static_initial_case(model, case, initial)?,
+            // "Stiffness at End of Nonlinear Case" (v19 help, "Stiffness to
+            // Use"): a Modal or linear static case names the nonlinear static
+            // case whose end stiffness it uses. Whether the model's hinges
+            // allow it is decided when the case runs (sixth wave, G48).
+            LoadCaseType::Modal | LoadCaseType::LinearStatic => {
+                let source = model
+                    .load_cases
+                    .get(initial)
+                    .filter(|c| c.name != case.name)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "initial case '{initial}' is not an existing, different case"
+                        ))
+                    })?;
+                if source.case_type != LoadCaseType::NonlinearStatic {
+                    return Err(invalid(format!(
+                        "initial case '{initial}' is not a nonlinear static case; a modal or linear static case can use the stiffness at the end of a nonlinear static case only"
+                    )));
+                }
+            }
             _ => {
                 return Err(invalid(
-                    "initial-state cases are supported only by nonlinear static cases (and as the modal source of a response-spectrum case)",
+                    "initial-state cases are supported only by nonlinear static cases, by modal and linear static cases that use the stiffness at the end of a nonlinear static case, and as the modal source of a response-spectrum case",
                 ));
             }
         }
     }
     if case.case_type != LoadCaseType::NonlinearStatic
         && model.load_cases.values().any(|c| {
-            c.case_type == LoadCaseType::NonlinearStatic
-                && c.initial_case.as_ref() == Some(&case.name)
+            matches!(
+                c.case_type,
+                LoadCaseType::NonlinearStatic | LoadCaseType::Modal | LoadCaseType::LinearStatic
+            ) && c.initial_case.as_ref() == Some(&case.name)
         })
     {
         return Err(invalid(
-            "case is the initial case of a nonlinear static case and must stay a nonlinear static case",
+            "case is the initial case of another case and must stay a nonlinear static case",
         ));
     }
     if case.case_type != LoadCaseType::NonlinearStatic && !case.nl_static.is_default() {
@@ -350,14 +372,17 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             .monitored
             .as_ref()
             .is_some_and(|(point, dof)| model.points.contains_key(point) && *dof < 6);
+        // P-Delta with displacement control is analyzed for models with
+        // frame hinges and for Accel or Mode loads (sixth wave, G14); the
+        // solver refuses the other combinations by name when the case runs.
         if case.case_type != LoadCaseType::NonlinearStatic
-            || case.nl_geom != NLGeomType::None
+            || case.nl_geom == NLGeomType::LargeDisplacements
             || !control.target.is_finite()
             || control.target <= 0.0
             || !monitored_ok
         {
             return Err(invalid(
-                "displacement control needs a small-displacement nonlinear static case, a positive finite target and an existing monitored joint displacement",
+                "displacement control needs a nonlinear static case with small displacements or P-Delta, a positive finite target and an existing monitored joint displacement",
             ));
         }
     }
@@ -585,7 +610,7 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                 }
                 _ => {}
             }
-            for (f, target, sf) in &case.history_loads {
+            for (entry, (f, target, sf)) in case.history_loads.iter().enumerate() {
                 let function = model
                     .functions
                     .get(f)
@@ -596,40 +621,19 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                         "history requires time-history functions and finite scales",
                     ));
                 }
-                if target == target.trim()
-                    && matches!(
-                        target.to_ascii_uppercase().as_str(),
-                        "U1" | "U2" | "U3" | "UX" | "UY" | "UZ" | "X" | "Y" | "Z"
-                    )
+                // D77: the stored kind decides; an entry that does not say is
+                // refused when its name could be a pattern or an acceleration.
+                if sap_model::resolve_history_load(model, case, entry).map_err(invalid)?
+                    != sap_model::ResolvedHistoryLoad::Pattern
                 {
                     continue;
                 }
-                let pattern = model
-                    .load_patterns
-                    .get(target)
-                    .ok_or_else(|| invalid(format!("missing history pattern '{target}'")))?;
-                if pattern.self_wt_multiplier != 0.0
-                    || model.frames.values().any(|f| {
-                        f.loads_dist.iter().any(|l| &l.load_pat == target)
-                            || f.loads_point.iter().any(|l| &l.load_pat == target)
-                            || f.loads_temp.iter().any(|l| &l.load_pat == target)
-                            || f.loads_gravity.contains_key(target)
-                    })
-                    || model.areas.values().any(|a| {
-                        a.loads_uniform.iter().any(|l| &l.load_pat == target)
-                            || a.loads_pressure.iter().any(|l| &l.load_pat == target)
-                            || a.loads_temp.iter().any(|l| &l.load_pat == target)
-                    })
-                    || model.solids.values().any(|s| {
-                        s.loads_surface.iter().any(|l| &l.load_pat == target)
-                            || s.loads_temp.contains_key(target)
-                    })
-                    || model
-                        .points
-                        .values()
-                        .any(|p| p.loads_displ.iter().any(|l| &l.load_pat == target))
-                {
-                    return Err(invalid("history patterns currently support joint forces only, without self-weight, element loads or support motion"));
+                if !model.load_patterns.contains_key(target) {
+                    return Err(invalid(format!("missing history pattern '{target}'")));
+                }
+                // D82: the solver's own rule, not a second list.
+                if let Some(reason) = sap_solver::history_pattern_refusal(model, target) {
+                    return Err(invalid(reason));
                 }
             }
         }

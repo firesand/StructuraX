@@ -9,7 +9,14 @@ use sap_model::{
 use crate::solid::solid_stress_from_components;
 
 /// Evaluates all `LoadCombo`s in `model.load_combos` in topological order and stores
-/// combined `CaseResults` in `model.case_results` (safely skipping cyclic or empty combos).
+/// combined `CaseResults` in `model.case_results`.
+///
+/// A combination is evaluated only when every contributor has results (D78). If one
+/// has none (a case with `RunCase=No`, a name that is no case or combination, a
+/// combination that is itself unavailable or circular, no contributor at all), the
+/// combination gets no result under any name and is listed with the reason in
+/// `model.unavailable_results`; the contributors that exist are never combined
+/// without it, and a zero scale factor does not excuse a missing contributor.
 pub(crate) fn evaluate_load_combos(model: &mut SapModel) {
     let n_combos = model.load_combos.len();
     if n_combos == 0 {
@@ -57,9 +64,17 @@ pub(crate) fn evaluate_load_combos(model: &mut SapModel) {
         }
     }
 
+    let evaluated: std::collections::BTreeSet<usize> = topo_order.iter().copied().collect();
     for combo_idx in topo_order {
         let combo = model.load_combos[combo_idx].clone();
+        if let Some(reason) = sap_model::results::combo_gap(model, &combo) {
+            model.unavailable_results.insert(combo.name.clone(), reason);
+            continue;
+        }
         let Some(mut maximum) = combine_pass(model, &combo, Sense::Max) else {
+            model
+                .unavailable_results
+                .insert(combo.name.clone(), "it has no contributing results".to_string());
             continue;
         };
         if is_single_valued(model, &combo.name) {
@@ -79,6 +94,14 @@ pub(crate) fn evaluate_load_combos(model: &mut SapModel) {
         minimum.case_name = combo.name.clone();
         maximum.combo_min = Some(Box::new(minimum));
         model.case_results.insert(combo.name.clone(), maximum);
+    }
+    // Circular combinations, and those that depend on one, were not ordered.
+    for (idx, combo) in model.load_combos.clone().values().enumerate() {
+        if !evaluated.contains(&idx) {
+            let reason = sap_model::results::combo_gap(model, combo)
+                .unwrap_or_else(|| "its contributors form a circular dependency".to_string());
+            model.unavailable_results.insert(combo.name.clone(), reason);
+        }
     }
 }
 
@@ -595,18 +618,23 @@ mod tests {
         assert_eq!(cr.joint_displacements["J"][0].to_bits(), acc.to_bits());
     }
 
-    /// Contributors without results are skipped and the first contributing case
-    /// starts the envelope; a combination with none is not stored.
+    /// D78 (replaces the old `missing_contributors_are_skipped`, which expected the
+    /// envelope of the contributors that exist, -2.0): a combination with a contributor
+    /// that has no results is unavailable, with the reason, under any name.
     #[test]
-    fn missing_contributors_are_skipped() {
+    fn missing_contributors_make_the_combination_unavailable() {
         let mut m = model(&[("A", STATIC, -1.0, 0.0)]);
         combo(&mut m, "E", ComboType::Envelope, &[("MISSING", 1.0), ("A", 2.0)]);
         combo(&mut m, "NONE", ComboType::Envelope, &[("MISSING", 1.0)]);
+        combo(&mut m, "OK", ComboType::Envelope, &[("A", 2.0)]);
         evaluate_load_combos(&mut m);
-        let ((mx, mn), _) = pair(&m, "E");
+        assert!(!m.case_results.contains_key("E"));
+        assert!(!m.case_results.contains_key("NONE"));
+        assert!(m.unavailable_results["E"].contains("'MISSING'"));
+        assert!(m.unavailable_results["NONE"].contains("'MISSING'"));
+        let ((mx, mn), _) = pair(&m, "OK");
         near(mx, -2.0);
         near(mn, -2.0);
-        assert!(!m.case_results.contains_key("NONE"));
     }
 
     /// Derived fields of a multi-valued result are not combined: 0 in both rows.

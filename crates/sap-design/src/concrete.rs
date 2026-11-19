@@ -547,6 +547,7 @@ pub fn run_concrete_design(model: &mut SapModel) {
 pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> {
     model.concrete_design_results.clear();
     let code = ConcreteCode::try_from_code_str(&model.concrete_design_code)?;
+    crate::steel::refuse_unavailable_combos(model, "concrete")?;
     let combo_forces = collect_design_combo_forces(model);
     validate_demands(
         model,

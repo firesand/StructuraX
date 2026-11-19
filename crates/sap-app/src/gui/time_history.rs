@@ -147,8 +147,8 @@ fn results_stamp(model: &SapModel) -> u64 {
         }
         name.hash(&mut h);
         bits(case.time_step_dt).hash(&mut h);
-        for (f, t, sf) in &case.history_loads {
-            (f, t, bits(*sf)).hash(&mut h);
+        for (i, (f, t, sf)) in case.history_loads.iter().enumerate() {
+            (f, t, bits(*sf), case.history_kind(i) as u8).hash(&mut h);
         }
     }
     for (name, f) in &model.functions {
@@ -486,15 +486,6 @@ struct PlotWindow {
     message: Option<Result<String, String>>,
 }
 
-/// Load-history targets that mean a ground acceleration (the spellings of
-/// `sap_solver`'s modal history).
-fn is_acceleration_target(target: &str) -> bool {
-    matches!(
-        target.trim().to_ascii_uppercase().as_str(),
-        "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
-    )
-}
-
 /// `(time, value)` of a plot function in model units.
 fn function_series(model: &SapModel, f: &PlotFunction) -> Result<Vec<(f64, f64)>, String> {
     match &f.source {
@@ -572,10 +563,13 @@ fn function_units(
                 .load_cases
                 .get(&f.case)
                 .ok_or_else(|| format!("Case '{}' does not exist.", f.case))?;
-            let (_, target, _) = case.history_loads.get(*entry).ok_or_else(|| {
-                format!("Case '{}' has no load entry {}.", f.case, entry + 1)
-            })?;
-            if is_acceleration_target(target) {
+            if *entry >= case.history_loads.len() {
+                return Err(format!("Case '{}' has no load entry {}.", f.case, entry + 1));
+            }
+            // D77: the stored load kind decides, not the name.
+            if let sap_model::ResolvedHistoryLoad::Acceleration(_) =
+                sap_model::resolve_history_load(model, case, *entry)?
+            {
                 dim(Dimension::Acceleration)
             } else {
                 (1.0, String::new())

@@ -26,7 +26,7 @@ fn model_with_history() -> SapModel {
     let mut history = LoadCase::linear_static("MHIST", "DEAD", 1.0);
     history.case_type = LoadCaseType::LinearHistory;
     history.loads.clear();
-    history.history_loads = vec![("RAMP".into(), "DEAD".into(), 1.)];
+    history.push_history_load("RAMP", "DEAD", HistoryLoadKind::Pattern, 1.);
     history.modal_damping = 0.05;
     history.modal_case = Some("MODES".into());
     m.load_cases.insert("MHIST".into(), history);

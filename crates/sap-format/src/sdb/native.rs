@@ -1988,15 +1988,27 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 ]));
             }
         } else if (5..=8).contains(&ctype_code) {
-            for (func_name, load_name, sf) in &lc.history_loads {
+            for (entry, (func_name, load_name, sf)) in lc.history_loads.iter().enumerate() {
                 let f_idx = func_index.get(func_name).copied().unwrap_or(0);
-                let (ltype, l_idx) = if let Some(u_idx) = load_name
+                let u_idx = load_name
                     .strip_prefix('U')
                     .or_else(|| load_name.strip_prefix('u'))
                     .and_then(|s| s.parse::<i32>().ok())
                     .filter(|&i| (1..=6).contains(&i))
-                    .filter(|_| !lpat_index.contains_key(load_name))
-                {
+                    .or_else(|| {
+                        sap_model::history_acceleration_direction(load_name).map(|d| d as i32 + 1)
+                    });
+                // D77: the stored kind decides the record type; the name only
+                // decides it for a case that does not say (and the export guard
+                // refuses such a name that a pattern shares).
+                let accel = match lc.history_kind(entry) {
+                    sap_model::HistoryLoadKind::Acceleration => u_idx,
+                    sap_model::HistoryLoadKind::Pattern => None,
+                    sap_model::HistoryLoadKind::Unspecified => {
+                        u_idx.filter(|_| !lpat_index.contains_key(load_name))
+                    }
+                };
+                let (ltype, l_idx) = if let Some(u_idx) = accel {
                     (2, u_idx)
                 } else {
                     (1, lpat_index.get(load_name).copied().unwrap_or(0))

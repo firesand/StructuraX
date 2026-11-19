@@ -999,6 +999,38 @@ pub enum TimeIntegrationMethod {
     WilsonTheta,
 }
 
+/// What a time-history load assignment names (D77). Imported text or native
+/// inputs say it (S2K `LoadType`, native `m_ltype`); an input that does not is
+/// `Unspecified` and is resolved by `resolve_history_load`, never by guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HistoryLoadKind {
+    #[default]
+    Unspecified,
+    /// A load pattern, whatever its name.
+    Pattern,
+    /// A unit ground acceleration in a global direction.
+    Acceleration,
+}
+
+/// A history assignment once its kind is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedHistoryLoad {
+    Pattern,
+    /// Global direction index 0, 1 or 2.
+    Acceleration(usize),
+}
+
+/// Direction of a history acceleration name: U1, U2, U3, UX, UY, UZ, X, Y, Z
+/// in any case.
+pub fn history_acceleration_direction(name: &str) -> Option<usize> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "U1" | "UX" | "X" => Some(0),
+        "U2" | "UY" | "Y" => Some(1),
+        "U3" | "UZ" | "Z" => Some(2),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadCase {
     pub name: String,
@@ -1021,6 +1053,12 @@ pub struct LoadCase {
     pub modal_damping: f64,
     /// Time-history parameters: `(function_name, load_pat_or_accel, scale_factor)`
     pub history_loads: Vec<(String, String, f64)>,
+    /// What each entry of `history_loads` names (D77): a load pattern or a
+    /// ground acceleration. Parallel to `history_loads`; a list of another
+    /// length (including the empty list of an input that does not say) leaves
+    /// every entry `Unspecified`. Use `history_kind` and `push_history_load`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_load_kinds: Vec<HistoryLoadKind>,
     pub num_time_steps: usize,
     pub time_step_dt: f64,
     pub time_integration: TimeIntegrationMethod,
@@ -1066,7 +1104,104 @@ pub struct DisplacementControl {
     pub conjugate: bool,
 }
 
+/// Decides what history entry `i` of `lc` names (D77). A stored kind wins and
+/// a name never overrides it. An entry without a kind is a load pattern when
+/// its name is no acceleration name, an acceleration when no pattern has the
+/// name, and otherwise ambiguous: the error names the case, the load and the
+/// two readings.
+pub fn resolve_history_load(
+    model: &SapModel,
+    lc: &LoadCase,
+    i: usize,
+) -> Result<ResolvedHistoryLoad, String> {
+    let name = &lc.history_loads[i].1;
+    let direction = history_acceleration_direction(name);
+    match lc.history_kind(i) {
+        HistoryLoadKind::Pattern => Ok(ResolvedHistoryLoad::Pattern),
+        HistoryLoadKind::Acceleration => direction
+            .map(ResolvedHistoryLoad::Acceleration)
+            .ok_or_else(|| {
+                format!(
+                    "case '{}': history load '{name}' is marked as a ground acceleration but is not U1, U2, U3, UX, UY, UZ, X, Y or Z",
+                    lc.name
+                )
+            }),
+        HistoryLoadKind::Unspecified => match direction {
+            None => Ok(ResolvedHistoryLoad::Pattern),
+            Some(d) if model.load_patterns.contains_key(name) => Err(format!(
+                "case '{}': history load '{name}' is ambiguous: the input does not say whether it is the load pattern '{name}' or a ground acceleration in direction U{}; state the load type (Load pattern or Accel)",
+                lc.name,
+                d + 1
+            )),
+            Some(d) => Ok(ResolvedHistoryLoad::Acceleration(d)),
+        },
+    }
+}
+
 impl LoadCase {
+    /// Kind stored for history entry `i`; `Unspecified` when the kinds list
+    /// does not match `history_loads`.
+    pub fn history_kind(&self, i: usize) -> HistoryLoadKind {
+        if self.history_load_kinds.len() == self.history_loads.len() {
+            self.history_load_kinds.get(i).copied().unwrap_or_default()
+        } else {
+            HistoryLoadKind::Unspecified
+        }
+    }
+
+    /// Whether history entry `i` applies a load pattern, by its resolved kind
+    /// (D81). A ground acceleration does not. An entry that cannot be resolved
+    /// (ambiguous, or marked as an acceleration with no direction name) counts
+    /// as a pattern: a dependency check must not drop a possible dependency.
+    pub fn history_entry_is_pattern(&self, model: &SapModel, i: usize) -> bool {
+        !matches!(
+            resolve_history_load(model, self, i),
+            Ok(ResolvedHistoryLoad::Acceleration(_))
+        )
+    }
+
+    /// Appends a history assignment together with its kind.
+    pub fn push_history_load(
+        &mut self,
+        function: impl Into<String>,
+        load: impl Into<String>,
+        kind: HistoryLoadKind,
+        scale_factor: f64,
+    ) {
+        let mut kinds: Vec<HistoryLoadKind> = (0..self.history_loads.len())
+            .map(|i| self.history_kind(i))
+            .collect();
+        kinds.push(kind);
+        self.history_loads
+            .push((function.into(), load.into(), scale_factor));
+        self.history_load_kinds = kinds;
+        self.normalize_history_kinds();
+    }
+
+    /// An all-`Unspecified` kinds list is stored as the empty list, so a
+    /// legacy case compares equal however it was built.
+    pub fn normalize_history_kinds(&mut self) {
+        if self.history_load_kinds.len() != self.history_loads.len()
+            || self
+                .history_load_kinds
+                .iter()
+                .all(|k| *k == HistoryLoadKind::Unspecified)
+        {
+            self.history_load_kinds.clear();
+        }
+    }
+
+    /// Removes history assignment `i` with its kind.
+    pub fn remove_history_load(&mut self, i: usize) {
+        let mut kinds: Vec<HistoryLoadKind> = (0..self.history_loads.len())
+            .map(|k| self.history_kind(k))
+            .collect();
+        self.history_loads.remove(i);
+        kinds.remove(i);
+        self.history_load_kinds = kinds;
+        self.normalize_history_kinds();
+    }
+
     pub fn linear_static(name: impl Into<String>, pat: impl Into<String>, sf: f64) -> Self {
         let name_s = name.into();
         let pat_s = pat.into();
@@ -1089,6 +1224,7 @@ impl LoadCase {
             modal_combo: ModalComboMethod::Cqc,
             modal_damping: 0.05,
             history_loads: Vec::new(),
+            history_load_kinds: Vec::new(),
             num_time_steps: 200,
             time_step_dt: 0.02,
             time_integration: TimeIntegrationMethod::NewmarkAverage,
@@ -1121,6 +1257,7 @@ impl LoadCase {
             modal_combo: ModalComboMethod::Cqc,
             modal_damping: 0.05,
             history_loads: Vec::new(),
+            history_load_kinds: Vec::new(),
             num_time_steps: 0,
             time_step_dt: 0.01,
             time_integration: TimeIntegrationMethod::NewmarkAverage,
@@ -1286,9 +1423,33 @@ pub struct TransientTerminalState {
     pub modal_a: Option<Vec<f64>>,
 }
 
+/// How far a case that has results got (v19 "Set Load Cases to Run": a case that "was
+/// unable to reach its requested final state" is "Not Finished"). A case that could not
+/// start because a prerequisite case did not finish has no results at all and is listed in
+/// `SapModel::unavailable_results` ("could not start: ..."), never stored with an empty
+/// `CaseResults`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CaseStatus {
+    #[default]
+    Finished,
+    /// The case stopped before its target. Its results are the states it reached: keeping
+    /// them is a project choice (v19 does not say which results a case that is not
+    /// finished keeps). `steps` is the number of saved states kept in `static_steps`.
+    NotFinished { reason: String, steps: usize },
+}
+
+impl CaseStatus {
+    pub fn is_finished(&self) -> bool {
+        matches!(self, CaseStatus::Finished)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CaseResults {
     pub case_name: String,
+    /// Whether the case reached its requested final state; old files read as `Finished`.
+    #[serde(default, skip_serializing_if = "CaseStatus::is_finished")]
+    pub status: CaseStatus,
     /// Joint displacements `joint_name -> [U1, U2, U3, R1, R2, R3]`
     pub joint_displacements: IndexMap<String, [f64; 6]>,
     /// Support/Spring reactions `joint_name -> [F1, F2, F3, M1, M2, M3]`
@@ -1424,9 +1585,17 @@ impl SapModel {
                     c.loads
                         .iter()
                         .any(|l| &l.load_name == pattern && l.scale_factor != 0.0)
+                        // D81: a history entry depends on a load pattern only when
+                        // it is one; an explicit ground acceleration U1 does not
+                        // use the pattern that happens to be called U1.
                         || c.history_loads
                             .iter()
-                            .any(|(_, p, scale)| p == pattern && *scale != 0.0)
+                            .enumerate()
+                            .any(|(i, (_, p, scale))| {
+                                p == pattern
+                                    && *scale != 0.0
+                                    && c.history_entry_is_pattern(self, i)
+                            })
                 }),
                 UnmodeledScope::Case(name) => chain.iter().any(|c| &c.name == name),
             })
@@ -1543,6 +1712,13 @@ pub struct SapModel {
 
     pub is_locked: bool,
     pub case_results: IndexMap<String, CaseResults>,
+    /// Cases and combinations that were requested but have no results, each with
+    /// the reason (D78): a combination one of whose contributors has no results is
+    /// listed here and is absent from `case_results`; it is never published with
+    /// the contributors that exist. Meaningful only while `is_locked` (see
+    /// `results::unavailable_reason`).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub unavailable_results: IndexMap<String, String>,
     pub steel_design_results: IndexMap<String, SteelDesignResult>,
     pub concrete_design_results: IndexMap<String, ConcreteDesignResult>,
 
@@ -1674,6 +1850,7 @@ impl SapModel {
             load_combos: IndexMap::new(),
             is_locked: false,
             case_results: IndexMap::new(),
+            unavailable_results: IndexMap::new(),
             steel_design_results: IndexMap::new(),
             concrete_design_results: IndexMap::new(),
             mass_source: seismic::MassSource::default(),
@@ -1970,6 +2147,7 @@ impl SapModel {
             }
         }
 
+        let patterns: Vec<String> = self.load_patterns.keys().cloned().collect();
         for lc in self.load_cases.values_mut() {
             for (_, dir, sf) in &mut lc.spectrum_loads {
                 let upper = dir.trim().to_ascii_uppercase();
@@ -1980,13 +2158,23 @@ impl SapModel {
                     *sf *= fl;
                 }
             }
-            for (_, pat_or_acc, sf) in &mut lc.history_loads {
-                let upper = pat_or_acc.trim().to_ascii_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
-                ) {
-                    *sf *= fl;
+            // D77: only a ground acceleration scales with length; a pattern
+            // named like one keeps its factor. An entry that cannot be told
+            // apart is scaled as an acceleration only when no pattern of that
+            // name exists; otherwise the conversion is refused by the analysis
+            // later, so the factor is left alone here.
+            for i in 0..lc.history_loads.len() {
+                let name = lc.history_loads[i].1.clone();
+                let is_accel = match lc.history_kind(i) {
+                    HistoryLoadKind::Acceleration => true,
+                    HistoryLoadKind::Pattern => false,
+                    HistoryLoadKind::Unspecified => {
+                        history_acceleration_direction(&name).is_some()
+                            && !patterns.contains(&name)
+                    }
+                };
+                if is_accel {
+                    lc.history_loads[i].2 *= fl;
                 }
             }
         }
@@ -1996,6 +2184,7 @@ impl SapModel {
         // Stored outputs use the previous units. Until every result component has
         // a dimensional conversion, require analysis again rather than relabeling it.
         self.case_results.clear();
+        self.unavailable_results.clear();
         self.steel_design_results.clear();
         self.concrete_design_results.clear();
         self.is_locked = false;
@@ -2176,6 +2365,40 @@ mod tests {
         assert!((model.load_cases["SPEC"].spectrum_loads[1].2 - 1.5).abs() < 1e-12);
         assert!((model.load_cases["HIST"].history_loads[0].2 - 32.174 * 12.0).abs() < 1e-9);
         assert!((model.load_cases["HIST"].history_loads[1].2 - 2.0).abs() < 1e-12);
+    }
+
+    /// D77: a unit change scales the factor of a ground acceleration (a length
+    /// per time squared) and leaves the factor of a force pattern alone, even
+    /// when the pattern is named X, U1 or UX. kip-ft to kip-in: lengths x 12.
+    #[test]
+    fn convert_units_scales_a_history_entry_by_its_kind_not_its_name() {
+        let mut model = SapModel::new(Units::KipFtF);
+        for name in ["X", "U1"] {
+            model.load_patterns.insert(
+                name.into(),
+                LoadPattern {
+                    name: name.into(),
+                    pat_type: LoadPatternType::Other,
+                    self_wt_multiplier: 0.0,
+                },
+            );
+        }
+        let mut hist = LoadCase::linear_static("HIST", "DEAD", 1.0);
+        hist.case_type = LoadCaseType::LinearHistory;
+        hist.loads.clear();
+        hist.push_history_load("TH1", "X", HistoryLoadKind::Pattern, 3.0);
+        hist.push_history_load("TH1", "U1", HistoryLoadKind::Acceleration, 3.0);
+        hist.push_history_load("TH1", "UZ", HistoryLoadKind::Acceleration, 3.0);
+        // No kind stated and a pattern of that name exists: left alone (the
+        // analysis refuses it as ambiguous).
+        hist.push_history_load("TH1", "U1", HistoryLoadKind::Unspecified, 3.0);
+        model.load_cases.insert("HIST".into(), hist);
+        model.convert_units_in_place(Units::KipInF);
+        let f = &model.load_cases["HIST"].history_loads;
+        assert!((f[0].2 - 3.0).abs() < 1e-12, "pattern X keeps its factor");
+        assert!((f[1].2 - 36.0).abs() < 1e-12, "acceleration U1 x 12");
+        assert!((f[2].2 - 36.0).abs() < 1e-12, "acceleration UZ x 12");
+        assert!((f[3].2 - 3.0).abs() < 1e-12, "ambiguous entry untouched");
     }
 
     #[test]

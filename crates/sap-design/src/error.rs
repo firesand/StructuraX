@@ -29,6 +29,22 @@ pub enum DesignError {
         /// The offending value, as text (the error type is `Eq`).
         value: String,
     },
+    /// A design combination that has no complete results (D78): design never
+    /// uses the contributors that exist in its place.
+    #[error("{discipline} design cannot use combination '{combo}': it is unavailable because {reason}")]
+    UnavailableCombination {
+        discipline: &'static str,
+        combo: String,
+        reason: String,
+    },
+    /// A case that is not finished (G16) has no complete response to design for, and a case
+    /// that could not start has none at all.
+    #[error("{discipline} design cannot use case '{case}': it did not finish ({reason})")]
+    UnfinishedCase {
+        discipline: &'static str,
+        case: String,
+        reason: String,
+    },
     #[error("{discipline} design has no frame force demand for member '{frame}'")]
     MissingDemand {
         discipline: &'static str,

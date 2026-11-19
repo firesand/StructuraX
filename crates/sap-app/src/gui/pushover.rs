@@ -146,11 +146,28 @@ pub(super) fn tick_text(v: f64) -> String {
     super::view::significant_text(v, 4)
 }
 
-pub(super) fn draw_plot(ui: &mut egui::Ui, xy: &[(f64, f64)]) {
+/// The plot without a title.
+#[cfg(test)]
+pub(super) fn draw_plot_untitled(ui: &mut egui::Ui, xy: &[(f64, f64)]) {
+    draw_plot(ui, xy, None);
+}
+
+/// The plot with a title at its top right (G16: "Not finished" for a case that stopped
+/// before its target).
+pub(super) fn draw_plot(ui: &mut egui::Ui, xy: &[(f64, f64)], title: Option<&str>) {
     let size = egui::vec2(ui.available_width().clamp(300.0, 720.0), 220.0);
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(16, 20, 28));
+    if let Some(title) = title {
+        painter.text(
+            egui::pos2(rect.right() - 6.0, rect.top() + 4.0),
+            egui::Align2::RIGHT_TOP,
+            title,
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgb(255, 170, 90),
+        );
+    }
     let finite: Vec<(f64, f64)> = xy
         .iter()
         .copied()
@@ -272,7 +289,23 @@ pub(super) fn render(
             });
             if cases.is_empty() {
                 ui.label("No nonlinear static results. Run the analysis with a nonlinear static case that saves multiple states first.");
+                // G16: a case that could not start has no results; say why.
+                for (name, reason) in sap_model::results::could_not_start_cases(model) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 170, 90),
+                        format!("Case '{name}': {reason}"),
+                    );
+                }
                 return;
+            }
+            // G16: the curve of a case that stopped before its target is the part it reached;
+            // the reason comes first, also when that part is too short to draw a curve.
+            let unfinished = sap_api::hinges::pushover_not_finished(model, &state.case);
+            if let Some((reason, steps)) = &unfinished {
+                ui.colored_label(
+                    egui::Color32::from_rgb(255, 170, 90),
+                    format!("Not finished: {reason} ({steps} saved steps kept)"),
+                );
             }
             let points = match pushover_curve(model, &state.case) {
                 Ok(points) => points,
@@ -282,7 +315,11 @@ pub(super) fn render(
                 }
             };
             ui.label("Base shear against monitored displacement (model units). Hinge counts by state and by performance status.");
-            draw_plot(ui, &curve_xy(&points));
+            draw_plot(
+                ui,
+                &curve_xy(&points),
+                unfinished.as_ref().map(|_| "NOT FINISHED"),
+            );
             egui::Grid::new("pushover_grid").striped(true).show(ui, |ui| {
                 for h in [
                     "Step", "Displacement", "Base shear", "A-B", "B-C", "C-D", "D-E", ">E",
@@ -593,16 +630,52 @@ mod tests {
         assert!(texts(&frames(&ctx, &mut state, &mut model)).is_empty());
     }
 
+    /// G16: a case that stopped before its target shows the reason above its table and
+    /// "NOT FINISHED" in the plot title; a finished case shows neither.
+    #[test]
+    fn a_case_that_is_not_finished_says_so_above_the_table_and_in_the_plot() {
+        let ctx = egui::Context::default();
+        let mut state = State {
+            open: true,
+            case: String::new(),
+        };
+        let mut finished = analyzed();
+        let t = texts(&frames(&ctx, &mut state, &mut finished));
+        assert!(!t.iter().any(|s| s.contains("Not finished") || s == "NOT FINISHED"), "{t:?}");
+        let mut model = example_1_026_model();
+        model.load_cases.get_mut("PUSH").unwrap().nl_static.max_total_steps = 5;
+        sap_solver::analyze_model(&mut model).unwrap();
+        let reason = match &model.case_results["PUSH"].status {
+            sap_model::CaseStatus::NotFinished { reason, .. } => reason.clone(),
+            other => panic!("expected NotFinished, got {other:?}"),
+        };
+        let t = texts(&frames(&ctx, &mut state, &mut model));
+        assert!(
+            t.iter()
+                .any(|s| s.starts_with("Not finished: ") && s.contains(&reason)),
+            "{t:?}"
+        );
+        assert!(t.iter().any(|s| s == "NOT FINISHED"), "{t:?}");
+        // The table still lists the states the case reached.
+        assert!(t.iter().any(|s| s == "Step"), "{t:?}");
+        // A case that stopped at its first step keeps one state only: no curve can be
+        // drawn, and the window still says that the case is not finished.
+        model.case_results.get_mut("PUSH").unwrap().static_steps.truncate(1);
+        let t = texts(&frames(&ctx, &mut state, &mut model));
+        assert!(t.iter().any(|s| s.starts_with("Not finished: ")), "{t:?}");
+        assert!(t.iter().any(|s| s.contains("saved a single state")), "{t:?}");
+    }
+
     #[test]
     fn the_plot_handles_degenerate_curves() {
         let points = [(0.0, 0.0), (1.0, 5.0), (2.0, 3.0)];
         let ctx = egui::Context::default();
         let _ = ctx.run(input(0.0), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                draw_plot(ui, &points);
-                draw_plot(ui, &points[..1]);
-                draw_plot(ui, &[(0.0, 0.0), (0.0, 0.0)]);
-                draw_plot(ui, &[(0.0, f64::NAN), (1.0, 1.0)]);
+                draw_plot_untitled(ui, &points);
+                draw_plot_untitled(ui, &points[..1]);
+                draw_plot_untitled(ui, &[(0.0, 0.0), (0.0, 0.0)]);
+                draw_plot_untitled(ui, &[(0.0, f64::NAN), (1.0, 1.0)]);
             });
         });
         assert_eq!(curve_xy(&[]).len(), 0);

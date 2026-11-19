@@ -25,6 +25,7 @@ pub mod solid;
 mod supported_subset;
 
 pub use modal_history::ground_acceleration_trace;
+pub use sap_model::results::{could_not_start_cases, unfinished_cases};
 pub use modal_history::function_value as time_function_value;
 
 use indexmap::IndexMap;
@@ -99,10 +100,18 @@ pub enum SolverError {
 
 /// Runs all active `LoadCase`s and evaluates all `LoadCombo`s in `model`,
 /// populating `model.case_results` and locking the model (`model.is_locked = true`).
+///
+/// Returns `Ok` when the only problems are results that are missing or short (G16, D78):
+/// a case that stopped before its target keeps the states it reached with the status
+/// `NotFinished` (see [`unfinished_cases`]); a case that could not start because a
+/// prerequisite did not finish, and a combination that has such a contributor, have no
+/// results and are listed in `model.unavailable_results`. A refusal of something that is
+/// not supported stays an `Err` with every result cleared.
 pub fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
     // A failed re-analysis must never leave old or partially computed results usable.
     model.is_locked = false;
     model.case_results.clear();
+    model.unavailable_results.clear();
     model.steel_design_results.clear();
     model.concrete_design_results.clear();
     // Analyze a working copy so coordinate normalization never rewrites assignments.
@@ -113,6 +122,7 @@ pub fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
         .and_then(|()| analyze_model_inner(&mut working));
     if result.is_ok() {
         model.case_results = working.case_results;
+        model.unavailable_results = working.unavailable_results;
         model.is_locked = working.is_locked;
         sap_model::auto_select::record_analysis_sections(model);
     }
@@ -125,6 +135,11 @@ pub fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
 fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     if model.points.is_empty() {
         return Err(SolverError::EmptyModel);
+    }
+    // D79: one name for a case and a combination cannot be told apart in the results or
+    // in the contributors of a combination; refuse before any case is evaluated.
+    if let Some(message) = sap_model::results::case_combo_collision_message(model) {
+        return Err(SolverError::UnsupportedInput(message));
     }
     refuse_unmodeled_source(model)?;
     validate_analysis_inputs(model)?;
@@ -198,6 +213,13 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
 
     for case_name in ordered_cases {
         let lc = model.load_cases.get(&case_name).unwrap().clone();
+        // G16 (v19 "Could Not Start"): a case whose prerequisite (the case it continues
+        // from or takes its stiffness or modes from) did not finish gets no results; the
+        // other cases run, and the reason goes where D78 records results that do not exist.
+        if let Some(reason) = sap_model::results::prerequisite_gap(model, &lc) {
+            model.unavailable_results.insert(case_name, reason);
+            continue;
+        }
         let res = (|| -> Result<CaseResults, SolverError> { Ok(match lc.case_type {
             LoadCaseType::LinearStatic | LoadCaseType::LinearStaticMultiStep => {
                 run_linear_static_case(
@@ -386,6 +408,110 @@ fn frame_insertion_offset(
             frame.name
         ))
     })
+}
+
+/// D82: the one rule for what a pattern of a time-history case may carry. A
+/// history applies joint forces and the frame distributed and point loads
+/// (whose span loads the frame-force recovery includes, D75); everything else
+/// would be dropped or mishandled by the integration, so it is refused. Returns
+/// the reason (naming the pattern, each load type and one object) or `None`.
+/// The solver's validation and `sap_api::validate_case_definition` both call
+/// it, so the two cannot disagree.
+pub fn history_pattern_refusal(model: &SapModel, pattern: &str) -> Option<String> {
+    let mut found: Vec<String> = Vec::new();
+    if model
+        .load_patterns
+        .get(pattern)
+        .is_some_and(|p| p.self_wt_multiplier != 0.0)
+    {
+        found.push("self-weight".to_string());
+    }
+    let mut add = |kind: &str, objects: Vec<&String>| {
+        if let Some(n) = objects.first() {
+            found.push(format!("{kind} (first on '{n}')"));
+        }
+    };
+    add(
+        "frame temperature loads",
+        model
+            .frames
+            .iter()
+            .filter(|(_, f)| f.loads_temp.iter().any(|l| l.load_pat == pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    add(
+        "frame gravity loads",
+        model
+            .frames
+            .iter()
+            .filter(|(_, f)| f.loads_gravity.contains_key(pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    add(
+        "area uniform loads",
+        model
+            .areas
+            .iter()
+            .filter(|(_, a)| a.loads_uniform.iter().any(|l| l.load_pat == pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    add(
+        "area surface pressure loads",
+        model
+            .areas
+            .iter()
+            .filter(|(_, a)| a.loads_pressure.iter().any(|l| l.load_pat == pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    add(
+        "area temperature loads",
+        model
+            .areas
+            .iter()
+            .filter(|(_, a)| a.loads_temp.iter().any(|l| l.load_pat == pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    // The history right-hand side has no solid part, so these would be dropped.
+    add(
+        "solid surface loads",
+        model
+            .solids
+            .iter()
+            .filter(|(_, s)| s.loads_surface.iter().any(|l| l.load_pat == pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    add(
+        "solid temperature loads",
+        model
+            .solids
+            .iter()
+            .filter(|(_, s)| s.loads_temp.contains_key(pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    add(
+        "support displacement (motion) loads",
+        model
+            .points
+            .iter()
+            .filter(|(_, p)| p.loads_displ.iter().any(|l| l.load_pat == pattern))
+            .map(|(n, _)| n)
+            .collect(),
+    );
+    if found.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "history pattern '{pattern}' contains {}; a history case supports joint forces and frame distributed and point loads only",
+            found.join(", ")
+        ))
+    }
 }
 
 /// Reject requests that the implemented algorithms cannot represent. Returning an
@@ -713,10 +839,15 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
         // The cases that assemble it: buckling; nonlinear static with
         // geometric nonlinearity; and linear static and modal cases with an
         // initial case, which take geometric stiffness from that case's frame
-        // forces whatever its type.
+        // forces whatever its type, except after a nonlinear static case
+        // without geometric nonlinearity and without cables
+        // (`continuation_uses_axial_forces`).
         let uses_geometric_stiffness = lc.case_type == LoadCaseType::Buckling
             || lc.nl_geom != NLGeomType::None
-            || (lc.initial_case.is_some()
+            || (lc
+                .initial_case
+                .as_ref()
+                .is_some_and(|initial| continuation_uses_axial_forces(model, initial))
                 && matches!(
                     lc.case_type,
                     LoadCaseType::LinearStatic
@@ -803,7 +934,12 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                     "case '{name}' monitors a missing joint or invalid degree of freedom"
                 )));
             }
-            if lc.nl_geom != NLGeomType::None
+            // P-Delta with displacement control is implemented on the hinge
+            // path only (frame hinges, Accel or Mode loads), which has its own
+            // refusals for what it does not carry.
+            let p_delta_on_hinge_path = lc.nl_geom == NLGeomType::PDelta
+                && hinge::applies(model, lc, hinge::model_has_hinges(model));
+            if (lc.nl_geom != NLGeomType::None && !p_delta_on_hinge_path)
                 || has_cables
                 || model
                     .frames
@@ -863,37 +999,26 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 )));
             }
             dynamics::validate_parameters(lc)?;
-            for (_, pattern, scale) in &lc.history_loads {
+            for (entry, (_, pattern, scale)) in lc.history_loads.iter().enumerate() {
                 if !scale.is_finite() {
                     return Err(SolverError::InvalidInput(format!(
                         "case '{name}' has a nonfinite history load scale"
                     )));
                 }
-                if matches!(
-                    pattern.trim().to_ascii_uppercase().as_str(),
-                    "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
-                ) {
+                // D77: the stored kind decides; a name does not.
+                if let sap_model::ResolvedHistoryLoad::Acceleration(_) =
+                    sap_model::resolve_history_load(model, lc, entry)
+                        .map_err(SolverError::InvalidInput)?
+                {
                     continue;
                 }
-                let pat = model.load_patterns.get(pattern).ok_or_else(|| {
-                    SolverError::InvalidInput(format!(
+                if !model.load_patterns.contains_key(pattern) {
+                    return Err(SolverError::InvalidInput(format!(
                         "case '{name}' references missing history load pattern '{pattern}'"
-                    ))
-                })?;
-                let unsupported_member_loads = model.frames.values().any(|f| {
-                    f.loads_temp.iter().any(|l| &l.load_pat == pattern)
-                        || f.loads_gravity.contains_key(pattern)
-                }) || model.areas.values().any(|a| {
-                    a.loads_uniform.iter().any(|l| &l.load_pat == pattern)
-                        || a.loads_pressure.iter().any(|l| &l.load_pat == pattern)
-                        || a.loads_temp.iter().any(|l| &l.load_pat == pattern)
-                });
-                let motion_loads = model
-                    .points
-                    .values()
-                    .any(|p| p.loads_displ.iter().any(|l| &l.load_pat == pattern));
-                if pat.self_wt_multiplier != 0.0 || unsupported_member_loads || motion_loads {
-                    return Err(SolverError::UnsupportedInput(format!("history pattern '{pattern}' contains self-weight, element loads, or support motion; only joint forces are implemented")));
+                    )));
+                }
+                if let Some(reason) = history_pattern_refusal(model, pattern) {
+                    return Err(SolverError::UnsupportedInput(reason));
                 }
             }
         }
@@ -952,8 +1077,12 @@ fn validate_active_loads(model: &SapModel) -> Result<(), SolverError> {
                 .chain(
                     case.history_loads
                         .iter()
-                        .filter(|(_, _, scale)| *scale != 0.0)
-                        .map(|(_, pattern, _)| pattern.as_str()),
+                        .enumerate()
+                        .filter(|(i, (_, _, scale))| {
+                            *scale != 0.0
+                                && case.history_kind(*i) != sap_model::HistoryLoadKind::Acceleration
+                        })
+                        .map(|(_, (_, pattern, _))| pattern.as_str()),
                 )
         })
         .collect();
@@ -2043,6 +2172,32 @@ fn add_penalty_constraint_local(k: &mut [f64], ndof: usize, terms: &[(usize, f64
     }
 }
 
+/// Whether a Modal, linear static or multi-step static case that uses the
+/// stiffness at the end of case `initial` takes a geometric stiffness from
+/// that case's frame axial forces.
+///
+/// v19 Analysis Reference p. 411: only the geometric nonlinearity that the
+/// nonlinear case itself considered affects a later linear or modal case that
+/// continues from it. A nonlinear static case with `nl_geom == None` therefore
+/// leaves no geometric stiffness (defect D70: it used to be added whatever
+/// the setting). Exception, kept as it was: a model with cable frames. The
+/// catenary cable carries its own geometric nonlinearity whatever the case
+/// setting (v19 Analysis Reference p. 412), and `run_cable_nonlinear_static_case`
+/// stores the cable tensions in `frame_forces` for this use. (Today a model
+/// with cables refuses every case type but nonlinear static, see
+/// `supported_subset.rs`, so no Modal or linear case can reach this branch yet;
+/// it keeps the rule in place for when they can.) Other kinds of
+/// initial case (linear static, histories) keep the forces they always gave;
+/// whether that is right is an open question.
+fn continuation_uses_axial_forces(model: &SapModel, initial: &str) -> bool {
+    match model.load_cases.get(initial) {
+        Some(c) if c.case_type == LoadCaseType::NonlinearStatic && c.nl_geom == NLGeomType::None => {
+            model.frames.values().any(|f| f.cable_params.is_some())
+        }
+        _ => true,
+    }
+}
+
 /// Assembles the global geometric stiffness matrix $\mathbf{K}_G$ ($N \times N$) given a map of frame axial forces.
 ///
 /// Note: When a frame has end releases or partial fixity springs, condensation is nonlinear in the
@@ -2164,7 +2319,12 @@ fn run_linear_static_case(
     let mut initial_axial: IndexMap<String, f64> = IndexMap::new();
 
     if let Some(init_name) = &lc.initial_case {
-        if let Some(init_res) = model.case_results.get(init_name) {
+        hinge::check_end_state_without_yield(model, &lc.name, init_name)?;
+        if let Some(init_res) = model
+            .case_results
+            .get(init_name)
+            .filter(|_| continuation_uses_axial_forces(model, init_name))
+        {
             for (fname, stations) in &init_res.frame_forces {
                 if !stations.is_empty() {
                     let p_avg = 0.5 * (stations.first().unwrap().p + stations.last().unwrap().p);
@@ -2213,7 +2373,10 @@ fn run_linear_static_case(
     )
 }
 
-fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(String, f64)> {
+fn accumulated_nonlinear_static_loads(
+    model: &SapModel,
+    lc: &LoadCase,
+) -> Result<Vec<(String, f64)>, SolverError> {
     let mut chain = Vec::new();
     let mut cur = Some(lc);
     let mut visited = std::collections::BTreeSet::new();
@@ -2248,12 +2411,11 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
                 | LoadCaseType::LinearHistory
         ) {
             let t_end = (c.num_time_steps as f64) * c.time_step_dt;
-            for (func_name, pat_or_acc, scale_factor) in &c.history_loads {
-                let upper = pat_or_acc.trim().to_ascii_uppercase();
-                if !matches!(
-                    upper.as_str(),
-                    "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
-                ) {
+            for (entry, (func_name, pat_or_acc, scale_factor)) in c.history_loads.iter().enumerate() {
+                if sap_model::resolve_history_load(model, c, entry)
+                    .map_err(SolverError::InvalidInput)?
+                    == sap_model::ResolvedHistoryLoad::Pattern
+                {
                     // A case that runs and names a missing function is refused by
                     // `validate_analysis_inputs`; a predecessor that does not run
                     // contributes nothing here rather than a factor of one.
@@ -2282,11 +2444,11 @@ fn accumulated_nonlinear_static_loads(model: &SapModel, lc: &LoadCase) -> Vec<(S
             }
         }
     }
-    loads
+    Ok(loads)
 }
 
 /// Loads already on the structure when a nonlinear static case starts.
-fn initial_chain_loads(model: &SapModel, lc: &LoadCase) -> Vec<(String, f64)> {
+fn initial_chain_loads(model: &SapModel, lc: &LoadCase) -> Result<Vec<(String, f64)>, SolverError> {
     lc.initial_case
         .as_ref()
         .and_then(|name| model.load_cases.get(name))
@@ -2299,7 +2461,7 @@ fn initial_chain_loads(model: &SapModel, lc: &LoadCase) -> Vec<(String, f64)> {
                     | LoadCaseType::LinearDynamic
             )
         })
-        .map_or_else(Vec::new, |prev| accumulated_nonlinear_static_loads(model, prev))
+        .map_or_else(|| Ok(Vec::new()), |prev| accumulated_nonlinear_static_loads(model, prev))
 }
 
 /// Final load factor of a path-dependent or displacement-controlled nonlinear
@@ -2333,7 +2495,7 @@ fn nonlinear_static_load_factor(
             ndof,
         )
     };
-    let prev = assemble(&initial_chain_loads(model, lc))?;
+    let prev = assemble(&initial_chain_loads(model, lc)?)?;
     let own = assemble(&own_loads)?;
     let fixed: Vec<bool> = prev
         .is_fixed
@@ -2736,7 +2898,7 @@ fn run_nonlinear_static_case(
             ndof,
         );
     }
-    let case_loads = accumulated_nonlinear_static_loads(model, lc);
+    let case_loads = accumulated_nonlinear_static_loads(model, lc)?;
 
     if model.frames.values().any(|f| f.cable_params.is_some()) {
         return run_cable_nonlinear_static_case(
@@ -2806,7 +2968,7 @@ fn run_nonlinear_static_case(
                 ndof,
             )?;
             if lc.displacement_control.is_some() {
-                case_loads = initial_chain_loads(model, lc);
+                case_loads = initial_chain_loads(model, lc)?;
                 case_loads.extend(
                     lc.loads
                         .iter()
@@ -3749,7 +3911,12 @@ fn run_modal_case(
 
     // Include P-Delta geometric stiffness if initial_case is set
     if let Some(init_name) = &lc.initial_case {
-        if let Some(init_res) = model.case_results.get(init_name) {
+        hinge::check_end_state_without_yield(model, &lc.name, init_name)?;
+        if let Some(init_res) = model
+            .case_results
+            .get(init_name)
+            .filter(|_| continuation_uses_axial_forces(model, init_name))
+        {
             let mut init_axial = IndexMap::new();
             for (fname, stations) in &init_res.frame_forces {
                 if !stations.is_empty() {
@@ -4402,6 +4569,14 @@ fn run_time_history_case(
     diag_mass: &[f64],
     ndof: usize,
 ) -> Result<CaseResults, SolverError> {
+    // A history that continues from a nonlinear static case of a hinged model
+    // treats the hinges as rigid; that is only the state of that case when no
+    // hinge has yielded (the same rule as for linear and modal cases; found
+    // next to review finding P1-1, where a NonlinearHistory case ran on the
+    // elastic stiffness after a yielded hinge).
+    if let Some(init_name) = &lc.initial_case {
+        hinge::check_end_state_without_yield(model, &lc.name, init_name)?;
+    }
     let n_steps = lc.num_time_steps;
     let dt = lc.time_step_dt;
     let mut is_fixed = vec![false; ndof];
@@ -4413,7 +4588,7 @@ fn run_time_history_case(
 
     // Precompute spatial load vectors for each history_loads entry
     let mut spatial_loads: Vec<(&[(f64, f64)], Vec<f64>)> = Vec::new();
-    for (func_name, pat_or_acc, sf) in &lc.history_loads {
+    for (entry, (func_name, pat_or_acc, sf)) in lc.history_loads.iter().enumerate() {
         let points = model
             .functions
             .get(func_name)
@@ -4425,16 +4600,10 @@ fn run_time_history_case(
                 ))
             })?;
         let mut f_vec = vec![0.0f64; ndof];
-        let upper = pat_or_acc.trim().to_ascii_uppercase();
-        if matches!(
-            upper.as_str(),
-            "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
-        ) {
-            let dir_idx = match upper.as_str() {
-                "U1" | "UX" | "X" => 0,
-                "U2" | "UY" | "Y" => 1,
-                _ => 2,
-            };
+        // D77: the stored kind decides; a name does not.
+        let resolved = sap_model::resolve_history_load(model, lc, entry)
+            .map_err(SolverError::InvalidInput)?;
+        if let sap_model::ResolvedHistoryLoad::Acceleration(dir_idx) = resolved {
             for idx in 0..work_points.len() {
                 for d in 0..3 {
                     let gdof = 6 * idx + d;
@@ -4465,7 +4634,7 @@ fn run_time_history_case(
                     | LoadCaseType::LinearDynamic
                     | LoadCaseType::LinearHistory
             ) {
-                let init_loads = accumulated_nonlinear_static_loads(model, init_lc);
+                let init_loads = accumulated_nonlinear_static_loads(model, init_lc)?;
                 assemble_static_pattern_rhs(
                     model,
                     &init_loads,
@@ -4777,7 +4946,34 @@ fn run_time_history_case(
         }
     }
 
-    let mut res = recover_results_from_displacement_vector(
+    // Span loads in force at the reported time (D75): those of the initial
+    // case, which `load_at` holds throughout, and the pattern entries of the
+    // history at the value of their function. Acceleration entries load the
+    // joints only.
+    let mut member_loads: Vec<(String, f64)> = lc
+        .initial_case
+        .as_ref()
+        .and_then(|name| model.load_cases.get(name))
+        .filter(|init| {
+            matches!(
+                init.case_type,
+                LoadCaseType::NonlinearStatic
+                    | LoadCaseType::NonlinearHistory
+                    | LoadCaseType::NonlinearDynamic
+                    | LoadCaseType::LinearDynamic
+                    | LoadCaseType::LinearHistory
+            )
+        })
+        .map(|init| accumulated_nonlinear_static_loads(model, init))
+        .transpose()?
+        .unwrap_or_default();
+    member_loads.extend(modal_history::history_member_loads(
+        model,
+        lc,
+        t_peak,
+        function_tol,
+    )?);
+    let (mut res, generated_reactions) = recover_results_with_member_loads(
         model,
         work_points,
         work_areas,
@@ -4787,6 +4983,7 @@ fn run_time_history_case(
         &reaction_struct,
         &u_peak,
         ndof,
+        &member_loads,
     );
     // Recover the simultaneous physical reaction, not just its elastic part.
     // Applied loads at fixed DOFs are retained in load_at even though the stepper
@@ -4805,7 +5002,14 @@ fn run_time_history_case(
     }
     let applied_peak = load_at(t_peak, false);
     let (alpha_mass, beta_stiffness) = lc.rayleigh_damping;
-    for (name, reaction) in &mut res.joint_reactions {
+    // Generated joints (D76) add their inertia and applied-load terms to the
+    // base reaction too; their elastic part is already in it.
+    let mut generated_reactions = generated_reactions;
+    for (name, reaction) in res
+        .joint_reactions
+        .iter_mut()
+        .chain(generated_reactions.iter_mut())
+    {
         let idx = pt_index[name];
         let point = &work_points[name];
         let ks_loc_opt = joint_spring_matrix_local(point, &joint_rot[idx]);
@@ -4879,6 +5083,7 @@ fn run_time_history_case(
     Ok(res)
 }
 
+/// Results from a displacement vector without span loads (response spectrum).
 #[allow(clippy::too_many_arguments)]
 fn recover_results_from_displacement_vector(
     model: &SapModel,
@@ -4891,8 +5096,46 @@ fn recover_results_from_displacement_vector(
     u_joint: &[f64],
     ndof: usize,
 ) -> CaseResults {
+    recover_results_with_member_loads(
+        model,
+        work_points,
+        work_areas,
+        orig_area_map,
+        pt_index,
+        joint_rot,
+        k_struct,
+        u_joint,
+        ndof,
+        &[],
+    )
+    .0
+}
+
+/// Results from a displacement vector of a dynamic case, with the span loads
+/// `member_loads` (pattern, scale) in force at the reported time (D75): the
+/// member end forces are `K u` plus the fixed-end forces of those loads, as in
+/// a static case, and the section forces include the span loads.
+///
+/// The second value holds the elastic reaction of every restrained joint that
+/// is not a joint of the model (a joint generated by area meshing, D76). It
+/// has no row in the results, but the caller adds its inertia and applied-load
+/// terms to the base reaction like those of the model's joints.
+#[allow(clippy::too_many_arguments)]
+fn recover_results_with_member_loads(
+    model: &SapModel,
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    orig_area_map: &IndexMap<String, Vec<String>>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
+    u_joint: &[f64],
+    ndof: usize,
+    member_loads: &[(String, f64)],
+) -> (CaseResults, IndexMap<String, [f64; 6]>) {
     let mut joint_displacements = IndexMap::new();
     let mut joint_reactions = IndexMap::new();
+    let mut generated_reactions = IndexMap::new();
     let mut base_reactions = [0.0f64; 6];
 
     for (idx, (pname, pt)) in work_points.iter().enumerate() {
@@ -4924,6 +5167,8 @@ fn recover_results_from_displacement_vector(
             // row of its own; its reaction still belongs to the base reaction.
             if model.points.contains_key(pname) {
                 joint_reactions.insert(pname.clone(), reac);
+            } else {
+                generated_reactions.insert(pname.clone(), reac);
             }
 
             let r_p = &joint_rot[idx];
@@ -4958,14 +5203,36 @@ fn recover_results_from_displacement_vector(
         let zones = rigid_zones(frame, length);
         
         let mut k_loc = compute_zoned_local_stiffness(model, frame, sec, mat, &zones);
-        let mut dummy_fef = [0.0; 12];
-        condense_releases_and_springs(&mut k_loc, &mut dummy_fef, frame);
-        apply_zoned_rigid_offsets(&mut k_loc, &mut dummy_fef, &zones);
+        // Fixed-end forces of the span loads in force at the reported time,
+        // built and condensed exactly as in the static path (D75).
+        let mut fef = [0.0f64; 12];
+        let mut fef_arms = [0.0f64; 12];
+        for (pat_name, sf) in member_loads {
+            let self_wt_mult = model
+                .load_patterns
+                .get(pat_name)
+                .map(|lp| lp.self_wt_multiplier)
+                .unwrap_or(0.0);
+            let fef_pat = compute_zoned_fef_for_pattern(
+                model, frame, sec, mat, pt_i, pt_j, &e_axes, &zones, pat_name, self_wt_mult, *sf,
+            );
+            for m in 0..12 {
+                fef[m] += fef_pat.flexible[m];
+                fef_arms[m] += fef_pat.arms[m];
+            }
+        }
+        condense_releases_and_springs(&mut k_loc, &mut fef, frame);
+        apply_zoned_rigid_offsets(&mut k_loc, &mut fef, &zones);
+        if zones.has_arms() {
+            for m in 0..12 {
+                fef[m] += fef_arms[m];
+            }
+        }
         // This path serves history and spectrum cases, which validation
         // refuses for a frame with an offset insertion point, so the offset
         // is zero here.
         let insertion = insertion_offset_local(model, frame).unwrap_or([0.0; 3]);
-        apply_insertion_offset(&mut k_loc, &mut dummy_fef, insertion);
+        apply_insertion_offset(&mut k_loc, &mut fef, insertion);
 
         let ti = mat3_mul(&e_axes, &joint_rot[idx_i]);
         let tj = mat3_mul(&e_axes, &joint_rot[idx_j]);
@@ -4980,7 +5247,7 @@ fn recover_results_from_displacement_vector(
             }
         }
 
-        let mut f_end_loc = [0.0f64; 12];
+        let mut f_end_loc = fef;
         for r in 0..12 {
             for c in 0..12 {
                 f_end_loc[r] += k_loc[r][c] * u_loc[c];
@@ -4997,21 +5264,24 @@ fn recover_results_from_displacement_vector(
             length,
             &u_loc,
             &f_end_loc,
-            &[],
+            member_loads,
         );
         frame_forces.insert(fname.clone(), stations);
     }
 
     let _ = (work_areas, orig_area_map);
 
-    CaseResults {
-        case_name: String::new(),
-        joint_displacements,
-        joint_reactions,
-        frame_forces,
-        base_reactions,
-        ..Default::default()
-    }
+    (
+        CaseResults {
+            case_name: String::new(),
+            joint_displacements,
+            joint_reactions,
+            frame_forces,
+            base_reactions,
+            ..Default::default()
+        },
+        generated_reactions,
+    )
 }
 
 /// Right derivative of the piecewise-linear time function: zero before the

@@ -232,6 +232,21 @@ fn run_cli_analyze(
         model.load_combos.len()
     );
     analyze_model(&mut model)?;
+    // D78: a combination without complete results has no result; say which and why.
+    // The run is not discarded (the other results are usable) and still exits 0.
+    for (name, reason) in &model.unavailable_results {
+        eprintln!("Warning: result '{name}' is unavailable: {reason}");
+    }
+    // G16: a case that stopped before its target keeps the states it reached and is
+    // "not finished" (v19 words). Like an unavailable combination, this is a warning: the
+    // run is kept, the JSON carries the status, and the exit status stays 0.
+    for (name, status) in sap_model::results::unfinished_cases(&model) {
+        if let sap_model::CaseStatus::NotFinished { reason, steps } = status {
+            eprintln!(
+                "Warning: case '{name}' is not finished: {reason} ({steps} saved steps kept)"
+            );
+        }
+    }
     for (cname, cr) in &model.case_results {
         let mut details = vec![
             format!("{} joint disp", cr.joint_displacements.len()),
@@ -267,6 +282,9 @@ fn run_cli_analyze(
                 "base F=[{:.3}, {:.3}, {:.3}]",
                 cr.base_reactions[0], cr.base_reactions[1], cr.base_reactions[2]
             ));
+        }
+        if !cr.status.is_finished() {
+            details.push("not finished".to_string());
         }
         println!("  Result '{}': {}", cname, details.join(", "));
     }

@@ -411,17 +411,37 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                 ));
             }
         }
-        for (function, load, _) in &case.history_loads {
+        for (entry, (function, load, _)) in case.history_loads.iter().enumerate() {
             reference(
                 model.functions.contains_key(function),
                 format!("load_cases.{name}.history_loads.function"),
                 function,
             )?;
-            reference(
-                model.load_patterns.contains_key(load) || acceleration(load),
-                format!("load_cases.{name}.history_loads.load"),
-                load,
-            )?;
+            // D77/D81: what the entry MEANS decides which record is written, and
+            // the guard compares meanings (see `semantic_model`). An explicit
+            // acceleration is written under any direction alias (X, UX, U1): the
+            // record holds the direction index, as the vendor's own file does.
+            let named_direction =
+                sap_model::history_acceleration_direction(load).is_some() || acceleration(load);
+            let ok = match case.history_kind(entry) {
+                sap_model::HistoryLoadKind::Pattern => model.load_patterns.contains_key(load),
+                sap_model::HistoryLoadKind::Acceleration => named_direction,
+                sap_model::HistoryLoadKind::Unspecified => {
+                    match sap_model::resolve_history_load(model, case, entry) {
+                        Err(ambiguity) => {
+                            return Err(unsupported(
+                                format!("load_cases.{name}.history_loads.load"),
+                                format!("{ambiguity}; native export does not guess, set the load type of the entry"),
+                            ));
+                        }
+                        Ok(sap_model::ResolvedHistoryLoad::Pattern) => {
+                            model.load_patterns.contains_key(load)
+                        }
+                        Ok(sap_model::ResolvedHistoryLoad::Acceleration(_)) => true,
+                    }
+                }
+            };
+            reference(ok, format!("load_cases.{name}.history_loads.load"), load)?;
         }
     }
     for (name, combo) in &model.load_combos {
@@ -671,6 +691,48 @@ fn semantic_model(model: &SapModel) -> SapModel {
     copy.case_results.clear();
     copy.steel_design_results.clear();
     copy.concrete_design_results.clear();
+    // D81: a history entry is compared by what it means, not by its stored tag
+    // or the alias of its direction. An entry without a kind that resolves
+    // without ambiguity is what the writer records (its type code) and the
+    // reader then returns with an explicit kind; an acceleration is read back
+    // as `U<direction>`. An entry that cannot be resolved keeps its tag, so a
+    // real change (and an ambiguous entry) still differs.
+    for case in copy.load_cases.values_mut() {
+        if case.history_loads.is_empty() {
+            continue;
+        }
+        let original = case.clone();
+        let mut kinds = Vec::with_capacity(original.history_loads.len());
+        for i in 0..original.history_loads.len() {
+            let load = original.history_loads[i].1.clone();
+            let kind = match original.history_kind(i) {
+                sap_model::HistoryLoadKind::Pattern => sap_model::HistoryLoadKind::Pattern,
+                sap_model::HistoryLoadKind::Acceleration => {
+                    case.history_loads[i].1 = match sap_model::history_acceleration_direction(&load)
+                    {
+                        Some(d) => format!("U{}", d + 1),
+                        None => load.to_ascii_uppercase(),
+                    };
+                    sap_model::HistoryLoadKind::Acceleration
+                }
+                sap_model::HistoryLoadKind::Unspecified => {
+                    match sap_model::resolve_history_load(model, &original, i) {
+                        Ok(sap_model::ResolvedHistoryLoad::Pattern) => {
+                            sap_model::HistoryLoadKind::Pattern
+                        }
+                        Ok(sap_model::ResolvedHistoryLoad::Acceleration(d)) => {
+                            case.history_loads[i].1 = format!("U{}", d + 1);
+                            sap_model::HistoryLoadKind::Acceleration
+                        }
+                        Err(_) => sap_model::HistoryLoadKind::Unspecified,
+                    }
+                }
+            };
+            kinds.push(kind);
+        }
+        case.history_load_kinds = kinds;
+        case.normalize_history_kinds();
+    }
     copy
 }
 fn semantic_value(model: &SapModel) -> Result<Value, FormatError> {

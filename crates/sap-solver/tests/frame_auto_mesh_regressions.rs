@@ -819,6 +819,16 @@ fn results_of_every_case_type_name_only_model_joints_and_frames() {
         LoadCombo {
             name: "COMBO".into(),
             combo_type: ComboType::LinearAdd,
+            cases: vec![("STATIC".into(), 1.2), ("PDELTA".into(), 0.5)],
+        },
+    );
+    // D80: a combination of a history is withheld (its extrema over time are not stored).
+    // It was STATIC * 1.2 + HIST * 0.5 here, published from the snapshot of HIST.
+    m.load_combos.insert(
+        "HCOMBO".into(),
+        LoadCombo {
+            name: "HCOMBO".into(),
+            combo_type: ComboType::LinearAdd,
             cases: vec![("STATIC".into(), 1.2), ("HIST".into(), 0.5)],
         },
     );
@@ -827,6 +837,8 @@ fn results_of_every_case_type_name_only_model_joints_and_frames() {
     let joints: Vec<&String> = m.points.keys().collect();
     let frames: Vec<&String> = m.frames.keys().collect();
     assert_eq!(m.case_results.len(), 8);
+    assert!(!m.case_results.contains_key("HCOMBO"));
+    assert!(m.unavailable_results["HCOMBO"].contains("'HIST'"));
     for (name, r) in &m.case_results {
         let only_joints = |keys: Vec<&String>, what: &str| {
             assert!(keys.iter().all(|k| joints.contains(k)), "{name} {what}: {keys:?}");

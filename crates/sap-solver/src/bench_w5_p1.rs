@@ -74,7 +74,7 @@ fn rigid_zone_bar() -> SapModel {
 fn verify_rigid_zone_axial_and_torsion() -> Vec<BenchmarkVerificationRow> {
     let mut model = rigid_zone_bar();
     // An analysis error must fail the suite, not drop the rows.
-    crate::analyze_model(&mut model).expect("rigid-zone benchmark bar must analyse");
+    crate::benchmarks::analyze_model(&mut model).expect("rigid-zone benchmark bar must analyse");
     let tip = |case: &str, dof: usize| model.case_results[case].joint_displacements["2"][dof];
     vec![
         BenchmarkVerificationRow::new(

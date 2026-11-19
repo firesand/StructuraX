@@ -2,7 +2,7 @@
 use super::*;
 use sap_model::hinge::{HingeUnloading, ModeLoad, ResultsSaved};
 use sap_model::{
-    DisplacementControl, DynamicFunction, LoadCaseAssignment, LoadCaseType, ModalComboMethod,
+    DisplacementControl, DynamicFunction, HistoryLoadKind, LoadCaseAssignment, LoadCaseType, ModalComboMethod,
     ModalSubType, NLGeomType, TimeIntegrationMethod,
 };
 
@@ -185,6 +185,75 @@ fn static_loads(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                 .unwrap_or_default(),
             scale_factor: 1.0,
         });
+    }
+}
+/// Load assignments of a time-history case. Each entry is either a ground
+/// acceleration (U1, U2, U3) or a load pattern, and the case stores which
+/// (D77): the form writes exactly the kind it shows, whatever the name.
+fn history_load_entries(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
+    let mut remove = None;
+    let mut edits: Vec<(usize, String, HistoryLoadKind)> = Vec::new();
+    for i in 0..case.history_loads.len() {
+        let kind = case.history_kind(i);
+        let (function, target, scale) = &mut case.history_loads[i];
+        ui.horizontal(|ui| {
+            text_choice(
+                ui,
+                ("case_function", true, i),
+                function,
+                model
+                    .functions
+                    .values()
+                    .filter(|f| f.is_time_history)
+                    .map(|f| f.name.clone()),
+            );
+            let shown = match kind {
+                HistoryLoadKind::Acceleration => format!("Accel {target}"),
+                HistoryLoadKind::Pattern => format!("Pattern {target}"),
+                HistoryLoadKind::Unspecified => format!("{target} (type not stated)"),
+            };
+            egui::ComboBox::from_id_salt(("case_target", true, i))
+                .selected_text(shown)
+                .show_ui(ui, |ui| {
+                    for dir in ["U1", "U2", "U3"] {
+                        let chosen = kind == HistoryLoadKind::Acceleration && target == dir;
+                        if ui.selectable_label(chosen, format!("Accel {dir}")).clicked() {
+                            edits.push((i, dir.to_string(), HistoryLoadKind::Acceleration));
+                        }
+                    }
+                    for name in model.load_patterns.keys() {
+                        let chosen = kind == HistoryLoadKind::Pattern && target == name;
+                        if ui.selectable_label(chosen, format!("Pattern {name}")).clicked() {
+                            edits.push((i, name.clone(), HistoryLoadKind::Pattern));
+                        }
+                    }
+                });
+            ui.add(egui::DragValue::new(scale).speed(0.1));
+            if ui.button("Remove").clicked() {
+                remove = Some(i);
+            }
+        });
+    }
+    let mut kinds: Vec<HistoryLoadKind> = (0..case.history_loads.len())
+        .map(|i| case.history_kind(i))
+        .collect();
+    for (i, name, kind) in edits {
+        case.history_loads[i].1 = name;
+        kinds[i] = kind;
+    }
+    case.history_load_kinds = kinds;
+    case.normalize_history_kinds();
+    if let Some(i) = remove {
+        case.remove_history_load(i);
+    }
+    if ui.button("Add Function Assignment").clicked() {
+        let function = model
+            .functions
+            .values()
+            .find(|f| f.is_time_history)
+            .map(|f| f.name.clone())
+            .unwrap_or_default();
+        case.push_history_load(function, "U1", HistoryLoadKind::Acceleration, 1.0);
     }
 }
 fn dynamic_loads(
@@ -376,8 +445,11 @@ pub(super) fn set_displacement_control(
     if case.case_type != LoadCaseType::NonlinearStatic {
         return Err("Only a nonlinear static case has load application control.".into());
     }
-    if case.nl_geom != NLGeomType::None {
-        return Err("Displacement control needs small displacements; set the geometry to small displacement first.".into());
+    // P-Delta with displacement control is analyzed for models with frame
+    // hinges and for Accel or Mode loads (sixth tutorial-video wave, G14);
+    // the solver refuses the other combinations by name when the case runs.
+    if case.nl_geom == NLGeomType::LargeDisplacements {
+        return Err("Displacement control is not available with large displacements; set the geometry to small displacements or P-Delta first.".into());
     }
     if !model.points.contains_key(joint) {
         return Err(format!("Joint '{joint}' does not exist."));
@@ -599,6 +671,78 @@ pub(super) fn remove_mode_load(case: &mut LoadCase, index: usize) -> Result<(), 
         case.modal_case = None;
     }
     Ok(())
+}
+
+/// "Stiffness to Use" of a modal or linear static case (v19 help topic of
+/// that name): the unstressed state, or the stiffness at the end of a
+/// nonlinear static case. Whether the hinges of that case allow it is decided
+/// when the case runs (sixth tutorial-video wave, G48).
+pub(super) fn set_stiffness_case(
+    model: &SapModel,
+    case: &mut LoadCase,
+    source: Option<&str>,
+) -> Result<(), String> {
+    if !matches!(
+        case.case_type,
+        LoadCaseType::Modal | LoadCaseType::LinearStatic
+    ) {
+        return Err("Only a modal or a linear static case chooses a stiffness here.".into());
+    }
+    let Some(name) = source else {
+        case.initial_case = None;
+        return Ok(());
+    };
+    if name == case.name {
+        return Err("A case cannot use its own stiffness.".into());
+    }
+    match model.load_cases.get(name) {
+        None => Err(format!("Case '{name}' does not exist.")),
+        Some(c) if c.case_type != LoadCaseType::NonlinearStatic => Err(format!(
+            "Case '{name}' is not a nonlinear static case; only the stiffness at the end of a nonlinear static case can be used."
+        )),
+        Some(_) => {
+            case.initial_case = Some(name.to_string());
+            Ok(())
+        }
+    }
+}
+
+/// The "Stiffness to Use" row of a modal or linear static case.
+fn stiffness_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
+    const ZERO: &str = "Zero initial conditions - unstressed state";
+    let sources: Vec<String> = model
+        .load_cases
+        .values()
+        .filter(|c| c.case_type == LoadCaseType::NonlinearStatic && c.name != case.name)
+        .map(|c| c.name.clone())
+        .collect();
+    let mut choice = case.initial_case.clone();
+    ui.horizontal(|ui| {
+        ui.label("Stiffness to use:");
+        egui::ComboBox::from_id_salt("stiffness_to_use")
+            .selected_text(match &choice {
+                Some(name) => format!("At end of nonlinear case {name}"),
+                None => ZERO.to_string(),
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut choice, None, ZERO);
+                for name in &sources {
+                    ui.selectable_value(
+                        &mut choice,
+                        Some(name.clone()),
+                        format!("At end of nonlinear case {name}"),
+                    );
+                }
+            });
+    });
+    if choice != case.initial_case {
+        if let Err(error) = set_stiffness_case(model, case, choice.as_deref()) {
+            ui.colored_label(Color32::YELLOW, format!("Not changed: {error}"));
+        }
+    }
+    if case.initial_case.is_some() {
+        ui.weak("The geometric stiffness of that case is used only if it considered P-Delta. In a model with hinges the case runs only if no hinge has yielded at the end of that case.");
+    }
 }
 
 /// The load rows and settings of a nonlinear static case. Returns the reason
@@ -904,6 +1048,9 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
             ui.label("Element applicability and convergence are checked when analysis runs.");
         }
         LoadCaseType::LinearStatic | LoadCaseType::Buckling => {
+            if case.case_type == LoadCaseType::LinearStatic {
+                stiffness_controls(ui, model, case);
+            }
             static_loads(ui, model, case);
             if case.case_type == LoadCaseType::Buckling {
                 ui.horizontal(|ui| {
@@ -913,6 +1060,7 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
             }
         }
         LoadCaseType::Modal => {
+            stiffness_controls(ui, model, case);
             let old_subtype = case.modal_sub_type;
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut case.modal_sub_type, ModalSubType::Eigen, "Eigen");
@@ -1054,10 +1202,10 @@ fn case_controls(ui: &mut egui::Ui, model: &SapModel, case: &mut LoadCase) {
                 ui.add(egui::DragValue::new(&mut case.rayleigh_damping.1).speed(0.001));
             });
             }
-            dynamic_loads(ui, model, &mut case.history_loads, true);
-            ui.label("U1/U2/U3 are global base acceleration. Other targets are joint-force patterns. Ordinate × scale multiplies the selected excitation.");
+            history_load_entries(ui, model, case);
+            ui.label("Accel U1/U2/U3 are global base acceleration. Pattern entries apply the joint forces and the frame distributed and point loads of that pattern, whatever its name. Ordinate × scale multiplies the selected excitation.");
             ui.label(
-                "History patterns cannot contain self-weight, member loads or support motion yet.",
+                "History patterns cannot contain self-weight, frame temperature or gravity loads, area or solid loads, or support motion; saving names the pattern and the load type.",
             );
         }
         _ => {
@@ -1393,6 +1541,41 @@ mod tests {
     }
 
     #[test]
+    fn the_stiffness_of_a_modal_or_linear_case_may_come_from_a_nonlinear_static_case() {
+        // v19 help "Stiffness to Use". `push_model` has the nonlinear static
+        // case GRAV; a draft may name it, and nothing else.
+        let m = push_model();
+        for kind in [LoadCaseType::Modal, LoadCaseType::LinearStatic] {
+            let mut c = new_case(kind, "X");
+            set_stiffness_case(&m, &mut c, Some("GRAV")).unwrap();
+            assert_eq!(c.initial_case.as_deref(), Some("GRAV"));
+            // The definition is one the command layer accepts.
+            sap_api::validate_case_definition(&m, &c).unwrap();
+            set_stiffness_case(&m, &mut c, None).unwrap();
+            assert!(c.initial_case.is_none());
+            assert!(set_stiffness_case(&m, &mut c, Some("GHOST"))
+                .unwrap_err()
+                .contains("does not exist"));
+            assert!(set_stiffness_case(&m, &mut c, Some("X"))
+                .unwrap_err()
+                .contains("own stiffness"));
+            assert!(c.initial_case.is_none());
+        }
+        // A source that is not a nonlinear static case is refused.
+        let mut with_lin = m.clone();
+        with_lin
+            .load_cases
+            .insert("LIN".into(), new_case(LoadCaseType::LinearStatic, "LIN"));
+        let mut c = new_case(LoadCaseType::Modal, "X");
+        assert!(set_stiffness_case(&with_lin, &mut c, Some("LIN"))
+            .unwrap_err()
+            .contains("not a nonlinear static case"));
+        // Other case types have no such choice.
+        let mut buckling = new_case(LoadCaseType::Buckling, "B");
+        assert!(set_stiffness_case(&m, &mut buckling, Some("GRAV")).is_err());
+    }
+
+    #[test]
     fn load_application_results_and_step_commands_validate() {
         let m = push_model();
         let mut c = draft("PUSH");
@@ -1416,9 +1599,17 @@ mod tests {
             assert!(set_displacement_control(&m, &mut c, joint, dof, target, false).is_err());
             assert_eq!(c, before);
         }
-        c.nl_geom = NLGeomType::PDelta;
+        // Large displacements: refused by the form. P-Delta: accepted since
+        // the sixth wave (the solver decides whether the model carries it).
+        c.nl_geom = NLGeomType::LargeDisplacements;
         let error = set_displacement_control(&m, &mut c, "K", 1, 1.0, false).unwrap_err();
-        assert!(error.contains("small displacements"), "{error}");
+        assert!(error.contains("large displacements"), "{error}");
+        c.nl_geom = NLGeomType::PDelta;
+        set_displacement_control(&m, &mut c, "K", 1, 1.0, false).unwrap();
+        assert_eq!(
+            c.displacement_control.as_ref().and_then(|d| d.monitored.clone()),
+            Some(("K".to_string(), 1))
+        );
         c.nl_geom = NLGeomType::None;
         set_full_load(&mut c);
         assert!(c.displacement_control.is_none());
@@ -1706,5 +1897,86 @@ mod tests {
         assert!(control.conjugate);
         press(&mut app, "Full load", 30.0);
         assert!(app.analysis_editor.case.displacement_control.is_none());
+    }
+
+    /// D77: the history form shows and writes the kind of each entry. A
+    /// pattern named U1 and the acceleration U1 are different rows, both survive
+    /// a frame unchanged, and "Add Function Assignment" appends an acceleration
+    /// without disturbing the kinds of the rows above it.
+    #[test]
+    fn history_form_shows_and_keeps_the_kind_of_each_entry() {
+        let mut model = SapModel::new(Units::KnMC);
+        model.load_patterns.insert(
+            "U1".into(),
+            sap_model::LoadPattern {
+                name: "U1".into(),
+                pat_type: sap_model::LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+        let mut case = LoadCase::linear_static("H", "U1", 1.0);
+        case.case_type = LoadCaseType::LinearHistory;
+        case.loads.clear();
+        case.push_history_load("F", "U1", HistoryLoadKind::Pattern, 1.0);
+        case.push_history_load("F", "U1", HistoryLoadKind::Acceleration, 2.0);
+        let ctx = egui::Context::default();
+        let mut time = 0.0;
+        let mut frame = |case: &mut LoadCase, events: Vec<egui::Event>| {
+            time += 0.5;
+            ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::Vec2::new(900.0, 400.0),
+                    )),
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        history_load_entries(ui, &model, case);
+                    });
+                },
+            )
+        };
+        let _ = frame(&mut case, vec![]);
+        let out = frame(&mut case, vec![]);
+        let shown: Vec<String> = out
+            .shapes
+            .iter()
+            .filter_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) => Some(t.galley.job.text.clone()),
+                _ => None,
+            })
+            .collect();
+        for want in ["Pattern U1", "Accel U1"] {
+            assert!(shown.iter().any(|t| t == want), "{want} in {shown:?}");
+        }
+        assert_eq!(case.history_kind(0), HistoryLoadKind::Pattern);
+        assert_eq!(case.history_kind(1), HistoryLoadKind::Acceleration);
+        let at = out
+            .shapes
+            .iter()
+            .find_map(|s| match &s.shape {
+                egui::epaint::Shape::Text(t) if t.galley.job.text == "Add Function Assignment" => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+            .expect("Add button");
+        let button = |pressed| egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        };
+        let _ = frame(&mut case, vec![egui::Event::PointerMoved(at), button(true)]);
+        let _ = frame(&mut case, vec![button(false)]);
+        assert_eq!(case.history_loads.len(), 3);
+        assert_eq!(case.history_kind(0), HistoryLoadKind::Pattern);
+        assert_eq!(case.history_kind(1), HistoryLoadKind::Acceleration);
+        assert_eq!(case.history_kind(2), HistoryLoadKind::Acceleration);
+        assert_eq!(case.history_loads[2].1, "U1");
     }
 }

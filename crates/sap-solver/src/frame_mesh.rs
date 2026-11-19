@@ -44,6 +44,9 @@ pub(crate) struct HingeSite {
     /// Position on the object, as assigned.
     pub rel_dist: f64,
     pub prop: String,
+    /// The object has the overwrite "do not allow hinges to drop loads" (its
+    /// elements do not keep the overwrite).
+    pub do_not_drop_load: bool,
 }
 
 /// What [`expand`] did, for [`collapse`].
@@ -103,12 +106,6 @@ fn hinge_splits(frame: &FrameObj) -> Result<Vec<f64>, SolverError> {
 }
 
 fn check_hinge_positions(frame: &FrameObj) -> Result<(), SolverError> {
-    if frame.hinge_overwrite.as_ref().is_some_and(|o| o.do_not_drop_load) {
-        return Err(SolverError::UnsupportedInput(format!(
-            "frame '{}' has the hinge overwrite \"do not allow hinges to drop loads\", which is stored but not analyzed",
-            frame.name
-        )));
-    }
     for hinge in &frame.hinges {
         if !hinge.rel_dist.is_finite() || !(0.0..=1.0).contains(&hinge.rel_dist) {
             return Err(SolverError::UnsupportedInput(format!(
@@ -131,6 +128,7 @@ fn direct_sites(frame: &FrameObj, sites: &mut Vec<HingeSite>) -> Result<(), Solv
             rel: hinge.rel_dist,
             rel_dist: hinge.rel_dist,
             prop: hinge.prop.clone(),
+            do_not_drop_load: frame.hinge_overwrite.as_ref().is_some_and(|o| o.do_not_drop_load),
         });
     }
     Ok(())
@@ -166,6 +164,7 @@ fn piece_sites(
             rel: ((x - ta) / (tb - ta)).clamp(0.0, 1.0),
             rel_dist: x,
             prop: hinge.prop.clone(),
+            do_not_drop_load: frame.hinge_overwrite.as_ref().is_some_and(|o| o.do_not_drop_load),
         });
     }
     Ok(())

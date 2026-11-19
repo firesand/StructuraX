@@ -50,7 +50,18 @@ pub struct PushoverPoint {
     pub total: usize,
 }
 
-/// The pushover curve of a nonlinear static case: one point per saved state.
+/// The status of the results behind [`pushover_curve`] (G16): `Some((reason, saved steps))`
+/// when the case stopped before its target and the curve is the part it reached; `None`
+/// for a case that finished or has no results.
+pub fn pushover_not_finished(model: &SapModel, case: &str) -> Option<(String, usize)> {
+    match &model.case_results.get(case)?.status {
+        sap_model::CaseStatus::NotFinished { reason, steps } => Some((reason.clone(), *steps)),
+        sap_model::CaseStatus::Finished => None,
+    }
+}
+
+/// The pushover curve of a nonlinear static case: one point per saved state. A case that
+/// is not finished gives the states it reached (see [`pushover_not_finished`]).
 ///
 /// Refused: an unknown case, a case that is not nonlinear static, a case
 /// without displacement control, a monitored DOF that is a rotation (a base
@@ -61,6 +72,10 @@ pub fn pushover_curve(model: &SapModel, case: &str) -> Result<Vec<PushoverPoint>
         .load_cases
         .get(case)
         .ok_or_else(|| format!("case '{case}' does not exist"))?;
+    // G16: a case that could not start has no results, and says why.
+    if let Some(reason) = sap_model::results::unavailable_reason(model, case) {
+        return Err(format!("case '{case}' has no results: {reason}"));
+    }
     if lc.case_type != LoadCaseType::NonlinearStatic {
         return Err(format!("case '{case}' is not a nonlinear static case"));
     }

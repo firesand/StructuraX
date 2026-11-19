@@ -261,22 +261,52 @@ fn nonlinear_static_initial_case_is_accepted_for_nonlinear_static_cases_only() {
     // Redefining N1 with itself unchanged is fine.
     set_case_definition(&mut api.inner, nl_static("N1")).unwrap();
 
-    // Other case types still refuse an initial case.
+    // Sixth tutorial-video wave (G48): a linear static or modal case may use
+    // the stiffness at the end of a nonlinear static case (v19 help, "Stiffness
+    // to Use"). Before, both were refused here ("initial-state cases are
+    // supported only by nonlinear static cases"), although the solver ran them.
     let mut lin = LoadCase::linear_static("LIN2", "DEAD", 1.);
     lin.initial_case = Some("N1".into());
-    refused(&api, lin, "initial-state cases are supported only");
+    sap_api::validate_case_definition(&api.inner, &lin).unwrap();
+    let mut modal = LoadCase::modal_eigen("M2", 2);
+    modal.initial_case = Some("N1".into());
+    sap_api::validate_case_definition(&api.inner, &modal).unwrap();
+    // ... but only of an existing, different, nonlinear static case.
+    for (bad, needle) in [
+        ("GHOST", "not an existing"),
+        ("LIN", "not a nonlinear static case"),
+        ("MODAL", "not a nonlinear static case"),
+    ] {
+        let mut lin = LoadCase::linear_static("LIN2", "DEAD", 1.);
+        lin.initial_case = Some(bad.into());
+        refused(&api, lin, needle);
+        let mut modal = LoadCase::modal_eigen("M2", 2);
+        modal.initial_case = Some(bad.into());
+        refused(&api, modal, needle);
+    }
+    let mut own = LoadCase::modal_eigen("M2", 2);
+    own.initial_case = Some("M2".into());
+    refused(&api, own, "not an existing, different");
+    // A history still refuses an initial case here.
     let mut h = history();
     h.initial_case = Some("N1".into());
     refused(&api, h, "initial-state cases are supported only");
-    let mut modal = LoadCase::modal_eigen("M2", 2);
-    modal.initial_case = Some("N1".into());
-    refused(&api, modal, "initial-state cases are supported only");
 
     // A case that others continue from must stay nonlinear static.
     refused(
         &api,
         LoadCase::linear_static("N1", "DEAD", 1.),
-        "initial case of a nonlinear static",
+        "must stay a nonlinear static case",
+    );
+    // Also when the only case that names it is a modal case.
+    set_case_definition(&mut api.inner, nl_static("N9")).unwrap();
+    let mut modal = LoadCase::modal_eigen("M9", 2);
+    modal.initial_case = Some("N9".into());
+    set_case_definition(&mut api.inner, modal).unwrap();
+    refused(
+        &api,
+        LoadCase::linear_static("N9", "DEAD", 1.),
+        "must stay a nonlinear static case",
     );
     assert_eq!(
         api.load_cases()
@@ -369,9 +399,15 @@ fn displacement_control_definition_keeps_its_checks() {
         b.displacement_control = Some(bad);
         refused(&api, b, "displacement control needs");
     }
-    let mut pdelta = c;
+    // Sixth tutorial-video wave (G14): P-Delta with displacement control is
+    // accepted here (before, it was refused); the solver decides whether the
+    // model carries it. Large displacements stay refused.
+    let mut pdelta = c.clone();
     pdelta.nl_geom = NLGeomType::PDelta;
-    refused(&api, pdelta, "displacement control needs");
+    sap_api::validate_case_definition(&api.inner, &pdelta).unwrap();
+    let mut large = c;
+    large.nl_geom = NLGeomType::LargeDisplacements;
+    assert!(sap_api::validate_case_definition(&api.inner, &large).is_err());
 }
 
 #[test]
@@ -519,4 +555,39 @@ fn pushover_definitions_refuse_while_locked_and_change_nothing() {
     assert_eq!(api.load_cases().set_definition(n2), OAPI_ERR);
     assert!(set_case_definition(&mut api.inner, mode_case(1, 1.)).is_err());
     assert_eq!(api.inner, before);
+}
+
+/// D77: the case editor accepts a pattern that is named like an acceleration
+/// when the entry says it is a pattern, applies it as a force (closed form of
+/// the test above: m = 2, k = 8, F = 4 gives u = 0.5 (1 - cos 2t), tolerance
+/// 1e-5 as there), and refuses an entry that does not say.
+#[test]
+fn history_pattern_named_like_an_acceleration_needs_its_kind() {
+    let mut a = oscillator();
+    a.inner.load_patterns.insert(
+        "X".into(),
+        LoadPattern {
+            name: "X".into(),
+            pat_type: LoadPatternType::Other,
+            self_wt_multiplier: 0.,
+        },
+    );
+    a.inner.points.get_mut("J").unwrap().loads_force[0].load_pat = "X".into();
+    assert_eq!(a.functions().set_definition(function("STEP", true)), OAPI_OK);
+
+    let mut unstated = history();
+    unstated.history_loads = vec![("STEP".into(), "X".into(), 1.)];
+    let err = set_case_definition(&mut a.inner, unstated).unwrap_err().to_string();
+    assert!(err.contains("'X'") && err.contains("ambiguous"), "{err}");
+
+    let mut stated = history();
+    stated.history_loads.clear();
+    stated.push_history_load("STEP", "X", HistoryLoadKind::Pattern, 1.);
+    assert_eq!(a.load_cases().set_definition(stated), OAPI_OK);
+    assert_eq!(a.analyze().run_analysis(), OAPI_OK);
+    let result = &a.inner.case_results["H"];
+    for (t, u) in result.time_steps.iter().zip(&result.time_history_disp["J"]) {
+        let exact = 0.5 * (1. - (2. * t).cos());
+        assert!((u[0] - exact).abs() < 1e-5, "{t}: {} vs {exact}", u[0]);
+    }
 }

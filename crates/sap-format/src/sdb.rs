@@ -2717,7 +2717,14 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     }
                 } else if matches!(ctype_code, 5..=8) {
                     if let (Some(function), Some(load_name)) = (function, load_name) {
-                        lc.history_loads.push((function.clone(), load_name, sf));
+                        // m_ltype 1 is a load pattern and 2 an acceleration (D77):
+                        // the record says which, whatever the pattern is named.
+                        let kind = if load_type == 2 {
+                            sap_model::HistoryLoadKind::Acceleration
+                        } else {
+                            sap_model::HistoryLoadKind::Pattern
+                        };
+                        lc.push_history_load(function.clone(), load_name, kind, sf);
                     }
                 } else if let Some(load_name) = load_name {
                     lc.loads.push(LoadCaseAssignment {
@@ -2918,6 +2925,14 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     cases.push((cname.clone(), sf));
                 }
             }
+        }
+        if model.load_cases.contains_key(&name) {
+            // D79: native references to a case and a combination of one name would be
+            // ambiguous in the results, as in the exporter's guard.
+            return Err(FormatError::InvalidSdb(format!(
+                "'{name}' is both a load case and a load combination of the file; results \
+                 and combination contributors are identified by name alone"
+            )));
         }
         model.load_combos.insert(
             name.clone(),

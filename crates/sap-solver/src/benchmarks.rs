@@ -4,7 +4,7 @@
 //! used by the CLI (`sap2000-rs verify`) and GUI (`Help -> Verification Suite`) to compare
 //! `sap2000-rs` against CSI SAP2000 v19 reference benchmarks.
 
-use crate::analyze_model;
+use crate::SolverError;
 use sap_model::{
     FrameLoadDistributed, FrameLoadPoint, FrameLoadTemperature, FrameSection, LoadCase,
     LoadCaseType, LoadPattern, LoadPatternType, Material, NLGeomType, PointLoadForce, SapModel,
@@ -12,6 +12,28 @@ use sap_model::{
 use sap_section::make_rectangular;
 use sap_units::Units;
 use serde::{Deserialize, Serialize};
+
+/// Analyzes the model of a verification row. A case that is not finished or could not
+/// start (G16) is a failure of the row, never a result to compare: `analyze_model` returns
+/// `Ok` for such a model, but a verification value read from its states would be one the
+/// case did not reach.
+pub(crate) fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
+    crate::analyze_model(model)?;
+    if let Some((name, status)) = crate::unfinished_cases(model).into_iter().next() {
+        let sap_model::CaseStatus::NotFinished { reason, .. } = status else {
+            unreachable!("unfinished_cases lists cases that are not finished");
+        };
+        return Err(SolverError::InvalidInput(format!(
+            "verification case '{name}' is not finished ({reason})"
+        )));
+    }
+    if let Some((name, reason)) = crate::could_not_start_cases(model).into_iter().next() {
+        return Err(SolverError::InvalidInput(format!(
+            "verification case '{name}' {reason}"
+        )));
+    }
+    Ok(())
+}
 
 /// A single verification comparison row between SAP2000 v19 reference and `sap2000-rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2466,7 +2488,7 @@ pub fn verify_shell_cantilever_strip() -> Vec<BenchmarkVerificationRow> {
             "PL",
         );
     }
-    crate::analyze_model(&mut m).expect("cantilever strip analyzes");
+    analyze_model(&mut m).expect("cantilever strip analyzes");
     let area = &m.case_results["D"].area_results["A0"];
     vec![
         BenchmarkVerificationRow::new(
@@ -2554,6 +2576,60 @@ pub fn verify_modal_participation_global() -> Vec<BenchmarkVerificationRow> {
 mod tests {
     use super::*;
     use sap_model::{AreaLoadUniform, AreaSection, DynamicFunction, ModalComboMethod, ShellType};
+
+    /// G16: the analysis of the model of a verification row fails when a case is not
+    /// finished or could not start, so no row is ever compared against states the case did
+    /// not reach. A steel cantilever (kip, in) with an elastic-perfectly-plastic root hinge
+    /// of 2000 kip in carries a tip load by load control: the limit load is
+    /// 2000 / 120 = 16.67 kip; a push of 100 kip stops at it, a push of 10 kip finishes.
+    #[test]
+    fn a_verification_model_with_a_case_that_is_not_finished_fails() {
+        use sap_model::hinge::{FrameHinge, HingeDof, HingePoint, HingeProp};
+        let build = |push: f64| {
+            let mut m = SapModel::new(Units::KipInF);
+            m.load_cases.clear();
+            m.load_patterns.clear();
+            m.load_patterns.insert(
+                "P".into(),
+                LoadPattern {
+                    name: "P".into(),
+                    pat_type: LoadPatternType::Other,
+                    self_wt_multiplier: 0.0,
+                },
+            );
+            let sec = sap_section::make_i_section("W14X90", "A992Fy50", 14.0, 14.5, 0.710, 0.440, 14.5, 0.710);
+            m.frame_sections.insert(sec.name.clone(), sec);
+            m.add_point("A", 0.0, 0.0, 0.0);
+            m.add_point("B", 120.0, 0.0, 0.0);
+            m.points.get_mut("A").unwrap().restraint = [true; 6];
+            m.points.get_mut("B").unwrap().loads_force.push(PointLoadForce {
+                load_pat: "P".into(),
+                csys: "GLOBAL".into(),
+                force: [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+            });
+            m.add_frame("BM", "A", "B", "W14X90");
+            let mut prop = HingeProp::symmetric(
+                "H",
+                HingeDof::M3,
+                [(1.0, 0.0), (1.0, 0.01), (1.0, 0.02), (1.0, 0.03)].map(|(f, d)| HingePoint::new(f, d)),
+            );
+            prop.force_sf = 2000.0;
+            prop.force_sf_negative = 2000.0;
+            m.hinge_props.insert("H".into(), prop);
+            m.frames.get_mut("BM").unwrap().hinges = vec![FrameHinge { prop: "H".into(), rel_dist: 0.0 }];
+            let mut case = LoadCase::linear_static("PUSH", "P", push);
+            case.case_type = LoadCaseType::NonlinearStatic;
+            m.load_cases.insert("PUSH".into(), case);
+            m
+        };
+        let mut finished = build(10.0);
+        analyze_model(&mut finished).expect("a push below the limit load finishes");
+        let mut short = build(100.0);
+        crate::analyze_model(&mut short).expect("the solver itself returns Ok");
+        assert!(!short.case_results["PUSH"].status.is_finished());
+        let e = analyze_model(&mut build(100.0)).unwrap_err().to_string();
+        assert!(e.contains("verification case 'PUSH' is not finished") && e.contains("limit"), "{e}");
+    }
 
     #[test]
     fn test_official_sap2000_verification_suite() {

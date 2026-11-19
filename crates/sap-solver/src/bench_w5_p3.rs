@@ -109,7 +109,7 @@ fn manual_solver_rows(rows: &mut Vec<Row>) {
     combo(&mut m, "COMB1", ComboType::LinearAdd, &[("LL", 1.0), ("QUAKE", 1.0)]);
     combo(&mut m, "COMB2", ComboType::Envelope, &[("LL", 1.0), ("QUAKE", 1.0)]);
     // An analysis error must fail the suite, not drop the rows.
-    crate::analyze_model(&mut m).expect("combination benchmark model of p. 353 must analyse");
+    crate::benchmarks::analyze_model(&mut m).expect("combination benchmark model of p. 353 must analyse");
     let ex = "Combinations p. 353";
     for (name, max, min) in [("COMB1", 5.5, 1.5), ("COMB2", 3.5, -2.0)] {
         let hi = &m.case_results[name];

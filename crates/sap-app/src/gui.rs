@@ -14,6 +14,7 @@ mod i_section;
 mod materials;
 mod messages;
 mod modal_tables;
+mod hinge_results;
 mod pushover;
 mod result_display;
 mod result_tables;
@@ -283,6 +284,7 @@ pub struct SapGuiApp {
     pub show_area_labels: bool,
     pub show_solid_labels: bool,
     pub show_link_labels: bool,
+    pub show_hinge_labels: bool,
     pub show_restraints: bool,
     pub show_loads: bool,
     pub show_extruded: bool,
@@ -354,6 +356,7 @@ pub struct SapGuiApp {
     panel_hinges: hinges::State,
     panel_modal_tables: modal_tables::State,
     panel_pushover: pushover::State,
+    panel_hinge_results: hinge_results::State,
     panel_seismic: seismic::State,
     panel_steel_design: steel_design::State,
     panel_time_history: time_history::State,
@@ -496,6 +499,7 @@ impl SapGuiApp {
             show_area_labels: false,
             show_solid_labels: false,
             show_link_labels: true,
+            show_hinge_labels: false,
             show_restraints: true,
             show_loads: true,
             show_extruded: false,
@@ -553,6 +557,7 @@ impl SapGuiApp {
             panel_hinges: hinges::State::default(),
             panel_modal_tables: modal_tables::State::default(),
             panel_pushover: pushover::State::default(),
+            panel_hinge_results: hinge_results::State::default(),
             panel_seismic: seismic::State::default(),
             panel_steel_design: steel_design::State::default(),
             panel_time_history: time_history::State::default(),
@@ -656,6 +661,7 @@ impl SapGuiApp {
         self.panel_hinges = hinges::State::default();
         self.panel_modal_tables = modal_tables::State::default();
         self.panel_pushover = pushover::State::default();
+        self.panel_hinge_results = hinge_results::State::default();
         self.panel_seismic = seismic::State::default();
         self.panel_steel_design = steel_design::State::default();
         self.panel_time_history = time_history::State::default();
@@ -853,6 +859,19 @@ impl SapGuiApp {
                     self.model.links.len(),
                     self.model.case_results.len()
                 );
+                // D78: results that could not be produced are named, not dropped silently.
+                for (name, reason) in &self.model.unavailable_results {
+                    self.status_msg
+                        .push_str(&format!(" Unavailable: '{name}' ({reason})."));
+                }
+                // G16: a case that stopped before its target keeps the states it reached.
+                for (name, status) in sap_model::results::unfinished_cases(&self.model) {
+                    if let sap_model::CaseStatus::NotFinished { reason, steps } = status {
+                        self.status_msg.push_str(&format!(
+                            " Not finished: '{name}' ({reason}; {steps} saved steps kept)."
+                        ));
+                    }
+                }
                 true
             }
             Err(e) => {
@@ -1414,6 +1433,7 @@ impl SapGuiApp {
                 ui.checkbox(&mut self.show_area_labels, "Show Area Labels");
                 ui.checkbox(&mut self.show_solid_labels, "Show Solid Labels");
                 ui.checkbox(&mut self.show_link_labels, "Show Link Labels");
+                ui.checkbox(&mut self.show_hinge_labels, "Show Hinge Labels");
                 ui.checkbox(&mut self.show_restraints, "Show Support Restraints");
                 ui.checkbox(&mut self.show_loads, "Show Applied Loads");
                 ui.checkbox(&mut self.show_extruded, "Show Extruded Profile View");
@@ -1601,6 +1621,10 @@ impl SapGuiApp {
                 }
                 if ui.button("Show Static Pushover Curve...").clicked() {
                     self.panel_pushover.open = true;
+                    ui.close_menu();
+                }
+                if ui.button("Show Hinge Results...").clicked() {
+                    self.panel_hinge_results.show(&self.model);
                     ui.close_menu();
                 }
                 if ui.button("Show Undeformed Shape (F4)").clicked() {
@@ -1973,14 +1997,25 @@ impl SapGuiApp {
                 .show(ui, |ui| {
                     for (name, lc) in &self.model.load_cases {
                         let is_act = &self.active_case == name;
-                        let run_tag = if lc.run_flag { "" } else { " [Off]" };
-                        if ui
-                            .selectable_label(
-                                is_act,
-                                format!("{name} ({:?}){run_tag}", lc.case_type),
-                            )
-                            .clicked()
+                        let run_tag = if !lc.run_flag {
+                            " [Off]"
+                        } else if sap_model::results::unavailable_reason(&self.model, name).is_some() {
+                            " [could not start]" // G16: no results, the reason is the tooltip
+                        } else if sap_model::results::unfinished_message(&self.model, name).is_some() {
+                            " [not finished]"
+                        } else {
+                            ""
+                        };
+                        let mut resp = ui.selectable_label(
+                            is_act,
+                            format!("{name} ({:?}){run_tag}", lc.case_type),
+                        );
+                        if let Some(note) = sap_model::results::unavailable_message(&self.model, name)
+                            .or_else(|| sap_model::results::unfinished_message(&self.model, name))
                         {
+                            resp = resp.on_hover_text(note);
+                        }
+                        if resp.clicked() {
                             self.active_case = name.clone();
                             self.active_mode_idx = 0;
                             self.active_step_idx = 0;
@@ -1997,14 +2032,28 @@ impl SapGuiApp {
                 .show(ui, |ui| {
                     for (name, combo) in &self.model.load_combos {
                         let is_act = &self.active_case == name;
-                        if ui
-                            .selectable_label(is_act, format!("{name} ({:?})", combo.combo_type))
-                            .clicked()
-                        {
+                        // D78: a combination without complete results is not offered
+                        // as if it had results; choosing it shows the reason.
+                        let gap = sap_model::results::unavailable_reason(&self.model, name);
+                        let label = if gap.is_some() {
+                            format!("{name} ({:?}) - unavailable", combo.combo_type)
+                        } else {
+                            format!("{name} ({:?})", combo.combo_type)
+                        };
+                        let mut resp = ui.selectable_label(is_act, label);
+                        if let Some(reason) = gap {
+                            resp = resp.on_hover_text(format!("No results: {reason}"));
+                        }
+                        if resp.clicked() {
                             self.active_case = name.clone();
                             self.active_mode_idx = 0;
                             self.active_step_idx = 0;
                         }
+                    }
+                    if let Some(msg) =
+                        sap_model::results::unavailable_message(&self.model, &self.active_case)
+                    {
+                        ui.colored_label(egui::Color32::from_rgb(200, 60, 40), msg);
                     }
                 });
             }
@@ -2910,6 +2959,9 @@ impl SapGuiApp {
                     Color32::from_rgb(200, 230, 255),
                 );
             }
+            if self.show_hinge_labels {
+                hinges::draw_view_labels(&painter, &self.model, fid, s1, s2);
+            }
             if self.display_mode == DisplayMode::DesignRatioSteel {
                 if let Some(res) = self.model.steel_design_results.get(fid) {
                     let lbl = if res.status == "OK" {
@@ -3631,7 +3683,11 @@ impl SapGuiApp {
         // A title wider than the pane (a narrow pane, a small video frame)
         // wraps onto further lines instead of running past the edge.
         let header = painter.layout(
-            result_display::scaling::view_title(&title, &self.active_case, subtitle),
+            result_display::scaling::view_title(
+                &title,
+                &result_display::scaling::case_label(&self.model, &self.active_case),
+                subtitle,
+            ),
             FontId::proportional(12.5),
             Color32::from_rgb(200, 220, 255),
             (rect.width() - 20.0).max(40.0),
@@ -4435,7 +4491,10 @@ impl SapGuiApp {
                         ui.label("No frame station forces for the selected case/combination.");
                     }
                 } else {
-                    ui.label("Run analysis (F5) to view station results.");
+                    ui.label(
+                        sap_model::results::unavailable_message(&self.model, &self.active_case)
+                            .unwrap_or_else(|| "Run analysis (F5) to view station results.".to_string()),
+                    );
                 }
             });
             if !open_insp {
@@ -4571,7 +4630,17 @@ impl SapGuiApp {
                             let Some(table) =
                                 result_tables::table_text(&self.model, &self.active_case, other_tab)
                             else {
-                                ui.label("No analysis results for active case/combo — press F5 to run analysis.");
+                                // D78: say why a combination has no results.
+                                ui.label(
+                                    sap_model::results::unavailable_message(
+                                        &self.model,
+                                        &self.active_case,
+                                    )
+                                    .unwrap_or_else(|| {
+                                        "No analysis results for active case/combo — press F5 to run analysis."
+                                            .to_string()
+                                    }),
+                                );
                                 return;
                             };
                             if let Some(message) = &table.empty {
@@ -5190,6 +5259,7 @@ impl SapGuiApp {
             modal_tables::render(ctx, &mut self.panel_modal_tables, &mut self.model),
             hinges::render(ctx, &mut self.panel_hinges, &mut self.model),
             pushover::render(ctx, &mut self.panel_pushover, &mut self.model),
+            hinge_results::render(ctx, &mut self.panel_hinge_results, &self.model),
         ];
         for outcome in outcomes.into_iter().flatten() {
             self.status_msg = match outcome {
@@ -5590,6 +5660,72 @@ mod tests {
     fn startup_file_errors_remain_visible() {
         let app = blank_app();
         assert!(app.status_msg.starts_with("Cannot open"));
+    }
+
+    /// D78: ULS = 1.2 D + 1.6 L with L not run: the analysis message and the design
+    /// message name the combination and the case, the list and the tables refuse it.
+    #[test]
+    fn unavailable_combination_is_named_in_analysis_and_design_messages() {
+        let text = "TABLE: \"PROGRAM CONTROL\"\n CurrUnits=\"kN, m, C\"\n\
+TABLE: \"JOINT COORDINATES\"\n Joint=J XorR=0 Y=0 Z=0\n\
+TABLE: \"JOINT RESTRAINT ASSIGNMENTS\"\n Joint=J U2=Yes U3=Yes R1=Yes R2=Yes R3=Yes\n\
+TABLE: \"JOINT SPRING ASSIGNMENTS 1 - UNCOUPLED\"\n Joint=J U1=100\n\
+TABLE: \"LOAD PATTERN DEFINITIONS\"\n LoadPat=D DesignType=Dead SelfWtMult=0\n LoadPat=L DesignType=Live SelfWtMult=0\n\
+TABLE: \"JOINT LOADS - FORCE\"\n Joint=J LoadPat=D F1=10\n Joint=J LoadPat=L F1=30\n\
+TABLE: \"LOAD CASE DEFINITIONS\"\n Case=D Type=LinStatic RunCase=Yes\n Case=L Type=LinStatic RunCase=No\n\
+TABLE: \"COMBINATION DEFINITIONS\"\n ComboName=ULS ComboType=\"Linear Add\" CaseName=D ScaleFactor=1.2\n \
+ComboName=ULS ComboType=\"Linear Add\" CaseName=L ScaleFactor=1.6\nEND TABLE DATA\n";
+        let mut app = blank_app();
+        app.model = sap_format::s2k::parse_s2k(text).unwrap();
+        assert!(app.execute_analysis());
+        assert!(
+            app.status_msg.contains("'ULS'") && app.status_msg.contains("'L'"),
+            "{}",
+            app.status_msg
+        );
+        assert!(app.model.case_results.contains_key("D"));
+        assert!(!app.model.case_results.contains_key("ULS"));
+        app.active_case = "ULS".into();
+        assert!(result_tables::table_text(&app.model, "ULS", TableTab::JointDisplacements).is_none());
+        let msg = sap_model::results::unavailable_message(&app.model, "ULS").unwrap();
+        assert!(msg.contains("'ULS'") && msg.contains("'L'"), "{msg}");
+        app.execute_design(true);
+        assert!(
+            app.status_msg.starts_with("Design Error:")
+                && app.status_msg.contains("'ULS'")
+                && app.status_msg.contains("'L'"),
+            "{}",
+            app.status_msg
+        );
+        assert!(app.model.steel_design_results.is_empty());
+    }
+
+    /// G16: the run message names a case that is not finished (with the reason and the
+    /// number of saved steps) and a case that could not start; the view title says so.
+    #[test]
+    fn the_run_message_names_cases_that_are_not_finished_and_could_not_start() {
+        let mut app = blank_app();
+        let mut model = pushover::example_1_026_model();
+        model.load_cases.get_mut("PUSH").unwrap().nl_static.max_total_steps = 5;
+        let mut next = model.load_cases["PUSH"].clone();
+        next.name = "NEXT".into();
+        next.initial_case = Some("PUSH".into());
+        model.load_cases.insert("NEXT".into(), next);
+        app.model = model;
+        assert!(app.execute_analysis());
+        let msg = &app.status_msg;
+        assert!(
+            msg.contains("Not finished: 'PUSH' (") && msg.contains("total steps") && msg.contains("saved steps kept"),
+            "{msg}"
+        );
+        assert!(msg.contains("Unavailable: 'NEXT' (could not start:") && msg.contains("'PUSH'"), "{msg}");
+        assert!(!app.model.case_results.contains_key("NEXT"));
+        assert_eq!(
+            result_display::scaling::case_label(&app.model, "PUSH"),
+            "PUSH (not finished)"
+        );
+        assert_eq!(result_display::scaling::case_label(&app.model, "NEXT"), "NEXT");
+        assert!(result_display::result_names(&app.model).iter().all(|n| n != "NEXT"));
     }
 
     #[test]
