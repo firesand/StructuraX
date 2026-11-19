@@ -39,19 +39,17 @@ pub enum DesignError {
         section: String,
         what: &'static str,
     },
-    /// EC3 6.3.3(4) member check under compression and bending (D89, G71). The vendor manual
-    /// (printed pp. 9-9 to 9-11) takes the interaction factors kyy, kyz, kzy, kzz from Annex A
-    /// (Method 1) or Annex B (Method 2, the CEN default, Table C.1) and does not repeat them.
-    ///
-    /// Intended consequence until G71: an Eurocode 3 design run stops at the first member that has
-    /// compression together with a moment at any station, which in a 3D frame is nearly every
-    /// column and many beams. Tension, zero axial force, and compression without a moment are
-    /// designed.
-    #[error("steel design of member '{frame}', combination '{combo}', station {station}: EC3 6.3.3(4) member check under compression and bending needs the interaction factors of EN 1993-1-1 Annex B (Method 2, CEN default of the vendor manual, Table C.1); not implemented")]
+    /// EC3 6.3.3(4) member check under compression and bending for a shape that EN 1993-1-1
+    /// Annex B (Method 2) has no factors for (D89, G71). The Annex has columns for I sections
+    /// (equal flanges) and rectangular hollow sections; the design reads Box and Pipe as the
+    /// latter. Every other shape with compression and a moment at one station is refused.
+    #[error("steel design of member '{frame}', combination '{combo}', station {station}: EC3 6.3.3(4) member check under compression and bending is built from the interaction factors of EN 1993-1-1 Annex B (Method 2) for I (equal flanges), Box and Pipe sections only; section {section} has none")]
     Ec3CompressionBendingUnsupported {
         frame: String,
         combo: String,
         station: String,
+        /// `'<name>' (<shape>)`, kept in one string so that the error type stays small.
+        section: String,
     },
     /// EC3 section whose class needs effective properties (Class 4) or cannot be read from the
     /// vendor tables (D90, G72): not designed.

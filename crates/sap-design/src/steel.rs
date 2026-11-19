@@ -1021,6 +1021,45 @@ pub fn compute_ec3_capacities(
     cb: f64,
     bending_class: u8,
 ) -> (f64, f64, f64, f64, f64, SectionCompactness) {
+    let r = compute_ec3_member_resistances(sec, mat, l33, l22, l_ltb, k33, k22, cb, bending_class);
+    (r.n_b_rd, r.n_t_rd, r.m_b_y_rd, r.m_c_z_rd, r.v_c_rd, r.compactness)
+}
+
+/// The EC3 member resistances of `compute_ec3_capacities`, with the per-axis values that the
+/// 6.3.3(4) interaction needs (D89, G71): `chi_y`, `chi_z` and the slendernesses of each axis
+/// (6.3.1, not only their minimum), the plastic resistance `N_pl,Rd = A fy`, and the section
+/// moment resistance `M_c,y,Rd = W_y fy` next to the lateral-torsional `M_b,y,Rd = chi_LT W_y fy`.
+/// `bending_class` selects the moduli (Class 1 and 2 plastic, else elastic). Not a different
+/// calculation: `compute_ec3_capacities` returns these values.
+#[derive(Debug, Clone)]
+pub struct Ec3MemberResistances {
+    pub n_pl_rd: f64,
+    pub n_b_rd: f64,
+    pub n_t_rd: f64,
+    pub chi_y: f64,
+    pub chi_z: f64,
+    pub lambda_y: f64,
+    pub lambda_z: f64,
+    pub chi_lt: f64,
+    pub m_c_y_rd: f64,
+    pub m_b_y_rd: f64,
+    pub m_c_z_rd: f64,
+    pub v_c_rd: f64,
+    pub compactness: SectionCompactness,
+}
+
+/// See [`Ec3MemberResistances`].
+pub fn compute_ec3_member_resistances(
+    sec: &FrameSection,
+    mat: &Material,
+    l33: f64,
+    l22: f64,
+    l_ltb: f64,
+    k33: f64,
+    k22: f64,
+    cb: f64,
+    bending_class: u8,
+) -> Ec3MemberResistances {
     let e = mat.e.max(1.0);
     let g = if mat.g > 0.0 { mat.g } else { e / 2.6 };
     let fy = mat.fy.max(1e-6);
@@ -1109,7 +1148,275 @@ pub fn compute_ec3_capacities(
         (av * fy) / (3.0_f64.sqrt() * gamma_m0)
     });
 
-    (n_brd, n_trd, m_brd_33, m_crd_22, v_crd, compactness)
+    Ec3MemberResistances {
+        n_pl_rd: n_trd,
+        n_b_rd: n_brd,
+        n_t_rd: n_trd,
+        chi_y: chi_33,
+        chi_z: chi_22,
+        lambda_y: lambda_bar_33,
+        lambda_z: lambda_bar_22,
+        chi_lt,
+        m_c_y_rd: (wy * fy) / gamma_m0,
+        m_b_y_rd: m_brd_33,
+        m_c_z_rd: m_crd_22,
+        v_c_rd: v_crd,
+        compactness,
+    }
+}
+
+/// Shapes for which EN 1993-1-1 Annex B (Method 2) has interaction-factor formulas: I sections
+/// (Table B.2, susceptible to torsional deformations, because the model holds no torsional
+/// restraint) and rectangular hollow sections (Table B.1). Circular hollow sections use the
+/// RHS column: the Annex has none of their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ec3AnnexBShape {
+    I,
+    Rhs,
+}
+
+/// The four interaction factors of EN 1993-1-1 6.3.3(4).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ec3InteractionFactors {
+    pub kyy: f64,
+    pub kyz: f64,
+    pub kzy: f64,
+    pub kzz: f64,
+}
+
+/// Interaction factors kyy, kyz, kzy, kzz of EN 1993-1-1 Annex B (Method 2), Tables B.1 and
+/// B.2 (D89, G71). `lambda_y`, `lambda_z` are the relative slendernesses, `n_y = N_Ed/(chi_y N_Rk)`
+/// and `n_z = N_Ed/(chi_z N_Rk)` (gamma_M1 = 1), `cmy`, `cmz`, `cmlt` the equivalent uniform
+/// moment factors, `plastic` is true for Class 1 and 2 (plastic set), false for Class 3 (elastic
+/// set). The note under Table B.1 (kzy may be 0 for uniaxial bending) is an allowance and is not used.
+#[allow(clippy::too_many_arguments)]
+pub fn ec3_annex_b_factors(
+    lambda_y: f64,
+    lambda_z: f64,
+    n_y: f64,
+    n_z: f64,
+    cmy: f64,
+    cmz: f64,
+    cmlt: f64,
+    plastic: bool,
+    shape: Ec3AnnexBShape,
+) -> Ec3InteractionFactors {
+    let susceptible = shape == Ec3AnnexBShape::I;
+    // CmLT is at least 0.4, so the denominator below is at least 0.15.
+    let den = (cmlt - 0.25).max(1e-3);
+    if plastic {
+        let kyy = (cmy * (1.0 + (lambda_y - 0.2) * n_y)).min(cmy * (1.0 + 0.8 * n_y));
+        let kzz = match shape {
+            Ec3AnnexBShape::I => {
+                (cmz * (1.0 + (2.0 * lambda_z - 0.6) * n_z)).min(cmz * (1.0 + 1.4 * n_z))
+            }
+            Ec3AnnexBShape::Rhs => {
+                (cmz * (1.0 + (lambda_z - 0.2) * n_z)).min(cmz * (1.0 + 0.8 * n_z))
+            }
+        };
+        let kyz = 0.6 * kzz;
+        let kzy = if !susceptible {
+            0.6 * kyy
+        } else if lambda_z >= 0.4 {
+            (1.0 - 0.1 * lambda_z * n_z / den).max(1.0 - 0.1 * n_z / den)
+        } else {
+            (0.6 + lambda_z).min(1.0 - 0.1 * lambda_z * n_z / den)
+        };
+        Ec3InteractionFactors { kyy, kyz, kzy, kzz }
+    } else {
+        let kyy = (cmy * (1.0 + 0.6 * lambda_y * n_y)).min(cmy * (1.0 + 0.6 * n_y));
+        let kzz = (cmz * (1.0 + 0.6 * lambda_z * n_z)).min(cmz * (1.0 + 0.6 * n_z));
+        let kyz = kzz;
+        let kzy = if susceptible {
+            (1.0 - 0.05 * lambda_z * n_z / den).max(1.0 - 0.05 * n_z / den)
+        } else {
+            0.8 * kyy
+        };
+        Ec3InteractionFactors { kyy, kyz, kzy, kzz }
+    }
+}
+
+/// Equivalent uniform moment factor Cm of EN 1993-1-1 Table B.3 (Cmy, Cmz and CmLT, D89) from
+/// one moment diagram given as `(position, moment)` points of the member (any positions, the
+/// extreme two are the ends; the moment at mid-length is interpolated). A diagram on the chord
+/// between its end moments (within 1e-9 of the largest moment) is linear: 0.6 + 0.4 psi >= 0.4.
+/// Otherwise the rows of the table apply with M_h the end moment of larger magnitude and psi the
+/// ratio of the other end to it. The span load is unknown at design: the larger of the uniform and
+/// concentrated columns is taken (the safe side). A diagram that is zero everywhere gives 1.0.
+/// The braced-point and sway conditions of the table notes are applied by the caller.
+pub fn ec3_equivalent_moment_factor(points: &[(f64, f64)]) -> f64 {
+    let mut pts: Vec<(f64, f64)> = points.to_vec();
+    pts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let m_max = pts.iter().fold(0.0_f64, |m, p| m.max(p.1.abs()));
+    if pts.len() < 2 || m_max <= 0.0 {
+        return 1.0;
+    }
+    let (x0, mi) = pts[0];
+    let (x1, mj) = pts[pts.len() - 1];
+    let span = x1 - x0;
+    if span <= 0.0 {
+        return 1.0;
+    }
+    let chord = |x: f64| mi + (mj - mi) * (x - x0) / span;
+    if pts.iter().all(|p| (p.1 - chord(p.0)).abs() <= 1e-9 * m_max) {
+        let psi = if mi.abs() >= mj.abs() { mj / mi } else { mi / mj };
+        return (0.6 + 0.4 * psi).max(0.4);
+    }
+    // moment at mid-length
+    let xm = x0 + 0.5 * span;
+    let mut ms = pts[0].1;
+    for w in pts.windows(2) {
+        if w[0].0 <= xm && xm <= w[1].0 {
+            let dx = w[1].0 - w[0].0;
+            ms = if dx > 0.0 {
+                w[0].1 + (w[1].1 - w[0].1) * (xm - w[0].0) / dx
+            } else {
+                w[0].1
+            };
+            break;
+        }
+    }
+    let (mh, other) = if mi.abs() >= mj.abs() { (mi, mj) } else { (mj, mi) };
+    let psi = if mh != 0.0 { other / mh } else { 0.0 };
+    if mh.abs() >= ms.abs() {
+        let a_s = ms / mh;
+        if a_s >= 0.0 {
+            (0.2 + 0.8 * a_s).max(0.4)
+        } else if psi >= 0.0 {
+            (0.1 - 0.8 * a_s).max(0.4).max((-0.8 * a_s).max(0.4))
+        } else {
+            (0.1 * (1.0 - psi) - 0.8 * a_s)
+                .max(0.4)
+                .max((0.2 * (-psi) - 0.8 * a_s).max(0.4))
+        }
+    } else {
+        let a_h = mh / ms;
+        if a_h >= 0.0 || psi >= 0.0 {
+            (0.95 + 0.05 * a_h).max(0.90 + 0.10 * a_h)
+        } else {
+            (0.95 + 0.05 * a_h * (1.0 + 2.0 * psi)).max(0.90 + 0.10 * a_h * (1.0 + 2.0 * psi))
+        }
+    }
+}
+
+/// What the caller reads from the design overwrite for the moment factors (Table B.3 notes).
+#[derive(Debug, Clone, Copy)]
+struct Ec3CmContext {
+    /// Unbraced length ratios of the major, minor and lateral-torsional direction equal 1.
+    major_full: bool,
+    minor_full: bool,
+    ltb_full: bool,
+    sway: bool,
+}
+
+/// One EN 1993-1-1 6.3.3(4) member check of a design state (equations 6.61 and 6.62).
+struct Ec3MemberCheck {
+    ratio: f64,
+    eq_name: &'static str,
+    pr: f64,
+    mr_major: f64,
+    mr_minor: f64,
+    /// Index of the station with the largest moment term of the governing equation.
+    station_index: usize,
+    k: Ec3InteractionFactors,
+    cm: (f64, f64, f64),
+}
+
+/// EN 1993-1-1 6.3.3(4) with the Annex B factors for one state (D89, G71). `class` is the worse
+/// of the compression and bending classes (1 to 3); `res` holds the resistances for that class.
+fn ec3_member_check(
+    stations: &[FrameStationResult],
+    res: &Ec3MemberResistances,
+    class: u8,
+    shape: Ec3AnnexBShape,
+    pipe: bool,
+    ctx: Ec3CmContext,
+) -> Ec3MemberCheck {
+    let n_ed = stations.iter().fold(0.0_f64, |n, s| n.max(-s.p));
+    let my_ed = stations.iter().fold(0.0_f64, |m, s| m.max(s.m3.abs()));
+    let mz_ed = stations.iter().fold(0.0_f64, |m, s| m.max(s.m2.abs()));
+    let n_y = n_ed / (res.chi_y * res.n_pl_rd).max(1e-12);
+    let n_z = n_ed / (res.chi_z * res.n_pl_rd).max(1e-12);
+    // moment diagrams of the state, by distance along the member
+    let diagram = |f: &dyn Fn(&FrameStationResult) -> f64| -> Vec<(f64, f64)> {
+        stations.iter().map(|s| (s.station, f(s))).collect()
+    };
+    let mut cmy = ec3_equivalent_moment_factor(&diagram(&|s| s.m3));
+    let mut cmz = ec3_equivalent_moment_factor(&diagram(&|s| s.m2));
+    let mut cmlt = ec3_equivalent_moment_factor(&diagram(&|s| s.m3));
+    // Table B.3 notes: the table wants the diagram between braced points; the model holds length
+    // ratios, not brace positions, so an unbraced length other than the member length gives the
+    // largest value of the table, 1.0. Sway buckling mode: 0.9 for Cmy and Cmz.
+    if !ctx.major_full {
+        cmy = 1.0;
+    } else if ctx.sway {
+        cmy = 0.9;
+    }
+    if !ctx.minor_full {
+        cmz = 1.0;
+    } else if ctx.sway {
+        cmz = 0.9;
+    }
+    if !ctx.ltb_full {
+        cmlt = 1.0;
+    }
+    let plastic = class <= 2;
+    let k = ec3_annex_b_factors(
+        res.lambda_y,
+        res.lambda_z,
+        n_y,
+        n_z,
+        cmy,
+        cmz,
+        cmlt,
+        plastic,
+        shape,
+    );
+    let m_y_res = res.m_b_y_rd.max(1e-12);
+    let m_z_res = res.m_c_z_rd.max(1e-12);
+    let terms = |ky: f64, kz: f64, m3: f64, m2: f64| -> (f64, f64) {
+        (ky * m3.abs() / m_y_res, kz * m2.abs() / m_z_res)
+    };
+    let combine = |a: f64, b: f64| if pipe { (a * a + b * b).sqrt() } else { a + b };
+    let (a61, b61) = terms(k.kyy, k.kyz, my_ed, mz_ed);
+    let (a62, b62) = terms(k.kzy, k.kzz, my_ed, mz_ed);
+    let eq61 = n_y + combine(a61, b61);
+    let eq62 = n_z + combine(a62, b62);
+    let first = eq61 >= eq62;
+    let (ky, kz) = if first { (k.kyy, k.kyz) } else { (k.kzy, k.kzz) };
+    let mut station_index = 0;
+    let mut best = -1.0;
+    for (i, s) in stations.iter().enumerate() {
+        let (a, b) = terms(ky, kz, s.m3, s.m2);
+        let t = combine(a, b);
+        if t > best + 1e-15 {
+            best = t;
+            station_index = i;
+        }
+    }
+    if first {
+        Ec3MemberCheck {
+            ratio: eq61,
+            eq_name: "EC3-6.3.3(4) eq 6.61",
+            pr: n_y,
+            mr_major: a61,
+            mr_minor: b61,
+            station_index,
+            k,
+            cm: (cmy, cmz, cmlt),
+        }
+    } else {
+        Ec3MemberCheck {
+            ratio: eq62,
+            eq_name: "EC3-6.3.3(4) eq 6.62",
+            pr: n_z,
+            mr_major: a62,
+            mr_minor: b62,
+            station_index,
+            k,
+            cm: (cmy, cmz, cmlt),
+        }
+    }
 }
 
 /// Evaluates a single station under AISC 360-10 / 360-16 Chapter H (Equations H1-1a & H1-1b)
@@ -2104,7 +2411,8 @@ pub(crate) fn design_frame_with_section(
                     }
                 });
 
-            let (phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness) = match code {
+            let mut ec3_res: Option<Ec3MemberResistances> = None;
+            let (mut phi_pnc, mut phi_pnt, mut phi_mn33, mut phi_mn22, mut phi_vn2, compactness) = match code {
                 SteelCode::Aisc360Lrfd | SteelCode::Aisc360Asd => {
                     compute_aisc_360_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb, is_asd)
                         .map_err(|err| match err {
@@ -2123,7 +2431,7 @@ pub(crate) fn design_frame_with_section(
                         })?
                 }
                 SteelCode::Eurocode3 => {
-                    compute_ec3_capacities(
+                    let r = compute_ec3_member_resistances(
                         sec,
                         mat,
                         l33,
@@ -2133,24 +2441,109 @@ pub(crate) fn design_frame_with_section(
                         k22,
                         cb,
                         ec3_classes.as_ref().map_or(1, |(_, bend)| bend.class),
-                    )
+                    );
+                    let t = (
+                        r.n_b_rd,
+                        r.n_t_rd,
+                        r.m_b_y_rd,
+                        r.m_c_z_rd,
+                        r.v_c_rd,
+                        r.compactness,
+                    );
+                    ec3_res = Some(r);
+                    t
                 }
             };
 
-            for st in stations {
-                // D89 (G71): EC3 6.3.3(4) under compression and bending needs the interaction
-                // factors of Annex A or B, which neither vendor manual prints.
-                if code == SteelCode::Eurocode3
-                    && st.p < 0.0
+            // D89 (G71): EN 1993-1-1 6.3.3(4) with the Annex B (Method 2) factors for a state that
+            // has a station with compression and a moment (the same roundoff-proof dimensionless
+            // tests as the D90 gate below). Other shapes than the ones the Annex has columns for
+            // stay refused by name.
+            let is_cb_station = |st: &FrameStationResult, phi_pnc: f64, phi_mn33: f64, phi_mn22: f64| {
+                st.p < 0.0
                     && st.p.abs() / phi_pnc.max(1e-12) > 1e-9
                     && st.m3.abs() / phi_mn33.max(1e-12) + st.m2.abs() / phi_mn22.max(1e-12) > 1e-9
+            };
+            let mut member_check: Option<Ec3MemberCheck> = None;
+            let mut member_mode = false;
+            if let (SteelCode::Eurocode3, Some((comp, bend))) = (code, &ec3_classes) {
+                if let Some(first) = stations
+                    .iter()
+                    .find(|st| is_cb_station(st, phi_pnc, phi_mn33, phi_mn22))
                 {
-                    return Err(DesignError::Ec3CompressionBendingUnsupported {
-                        frame: frame_name.to_string(),
-                        combo: combo_name.clone(),
-                        station: st.station.to_string(),
-                    });
+                    let unequal_i = sec.prop_type == FramePropType::I && {
+                        let differs = |top: f64, bottom: f64| {
+                            bottom > 0.0 && (bottom - top).abs() > 1e-9 * top.abs()
+                        };
+                        differs(sec.t2, sec.t2b) || differs(sec.tf, sec.tfb)
+                    };
+                    let shape = match sec.prop_type {
+                        FramePropType::I if !unequal_i => Some((Ec3AnnexBShape::I, false)),
+                        FramePropType::Box | FramePropType::ColdBox => {
+                            Some((Ec3AnnexBShape::Rhs, false))
+                        }
+                        FramePropType::Pipe | FramePropType::ColdPipe => {
+                            Some((Ec3AnnexBShape::Rhs, true))
+                        }
+                        _ => None,
+                    };
+                    let Some((shape, pipe)) = shape else {
+                        return Err(DesignError::Ec3CompressionBendingUnsupported {
+                            frame: frame_name.to_string(),
+                            combo: combo_name.clone(),
+                            station: first.station.to_string(),
+                            section: format!(
+                                "'{}' ({})",
+                                sec.name,
+                                if unequal_i {
+                                    "I with unequal flanges".to_string()
+                                } else {
+                                    format!("{:?}", sec.prop_type)
+                                }
+                            ),
+                        });
+                    };
+                    member_mode = true;
+                    // The class of a member in compression and bending is the worse of the two
+                    // (conservative against the vendor's Table 4-3, which is not built, G72);
+                    // Class 4 stays refused by the D90 gate below.
+                    let worst = comp.class.max(bend.class);
+                    if worst <= 3 {
+                        let r = compute_ec3_member_resistances(
+                            sec,
+                            mat,
+                            l33,
+                            l22,
+                            l_ltb,
+                            k33,
+                            k22,
+                            cb,
+                            worst,
+                        );
+                        phi_pnc = r.n_b_rd;
+                        phi_pnt = r.n_t_rd;
+                        phi_mn33 = r.m_b_y_rd;
+                        phi_mn22 = r.m_c_z_rd;
+                        phi_vn2 = r.v_c_rd;
+                        let full = |ratio: Option<f64>| ratio.is_none_or(|r| (r - 1.0).abs() < 1e-9);
+                        let ctx = Ec3CmContext {
+                            major_full: full(ow.and_then(|o| o.l_ratio_major)),
+                            minor_full: full(ow.and_then(|o| o.l_ratio_minor)),
+                            ltb_full: full(ow.and_then(|o| o.l_ratio_ltb)),
+                            sway: ow.is_some_and(|o| o.is_sway),
+                        };
+                        member_check = Some(ec3_member_check(stations, &r, worst, shape, pipe, ctx));
+                        ec3_res = Some(r);
+                    }
                 }
+            }
+
+            for (station_index, st) in stations.iter().enumerate() {
+                // A station with compression and a moment of a member-mode state: the section
+                // check of 6.2.1(7) with the section resistances, and the buckling checks 6.3.1
+                // and 6.3.2 (the member equations 6.61 and 6.62 are applied below).
+                let station_mode =
+                    member_mode && is_cb_station(st, phi_pnc, phi_mn33, phi_mn22);
                 // D90: a Class 4 (or unclassifiable) element needs effective properties that
                 // are not built (G72): refuse the station that would use them.
                 if let Some((comp, bend)) = &ec3_classes {
@@ -2211,6 +2604,13 @@ pub(crate) fn design_frame_with_section(
                         0.0
                     };
 
+                    // The shear reduction (6.2.8) acts on the moment resistance of the check at hand:
+                    // M_b,Rd for the plain station sum of today, the section resistance M_c,y,Rd
+                    // for the 6.2.1(7) check of a station under compression and a moment.
+                    let m3_cap = match (&ec3_res, station_mode) {
+                        (Some(r), true) => r.m_c_y_rd,
+                        _ => phi_mn33,
+                    };
                     let reduced_m3 = if rho2 > 0.0 {
                         let m_red = match sec.prop_type {
                             FramePropType::I | FramePropType::Channel => {
@@ -2237,11 +2637,11 @@ pub(crate) fn design_frame_with_section(
                                 let wpl = w_major_red;
                                 (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
                             }
-                            _ => (1.0 - rho2) * phi_mn33,
+                            _ => (1.0 - rho2) * m3_cap,
                         };
-                        m_red.min(phi_mn33).max(1e-12)
+                        m_red.min(m3_cap).max(1e-12)
                     } else {
-                        phi_mn33
+                        m3_cap
                     };
                     reported_phi_mn33 = reduced_m3;
 
@@ -2284,10 +2684,11 @@ pub(crate) fn design_frame_with_section(
                     };
                     reported_phi_mn22 = reduced_m2;
 
-                    let pc = if st.p >= 0.0 {
-                        phi_pnt.max(1e-12)
-                    } else {
-                        phi_pnc.max(1e-12)
+                    // 6.2.1(7) uses N_pl,Rd = A fy, the member checks use the buckling resistance.
+                    let pc = match (&ec3_res, station_mode) {
+                        (Some(r), true) => r.n_pl_rd.max(1e-12),
+                        _ if st.p >= 0.0 => phi_pnt.max(1e-12),
+                        _ => phi_pnc.max(1e-12),
                     };
                     let pr_part = st.p.abs() / pc;
                     let mr3_part = st.m3.abs() / reduced_m3;
@@ -2308,13 +2709,43 @@ pub(crate) fn design_frame_with_section(
                         "EC3-6.2"
                     };
 
-                    (tot, pr_part, mr3_part, mr2_part, r_v2, eq)
+                    if station_mode {
+                        // 6.3.1: N/(min(chi_y, chi_z) N_pl) = N/N_b,Rd; 6.3.2: M3/M_b,Rd.
+                        let buck = st.p.abs() / phi_pnc.max(1e-12);
+                        let ltb = st.m3.abs() / phi_mn33.max(1e-12);
+                        if buck > tot && buck >= ltb {
+                            (buck, buck, 0.0, 0.0, r_v2, "EC3-6.3.1")
+                        } else if ltb > tot {
+                            (ltb, 0.0, ltb, 0.0, r_v2, "EC3-6.3.2")
+                        } else {
+                            (tot, pr_part, mr3_part, mr2_part, r_v2, eq)
+                        }
+                    } else {
+                        (tot, pr_part, mr3_part, mr2_part, r_v2, eq)
+                    }
                 } else {
                     evaluate_station_interaction(
                         code, st.p, st.v2, st.m3, st.m2, phi_pnc, phi_pnt, phi_mn33, phi_mn22,
                         phi_vn2,
                     )
                 };
+
+                // The member equations 6.61 / 6.62 of the state, at the station of its largest
+                // moment term: the ratio of the state is the largest of them and the station checks.
+                let mut member_note: Option<String> = None;
+                if let Some(mc) = &member_check {
+                    if station_index == mc.station_index && mc.ratio > total_ratio {
+                        total_ratio = mc.ratio;
+                        pr_ratio = mc.pr;
+                        mr_major_ratio = mc.mr_major;
+                        mr_minor_ratio = mc.mr_minor;
+                        eq_name = mc.eq_name;
+                        member_note = Some(format!(
+                            "EC3 6.3.3(4) with the Annex B (Method 2) factors: Cmy = {:.4}, Cmz = {:.4}, CmLT = {:.4}, kyy = {:.4}, kyz = {:.4}, kzy = {:.4}, kzz = {:.4}",
+                            mc.cm.0, mc.cm.1, mc.cm.2, mc.k.kyy, mc.k.kyz, mc.k.kzy, mc.k.kzz
+                        ));
+                    }
+                }
 
                 let shear_minor_ratio = if phi_vn3 > 0.0 {
                     st.v3.abs() / phi_vn3
@@ -2398,6 +2829,11 @@ pub(crate) fn design_frame_with_section(
                 };
 
                 if is_more_critical {
+                    let mut result_notes = notes.clone();
+                    // only when the member check is what governs (not a shear check above it)
+                    if gov_eq == eq_name && eq_name.starts_with("EC3-6.3.3(4)") {
+                        result_notes.extend(member_note);
+                    }
                     best_result = Some(SteelDesignResult {
                         frame_name: frame_name.to_string(),
                         section_name: sec.name.clone(),
@@ -2418,7 +2854,7 @@ pub(crate) fn design_frame_with_section(
                         phi_vn3,
                         status,
                         eq_name: gov_eq.to_string(),
-                        notes: notes.clone(),
+                        notes: result_notes,
                     });
                 }
             }

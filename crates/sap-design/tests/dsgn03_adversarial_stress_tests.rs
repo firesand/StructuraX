@@ -700,8 +700,8 @@ fn test_ec3_adversarial_boundaries_and_extreme_conditions() {
     assert!(res_tiny.total_ratio >= 0.0 && res_tiny.total_ratio.is_finite());
     assert_eq!(res_tiny.status, "OK");
 
-    // 3. Boundary: Massive demands exceeding plastic capacity by 10x (an axial tension: EC3
-    // compression with bending is refused until the Annex B factors exist, D89/G71)
+    // 3. Boundary: Massive demands exceeding plastic capacity by 10x (an axial tension, so that the
+    // Annex B member check of D89/G71 plays no part)
     let res_extreme = run_design_with_forces(
         &mut model,
         "F1",

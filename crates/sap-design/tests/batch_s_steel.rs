@@ -528,26 +528,43 @@ fn st3(p: f64, m3: f64, m2: f64) -> FrameStationResult {
     }
 }
 
-/// Welded I 400 x 250, tf 11, tw 12 (S355-like, N and mm), L = 3 m. EC3 6.3.3(4) under compression
-/// and bending needs the Annex B factors, which the vendor manual does not print (D89, G71): a station
-/// with N = -500 kN and M2 = 10 kNm is refused by name; N = -500 kN alone is designed (hand:
-/// A = 2 (250)(11) + 378 (12) = 10036 mm^2); tension 500 kN with M3 = 100 kNm is designed, its ratio at
-/// least N/(A fy) = 500000/(10036 (345)) = 0.14441.
+/// Welded I 400 x 250, tf 11, tw 12 (Fy 345 MPa, E 200000 MPa, N and mm), L = 4 m, one station with
+/// N = -500 kN and M2 = 10 kNm. D89 refused this until the Annex B factors were built (G71); it is now
+/// designed by EC3 6.3.3(4). Hand calculation (single station: Cm = 1; flange (250 - 12)/2/11 = 10.82
+/// is Class 3, 10 eps = 8.25 < 10.82 <= 14 eps = 11.55: elastic set and W_el):
+/// A = 10036 mm^2, I33 = 2.62132e8, I22 = 2.87003e7, W_el,z = 229602 mm^3; lambda_y = 0.32721 (curve a),
+/// lambda_z = 0.98888 (curve b), chi_y = 0.97105, chi_z = 0.60410; N_pl = 10036 x 345 = 3462420 N;
+/// n_y = 0.148713, n_z = 0.239047; kzz = kyz = 1 + 0.6 x 0.98888 x 0.239047 = 1.141833 (cap 1.143428);
+/// m_z = 10e6/(229602 x 345) = 0.126242; eq 6.61 = 0.148713 + 1.141833 x 0.126242 = 0.292861 (hand
+/// script, fy 345), eq 6.62 = 0.239047 + 1.141833 x 0.126242 = 0.383195; cross section 0.270650.
+/// The channel (no Annex B column) is refused by name. Compression alone and tension with a moment are
+/// designed as before.
 #[test]
-fn d89_ec3_compression_with_bending_is_refused_by_name() {
+fn d89_ec3_compression_with_bending_is_designed_by_annex_b_and_a_channel_is_refused() {
     let sec = make_i_section("WI", "A992Fy50", 400.0, 250.0, 11.0, 12.0, 250.0, 11.0);
     let code = "Eurocode 3-2005";
 
     let mut model = nmm_member(code, sec.clone(), vec![st3(-500_000.0, 0.0, 10.0e6)]);
+    try_run_steel_design(&mut model).unwrap();
+    let r = &model.steel_design_results["M1"];
+    assert_eq!(r.eq_name, "EC3-6.3.3(4) eq 6.62");
+    assert!((r.total_ratio - 0.383195).abs() < 1e-5, "{}", r.total_ratio);
+    // M3 instead of M2 is designed as well
+    let mut model = nmm_member(code, sec.clone(), vec![st3(-500_000.0, 100.0e6, 0.0)]);
+    assert!(try_run_steel_design(&mut model).is_ok());
+
+    // a Channel (no column in Annex B) with compression and a moment is refused by name
+    let mut chan = sec.clone();
+    chan.prop_type = FramePropType::Channel;
+    chan.name = "CH".into();
+    chan.t2 = 150.0;
+    let mut model = nmm_member(code, chan, vec![st3(-500_000.0, 0.0, 10.0e6)]);
     let text = try_run_steel_design(&mut model).unwrap_err().to_string();
     assert!(
         text.contains("'M1'") && text.contains("combination 'LC'") && text.contains("Annex B"),
         "{text}"
     );
     assert!(model.steel_design_results.is_empty());
-    // M3 instead of M2 is refused as well
-    let mut model = nmm_member(code, sec.clone(), vec![st3(-500_000.0, 100.0e6, 0.0)]);
-    assert!(try_run_steel_design(&mut model).is_err());
 
     // compression without a moment: designed
     let mut model = nmm_member(code, sec.clone(), vec![st3(-500_000.0, 0.0, 0.0)]);
