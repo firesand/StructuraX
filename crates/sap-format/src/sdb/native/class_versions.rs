@@ -25,6 +25,10 @@ pub(super) fn observed_class_version(class_id: &str) -> Option<i32> {
         "SOLUTIONCONTROLARRAY" => 3,
         "S_AREAOBJECTS" => 1,
         "S_CableData" => 1,
+        // D114: all 64 live section rebar records of the 336 corpus files carry
+        // tag 1 (planner's decode of `SECTIONARRAY.m_Cp`); the JSON above predates
+        // the writer of this record.
+        "S_CP" => 1,
         "S_GUIDE" => 1,
         "S_LINEOBJECTS" => 1,
         "S_MT" => 1,

@@ -22,7 +22,7 @@ use sap_units::Units;
 use crate::s2k::write_s2k;
 use crate::s2k::{parse_s2k, try_write_s2k_with_report};
 use crate::FormatError;
-use sap_model::{UnmodeledScope, UnmodeledSourceData};
+use sap_model::{ConcreteRebarConfig, UnmodeledScope, UnmodeledSourceData};
 
 pub mod native;
 mod hinges;
@@ -1435,11 +1435,9 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     }
                 }
             }
-            let mut steel_fy_present = false;
             if let Some(sp) = mt0.get("m_SteelProps").and_then(|v| v.as_obj()) {
                 if let Some(fy) = sp.get("m_fy").and_then(|v| v.as_f64()) {
                     mat.fy = fy;
-                    steel_fy_present = true;
                 }
                 if let Some(fu) = sp.get("m_Fu").and_then(|v| v.as_f64()) {
                     mat.fu = fu;
@@ -1451,11 +1449,13 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 }
             }
             if let Some(rp) = mt0.get("m_RebarProps").and_then(|v| v.as_obj()) {
+                // D114: every material record carries a steel template, so for a
+                // Rebar material the yield is the one of the rebar record
+                // (`m_RebarProps`), not the template's.
+                let is_rebar = mat.mat_type == MatType::Rebar;
                 if let Some(rfy) = rp.get("m_fy").and_then(|v| v.as_f64()) {
-                    if mat.mat_type == MatType::Rebar && rfy > 0.0 {
-                        if !steel_fy_present || mat.fy == 0.0 {
-                            mat.fy = rfy;
-                        }
+                    if is_rebar && rfy > 0.0 {
+                        mat.fy = rfy;
                         mat.fys = rfy;
                     } else if rfy > 0.0 {
                         mat.fys = rfy;
@@ -1466,7 +1466,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                     mat.fys = mat.fy;
                 }
                 if let Some(rfu) = rp.get("m_Fu").and_then(|v| v.as_f64()) {
-                    if mat.mat_type == MatType::Rebar && rfu > 0.0 {
+                    if is_rebar && rfu > 0.0 {
                         mat.fu = rfu;
                     }
                 }
@@ -1505,6 +1505,7 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
                 modifiers[i] = msf[i];
             }
         }
+        let mat_name_for_rebar = mat_name.clone();
         let sec = FrameSection {
             name: name.clone(),
             material: mat_name,
@@ -1532,7 +1533,16 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
             modifiers,
             non_prismatic: Vec::new(),
             auto_select_list: Vec::new(),
-            concrete_rebar: None,
+            concrete_rebar: if model
+                .materials
+                .get(&mat_name_for_rebar)
+                .is_some_and(|m| m.mat_type == MatType::Concrete)
+            {
+                frame_section_rebar(s, &name, &mat_names)
+                    .map_err(FormatError::InvalidSdb)?
+            } else {
+                None
+            },
             file_name: s
                 .get("m_PropertyFile")
                 .and_then(|v| v.as_str())
@@ -1924,39 +1934,9 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
         if !c.get("m_alive").and_then(|v| v.as_bool()).unwrap_or(true) {
             continue;
         }
-        let ctype = match c.get("m_type").and_then(|v| v.as_i32()).unwrap_or(1) {
-            1 => ConstraintType::Body,
-            2 => ConstraintType::Diaphragm,
-            3 => ConstraintType::Plate,
-            4 => ConstraintType::Rod,
-            5 => ConstraintType::Beam,
-            6 => ConstraintType::Equal,
-            7 => ConstraintType::Local,
-            8 => ConstraintType::Weld,
-            9 => ConstraintType::Line,
-            _ => ConstraintType::Body,
-        };
-        let axis = match c.get("m_axis").and_then(|v| v.as_i32()).unwrap_or(3) {
-            1 => ConstraintAxis::X,
-            2 => ConstraintAxis::Y,
-            3 => ConstraintAxis::Z,
-            _ => ConstraintAxis::AutoAxis,
-        };
-        let mut dofs = [true; 6];
-        if let Some(raw_dofs) = c.get("m_DOFs").and_then(|v| v.as_arr_i32()) {
-            for i in 0..6.min(raw_dofs.len()) {
-                dofs[i] = raw_dofs[i] != 0;
-            }
-        }
-        model.constraints.insert(
-            cname.clone(),
-            ConstraintDef {
-                name: cname,
-                constraint_type: ctype,
-                axis,
-                dofs,
-            },
-        );
+        let (def, unmodeled) = decode_constraint(c, cname.clone());
+        model.unmodeled_source.extend(unmodeled);
+        model.constraints.insert(cname, def);
     }
     for cj in &raw_cjoint {
         if !cj.get("m_alive").and_then(|v| v.as_bool()).unwrap_or(true) {
@@ -2648,6 +2628,12 @@ pub fn extract_sdb_to_model(sdb: &SdbFile) -> Result<SapModel, FormatError> {
         }
         let ctype_code = ac.get("m_casetype").and_then(SdbVal::as_i32).unwrap_or(1);
         let case_type = native_case_type(ctype_code)?;
+        model
+            .unmodeled_source
+            .extend(spectrum_direction_combination_entry(&name, ctype_code, ac));
+        model
+            .unmodeled_source
+            .extend(spectrum_modal_combination_entry(&name, ctype_code, ac));
         let mut lc = LoadCase::linear_static(name.clone(), name.clone(), 1.0);
         lc.case_type = case_type;
         lc.loads.clear();
@@ -3524,9 +3510,280 @@ fn crossing_line(model: &SapModel, frame: &FrameObj) -> Option<String> {
         .map(|other| other.name.clone())
 }
 
+/// Decodes one live `CONSTRAINTARRAY` record (D113). `m_MultipleZ` makes SAP2000
+/// build a separate diaphragm per Z level of the joints that carry the constraint
+/// (v19 API help); the solver ties all levels together. No corpus file has the flag
+/// set (planner's decode of all 336 files), so there is nothing to test a split
+/// against: the constraint is read as one and the difference is recorded, which
+/// refuses the analysis (G76 is the split itself).
+fn decode_constraint(
+    c: &HashMap<String, SdbVal>,
+    name: String,
+) -> (ConstraintDef, Option<UnmodeledSourceData>) {
+    let ctype = match c.get("m_type").and_then(|v| v.as_i32()).unwrap_or(1) {
+        1 => ConstraintType::Body,
+        2 => ConstraintType::Diaphragm,
+        3 => ConstraintType::Plate,
+        4 => ConstraintType::Rod,
+        5 => ConstraintType::Beam,
+        6 => ConstraintType::Equal,
+        7 => ConstraintType::Local,
+        8 => ConstraintType::Weld,
+        9 => ConstraintType::Line,
+        _ => ConstraintType::Body,
+    };
+    let axis = match c.get("m_axis").and_then(|v| v.as_i32()).unwrap_or(3) {
+        1 => ConstraintAxis::X,
+        2 => ConstraintAxis::Y,
+        3 => ConstraintAxis::Z,
+        _ => ConstraintAxis::AutoAxis,
+    };
+    let mut dofs = [true; 6];
+    if let Some(raw_dofs) = c.get("m_DOFs").and_then(|v| v.as_arr_i32()) {
+        for i in 0..6.min(raw_dofs.len()) {
+            dofs[i] = raw_dofs[i] != 0;
+        }
+    }
+    let unmodeled = c
+        .get("m_MultipleZ")
+        .and_then(SdbVal::as_bool)
+        .unwrap_or(false)
+        .then(|| UnmodeledSourceData {
+            scope: UnmodeledScope::AllCases,
+            description: format!(
+                "constraint '{name}' is split per Z level in SAP2000 (m_MultipleZ); one constraint over all levels would be analysed"
+            ),
+        });
+    (
+        ConstraintDef {
+            name,
+            constraint_type: ctype,
+            axis,
+            dofs,
+        },
+        unmodeled,
+    )
+}
+
+/// D122: the directional combination of a response-spectrum case. The v19 API
+/// (`SetDirComb`) numbers it 1 = SRSS, 2 = ABS, 3 = CQC3; the native field is
+/// `ANALYSISCASEARRAY.m_dirtype` (every corpus response-spectrum case has 1). The
+/// solver combines directions by SRSS, so another value is recorded for the case.
+fn spectrum_direction_combination_entry(
+    case_name: &str,
+    case_type_code: i32,
+    record: &HashMap<String, SdbVal>,
+) -> Option<UnmodeledSourceData> {
+    if case_type_code != 4 {
+        return None;
+    }
+    let dir_type = record
+        .get("m_dirtype")
+        .and_then(SdbVal::as_i32)
+        .unwrap_or(1);
+    (dir_type != 1).then(|| UnmodeledSourceData {
+        scope: UnmodeledScope::Case(case_name.to_string()),
+        description: format!(
+            "response-spectrum case '{case_name}' combines directions with type {dir_type} (SetDirComb: 1 = SRSS, 2 = ABS, 3 = CQC3); the directions would be combined by SRSS"
+        ),
+    })
+}
+
+/// D141: the modal combination of a response-spectrum case. The v19 API
+/// (`SetModalComb_1`) numbers it 1 = CQC, 2 = SRSS, 3 = Absolute, 4 = GMC,
+/// 5 = NRC 10 percent, 6 = Double sum; the native field is
+/// `ANALYSISCASEARRAY.m_modc` (vendor Example 1-024 has a case with 5). The model
+/// holds the first three only, and the reader maps every other value to CQC, so
+/// such a case is recorded.
+fn spectrum_modal_combination_entry(
+    case_name: &str,
+    case_type_code: i32,
+    record: &HashMap<String, SdbVal>,
+) -> Option<UnmodeledSourceData> {
+    if case_type_code != 4 {
+        return None;
+    }
+    let modal = record.get("m_modc").and_then(SdbVal::as_i32).unwrap_or(1);
+    let method = match modal {
+        1..=3 => return None,
+        4 => "GMC",
+        5 => "NRC 10 percent",
+        6 => "Double sum",
+        _ => "unknown",
+    };
+    Some(UnmodeledSourceData {
+        scope: UnmodeledScope::Case(case_name.to_string()),
+        description: format!(
+            "response-spectrum case '{case_name}' combines modes with type {modal} ({method}; SetModalComb: 1 = CQC, 2 = SRSS, 3 = Absolute); the modes would be combined by CQC"
+        ),
+    })
+}
+
+/// D114: the rebar record of a concrete frame section (`SECTIONARRAY.m_Cp`,
+/// class `S_CP`), read the way the S2K reader reads the concrete tables.
+/// `m_MindexRebar` and `m_MindexRebarShear` are 1-based material indices like
+/// `m_Mindex`. `m_type` 1 = column, 2 = beam: this meaning is inferred from the
+/// section names in the vendor corpus ("Conc Col ..." is 1, "Conc Bm ..." is 2),
+/// not from a vendor document. The bar size table is not read, so the total
+/// rebar area stays 0 and design uses its fallback, as for an S2K file without
+/// `TotalRebarArea`. Returns `None` when the section has no live record.
+fn frame_section_rebar(
+    section: &HashMap<String, SdbVal>,
+    name: &str,
+    mat_names: &[String],
+) -> Result<Option<ConcreteRebarConfig>, String> {
+    let Some(cp) = section.get("m_Cp").and_then(SdbVal::as_obj) else {
+        return Ok(None);
+    };
+    if !cp.get("m_alive").and_then(SdbVal::as_bool).unwrap_or(true) {
+        return Ok(None);
+    }
+    let material = |key: &str| -> Result<String, String> {
+        let index = cp.get(key).and_then(SdbVal::as_i32).unwrap_or(0);
+        usize::try_from(index)
+            .ok()
+            .and_then(|i| mat_names.get(i))
+            .filter(|n| !n.is_empty())
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "frame section '{name}': rebar record {key} = {index} names no material"
+                )
+            })
+    };
+    let is_column = match cp.get("m_type").and_then(SdbVal::as_i32) {
+        Some(1) => true,
+        Some(2) => false,
+        other => {
+            return Err(format!(
+                "frame section '{name}': rebar record m_type {other:?} is neither 1 (column) nor 2 (beam)"
+            ))
+        }
+    };
+    let real = |key: &str| cp.get(key).and_then(SdbVal::as_f64).unwrap_or(0.0);
+    let count = |key: &str| cp.get(key).and_then(SdbVal::as_i32).unwrap_or(0).max(0) as usize;
+    let (cover_top, cover_bot) = if is_column {
+        (real("m_Cover"), real("m_Cover"))
+    } else {
+        (real("m_CoverTop"), real("m_CoverBot"))
+    };
+    Ok(Some(ConcreteRebarConfig {
+        is_column,
+        rebar_mat_long: material("m_MindexRebar")?,
+        rebar_mat_confine: material("m_MindexRebarShear")?,
+        cover_top,
+        cover_bot,
+        num_bars_3dir: count("m_NumberR3Bars"),
+        num_bars_2dir: count("m_NumberR2Bars"),
+        total_rebar_area: 0.0,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constraint_with_multiple_z_is_recorded_and_without_is_not() {
+        let record = |multiple_z: bool| -> HashMap<String, SdbVal> {
+            HashMap::from([
+                ("m_type".to_string(), SdbVal::I32(2)),
+                ("m_axis".to_string(), SdbVal::I32(3)),
+                ("m_MultipleZ".to_string(), SdbVal::Bool(multiple_z)),
+            ])
+        };
+        let (def, entry) = decode_constraint(&record(true), "DIAPH".to_string());
+        assert_eq!(def.constraint_type, ConstraintType::Diaphragm);
+        let entry = entry.expect("m_MultipleZ true is recorded");
+        assert_eq!(entry.scope, UnmodeledScope::AllCases);
+        assert!(entry.description.contains("constraint 'DIAPH'"));
+        assert!(entry.description.contains("m_MultipleZ"));
+        let (_, entry) = decode_constraint(&record(false), "DIAPH".to_string());
+        assert!(entry.is_none());
+    }
+
+    #[test]
+    fn response_spectrum_direction_combination_other_than_srss_is_recorded() {
+        let record = |dir_type: i32| -> HashMap<String, SdbVal> {
+            HashMap::from([("m_dirtype".to_string(), SdbVal::I32(dir_type))])
+        };
+        let entry = spectrum_direction_combination_entry("RSX", 4, &record(2)).expect("ABS");
+        assert_eq!(entry.scope, UnmodeledScope::Case("RSX".to_string()));
+        assert!(entry.description.contains("'RSX'") && entry.description.contains("type 2"));
+        assert!(spectrum_direction_combination_entry("RSX", 4, &record(3)).is_some());
+        assert!(spectrum_direction_combination_entry("RSX", 4, &record(1)).is_none());
+        // Other case types carry no direction combination.
+        assert!(spectrum_direction_combination_entry("MOD", 3, &record(2)).is_none());
+    }
+
+    #[test]
+    fn response_spectrum_modal_combination_outside_the_model_is_recorded() {
+        let record = |modal: i32| -> HashMap<String, SdbVal> {
+            HashMap::from([("m_modc".to_string(), SdbVal::I32(modal))])
+        };
+        // 4 = GMC, 5 = NRC 10 percent, 6 = Double sum (v19 API, SetModalComb_1).
+        for (code, word) in [(4, "GMC"), (5, "NRC 10 percent"), (6, "Double sum")] {
+            let entry = spectrum_modal_combination_entry("RS", 4, &record(code)).expect("entry");
+            assert_eq!(entry.scope, UnmodeledScope::Case("RS".to_string()));
+            assert!(entry.description.contains("'RS'") && entry.description.contains(word));
+        }
+        // CQC, SRSS and Absolute are in the model; other case types have no such field.
+        for code in 1..=3 {
+            assert!(spectrum_modal_combination_entry("RS", 4, &record(code)).is_none());
+        }
+        assert!(spectrum_modal_combination_entry("RS", 4, &HashMap::new()).is_none());
+        assert!(spectrum_modal_combination_entry("MOD", 3, &record(5)).is_none());
+    }
+
+    #[test]
+    fn section_rebar_record_is_read_and_bad_indices_are_errors() {
+        let names: Vec<String> = ["", "4000Psi", "A615Gr60", "A615Gr40"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+        let section = |cp: HashMap<String, SdbVal>| -> HashMap<String, SdbVal> {
+            HashMap::from([("m_Cp".to_string(), SdbVal::Obj(cp))])
+        };
+        let cp = |rebar: i32, shear: i32, ty: i32| -> HashMap<String, SdbVal> {
+            HashMap::from([
+                ("m_MindexRebar".to_string(), SdbVal::I32(rebar)),
+                ("m_MindexRebarShear".to_string(), SdbVal::I32(shear)),
+                ("m_type".to_string(), SdbVal::I32(ty)),
+                ("m_CoverTop".to_string(), SdbVal::F64(2.5)),
+                ("m_CoverBot".to_string(), SdbVal::F64(3.0)),
+                ("m_Cover".to_string(), SdbVal::F64(1.5)),
+                ("m_NumberR3Bars".to_string(), SdbVal::I32(5)),
+                ("m_NumberR2Bars".to_string(), SdbVal::I32(3)),
+            ])
+        };
+        // Beam (type 2): own top and bottom covers; shear rebar is material 3.
+        let beam = frame_section_rebar(&section(cp(2, 3, 2)), "B1", &names)
+            .unwrap()
+            .unwrap();
+        assert!(!beam.is_column);
+        assert_eq!(beam.rebar_mat_long, "A615Gr60");
+        assert_eq!(beam.rebar_mat_confine, "A615Gr40");
+        assert_eq!((beam.cover_top, beam.cover_bot), (2.5, 3.0));
+        assert_eq!((beam.num_bars_3dir, beam.num_bars_2dir), (5, 3));
+        // Column (type 1): one cover for both.
+        let col = frame_section_rebar(&section(cp(2, 2, 1)), "C1", &names)
+            .unwrap()
+            .unwrap();
+        assert!(col.is_column);
+        assert_eq!((col.cover_top, col.cover_bot), (1.5, 1.5));
+        // Refused: an index that names no material, an unknown type.
+        let e = frame_section_rebar(&section(cp(9, 2, 2)), "B2", &names).unwrap_err();
+        assert!(e.contains("'B2'") && e.contains("m_MindexRebar"), "{e}");
+        let e = frame_section_rebar(&section(cp(2, 0, 2)), "B3", &names).unwrap_err();
+        assert!(e.contains("m_MindexRebarShear"), "{e}");
+        let e = frame_section_rebar(&section(cp(2, 2, 3)), "B4", &names).unwrap_err();
+        assert!(e.contains("'B4'") && e.contains("m_type"), "{e}");
+        // No record, or a dead one: no rebar configuration.
+        assert_eq!(frame_section_rebar(&HashMap::new(), "S", &names), Ok(None));
+        let mut dead = cp(2, 2, 2);
+        dead.insert("m_alive".to_string(), SdbVal::Bool(false));
+        assert_eq!(frame_section_rebar(&section(dead), "S", &names), Ok(None));
+    }
 
     #[test]
     fn frame_joint_offsets_are_read_only_in_the_one_verified_form() {

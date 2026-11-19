@@ -1082,6 +1082,13 @@ fn independent_shear_rebar_fys_roundtrips_through_native_sdb() {
     };
     m.materials.insert("A615Gr60".into(), rebar);
 
+    // D114: the Rebar material (fys 40 != fy 60) has no native form: its
+    // `m_RebarProps.m_fy` is its own yield. The export is refused.
+    assert!(pack_model_to_native_sdb(&m).is_err());
+    // With fys == fy the Rebar material round-trips; the concrete material's
+    // independent fys (72 != 60) still does.
+    m.materials.get_mut("A615Gr60").unwrap().fys = 60.0;
+
     let native =
         pack_model_to_native_sdb(&m).expect("native export of independent fys must succeed");
     let doc = inspect_native_sdb(&native).unwrap();
@@ -1089,15 +1096,12 @@ fn independent_shear_rebar_fys_roundtrips_through_native_sdb() {
 
     let restored =
         extract_sdb_to_model(&native).expect("native import of independent fys must succeed");
-    // Assert Concrete properties preserved
     assert_eq!(restored.materials["4000Psi"].mat_type, MatType::Concrete);
     assert_eq!(restored.materials["4000Psi"].fy, 60.0);
     assert_eq!(restored.materials["4000Psi"].fys, 72.0);
-
-    // Assert Rebar properties preserved without clobbering fy
     assert_eq!(restored.materials["A615Gr60"].mat_type, MatType::Rebar);
     assert_eq!(restored.materials["A615Gr60"].fy, 60.0);
-    assert_eq!(restored.materials["A615Gr60"].fys, 40.0);
+    assert_eq!(restored.materials["A615Gr60"].fys, 60.0);
 
     assert_eq!(restored, m);
     assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);
@@ -1173,22 +1177,21 @@ fn rebar_materials_with_independent_fy_and_fys_multi_regime_roundtrip() {
     };
     m.materials.insert("Rebar60_60".into(), rebar_equal);
 
+    // D114: Rebar60_40 and Rebar60_80 (fys != fy) cannot be written natively.
+    assert!(pack_model_to_native_sdb(&m).is_err());
+    m.materials.shift_remove("Rebar60_40");
+    m.materials.shift_remove("Rebar60_80");
+
     let native = pack_model_to_native_sdb(&m)
-        .expect("native export with multi-regime rebar materials must succeed");
+        .expect("native export with the equal-yield rebar material must succeed");
     let doc = inspect_native_sdb(&native).unwrap();
     assert_eq!(doc.inventory().parsed_bytes, doc.inventory().stream_bytes);
-
     let restored = extract_sdb_to_model(&native)
-        .expect("native import with multi-regime rebar materials must succeed");
-
-    assert_eq!(restored.materials["Rebar60_40"].fy, 60.0);
-    assert_eq!(restored.materials["Rebar60_40"].fys, 40.0);
-
-    assert_eq!(restored.materials["Rebar60_80"].fy, 60.0);
-    assert_eq!(restored.materials["Rebar60_80"].fys, 80.0);
+        .expect("native import with the equal-yield rebar material must succeed");
 
     assert_eq!(restored.materials["Rebar60_60"].fy, 60.0);
     assert_eq!(restored.materials["Rebar60_60"].fys, 60.0);
+    assert_eq!(restored.materials["Rebar60_60"].fu, 90.0);
 
     assert_eq!(restored, m);
     assert_eq!(parse_s2k(&write_s2k(&restored)).unwrap(), m);

@@ -52,7 +52,8 @@ pub fn compute_whitney_beta1(fc_psi: f64) -> f64 {
 
 /// Computes required flexural reinforcement area $A_s$ and minimum reinforcement $A_{s,\min}$
 /// for a rectangular concrete beam section ($b \times h$, effective depth $d$, compression cover $d'$)
-/// under factored moment $M_u \ge 0$ per ACI 318-14.
+/// under factored moment $M_u \ge 0$ per ACI 318-14. The tension steel only: see
+/// [`design_aci_beam_flexure_doubly`] for the compression steel of a doubly reinforced section.
 pub fn design_aci_beam_flexure(
     mu: f64,
     b: f64,
@@ -63,6 +64,31 @@ pub fn design_aci_beam_flexure(
     es: f64,
     units: Units,
 ) -> (f64, f64, bool) {
+    let (as_t, _as_c, as_min, over) =
+        design_aci_beam_flexure_doubly(mu, b, d, d_prime, fc, fy, es, units);
+    (as_t, as_min, over)
+}
+
+/// Flexural design of a rectangular beam per ACI 318-14 (CSI manual pp. 3-31 and 3-32) that also
+/// returns the compression steel: `(A_s tension, A's compression, A_s,min, overstressed)`.
+///
+/// When $\phi M_n$ of the singly reinforced section at $a_{max}$ ($c_{max} = 0.375d$, tension
+/// strain 0.005) is exceeded: $M_{uc} = \phi C (d - a_{max}/2)$, $C = 0.85 f'_c b a_{max}$,
+/// $M_{us} = M_u - M_{uc}$, $A'_s = M_{us}/((f'_s - 0.85 f'_c)(d - d')\phi)$ with
+/// $f'_s = E_s \varepsilon_c (c_{max} - d')/c_{max} \le f_y$, $A_{s1} = M_{uc}/(f_y(d - a_{max}/2)\phi)$,
+/// $A_{s2} = M_{us}/(f_y(d - d')\phi)$, $A_s = A_{s1} + A_{s2}$. $A_s$ goes on the tension face,
+/// $A'_s$ on the compression face. When $f'_s \le 0.85 f'_c$ no compression steel can
+/// balance $M_{us}$: the section is overstressed and `A's` is returned as 0.
+pub fn design_aci_beam_flexure_doubly(
+    mu: f64,
+    b: f64,
+    d: f64,
+    d_prime: f64,
+    fc: f64,
+    fy: f64,
+    es: f64,
+    units: Units,
+) -> (f64, f64, f64, bool) {
     let to_psi = units.stress_factor_to(Units::LbInF);
     let fc_psi = (fc * to_psi).max(2000.0);
     let fy_psi = (fy * to_psi).max(20000.0);
@@ -73,7 +99,7 @@ pub fn design_aci_beam_flexure(
     let as_min = rho_min * b * d;
 
     if mu <= 1e-12 {
-        return (0.0, as_min, false);
+        return (0.0, 0.0, as_min, false);
     }
 
     let phi_b = 0.90;
@@ -93,7 +119,7 @@ pub fn design_aci_beam_flexure(
         let as_req = (0.85 * fc * a * b) / fy.max(1e-12);
         // ACI 318-14 Section 9.6.1.3: enforce As_min unless As_req * 4/3 < As_min
         let as_govern = as_req.max(as_min.min((4.0 / 3.0) * as_req));
-        (as_govern, as_min, false)
+        (as_govern, 0.0, as_min, false)
     } else {
         // Doubly reinforced beam section
         let as1 = (0.85 * fc * a_max * b) / fy.max(1e-12);
@@ -103,7 +129,9 @@ pub fn design_aci_beam_flexure(
         let eps_s_prime = ecu * ((c_max - d_prime) / c_max).max(0.0);
         let fs_prime = (eps_s_prime * es).min(fy);
         let overstressed = fs_prime <= 0.0 || mu2 > 1.5 * phi_mn_max_single;
-        (as1 + as2, as_min, overstressed)
+        let denom = (fs_prime - 0.85 * fc) * lever * phi_b;
+        let as_comp = if denom > 0.0 { mu2 / denom } else { 0.0 };
+        (as1 + as2, as_comp, as_min, overstressed || denom <= 0.0)
     }
 }
 
@@ -118,12 +146,27 @@ pub fn design_aci_beam_shear(
 ) -> (f64, bool) {
     let to_psi = units.stress_factor_to(Units::LbInF);
     let fc_psi = (fc * to_psi).max(2000.0);
+    // vc = 2 * sqrt(fc_psi) in psi -> convert back to model stress units
+    let vc_stress = (2.0 * fc_psi.sqrt()) / to_psi;
+    aci_shear_from_vc(vu, vc_stress * bw * d, bw, d, fc, fyt, units)
+}
+
+/// Stirrup demand $A_v/s$ and the overstress flag from a given concrete shear strength `vc`
+/// (ACI 318-14 22.5.1, 22.5.10.5.3 and Table 9.6.3.3), shared by the beam and column rules.
+fn aci_shear_from_vc(
+    vu: f64,
+    vc: f64,
+    bw: f64,
+    d: f64,
+    fc: f64,
+    fyt: f64,
+    units: Units,
+) -> (f64, bool) {
+    let to_psi = units.stress_factor_to(Units::LbInF);
+    let fc_psi = (fc * to_psi).max(2000.0);
     let fyt_psi = (fyt * to_psi).max(20000.0);
 
     let phi_v = 0.75;
-    // vc = 2 * sqrt(fc_psi) in psi -> convert back to model stress units
-    let vc_stress = (2.0 * fc_psi.sqrt()) / to_psi;
-    let vc = vc_stress * bw * d;
     let phi_vc = phi_v * vc;
 
     let vs_max_stress = (8.0 * fc_psi.sqrt()) / to_psi;
@@ -144,6 +187,135 @@ pub fn design_aci_beam_shear(
     }
 }
 
+/// Concrete shear strength $V_c$ of a column section under the axial force `pu_comp`
+/// (compression positive), ACI 318-14 22.5.6.1 and 22.5.7.1 (CSI ACI 318-14 manual p. 3-25).
+/// With $P_u/A_g$ in psi: compression $V_c = 2\lambda\sqrt{f'_c}(1 + P_u/2000A_g)A_{cv}$, at most
+/// $3.5\lambda\sqrt{f'_c}\sqrt{1 + P_u/500A_g}\,A_{cv}$; tension
+/// $V_c = 2\lambda\sqrt{f'_c}(1 + P_u/500A_g)A_{cv} \ge 0$. $\lambda = 1$: the model has no
+/// lightweight-concrete factor. `bw * d` is $A_{cv}$.
+pub fn aci_column_vc(pu_comp: f64, ag: f64, bw: f64, d: f64, fc: f64, units: Units) -> f64 {
+    let to_psi = units.stress_factor_to(Units::LbInF);
+    let fc_psi = (fc * to_psi).max(2000.0);
+    let n_psi = pu_comp * to_psi / ag.max(1e-12);
+    let base = 2.0 * fc_psi.sqrt();
+    let stress_psi = if n_psi >= 0.0 {
+        let cap = 3.5 * fc_psi.sqrt() * (1.0 + n_psi / 500.0).sqrt();
+        (base * (1.0 + n_psi / 2000.0)).min(cap)
+    } else {
+        (base * (1.0 + n_psi / 500.0)).max(0.0)
+    };
+    stress_psi / to_psi * bw * d
+}
+
+/// Required stirrup area per unit spacing and overstress flag for a column in one shear
+/// direction (ACI 318-14), with the axial force in $V_c$ (see [`aci_column_vc`]).
+pub fn design_aci_column_shear(
+    vu: f64,
+    pu_comp: f64,
+    ag: f64,
+    bw: f64,
+    d: f64,
+    fc: f64,
+    fyt: f64,
+    units: Units,
+) -> (f64, bool) {
+    let vc = aci_column_vc(pu_comp, ag, bw, d, fc, units);
+    aci_shear_from_vc(vu, vc, bw, d, fc, fyt, units)
+}
+
+/// Strut inclination $\cot\theta$ of a beam under EN 1992-1-1 6.2.3 as the CSI manual states it
+/// (printed pp. 3-32 and 3-33). With seismic in the design combination $\theta = 45^\circ$
+/// ($\cot\theta = 1$). Otherwise $\theta$ is optimised from
+/// $\cot\theta + \tan\theta = 0.9\,\alpha_{cw}\nu_1 f_{cd}/v_{Ed}$, $v_{Ed} = V_{Ed}/(b_w d)$,
+/// $\alpha_{cw} = 1$, $21.8^\circ \le \theta \le 45^\circ$ (the 0.9 is $z/d$: the equation is
+/// $V_{Ed} = V_{Rd,max}(\theta)$). With $X = 0.9\nu_1 f_{cd}/v_{Ed}$ the root is
+/// $\cot\theta = (X + \sqrt{X^2 - 4})/2$ clamped to $[1, 2.5]$; for $X < 2$ no angle gives
+/// $V_{Rd,max} \ge V_{Ed}$ and $\cot\theta = 1$ (the station is then overstressed). The manual's
+/// torsion clause ($T_{Ed} > T_{cr}$ gives 45 degrees) is not applied: concrete torsion is not designed.
+pub fn ec2_beam_strut_cot(vu: f64, b: f64, d: f64, fck: f64, units: Units, seismic: bool) -> f64 {
+    if seismic {
+        return 1.0;
+    }
+    let to_mpa = units.stress_factor_to(Units::NMmC);
+    let fck_mpa = (fck * to_mpa).max(12.0);
+    let fcd_mpa = 0.85 * fck_mpa / 1.5;
+    let nu1 = 0.6 * (1.0 - fck_mpa / 250.0).max(0.3);
+    let v_ed = vu.abs() * to_mpa / (b * d).max(1e-12);
+    if v_ed <= 1e-12 {
+        return 2.5;
+    }
+    let x = 0.9 * nu1 * fcd_mpa / v_ed;
+    if x < 2.0 {
+        1.0
+    } else {
+        (0.5 * (x + (x * x - 4.0).sqrt())).clamp(1.0, 2.5)
+    }
+}
+
+/// Shear reinforcement $A_{sw}/s$ and the $V_{Rd,max}$ flag of EN 1992-1-1 6.2.3 for the strut
+/// inclination `cot_theta`: $A_{sw}/s = V_{Ed}/(z f_{ywd} \cot\theta)$, $z = 0.9d$,
+/// $V_{Rd,max} = b z \nu_1 f_{cd}/(\cot\theta + \tan\theta)$. The strength without shear
+/// reinforcement is (6.2.2(1), manual pp. 3-31 and 3-32) $V_{Rd,c} = C_{Rd,c} k (100\rho_l f_{ck})^{1/3} b d$
+/// at least $v_{min} b d$, with $C_{Rd,c} = 0.18/1.5$, $k = 1 + \sqrt{200/d} \le 2$ ($d$ in mm),
+/// $v_{min} = 0.035 k^{3/2} f_{ck}^{1/2}$ and $\rho_l$ = `rho_l`, at most 0.02 ($\sigma_{cp} = 0$). The
+/// minimum ratio is $\rho_{w,\min} = 0.08\sqrt{f_{ck}}/f_{yk}$ with the yield stress `fytk` of the shear
+/// reinforcement (EC2 9.5N). Shared by beams and columns.
+fn ec2_shear_core(
+    vu: f64,
+    b: f64,
+    d: f64,
+    rho_l: f64,
+    fck: f64,
+    fytk: f64,
+    cot_theta: f64,
+    units: Units,
+) -> (f64, bool) {
+    let to_mpa = units.stress_factor_to(Units::NMmC);
+    let to_mm = units.length_factor_to(Units::NMmC);
+    let fck_mpa = (fck * to_mpa).max(12.0);
+    let fytk_mpa = (fytk * to_mpa).max(200.0);
+    let gamma_c = 1.50;
+    let gamma_s = 1.15;
+    let fcd = 0.85 * fck / gamma_c;
+    let fywd = fytk / gamma_s;
+
+    let z = 0.9 * d;
+    let rho_w_min = (0.08 * fck_mpa.sqrt()) / fytk_mpa;
+    let asw_s_min = rho_w_min * b;
+    let k = (1.0 + (200.0 / (d * to_mm).max(1e-9)).sqrt()).min(2.0);
+    let rho_l = rho_l.clamp(0.0, 0.02);
+    let v_min = 0.035 * k.powf(1.5) * fck_mpa.sqrt();
+    let v_rd_c_stress = ((0.18 / gamma_c) * k * (100.0 * rho_l * fck_mpa).cbrt()).max(v_min) / to_mpa;
+    let v_rd_c = v_rd_c_stress * b * d;
+    let nu1 = 0.6 * (1.0 - fck_mpa / 250.0).max(0.3);
+    let v_rd_max = (b * z * nu1 * fcd) / (cot_theta + 1.0 / cot_theta);
+
+    let av_s = if vu <= v_rd_c {
+        asw_s_min
+    } else {
+        let req = vu / (z * fywd * cot_theta).max(1e-12);
+        req.max(asw_s_min)
+    };
+    // V_Ed = V_Rd,max holds at the optimised angle: allow for the rounding of that equality
+    (av_s, vu > v_rd_max * (1.0 + 1e-9))
+}
+
+/// Shear reinforcement of a column in one direction, EN 1992-1-1 as the CSI manual states it for
+/// columns (printed p. 3-21): the strut angle is taken as 45 degrees ("The program assumes the
+/// conservative value of 45 degrees"), so $\cot\theta = 1$ for both $V_{Rd,max}$ and
+/// $A_{sw}/s$. $\sigma_{cp}$ in $V_{Rd,c}$ is not included (open) and the call has no moment, so
+/// $\rho_l = 0$.
+pub fn design_ec2_column_shear(
+    vu: f64,
+    b: f64,
+    d: f64,
+    fck: f64,
+    fytk: f64,
+    units: Units,
+) -> (f64, bool) {
+    ec2_shear_core(vu, b, d, 0.0, fck, fytk, 1.0, units)
+}
+
 /// Computes required flexural and shear reinforcement for a beam under Eurocode 2-2004 (`EN 1992-1-1`).
 pub fn design_ec2_beam(
     mu: f64,
@@ -156,58 +328,141 @@ pub fn design_ec2_beam(
     fytk: f64,
     units: Units,
 ) -> (f64, f64, f64, bool) {
+    let r = design_ec2_beam_doubly(mu, vu, b, d, d_prime, fck, fyk, fytk, units);
+    (r.as_tension, r.as_min, r.av_s, r.overstressed)
+}
+
+/// Result of [`design_ec2_beam_doubly`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ec2BeamDesign {
+    /// Tension steel $A_s$ (on the tension face).
+    pub as_tension: f64,
+    /// Compression steel $A'_s$ (on the compression face; 0 for a singly reinforced section).
+    pub as_comp: f64,
+    /// Minimum tension steel $A_{s,\min}$.
+    pub as_min: f64,
+    /// Shear reinforcement $A_{sw}/s$.
+    pub av_s: f64,
+    pub overstressed: bool,
+}
+
+/// Flexural part of [`design_ec2_beam_doubly`]: `(A_s, A's, overstressed)` for the moment `mu`.
+fn ec2_flexure(
+    mu: f64,
+    b: f64,
+    d: f64,
+    d_prime: f64,
+    fck: f64,
+    fyk: f64,
+    as_min: f64,
+    units: Units,
+) -> (f64, f64, bool) {
+    let to_mpa = units.stress_factor_to(Units::NMmC);
+    let fck_mpa = (fck * to_mpa).max(12.0);
+    let gamma_s = 1.15;
+    let fyd = fyk / gamma_s;
+
+    // Flexural design (EN 1992-1-1 6.1, K_bal = 0.167 for x/d <= 0.45)
+    let k = mu / (b * d * d * fck).max(1e-12);
+    let k_bal = 0.167;
+    if mu <= 1e-12 {
+        (0.0, 0.0, false)
+    } else if k <= k_bal {
+        let z = d * (0.5 + (0.25 - k / 1.134).max(0.0).sqrt()).min(0.95);
+        let as_val = (mu / (fyd * z).max(1e-12)).max(as_min);
+        (as_val, 0.0, false)
+    } else if fck_mpa <= 50.0 {
+        // Doubly reinforced, CSI manual pp. 3-24 to 3-26 (fck <= 50 MPa: lambda = 0.8, eta = 1):
+        // m = M/(b d^2 eta fcd), m_lim = lambda (x/d)lim (1 - lambda/2 (x/d)lim),
+        // omega' = (m - m_lim)/(1 - d'/d), omega = lambda (x/d)lim + omega',
+        // A's = omega' eta fcd b d / f's with f's = Es eps_cu2 (1 - d'/x_lim) <= fyd,
+        // As = omega eta fcd b d / fyd. The design strength eta fcd is the code's 0.85 fck/1.5.
+        let fcd = 0.85 * fck / 1.5;
+        let lambda = 0.8;
+        let ecu2 = 0.0035;
+        let es = 200_000.0 / to_mpa;
+        let x_lim_d = (1.0 - 0.44) / (1.25 * (0.6 + 0.0014 / ecu2));
+        let m_lim = lambda * x_lim_d * (1.0 - 0.5 * lambda * x_lim_d);
+        let omega_lim = lambda * x_lim_d;
+        let m = mu / (b * d * d * fcd).max(1e-12);
+        let omega_p = (m - m_lim) / (1.0 - d_prime / d).max(1e-9);
+        let omega = omega_lim + omega_p;
+        let x_lim = x_lim_d * d;
+        let fs_prime = (es * ecu2 * (1.0 - d_prime / x_lim)).min(fyd);
+        let as_t = omega * fcd * b * d / fyd;
+        // f's <= 0: the compression steel lies at or beyond the neutral axis, no area balances it
+        let as_c = if fs_prime > 0.0 {
+            omega_p * fcd * b * d / fs_prime
+        } else {
+            0.0
+        };
+        (as_t, as_c, k > 2.0 * k_bal || fs_prime <= 0.0)
+    } else {
+        // fck > 50 MPa: the manual's high-strength parameters are not implemented here; the
+        // earlier balanced-moment form is kept for the tension steel and the compression steel
+        // balances the excess moment with both steels at fyd (A's = As2).
+        let z_bal = d * (0.5 + (0.25 - k_bal / 1.134).sqrt());
+        let m_bal = k_bal * b * d * d * fck;
+        let as1 = m_bal / (fyd * z_bal);
+        let as2 = (mu - m_bal) / (fyd * (d - d_prime).max(0.5 * d));
+        (as1 + as2, as2, k > 2.0 * k_bal)
+    }
+}
+
+/// Flexural and shear design of a rectangular beam under Eurocode 2-2004 (`EN 1992-1-1`), with the
+/// compression steel of a doubly reinforced section; the combination has no seismic case (see
+/// [`design_ec2_beam_seismic`]).
+pub fn design_ec2_beam_doubly(
+    mu: f64,
+    vu: f64,
+    b: f64,
+    d: f64,
+    d_prime: f64,
+    fck: f64,
+    fyk: f64,
+    fytk: f64,
+    units: Units,
+) -> Ec2BeamDesign {
+    design_ec2_beam_seismic(mu, vu, b, d, d_prime, fck, fyk, fytk, units, false)
+}
+
+/// [`design_ec2_beam_doubly`] with the seismic flag of the design combination: seismic fixes
+/// $\theta = 45^\circ$, otherwise the strut angle is optimised ([`ec2_beam_strut_cot`]).
+pub fn design_ec2_beam_seismic(
+    mu: f64,
+    vu: f64,
+    b: f64,
+    d: f64,
+    d_prime: f64,
+    fck: f64,
+    fyk: f64,
+    fytk: f64,
+    units: Units,
+    seismic: bool,
+) -> Ec2BeamDesign {
     let to_mpa = units.stress_factor_to(Units::NMmC);
     let fck_mpa = (fck * to_mpa).max(12.0);
     let fyk_mpa = (fyk * to_mpa).max(200.0);
-
-    let gamma_c = 1.50;
-    let gamma_s = 1.15;
-    let fcd = 0.85 * fck / gamma_c;
-    let fyd = fyk / gamma_s;
-    let fywd = fytk / gamma_s;
 
     // Mean tensile strength fctm = 0.30 * fck^(2/3) MPa (EN 1992-1-1 Table 3.1)
     let fctm_mpa = 0.30 * fck_mpa.powf(2.0 / 3.0);
     let rho_min = (0.26 * fctm_mpa / fyk_mpa).max(0.0013);
     let as_min = rho_min * b * d;
 
-    // Flexural design (EN 1992-1-1 6.1, K_bal = 0.167 for x/d <= 0.45)
-    let k = mu / (b * d * d * fck).max(1e-12);
-    let k_bal = 0.167;
-    let (as_req, over_flex) = if mu <= 1e-12 {
-        (0.0, false)
-    } else if k <= k_bal {
-        let z = d * (0.5 + (0.25 - k / 1.134).max(0.0).sqrt()).min(0.95);
-        let as_val = (mu / (fyd * z).max(1e-12)).max(as_min);
-        (as_val, false)
-    } else {
-        let z_bal = d * (0.5 + (0.25 - k_bal / 1.134).sqrt());
-        let m_bal = k_bal * b * d * d * fck;
-        let as1 = m_bal / (fyd * z_bal);
-        let as2 = (mu - m_bal) / (fyd * (d - d_prime).max(0.5 * d));
-        (as1 + as2, k > 2.0 * k_bal)
-    };
+    let (as_req, as_comp, over_flex) = ec2_flexure(mu, b, d, d_prime, fck, fyk, as_min, units);
 
-    // Shear design (EN 1992-1-1 6.2.3 variable strut inclination cot(theta) = 2.5 clamped)
-    let z = 0.9 * d;
-    let cot_theta = 2.5;
-    let rho_w_min = (0.08 * fck_mpa.sqrt()) / fyk_mpa;
-    let asw_s_min = rho_w_min * b;
-    let v_rd_c_stress =
-        ((0.12 * (100.0 * rho_min * fck_mpa).cbrt()).max(0.035 * fck_mpa.sqrt())) / to_mpa;
-    let v_rd_c = v_rd_c_stress * b * d;
-    let nu1 = 0.6 * (1.0 - fck_mpa / 250.0).max(0.3);
-    let v_rd_max = (b * z * nu1 * fcd) / (cot_theta + 1.0 / cot_theta);
-
-    let av_s = if vu <= v_rd_c {
-        asw_s_min
-    } else {
-        let req = vu / (z * fywd * cot_theta).max(1e-12);
-        req.max(asw_s_min)
-    };
-    let overstressed = over_flex || vu > v_rd_max;
-
-    (as_req, as_min, av_s, overstressed)
+    // Shear design (EN 1992-1-1 6.2.3): rho_l is the tension steel this call designs (0 without
+    // a moment), the strut angle follows the manual.
+    let rho_l = as_req / (b * d).max(1e-12);
+    let cot_theta = ec2_beam_strut_cot(vu, b, d, fck, units, seismic);
+    let (av_s, over_shear) = ec2_shear_core(vu, b, d, rho_l, fck, fytk, cot_theta, units);
+    Ec2BeamDesign {
+        as_tension: as_req,
+        as_comp,
+        as_min,
+        av_s,
+        overstressed: over_flex || over_shear,
+    }
 }
 
 /// Point on a uniaxial factored P-M interaction curve $(\phi P_n, \phi M_n)$.
@@ -477,10 +732,46 @@ pub fn evaluate_column_biaxial_pmm_ratio(
     h3: f64,
     h2: f64,
 ) -> f64 {
+    evaluate_pmm_ratio(
+        pu_comp_positive,
+        mu3,
+        mu2,
+        curve_major,
+        curve_minor,
+        phi_pn_max,
+        phi_pnt,
+        h3,
+        h2,
+        true,
+    )
+}
+
+/// Minimum eccentricity of an ACI 318-14 column in the direction of the dimension `h`:
+/// $e_{min} = 0.6 + 0.03h$ inches, $h$ in inches (ACI 318-14 6.6.4.5.4; CSI manual p. 3-13),
+/// returned in model length units.
+pub fn aci_min_eccentricity(h: f64, units: Units) -> f64 {
+    let h_in = h * units.length_factor_to(Units::KipInF);
+    (0.6 + 0.03 * h_in) * Units::KipInF.length_factor_to(units)
+}
+
+/// The P-M-M contour ratio of [`evaluate_column_biaxial_pmm_ratio`]; `old_min_ecc` keeps the
+/// earlier 0.05 h minimum-eccentricity rule for pure axial load (used for Eurocode 2). ACI 318-14
+/// applies its minimum eccentricity to the moments before the magnifiers instead.
+fn evaluate_pmm_ratio(
+    pu_comp_positive: f64,
+    mu3: f64,
+    mu2: f64,
+    curve_major: &[PmCurvePoint],
+    curve_minor: &[PmCurvePoint],
+    phi_pn_max: f64,
+    phi_pnt: f64,
+    h3: f64,
+    h2: f64,
+    old_min_ecc: bool,
+) -> f64 {
     let mu3 = mu3.abs();
     let mu2 = mu2.abs();
 
-    // Minimum eccentricity per ACI 318-14 (0.6 + 0.03*h in inches) when bending moments are tiny
     let axial_ratio = if pu_comp_positive >= 0.0 {
         pu_comp_positive / phi_pn_max.max(1e-12)
     } else {
@@ -502,8 +793,8 @@ pub fn evaluate_column_biaxial_pmm_ratio(
     let r2 = mu2 / phi_mn20;
     let contour_ratio = (r3.powf(alpha) + r2.powf(alpha)).powf(1.0 / alpha);
 
-    // Also account for minimum eccentricity moment ratio if pure axial compression
-    let e_min_ratio = if pu_comp_positive > 0.0 && mu3 < 1e-9 && mu2 < 1e-9 {
+    // Earlier minimum-eccentricity rule (0.05 h, pure axial compression only); see `old_min_ecc`
+    let e_min_ratio = if old_min_ecc && pu_comp_positive > 0.0 && mu3 < 1e-9 && mu2 < 1e-9 {
         let m_min3 = pu_comp_positive * 0.05 * h3;
         let m_min2 = pu_comp_positive * 0.05 * h2;
         (m_min3 / phi_mn30).max(m_min2 / phi_mn20)
@@ -512,6 +803,56 @@ pub fn evaluate_column_biaxial_pmm_ratio(
     };
 
     axial_ratio.max(contour_ratio).max(e_min_ratio)
+}
+
+/// Euler buckling load $P_c = \pi^2 EI_{eff}/l^2$ of a column about one axis with
+/// $EI_{eff} = 0.4 E_c I_g/(1 + \beta_{dns})$, $\beta_{dns} = 0.4$ (the code's fixed value),
+/// $k = 1$ (ACI 318-14 6.6.4.4.4 and 6.6.4.4.2; CSI manual p. 3-15). `i` is the moment of
+/// inertia for that axis: $I_{33}$ for bending about the 3-axis, $I_{22}$ for the 2-axis.
+pub fn aci_column_pc(e: f64, i: f64, l_clear: f64) -> f64 {
+    if l_clear > 1e-6 {
+        let ei_eff = 0.40 * e * i / 1.4;
+        (PI * PI * ei_eff) / (l_clear * l_clear)
+    } else {
+        1e18
+    }
+}
+
+/// Non-sway moment magnifier $\delta_{ns} = 1/(1 - P_u/(0.75 P_c)) \ge 1$ for one axis
+/// (ACI 318-14 6.6.4.5.2 with $C_m = 1$). Valid for $P_u < 0.75 P_c$; the caller declares the
+/// failure condition of the manual ($P_u \ge 0.75 P_c$) before.
+pub fn aci_moment_magnifier(pu_comp: f64, pc: f64) -> f64 {
+    (1.0 / (1.0 - pu_comp / (0.75 * pc))).max(1.0)
+}
+
+/// Whether the design combination (or case, when the design runs on cases) includes seismic,
+/// through any nesting of combinations: a response-spectrum case, or a case that loads a pattern of
+/// type Quake (the classification of `default_combos.rs`). Time-history and other cases do not count.
+pub fn combo_has_seismic(model: &SapModel, name: &str) -> bool {
+    fn walk(model: &SapModel, name: &str, depth: usize) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        if let Some(combo) = model.load_combos.get(name) {
+            return combo
+                .cases
+                .iter()
+                .any(|(member, _)| walk(model, member, depth + 1));
+        }
+        let Some(case) = model.load_cases.get(name) else {
+            return false;
+        };
+        if case.case_type == sap_model::LoadCaseType::ResponseSpectrum {
+            return true;
+        }
+        case.loads.iter().any(|assignment| {
+            model
+                .load_patterns
+                .get(&assignment.load_name)
+                .is_some_and(|p| p.pat_type == sap_model::LoadPatternType::Quake)
+        })
+    }
+    walk(model, name, 0)
 }
 
 /// Determines whether a concrete frame element is designed as a column (`true`) or a beam (`false`).
@@ -558,6 +899,10 @@ pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> 
             let Some(frame) = model.frames.get(frame_name) else {
                 return false;
             };
+            // A cable is not a design member (D103)
+            if frame.cable_params.is_some() {
+                return false;
+            }
             let Some(section) = model.frame_sections.get(&frame.section) else {
                 return false;
             };
@@ -590,6 +935,9 @@ fn resolve_rebar_fy(model: &SapModel, sec: &FrameSection, mat: &Material) -> Opt
 /// material with a positive yield stress). Earlier versions assumed 60 ksi.
 fn check_rebar_yield(model: &SapModel) -> Result<(), DesignError> {
     for (frame_name, frame) in &model.frames {
+        if frame.cable_params.is_some() {
+            continue;
+        }
         let Some(sec) = model.frame_sections.get(&frame.section) else {
             continue;
         };
@@ -627,6 +975,10 @@ fn run_concrete_design_validated(
     let default_cover = 2.5 * Units::KipInF.length_factor_to(units);
 
     for (frame_name, frame) in &model.frames {
+        // A cable is not designed (D103): SAP2000 designs no cable members.
+        if frame.cable_params.is_some() {
+            continue;
+        }
         let Some(sec) = model.frame_sections.get(&frame.section) else {
             continue;
         };
@@ -722,12 +1074,11 @@ fn run_concrete_design_validated(
             // Euler critical buckling load Pc for non-sway moment magnification (ACI 318-14 6.6.4.3 & 6.6.4.5)
             let r_gyr = sec.r33.min(sec.r22).max(0.3 * h.min(b));
             let kl_over_r = l_clear / r_gyr.max(1e-6);
-            let ei_eff = 0.40 * mat.e * sec.i33 / 1.4;
-            let pc_euler = if l_clear > 1e-6 {
-                (PI * PI * ei_eff) / (l_clear * l_clear)
-            } else {
-                1e18
-            };
+            // Pc and delta_ns are evaluated per axis (manual p. 3-15): I33 for bending about 3,
+            // I22 for bending about 2. The same unbraced length and k = 1 serve both axes.
+            let pc33 = aci_column_pc(mat.e, sec.i33, l_clear);
+            let pc22 = aci_column_pc(mat.e, sec.i22, l_clear);
+            let pc_min = pc33.min(pc22);
 
             let mut buckled = false;
             // Every state of a combination is a design entry of its own; a multi-valued
@@ -753,71 +1104,117 @@ fn run_concrete_design_validated(
                 for st in stations.iter() {
                     // SAP2000 sign convention: st.p < 0 is compression, st.p > 0 is tension
                     let pu_comp = -st.p;
-                    if kl_over_r > 34.0 && pu_comp > 0.0 && pu_comp >= 0.75 * pc_euler {
+                    if kl_over_r > 34.0 && pu_comp > 0.0 && pu_comp >= 0.75 * pc_min {
                         buckled = true;
-                        let buck_ratio = (pu_comp / (0.75 * pc_euler.max(1e-12))).max(999.0);
+                        let buck_ratio = (pu_comp / (0.75 * pc_min.max(1e-12))).max(999.0);
                         if buck_ratio > max_pmm_ratio {
                             max_pmm_ratio = buck_ratio;
                             gov_combo = combo_name.clone();
                         }
                         continue;
                     }
-                    let delta_ns = if kl_over_r > 34.0 && pu_comp > 0.0 {
-                        (1.0 / (1.0 - pu_comp / (0.75 * pc_euler))).max(1.0)
+                    let (delta33, delta22) = if kl_over_r > 34.0 && pu_comp > 0.0 {
+                        (
+                            aci_moment_magnifier(pu_comp, pc33),
+                            aci_moment_magnifier(pu_comp, pc22),
+                        )
                     } else {
-                        1.0
+                        (1.0, 1.0)
                     };
-                    let mu3 = st.m3.abs() * delta_ns;
-                    let mu2 = st.m2.abs() * delta_ns;
-
-                    let pmm = evaluate_column_biaxial_pmm_ratio(
-                        pu_comp,
-                        mu3,
-                        mu2,
-                        &curve_major,
-                        &curve_minor,
-                        phi_pn_max,
-                        phi_pnt,
-                        h,
-                        b,
-                    );
+                    let pmm = match code {
+                        ConcreteCode::Aci318 => {
+                            // Minimum eccentricity (0.6 + 0.03h) in, applied in one direction
+                            // at a time and then amplified (manual p. 3-13): two moment pairs.
+                            let (m3_abs, m2_abs) = (st.m3.abs(), st.m2.abs());
+                            let (m3_min, m2_min) = if pu_comp > 0.0 {
+                                (
+                                    pu_comp * aci_min_eccentricity(h, units),
+                                    pu_comp * aci_min_eccentricity(b, units),
+                                )
+                            } else {
+                                (0.0, 0.0)
+                            };
+                            [
+                                (m3_abs.max(m3_min), m2_abs),
+                                (m3_abs, m2_abs.max(m2_min)),
+                            ]
+                            .into_iter()
+                            .map(|(m3p, m2p)| {
+                                evaluate_pmm_ratio(
+                                    pu_comp,
+                                    m3p * delta33,
+                                    m2p * delta22,
+                                    &curve_major,
+                                    &curve_minor,
+                                    phi_pn_max,
+                                    phi_pnt,
+                                    h,
+                                    b,
+                                    false,
+                                )
+                            })
+                            .fold(0.0_f64, f64::max)
+                        }
+                        ConcreteCode::Eurocode2 => evaluate_pmm_ratio(
+                            pu_comp,
+                            st.m3.abs() * delta33,
+                            st.m2.abs() * delta22,
+                            &curve_major,
+                            &curve_minor,
+                            phi_pn_max,
+                            phi_pnt,
+                            h,
+                            b,
+                            true,
+                        ),
+                    };
                     let (av_s_2, over_v2) = match code {
                         ConcreteCode::Aci318 => {
-                            design_aci_beam_shear(st.v2.abs(), bw2, d2_shear, fc, fyt, units)
+                            design_aci_column_shear(
+                                st.v2.abs(),
+                                pu_comp,
+                                sec.area,
+                                bw2,
+                                d2_shear,
+                                fc,
+                                fyt,
+                                units,
+                            )
                         }
                         ConcreteCode::Eurocode2 => {
-                            let (_, _, avs, ov) = design_ec2_beam(
-                                0.0,
+                            design_ec2_column_shear(
                                 st.v2.abs(),
                                 bw2,
                                 d2_shear,
-                                cover_top,
                                 fc,
-                                fy,
                                 fyt,
                                 units,
-                            );
-                            (avs, ov)
+                            )
                         }
                     };
                     let (av_s_3, over_v3) = if st.v3.abs() > 1e-9 {
                         match code {
                             ConcreteCode::Aci318 => {
-                                design_aci_beam_shear(st.v3.abs(), bw3, d3_shear, fc, fyt, units)
+                                design_aci_column_shear(
+                                    st.v3.abs(),
+                                    pu_comp,
+                                    sec.area,
+                                    bw3,
+                                    d3_shear,
+                                    fc,
+                                    fyt,
+                                    units,
+                                )
                             }
                             ConcreteCode::Eurocode2 => {
-                                let (_, _, avs, ov) = design_ec2_beam(
-                                    0.0,
+                                design_ec2_column_shear(
                                     st.v3.abs(),
                                     bw3,
                                     d3_shear,
-                                    cover_minor,
                                     fc,
-                                    fy,
                                     fyt,
                                     units,
-                                );
-                                (avs, ov)
+                                )
                             }
                         }
                     } else {
@@ -879,6 +1276,17 @@ fn run_concrete_design_validated(
                 }
             };
 
+            // The largest moment of this beam over its stations, states and combinations: a
+            // minor-axis moment below 1e-9 of it is numerical noise, not a demand (the threshold
+            // is relative, so it does not depend on the force and length units).
+            let moment_scale = combo_forces
+                .iter()
+                .filter_map(|(_, fm)| fm.iter().find(|(fn_k, _)| fn_k == frame_name))
+                .flat_map(|(_, states)| states.iter().flatten())
+                .map(|st| st.m2.abs().max(st.m3.abs()))
+                .fold(0.0_f64, f64::max);
+            let m2_threshold = 1e-9 * moment_scale;
+
             // Beam checks: flexure about 3 (top and bottom steel) from M3 alone, side flexure
             // from M2 alone, shear from V2 and V3 alone; no check combines two forces, so no
             // maxima/minima permutation is formed (ACI 318-14 manual section 2.1 permutes the
@@ -936,6 +1344,8 @@ fn run_concrete_design_validated(
                     .map(|st| end_positive(st).max((-st.m3).max(0.0)))
                     .fold(0.0_f64, f64::max);
                 {
+                    // The seismic state of the combination fixes the EC2 strut angle at 45 degrees.
+                    let seismic = combo_has_seismic(model, combo_name);
                     // Positive M3 -> bottom tension; Negative M3 -> top tension
                     let at_end = is_end(st);
                     let m_pos = if at_end { end_positive(st) } else { st.m3.max(0.0) }
@@ -944,37 +1354,49 @@ fn run_concrete_design_validated(
                     let vu2 = st.v2.abs();
                     let vu3 = st.v3.abs();
 
-                    let (as_bot, as_min_b, over_b, av_s_2, over_v2) = match code {
+                    // A doubly reinforced section also needs compression steel: A's of the
+                    // positive moment goes to the top face, A's of the negative moment to the
+                    // bottom face (ACI 318-14 manual p. 3-32; EC2 manual p. 3-26).
+                    let (as_bot_t, as_top_c, as_min_b, over_b, av_s_2, over_v2) = match code {
                         ConcreteCode::Aci318 => {
-                            let (ab, amin, ob) = design_aci_beam_flexure(
+                            let (ab, ac, amin, ob) = design_aci_beam_flexure_doubly(
                                 m_pos, b, d_bot, cover_top, fc, fy, es, units,
                             );
                             let (avs, ov) =
                                 design_aci_beam_shear(vu2, bw2, d2_shear, fc, fyt, units);
-                            (ab, amin, ob, avs, ov)
+                            (ab, ac, amin, ob, avs, ov)
                         }
                         ConcreteCode::Eurocode2 => {
-                            let (ab, amin, avs, ov) = design_ec2_beam(
-                                m_pos, vu2, b, d_bot, cover_top, fc, fy, fyt, units,
+                            let r = design_ec2_beam_seismic(
+                                m_pos, vu2, b, d_bot, cover_top, fc, fy, fyt, units, seismic,
                             );
-                            (ab, amin, ov, avs, ov)
+                            (
+                                r.as_tension,
+                                r.as_comp,
+                                r.as_min,
+                                r.overstressed,
+                                r.av_s,
+                                r.overstressed,
+                            )
                         }
                     };
 
-                    let (as_top, as_min_t, over_t) = match code {
-                        ConcreteCode::Aci318 => {
-                            design_aci_beam_flexure(m_neg, b, d_top, cover_bot, fc, fy, es, units)
-                        }
+                    let (as_top_t, as_bot_c, as_min_t, over_t) = match code {
+                        ConcreteCode::Aci318 => design_aci_beam_flexure_doubly(
+                            m_neg, b, d_top, cover_bot, fc, fy, es, units,
+                        ),
                         ConcreteCode::Eurocode2 => {
-                            let (at, amin, _, ov) = design_ec2_beam(
+                            let r = design_ec2_beam_doubly(
                                 m_neg, 0.0, b, d_top, cover_bot, fc, fy, fyt, units,
                             );
-                            (at, amin, ov)
+                            (r.as_tension, r.as_comp, r.as_min, r.overstressed)
                         }
                     };
+                    let as_bot = as_bot_t.max(as_bot_c);
+                    let as_top = as_top_t.max(as_top_c);
 
                     // Minor-axis flexure M2 produces tension on side faces across width b with depth b and effective width h
-                    let (as_side, as_min_s, over_s) = if st.m2.abs() > 1e-12 {
+                    let (as_side, as_min_s, over_s) = if st.m2.abs() > m2_threshold.max(1e-300) {
                         match code {
                             ConcreteCode::Aci318 => design_aci_beam_flexure(
                                 st.m2.abs(),
@@ -1011,7 +1433,7 @@ fn run_concrete_design_validated(
                                 design_aci_beam_shear(vu3, bw3, d3_shear, fc, fyt, units)
                             }
                             ConcreteCode::Eurocode2 => {
-                                let (_, _, avs3, ov3) = design_ec2_beam(
+                                let r = design_ec2_beam_seismic(
                                     0.0,
                                     vu3,
                                     bw3,
@@ -1021,8 +1443,9 @@ fn run_concrete_design_validated(
                                     fy,
                                     fyt,
                                     units,
+                                    seismic,
                                 );
-                                (avs3, ov3)
+                                (r.av_s, r.overstressed)
                             }
                         }
                     } else {

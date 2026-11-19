@@ -174,9 +174,8 @@ pub(super) fn add_material(
     }
     let material = library_material(entry, model.present_units, name)?;
     model.materials.insert(name.to_string(), material);
-    model.case_results.clear();
-    model.steel_design_results.clear();
-    model.concrete_design_results.clear();
+    // D124: one way to clear results (reasons included).
+    model.invalidate_results();
     Ok(format!(
         "Added material {name} from the library ({} / {} / {}).",
         entry.region, entry.standard, entry.grade

@@ -383,6 +383,9 @@ pub(crate) struct System {
     linear: Vec<f64>,
     reference: Vec<f64>,
     springs: Vec<Spring>,
+    /// Diagonal of the reference without the constraint penalties (D112): the pivot test of
+    /// the factorizations is relative to it, not to the penalty. `None` keeps the plain test.
+    structural_diagonal: Option<Vec<f64>>,
 }
 
 impl System {
@@ -530,6 +533,30 @@ impl System {
             linear,
             reference,
             springs,
+            structural_diagonal: None,
+        })
+    }
+
+    /// Makes the factorizations judge a pivot against the structural diagonal: the reference
+    /// diagonal minus what the multipoint-constraint penalties added (`k_total - k_struct`,
+    /// diagonals) (D112).
+    pub fn with_structural_stiffness(mut self, k_total: &[f64], k_struct: &[f64]) -> Self {
+        let n = self.n;
+        self.structural_diagonal = Some(
+            (0..n)
+                .map(|i| self.reference[i * n + i] - (k_total[i * n + i] - k_struct[i * n + i]))
+                .collect(),
+        );
+        self
+    }
+
+    /// Reference diagonal for a factorization with the rows `fixed` replaced by identity rows.
+    fn pivot_reference(&self, fixed: &[bool]) -> Option<Vec<f64>> {
+        self.structural_diagonal.as_ref().map(|d| {
+            d.iter()
+                .zip(fixed)
+                .map(|(v, f)| if *f { 1.0 } else { *v })
+                .collect()
         })
     }
 
@@ -802,7 +829,12 @@ impl System {
             }
             matrix
         };
-        let reference = SymmetricLdlt::factorize(&constrain(self.reference.clone()), self.n)?;
+        let pivot_reference = self.pivot_reference(fixed);
+        let reference = SymmetricLdlt::factorize_with_reference(
+            &constrain(self.reference.clone()),
+            self.n,
+            pivot_reference.as_deref(),
+        )?;
         let mut u: Vec<f64> = (0..self.n)
             .map(|i| {
                 if fixed[i] {
@@ -844,8 +876,12 @@ impl System {
             let rhs: Vec<f64> = (0..self.n)
                 .map(|i| if fixed[i] { 0. } else { -residual[i] })
                 .collect();
-            let mut direction = SymmetricLdlt::factorize(&constrain(tangent), self.n)
-                .and_then(|factor| factor.solve(&rhs))
+            let mut direction = SymmetricLdlt::factorize_with_reference(
+                &constrain(tangent),
+                self.n,
+                pivot_reference.as_deref(),
+            )
+            .and_then(|factor| factor.solve(&rhs))
                 .or_else(|_| reference.solve(&rhs))?;
             let mut slope: f64 = residual.iter().zip(&direction).map(|(r, p)| r * p).sum();
             if !slope.is_finite() || slope >= 0. {

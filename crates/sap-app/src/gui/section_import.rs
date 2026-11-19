@@ -159,9 +159,8 @@ pub(super) fn import_sections(
         .filter(|s| model.frame_sections.contains_key(&s.name))
         .count();
     if replaced > 0 {
-        model.case_results.clear();
-        model.steel_design_results.clear();
-        model.concrete_design_results.clear();
+        // D124: one way to clear results (reasons included).
+        model.invalidate_results();
     }
     let listed: Vec<&str> = sections.iter().take(6).map(|s| s.name.as_str()).collect();
     let mut message = format!(
@@ -566,6 +565,30 @@ mod tests {
             .unwrap()
             .name
             .clone()
+    }
+
+    #[test]
+    fn replacing_a_section_clears_the_reasons_a_result_is_unavailable_too() {
+        // D124: the replace path cleared the results but kept `unavailable_results`.
+        let db = database();
+        let mut model = model_kn_m();
+        let material = steel(&model);
+        import_sections(&mut model, &db, &names(&["IPE200"]), &material, false).unwrap();
+        model
+            .unavailable_results
+            .insert("COMBO1".into(), "stale reason".into());
+        model
+            .case_results
+            .insert("stale".into(), Default::default());
+        import_sections(&mut model, &db, &names(&["IPE200"]), &material, true).unwrap();
+        assert!(model.unavailable_results.is_empty());
+        assert!(model.case_results.is_empty());
+        // Negative: an import that replaces nothing leaves the results alone.
+        model
+            .unavailable_results
+            .insert("COMBO1".into(), "kept".into());
+        import_sections(&mut model, &db, &names(&["IPE220"]), &material, false).unwrap();
+        assert_eq!(model.unavailable_results.len(), 1);
     }
 
     #[test]

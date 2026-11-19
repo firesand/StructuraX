@@ -187,9 +187,8 @@ fn editable(model: &SapModel) -> Result<(), String> {
     }
 }
 fn invalidate(model: &mut SapModel) {
-    model.case_results.clear();
-    model.steel_design_results.clear();
-    model.concrete_design_results.clear();
+    // D124: one way to clear results (reasons included).
+    model.invalidate_results();
 }
 fn named(name: &str) -> Result<(), String> {
     if name.trim().is_empty() || name.chars().any(char::is_control) {

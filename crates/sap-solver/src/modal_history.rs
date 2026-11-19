@@ -631,6 +631,8 @@ pub(crate) fn run_case(
         pt_index,
         joint_rot,
         k_struct,
+        // The physical reaction below is built from `k_base` already.
+        None,
         &u_peak,
         ndof,
         &member_loads,
@@ -680,11 +682,13 @@ pub(crate) fn run_case(
     }
 
     // Link forces and the reactions of grounded links at the peak.
+    let link_fixed = crate::link_fixed_stiffness(model, work_points, work_areas, pt_index, joint_rot, ndof)?;
     let mut grounded = IndexMap::<String, [f64; 6]>::new();
     for (name, object) in &model.links {
         let prop = &model.link_props[&object.prop];
         let op = link::operator(object, prop, work_points, pt_index, joint_rot);
-        let raw = link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &[None; 6], 0.0);
+        let raw =
+            link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &[None; 6], 0.0, link_fixed);
         res.link_forces
             .insert(name.clone(), link::section_at_j(prop, raw));
         if object.point_j.is_none() {

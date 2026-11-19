@@ -901,6 +901,7 @@ fn design_refuses_a_broken_list_and_leaves_no_results() {
             phi_vn3: 0.0,
             status: "OK".into(),
             eq_name: String::new(),
+            notes: Vec::new(),
         },
     );
     m.frame_sections

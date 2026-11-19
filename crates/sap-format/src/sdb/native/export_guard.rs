@@ -691,6 +691,10 @@ fn semantic_model(model: &SapModel) -> SapModel {
     copy.case_results.clear();
     copy.steel_design_results.clear();
     copy.concrete_design_results.clear();
+    // D120: the reasons a result is unavailable are result state like the maps
+    // above; the projected model never has them, so they must not make the export
+    // look lossy.
+    copy.unavailable_results.clear();
     // D81: a history entry is compared by what it means, not by its stored tag
     // or the alias of its direction. An entry without a kind that resolves
     // without ambiguity is what the writer records (its type code) and the

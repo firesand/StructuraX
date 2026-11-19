@@ -208,8 +208,17 @@ fn analyze_model_inner(model: &mut SapModel) -> Result<(), SolverError> {
     let auto_lateral = auto_seismic::apply(model, &mut work_points, &joint_rot, &diag_mass)?;
 
     // Build K_base = K_struct + grounded springs + multipoint constraints
-    let k_base =
-        add_springs_and_constraints(model, &work_points, &pt_index, &joint_rot, &k_struct, ndof);
+    let link_fixed =
+        link_fixed_stiffness(model, &work_points, &work_areas, &pt_index, &joint_rot, ndof)?;
+    let k_base = add_springs_and_constraints(
+        model,
+        &work_points,
+        &pt_index,
+        &joint_rot,
+        &k_struct,
+        ndof,
+        link_fixed,
+    );
 
     for case_name in ordered_cases {
         let lc = model.load_cases.get(&case_name).unwrap().clone();
@@ -1022,9 +1031,19 @@ fn validate_analysis_inputs(model: &SapModel) -> Result<(), SolverError> {
                 }
             }
         }
+        let mut spectrum_directions_seen = [false; 3];
         for (_, direction, _) in &lc.spectrum_loads {
             match direction.trim().to_ascii_uppercase().as_str() {
-                "U1" | "UX" | "X" | "1" | "U2" | "UY" | "Y" | "2" | "U3" | "UZ" | "Z" | "3" => {}
+                "U1" | "UX" | "X" | "1" | "U2" | "UY" | "Y" | "2" | "U3" | "UZ" | "Z" | "3" => {
+                    // Several functions in one direction would be summed with signs inside
+                    // each mode; the vendor combines directions, not functions (G74).
+                    let dir_idx = spectrum_direction_index(direction).unwrap_or(0);
+                    if std::mem::replace(&mut spectrum_directions_seen[dir_idx], true) {
+                        return Err(SolverError::UnsupportedInput(format!(
+                            "case '{name}' has more than one response spectrum load in direction '{direction}': several spectrum functions in one direction are not implemented (G74)"
+                        )));
+                    }
+                }
                 "R1" | "R2" | "R3" | "RX" | "RY" | "RZ" | "4" | "5" | "6" => {
                     return Err(SolverError::UnsupportedInput(format!(
                         "case '{name}' has response spectrum direction '{direction}': rotational spectrum loads are not implemented"
@@ -1440,6 +1459,62 @@ fn assemble_elastic_stiffness_and_mass(
     joint_rot: &[[[f64; 3]; 3]],
     ndof: usize,
 ) -> Result<(Vec<f64>, Vec<f64>), SolverError> {
+    assemble_elastic_stiffness_and_mass_impl(
+        model,
+        work_points,
+        work_areas,
+        pt_index,
+        joint_rot,
+        ndof,
+        true,
+    )
+}
+
+/// The penalty stiffness of a fixed link degree of freedom: like the multipoint constraints a
+/// penalty scaled to the model, 1e6 x max(1e6, largest diagonal of the stiffness before the
+/// links are added) (D110). It is the value `assemble_elastic_stiffness_and_mass` puts into the
+/// links, recomputed from the same pre-link matrix wherever link forces are recovered; a model
+/// without a fixed link degree of freedom skips the assembly (the value is then not used).
+fn link_fixed_stiffness(
+    model: &SapModel,
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    ndof: usize,
+) -> Result<f64, SolverError> {
+    if !link::has_fixed_dofs(model) {
+        return Ok(0.0);
+    }
+    let (k, _) = assemble_elastic_stiffness_and_mass_impl(
+        model,
+        work_points,
+        work_areas,
+        pt_index,
+        joint_rot,
+        ndof,
+        false,
+    )?;
+    Ok(fixed_link_penalty(&k, ndof))
+}
+
+fn fixed_link_penalty(k_without_links: &[f64], ndof: usize) -> f64 {
+    let mut max_diag = 1e6f64;
+    for i in 0..ndof {
+        max_diag = max_diag.max(k_without_links[i * ndof + i].abs());
+    }
+    max_diag * 1e6
+}
+
+fn assemble_elastic_stiffness_and_mass_impl(
+    model: &SapModel,
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    ndof: usize,
+    with_links: bool,
+) -> Result<(Vec<f64>, Vec<f64>), SolverError> {
     let mut k_struct = vec![0.0f64; ndof * ndof];
     let mut diag_mass = vec![0.0f64; ndof];
 
@@ -1572,11 +1647,9 @@ fn assemble_elastic_stiffness_and_mass(
         }
     }
 
-    // 4. Link springs in element axes, including shear/rotation coupling.
+    // 4. Link masses (the link springs are added after all other elements, step 6).
     for link in model.links.values() {
         let prop = &model.link_props[&link.prop];
-        let op = link::operator(link, prop, work_points, pt_index, joint_rot);
-        link::assemble(&mut k_struct, ndof, &op, link::stiffness(prop));
         if source.element_self_mass {
             for name in std::iter::once(&link.point_i).chain(link.point_j.iter()) {
                 for d in 0..3 {
@@ -1620,6 +1693,21 @@ fn assemble_elastic_stiffness_and_mass(
                     diag_mass[6 * idx + d] += m_solid_diag[3 * a + d];
                 }
             }
+        }
+    }
+
+    // 6. Link springs in element axes, including shear/rotation coupling. A fixed degree of
+    // freedom is a penalty scaled to the stiffness assembled so far (D110).
+    if with_links && !model.links.is_empty() {
+        let fixed = if link::has_fixed_dofs(model) {
+            fixed_link_penalty(&k_struct, ndof)
+        } else {
+            0.0
+        };
+        for link in model.links.values() {
+            let prop = &model.link_props[&link.prop];
+            let op = link::operator(link, prop, work_points, pt_index, joint_rot);
+            link::assemble(&mut k_struct, ndof, &op, link::stiffness(prop, fixed));
         }
     }
 
@@ -1843,6 +1931,7 @@ fn add_springs_and_constraints(
     joint_rot: &[[[f64; 3]; 3]],
     k_struct: &[f64],
     ndof: usize,
+    link_fixed: f64,
 ) -> Vec<f64> {
     let mut k = k_struct.to_vec();
 
@@ -1858,11 +1947,20 @@ fn add_springs_and_constraints(
     }
 
     // 2. Multipoint constraints (Equal, Diaphragm, Body, Plate, Rod, Beam, Weld)
-    let mut max_diag = 1e6f64;
-    for i in 0..ndof {
-        max_diag = max_diag.max(k[i * ndof + i].abs());
-    }
-    let penalty = max_diag * 1e6;
+    // With a fixed link degree of freedom the diagonal of `k` already holds a penalty
+    // (`link_fixed`, 1e6 x the largest diagonal before the links, D110). Scaling the constraint
+    // penalty to that diagonal would stack the two factors (1e12 x the structure), so the
+    // constraints then take the link's value, which is this same rule applied to the matrix
+    // before the links. Without a fixed link degree of freedom nothing changes.
+    let penalty = if link_fixed > 0.0 {
+        link_fixed
+    } else {
+        let mut max_diag = 1e6f64;
+        for i in 0..ndof {
+            max_diag = max_diag.max(k[i * ndof + i].abs());
+        }
+        max_diag * 1e6
+    };
 
     for (cname, cdef) in &model.constraints {
         let mut constrained_pts: Vec<usize> = Vec::new();
@@ -2474,6 +2572,7 @@ fn nonlinear_static_load_factor(
     work_areas: &IndexMap<String, AreaObj>,
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
     k_total: &[f64],
     ndof: usize,
 ) -> Result<f64, SolverError> {
@@ -2517,7 +2616,8 @@ fn nonlinear_static_load_factor(
         &IndexMap::new(),
         initial_hysteresis,
         ndof,
-    )?;
+    )?
+    .with_structural_stiffness(k_total, k_struct);
     let monitor = match &lc.displacement_control {
         Some(control) => {
             let (point, dof) = control.monitored.as_ref().ok_or_else(|| {
@@ -2750,8 +2850,22 @@ fn run_cable_nonlinear_static_case(
                     x_i, x_j, area, e, alpha, shaped.l0, w_vec, delta_t,
                 )?
             } else if let Some(h_target) = cp.horizontal_tension {
-                cable::CableElement::from_horizontal_tension(
-                    x_i, x_j, area, e, alpha, h_target, w_vec, delta_t,
+                // The shape calculator uses the cable's own weight only and fixes the cable
+                // length once for every case (Analysis Reference p. 168: the shape loads are
+                // not applied during analysis, "only the cable length is determined"); the
+                // loads of this case act on the element of that length (D109).
+                let shaped = cable::CableElement::from_horizontal_tension(
+                    x_i,
+                    x_j,
+                    area,
+                    e,
+                    alpha,
+                    h_target,
+                    [0.0, 0.0, -weight_per_len],
+                    0.0,
+                )?;
+                cable::CableElement::from_undeformed_length(
+                    x_i, x_j, area, e, alpha, shaped.l0, w_vec, delta_t,
                 )?
             } else {
                 cable::CableElement::from_undeformed_length(
@@ -2953,6 +3067,14 @@ fn run_nonlinear_static_case(
             joint_rot,
             &linear_struct,
             ndof,
+            link_fixed_stiffness(
+                &constitutive_model,
+                work_points,
+                work_areas,
+                pt_index,
+                joint_rot,
+                ndof,
+            )?,
         );
         let mut case_loads = case_loads;
         let mut reached_factor = None;
@@ -2964,6 +3086,7 @@ fn run_nonlinear_static_case(
                 work_areas,
                 pt_index,
                 joint_rot,
+                &linear_struct,
                 &linear_base,
                 ndof,
             )?;
@@ -3538,6 +3661,7 @@ fn solve_static_with_stiffness(
                 initial_hysteresis,
                 ndof,
             )
+            .map(|system| system.with_structural_stiffness(k_total, k_struct))
         })
         .transpose()?;
     let u_joint = if let (Some(system), Some(case)) = (&nonlinear_system, nonlinear_case) {
@@ -3581,11 +3705,61 @@ fn solve_static_with_stiffness(
         pt_index,
         joint_rot,
         k_struct,
+        Some((k_struct, k_total)),
         &loads,
         &u_joint,
         nonlinear_system.as_ref(),
         nonlinear_case,
     )
+}
+
+/// True for every joint that belongs to at least one constraint that ties two or more joints
+/// (the constraints that `add_springs_and_constraints` turns into penalty terms).
+fn constrained_joint_flags(
+    model: &SapModel,
+    work_points: &IndexMap<String, PointObj>,
+) -> Vec<bool> {
+    let mut flags = vec![false; work_points.len()];
+    for cname in model.constraints.keys() {
+        let members: Vec<usize> = work_points
+            .values()
+            .enumerate()
+            .filter(|(_, pt)| pt.constraints.iter().any(|c| c == cname))
+            .map(|(i, _)| i)
+            .collect();
+        if members.len() >= 2 {
+            for i in members {
+                flags[i] = true;
+            }
+        }
+    }
+    flags
+}
+
+/// Force that the constraint penalties put on DOF `d` of joint `idx` (D106): row `g` of
+/// `k_base - k_struct` times `u`, minus the joint's own grounded-spring row (the difference of
+/// the two matrices is springs plus penalties). `pair` is `(k_struct, k_base)` without any
+/// geometric stiffness, which cancels in the difference.
+fn constraint_penalty_force(
+    pair: (&[f64], &[f64]),
+    ks_loc: Option<&[[f64; 6]; 6]>,
+    idx: usize,
+    d: usize,
+    u: &[f64],
+    ndof: usize,
+) -> f64 {
+    let g = 6 * idx + d;
+    let (ks, kb) = pair;
+    let mut f = 0.0;
+    for j in 0..ndof {
+        f += (kb[g * ndof + j] - ks[g * ndof + j]) * u[j];
+    }
+    if let Some(sp) = ks_loc {
+        for c in 0..6 {
+            f -= sp[d][c] * u[6 * idx + c];
+        }
+    }
+    f
 }
 
 /// Joint, reaction, frame, area, solid and link results of a static solution
@@ -3601,12 +3775,16 @@ fn recover_static_results(
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
     k_struct: &[f64],
+    penalty_pair: Option<(&[f64], &[f64])>,
     loads: &StaticLoads,
     u_joint: &[f64],
     nonlinear_system: Option<&nonlinear::System>,
     nonlinear_case: Option<&LoadCase>,
 ) -> Result<CaseResults, SolverError> {
     let ndof = u_joint.len();
+    let link_fixed =
+        link_fixed_stiffness(model, work_points, work_areas, pt_index, joint_rot, ndof)?;
+    let constrained = penalty_pair.map(|_| constrained_joint_flags(model, work_points));
     let StaticLoads {
         f_ext_joint,
         f_fef_joint,
@@ -3647,6 +3825,18 @@ fn recover_static_results(
                     let mut f_int = f_fef_joint[gdof] + nonlinear_correction[gdof];
                     for j in 0..ndof {
                         f_int += k_struct[gdof * ndof + j] * u_joint[j];
+                    }
+                    if let (Some(pair), Some(flags)) = (penalty_pair, &constrained) {
+                        if flags[idx] {
+                            f_int += constraint_penalty_force(
+                                pair,
+                                ks_loc_opt.as_ref(),
+                                idx,
+                                d,
+                                u_joint,
+                                ndof,
+                            );
+                        }
                     }
                     reac[d] = f_int - f_ext_joint[gdof];
                 } else if let Some(ks_loc) = &ks_loc_opt {
@@ -3692,6 +3882,7 @@ fn recover_static_results(
             None,
             nonlinear_case.is_some(),
             &hysteretic_forces,
+            link_fixed,
         ),
         work_points,
         pt_index,
@@ -3868,6 +4059,7 @@ fn recover_static_results(
                 u_joint,
                 nonlinear_case.is_some(),
                 &link::hysteretic_overrides(&hysteretic_forces, lname),
+                link_fixed,
             ),
         );
     }
@@ -4240,16 +4432,133 @@ fn run_response_spectrum_case(
         }
     };
 
-    let modes = &modal_res.modes;
-    let n_modes = modes.len();
-    if n_modes == 0 {
+    if modal_res.modes.is_empty() {
         return Ok(CaseResults {
             case_name: lc.name.clone(),
             ..Default::default()
         });
     }
 
-    // For each mode m, compute modal coordinate amplitude q_m = sum_{dir} (Gamma_{m,dir} * Sa(T_m) * sf) / omega_m^2
+    // One modal combination per direction of acceleration, then the directions are
+    // combined by SRSS, R = sqrt(R1^2 + R2^2 + R3^2) (Analysis Reference pp. 391-392, the
+    // default directional combination). With a single direction the result is returned
+    // as it is (no square root), so single-direction cases are unchanged (D107).
+    let mut by_direction: Vec<Vec<(String, String, f64)>> = vec![Vec::new(); 3];
+    for load in &lc.spectrum_loads {
+        match spectrum_direction_index(&load.1) {
+            Some(dir_idx) => by_direction[dir_idx].push(load.clone()),
+            None => {
+                // `validate_analysis_inputs` refuses every other direction string.
+                return Err(SolverError::UnsupportedInput(format!(
+                    "case '{}' has unsupported response spectrum direction '{}'",
+                    lc.name,
+                    load.1.trim().to_ascii_uppercase()
+                )));
+            }
+        }
+    }
+    let mut per_direction: Vec<CaseResults> = Vec::new();
+    for loads in by_direction.iter().filter(|l| !l.is_empty()) {
+        per_direction.push(run_response_spectrum_direction(
+            model,
+            lc,
+            loads,
+            &modal_res,
+            work_points,
+            work_areas,
+            orig_area_map,
+            pt_index,
+            joint_rot,
+            k_struct,
+            k_base,
+            ndof,
+        )?);
+    }
+    if per_direction.len() <= 1 {
+        return Ok(per_direction.pop().unwrap_or_else(|| CaseResults {
+            case_name: lc.name.clone(),
+            ..Default::default()
+        }));
+    }
+    Ok(srss_of_directions(lc, per_direction))
+}
+
+fn spectrum_direction_index(direction: &str) -> Option<usize> {
+    match direction.trim().to_ascii_uppercase().as_str() {
+        "U1" | "UX" | "X" | "1" => Some(0),
+        "U2" | "UY" | "Y" | "2" => Some(1),
+        "U3" | "UZ" | "Z" | "3" => Some(2),
+        _ => None,
+    }
+}
+
+/// SRSS of the per-direction modal-combined results, quantity by quantity.
+fn srss_of_directions(lc: &LoadCase, parts: Vec<CaseResults>) -> CaseResults {
+    let srss = |vals: Vec<f64>| vals.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let mut out = CaseResults {
+        case_name: lc.name.clone(),
+        ..Default::default()
+    };
+    for name in parts[0].joint_displacements.keys() {
+        let mut v = [0.0f64; 6];
+        for d in 0..6 {
+            v[d] = srss(parts.iter().map(|p| p.joint_displacements[name][d]).collect());
+        }
+        out.joint_displacements.insert(name.clone(), v);
+    }
+    for name in parts[0].joint_reactions.keys() {
+        let mut v = [0.0f64; 6];
+        for d in 0..6 {
+            v[d] = srss(parts.iter().map(|p| p.joint_reactions[name][d]).collect());
+        }
+        out.joint_reactions.insert(name.clone(), v);
+    }
+    for d in 0..6 {
+        out.base_reactions[d] = srss(parts.iter().map(|p| p.base_reactions[d]).collect());
+    }
+    for (fname, first) in &parts[0].frame_forces {
+        let mut stations = Vec::with_capacity(first.len());
+        for (s, st) in first.iter().enumerate() {
+            let pick = |f: fn(&FrameStationResult) -> f64| {
+                srss(parts.iter().map(|p| f(&p.frame_forces[fname][s])).collect())
+            };
+            stations.push(FrameStationResult {
+                station: st.station,
+                rel_dist: st.rel_dist,
+                p: pick(|r| r.p),
+                v2: pick(|r| r.v2),
+                v3: pick(|r| r.v3),
+                t: pick(|r| r.t),
+                m2: pick(|r| r.m2),
+                m3: pick(|r| r.m3),
+                local_disp: [0.0; 3],
+            });
+        }
+        out.frame_forces.insert(fname.clone(), stations);
+    }
+    out
+}
+
+/// The modal combination of one direction of acceleration (the loads `loads` all name it).
+#[allow(clippy::too_many_arguments)]
+fn run_response_spectrum_direction(
+    model: &SapModel,
+    lc: &LoadCase,
+    loads: &[(String, String, f64)],
+    modal_res: &CaseResults,
+    work_points: &IndexMap<String, PointObj>,
+    work_areas: &IndexMap<String, AreaObj>,
+    orig_area_map: &IndexMap<String, Vec<String>>,
+    pt_index: &IndexMap<String, usize>,
+    joint_rot: &[[[f64; 3]; 3]],
+    k_struct: &[f64],
+    k_base: &[f64],
+    ndof: usize,
+) -> Result<CaseResults, SolverError> {
+    let modes = &modal_res.modes;
+    let n_modes = modes.len();
+
+    // For each mode m, compute modal coordinate amplitude q_m = (Gamma_{m,dir} * Sa(T_m) * sf) / omega_m^2
     let mut modal_u_vecs: Vec<Vec<f64>> = Vec::with_capacity(n_modes);
     let mut omegas: Vec<f64> = Vec::with_capacity(n_modes);
 
@@ -4259,19 +4568,13 @@ fn run_response_spectrum_case(
         omegas.push(omega);
 
         let mut q_m = 0.0f64;
-        for (func_name, dir_str, sf) in &lc.spectrum_loads {
-            let dir_idx = match dir_str.trim().to_ascii_uppercase().as_str() {
-                "U1" | "UX" | "X" | "1" => 0,
-                "U2" | "UY" | "Y" | "2" => 1,
-                "U3" | "UZ" | "Z" | "3" => 2,
-                // `validate_analysis_inputs` refuses every other direction string.
-                other => {
-                    return Err(SolverError::UnsupportedInput(format!(
-                        "case '{}' has unsupported response spectrum direction '{other}'",
-                        lc.name
-                    )))
-                }
-            };
+        for (func_name, dir_str, sf) in loads {
+            let dir_idx = spectrum_direction_index(dir_str).ok_or_else(|| {
+                SolverError::UnsupportedInput(format!(
+                    "case '{}' has unsupported response spectrum direction '{dir_str}'",
+                    lc.name
+                ))
+            })?;
             let sa = spectrum_value(model, &lc.name, func_name, t_sec)?;
             q_m += mode.participation_factors[dir_idx] * sa * (*sf) / (omega * omega);
         }
@@ -4343,6 +4646,7 @@ fn run_response_spectrum_case(
             pt_index,
             joint_rot,
             k_struct,
+            k_base,
             u_m,
             ndof,
         );
@@ -4550,7 +4854,59 @@ fn assemble_static_pattern_rhs(
             rhs[6 * idx_j + 3 + c] -= fj_m;
         }
     }
-    let _ = work_areas;
+    // Area loads (uniform, gravity, self weight, temperature): the block of
+    // `assemble_static_loads`, with the sign of this function (the static path subtracts the
+    // local load from its fixed-end vector, here the load is added to the right-hand side).
+    // Without it the load of the initial chain kept in a history misses the slab loads that
+    // the initial displacement carries (D108).
+    for area in work_areas.values() {
+        if area.points.len() < 3 {
+            continue;
+        }
+        let sec = &model.area_sections[&area.section];
+        let mat = &model.materials[&sec.material];
+        let n_nodes = area.points.len().min(4);
+        let mut node_indices = Vec::with_capacity(n_nodes);
+        let mut coords = Vec::with_capacity(n_nodes);
+        for pname in area.points.iter().take(n_nodes) {
+            let idx = pt_index[pname];
+            let pt = &work_points[idx];
+            node_indices.push(idx);
+            coords.push([pt.x, pt.y, pt.z]);
+        }
+        let (e_axes, _, local_xy) =
+            area_local_system(&coords, crate::area::area_axes_angle(area, sec));
+        for (pat_name, sf) in case_loads {
+            let self_wt_mult = model
+                .load_patterns
+                .get(pat_name)
+                .map(|lp| lp.self_wt_multiplier)
+                .unwrap_or(0.0);
+            let f_area_loc = compute_area_local_loads(
+                area,
+                sec,
+                mat,
+                &e_axes,
+                &local_xy,
+                pat_name,
+                self_wt_mult,
+                *sf,
+            );
+            for (a, &pt_idx) in node_indices.iter().enumerate() {
+                let ta = mat3_mul(&e_axes, &joint_rot[pt_idx]);
+                for c in 0..3 {
+                    let mut ff = 0.0;
+                    let mut fm = 0.0;
+                    for r in 0..3 {
+                        ff += ta[r][c] * f_area_loc[6 * a + r];
+                        fm += ta[r][c] * f_area_loc[6 * a + 3 + r];
+                    }
+                    rhs[6 * pt_idx + c] += ff;
+                    rhs[6 * pt_idx + 3 + c] += fm;
+                }
+            }
+        }
+    }
     Ok(rhs)
 }
 
@@ -4767,6 +5123,14 @@ fn run_time_history_case(
             joint_rot,
             &linear_struct,
             ndof,
+            link_fixed_stiffness(
+                &constitutive_model,
+                work_points,
+                work_areas,
+                pt_index,
+                joint_rot,
+                ndof,
+            )?,
         );
         reaction_base = std::borrow::Cow::Owned(linear_base);
         reaction_struct = std::borrow::Cow::Owned(linear_struct);
@@ -4778,6 +5142,7 @@ fn run_time_history_case(
             pt_index,
             joint_rot,
             &reaction_base,
+            &reaction_struct,
             diag_mass,
             &is_fixed,
             lc,
@@ -4981,6 +5346,8 @@ fn run_time_history_case(
         pt_index,
         joint_rot,
         &reaction_struct,
+        // The physical reaction below is built from the full base matrix already.
+        None,
         &u_peak,
         ndof,
         &member_loads,
@@ -5055,17 +5422,27 @@ fn run_time_history_case(
     res.time_history_disp = time_history_disp;
     res.transient_state = terminal_state;
     res.link_hysteresis = terminal_hysteresis;
+    let link_fixed =
+        link_fixed_stiffness(model, work_points, work_areas, pt_index, joint_rot, ndof)?;
     let mut grounded = IndexMap::<String, [f64; 6]>::new();
     for (name, object) in &model.links {
         let prop = &model.link_props[&object.prop];
         let op = link::operator(object, prop, work_points, pt_index, joint_rot);
         let snapshot = std::array::from_fn(|d| nl_link_peak.get(&(name.clone(), d)).copied());
-        let raw = link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &snapshot, 0.);
+        let raw = link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &snapshot, 0., link_fixed);
         res.link_forces
             .insert(name.clone(), link::section_at_j(prop, raw));
         if object.point_j.is_none() {
             let support_raw =
-                link::dynamic_spring_forces(prop, &op, &u_peak, &v_peak, &snapshot, beta_stiffness);
+                link::dynamic_spring_forces(
+                    prop,
+                    &op,
+                    &u_peak,
+                    &v_peak,
+                    &snapshot,
+                    beta_stiffness,
+                    link_fixed,
+                );
             let force = grounded.entry(object.point_i.clone()).or_insert([0.; 6]);
             for (c, value) in force.iter_mut().enumerate() {
                 *value -= (0..6).map(|d| op.b[d][c] * support_raw[d]).sum::<f64>();
@@ -5093,6 +5470,7 @@ fn recover_results_from_displacement_vector(
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
     k_struct: &[f64],
+    k_base: &[f64],
     u_joint: &[f64],
     ndof: usize,
 ) -> CaseResults {
@@ -5104,6 +5482,7 @@ fn recover_results_from_displacement_vector(
         pt_index,
         joint_rot,
         k_struct,
+        Some((k_struct, k_base)),
         u_joint,
         ndof,
         &[],
@@ -5129,10 +5508,12 @@ fn recover_results_with_member_loads(
     pt_index: &IndexMap<String, usize>,
     joint_rot: &[[[f64; 3]; 3]],
     k_struct: &[f64],
+    penalty_pair: Option<(&[f64], &[f64])>,
     u_joint: &[f64],
     ndof: usize,
     member_loads: &[(String, f64)],
 ) -> (CaseResults, IndexMap<String, [f64; 6]>) {
+    let constrained = penalty_pair.map(|_| constrained_joint_flags(model, work_points));
     let mut joint_displacements = IndexMap::new();
     let mut joint_reactions = IndexMap::new();
     let mut generated_reactions = IndexMap::new();
@@ -5152,6 +5533,18 @@ fn recover_results_with_member_loads(
                     let mut f_int = 0.0;
                     for j in 0..ndof {
                         f_int += k_struct[gdof * ndof + j] * u_joint[j];
+                    }
+                    if let (Some(pair), Some(flags)) = (penalty_pair, &constrained) {
+                        if flags[idx] {
+                            f_int += constraint_penalty_force(
+                                pair,
+                                ks_loc_opt.as_ref(),
+                                idx,
+                                d,
+                                u_joint,
+                                ndof,
+                            );
+                        }
                     }
                     reac[d] = f_int;
                 } else if let Some(ks_loc) = &ks_loc_opt {

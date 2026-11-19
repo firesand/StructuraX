@@ -64,6 +64,7 @@ fn populated_model_with_results() -> cSapModel {
             phi_vn3: 80.0,
             status: "OK".into(),
             eq_name: "H1-1b".into(),
+            notes: Vec::new(),
         },
     );
     api.inner.concrete_design_results.insert(

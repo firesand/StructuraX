@@ -377,6 +377,9 @@ impl cFile<'_> {
                 let model = report.model;
                 self.api.selected_cases = model.load_cases.keys().cloned().collect();
                 self.api.selected_combos.clear();
+                // D118: tables staged for the previous model must not be applied
+                // to the one just opened (`initialize_new_model` clears them too).
+                self.api.staged_tables.clear();
                 self.api.inner = model;
                 self.api.last_file_path = Some(path.to_path_buf());
                 OAPI_OK
@@ -2928,6 +2931,7 @@ mod tests {
                 phi_vn3: 0.0,
                 status: "OK".into(),
                 eq_name: String::new(),
+                notes: Vec::new(),
             },
         );
         api.inner.concrete_design_results.insert(

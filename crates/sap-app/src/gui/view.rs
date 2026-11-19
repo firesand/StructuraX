@@ -324,14 +324,19 @@ pub(super) fn step_level(levels: &[f64], current: Option<f64>, up: bool, tol: f6
     }
 }
 
-/// Corner indices of the six faces of a solid object.
+/// Corner indices of the six faces of a solid object (D121). The corner order of
+/// the model is binary: corner k has bit 0 = xi1, bit 1 = xi2, bit 2 = xi3
+/// (Analysis Reference, Figure 55; `sap-solver/src/solid.rs`). Each face holds the
+/// four corners that share one bit, in the order of the solver's face list
+/// (`solid_face_nodes`): faces 1 to 6 are -2, +1, +2, -1, -3, +3. One constant for
+/// drawing, plane outlines and window picking.
 pub(super) const SOLID_FACES: [[usize; 4]; 6] = [
-    [0, 1, 2, 3],
-    [4, 5, 6, 7],
     [0, 1, 5, 4],
-    [1, 2, 6, 5],
-    [2, 3, 7, 6],
-    [3, 0, 4, 7],
+    [1, 3, 7, 5],
+    [2, 6, 7, 3],
+    [0, 4, 6, 2],
+    [0, 2, 3, 1],
+    [4, 5, 7, 6],
 ];
 
 /// The objects that lie in a view plane.
@@ -587,6 +592,89 @@ pub(super) fn polygon_fill_of(shape: &Shape) -> Option<Color32> {
 mod tests {
     use super::*;
     use sap_units::Units;
+
+    /// A unit cube whose corner k sits at (bit 0, bit 1, bit 2) of k, the
+    /// binary corner order of the solid element (Analysis Reference, Figure 55).
+    fn unit_cube_model() -> SapModel {
+        let mut m = SapModel::new(Units::KnMC);
+        for k in 0..8usize {
+            m.add_point(
+                format!("P{k}"),
+                (k & 1) as f64,
+                ((k >> 1) & 1) as f64,
+                ((k >> 2) & 1) as f64,
+            );
+        }
+        let points: [String; 8] = std::array::from_fn(|k| format!("P{k}"));
+        m.solids.insert(
+            "S1".to_string(),
+            sap_model::SolidObj {
+                name: "S1".to_string(),
+                points,
+                section: "SOLID1".to_string(),
+                loads_surface: Vec::new(),
+                loads_temp: Default::default(),
+                selected: false,
+            },
+        );
+        m
+    }
+
+    #[test]
+    fn each_solid_face_holds_the_four_corners_that_share_one_bit() {
+        // Hand check on the binary order: a face of the cube is the set of four
+        // corners with one bit fixed, and consecutive corners of the loop
+        // differ in exactly one bit (they are joined by an edge).
+        let mut seen = BTreeSet::new();
+        for face in SOLID_FACES {
+            let fixed: Vec<(u32, bool)> = (0..3)
+                .filter_map(|bit| {
+                    let first = face[0] >> bit & 1;
+                    face.iter()
+                        .all(|c| c >> bit & 1 == first)
+                        .then_some((bit as u32, first == 1))
+                })
+                .collect();
+            assert_eq!(fixed.len(), 1, "face {face:?} must fix exactly one bit");
+            seen.insert(fixed[0]);
+            let distinct: BTreeSet<usize> = face.iter().copied().collect();
+            assert_eq!(distinct.len(), 4, "{face:?}");
+            for i in 0..4 {
+                let differ = (face[i] ^ face[(i + 1) % 4]).count_ones();
+                assert_eq!(differ, 1, "corners {} and {} of {face:?}", face[i], face[(i + 1) % 4]);
+            }
+        }
+        // All six faces: each bit fixed at 0 and at 1.
+        assert_eq!(seen.len(), 6);
+    }
+
+    #[test]
+    fn a_plane_through_corners_0_2_4_6_finds_the_minus_1_face() {
+        // Corners 0, 2, 4, 6 are the ones with bit 0 clear: the plane x = 0.
+        let m = unit_cube_model();
+        let plane = PlaneView {
+            normal: PlaneAxis::X,
+            coordinate: 0.0,
+        };
+        let members = plane_members(&m, plane, 1e-9);
+        let faces: Vec<_> = members
+            .solid_faces
+            .iter()
+            .map(|(name, k)| (name.as_str(), SOLID_FACES[*k]))
+            .collect();
+        // Before the repair no face of the list lay in this plane.
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].0, "S1");
+        let mut corners = faces[0].1;
+        corners.sort_unstable();
+        assert_eq!(corners, [0, 2, 4, 6]);
+        // Negative: a plane that touches no corner finds none.
+        let off = PlaneView {
+            normal: PlaneAxis::X,
+            coordinate: 0.5,
+        };
+        assert!(plane_members(&m, off, 1e-9).solid_faces.is_empty());
+    }
 
     fn view_3d(yaw: f32, pitch: f32) -> ViewTransform {
         ViewTransform {

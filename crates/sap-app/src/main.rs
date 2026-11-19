@@ -296,14 +296,15 @@ fn run_cli_analyze(
         model.concrete_design_code = code.to_string();
     }
 
-    let has_steel_frames = model.frames.values().any(|f| {
+    // Cables are not design members (D103), so a cable does not make the model a design model.
+    let has_steel_frames = model.frames.values().filter(|f| f.cable_params.is_none()).any(|f| {
         model
             .frame_sections
             .get(&f.section)
             .and_then(|s| model.materials.get(&s.material))
             .is_some_and(|m| m.mat_type == sap_model::MatType::Steel)
     });
-    let has_concrete_frames = model.frames.values().any(|f| {
+    let has_concrete_frames = model.frames.values().filter(|f| f.cable_params.is_none()).any(|f| {
         model
             .frame_sections
             .get(&f.section)

@@ -65,6 +65,17 @@ impl Default for State {
     }
 }
 
+impl State {
+    /// D125: the lengths the draft holds, in the model's present units, follow a
+    /// change of units (the elevations of the story range and the eccentricity
+    /// distance); ratios, periods and factors do not change.
+    pub(super) fn scale_lengths(&mut self, factor: f64) {
+        self.z_min *= factor;
+        self.z_max *= factor;
+        self.ecc_distance *= factor;
+    }
+}
+
 fn locked(model: &SapModel) -> Result<(), String> {
     if model.is_locked {
         Err("The model is locked. Unlock it before changing the mass source or automatic loads.".into())
@@ -614,6 +625,25 @@ pub(super) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_of_units_rescales_the_lengths_of_the_draft() {
+        // D125: 120 in = 3.048 m (120 * 0.0254); 240 in = 6.096 m; 36 in = 0.9144 m.
+        let mut app = crate::gui::SapGuiApp::new(Some(std::path::PathBuf::from(
+            "/nonexistent/sap-review-model.s2k",
+        )));
+        app.model = SapModel::new(Units::KipInF);
+        app.panel_seismic.z_min = 120.0;
+        app.panel_seismic.z_max = 240.0;
+        app.panel_seismic.ecc_distance = 36.0;
+        app.panel_seismic.fa = 1.2;
+        app.change_units(Units::KnMC);
+        assert!((app.panel_seismic.z_min - 3.048).abs() < 1e-12, "{}", app.panel_seismic.z_min);
+        assert!((app.panel_seismic.z_max - 6.096).abs() < 1e-12);
+        assert!((app.panel_seismic.ecc_distance - 0.9144).abs() < 1e-12);
+        // Negative: a factor is not a length.
+        assert_eq!(app.panel_seismic.fa, 1.2);
+    }
     use eframe::egui::{Pos2, Rect, Vec2};
     use sap_model::LoadPattern;
     use sap_units::Units;

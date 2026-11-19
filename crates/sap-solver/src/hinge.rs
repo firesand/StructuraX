@@ -2628,6 +2628,7 @@ impl<'a> CaseSetup<'a> {
             self.pt_index,
             self.joint_rot,
             built.k_struct_n.as_deref().unwrap_or(self.k_struct),
+            Some((self.k_struct, self.k_base)),
             &sl,
             &u,
             None,

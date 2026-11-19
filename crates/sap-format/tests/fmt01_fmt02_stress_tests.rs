@@ -414,12 +414,20 @@ fn test_fmt02_rebar_material_independent_fys() {
     };
     m.materials.insert("Rebar60_40".to_string(), rebar);
 
-    let native =
-        pack_model_to_native_sdb(&m).expect("rebar material independent fys export must succeed");
-    let restored =
-        extract_sdb_to_model(&native).expect("rebar material independent fys import must succeed");
+    // D114: a Rebar material's `m_RebarProps.m_fy` is its own yield, so a
+    // Rebar material with fys != fy has no native form and its export is refused.
+    assert!(
+        pack_model_to_native_sdb(&m).is_err(),
+        "a Rebar material with fys != fy cannot be written natively"
+    );
+    // With fys == fy the same material round-trips.
+    let r = m.materials.get_mut("Rebar60_40").unwrap();
+    r.fys = r.fy;
+    let native = pack_model_to_native_sdb(&m).expect("rebar material with fys == fy must export");
+    let restored = extract_sdb_to_model(&native).expect("rebar material import must succeed");
     assert_eq!(restored.materials["Rebar60_40"].fy, 60.0);
-    assert_eq!(restored.materials["Rebar60_40"].fys, 40.0);
+    assert_eq!(restored.materials["Rebar60_40"].fu, 90.0);
+    assert_eq!(restored.materials["Rebar60_40"].fys, 60.0);
     assert_eq!(restored, m);
 }
 

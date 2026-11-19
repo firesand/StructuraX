@@ -871,28 +871,17 @@ fn test_opposing_span_loads_internal_limits() {
     nl_case.case_type = LoadCaseType::NonlinearStatic;
     model.load_cases.insert("NL_OPP".into(), nl_case);
 
-    analyze_model(&mut model).expect("solve opposing span loads");
-
-    let res = &model.case_results["NL_OPP"];
-    let r_a = res.joint_reactions["A"][0];
-    let r_b = res.joint_reactions["B"][0];
-
-    // Net applied load is 0, so R_A + R_B = 0
-    assert_close(r_a + r_b, 0.0, 1e-9, "Equilibrium under net zero span load");
-
-    // All stations must satisfy limits
-    for sta in &res.frame_forces["BAR1"] {
-        assert!(
-            sta.p <= 100.0 + 1e-6,
-            "Tension limit violated: p = {}",
-            sta.p
-        );
-        assert!(
-            sta.p >= -100.0 - 1e-6,
-            "Compression limit violated: p = {}",
-            sta.p
-        );
-    }
+    // D111 / G75: the solver estimates the extreme axial forces of a T/C member as
+    // p_avg +- |W|/2, exact only when the axial span load keeps one sign. Here W = 0 but the
+    // force inside the member varies by 2 x 50 = 100 kip (P(x) = P(0) - 2x on [0, 50] and
+    // P(0) - 100 + 2 (x - 50) on [50, 100]), which that estimate cannot see; the case is
+    // therefore refused by name. (Before D111 it ran, and the test checked equilibrium and
+    // the station limits.)
+    let err = analyze_model(&mut model).unwrap_err().to_string();
+    assert!(
+        err.contains("BAR1") && err.contains("NL_OPP") && err.contains("both signs"),
+        "{err}"
+    );
 }
 
 // ============================================================================

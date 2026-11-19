@@ -197,6 +197,14 @@ pub(super) struct State {
 pub(super) const TAB_GRID: usize = 0;
 
 impl State {
+    /// D125: the quick grid spacing and first line coordinates are lengths in the
+    /// model's present units and follow a change of units.
+    pub(super) fn scale_lengths(&mut self, factor: f64) {
+        for v in self.grid_spacing.iter_mut().chain(self.grid_origin.iter_mut()) {
+            *v *= factor;
+        }
+    }
+
     /// Open the window on `tab`.
     pub(super) fn show_tab(&mut self, tab: usize) {
         self.open = true;
@@ -805,6 +813,23 @@ pub(super) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_change_of_units_rescales_the_quick_grid_draft() {
+        // D125: 20 in = 0.508 m (20 * 0.0254); 12 in = 0.3048 m; origin 10 in = 0.254 m.
+        let mut app = crate::gui::SapGuiApp::new(Some(std::path::PathBuf::from(
+            "/nonexistent/sap-review-model.s2k",
+        )));
+        app.model = SapModel::new(sap_units::Units::KipInF);
+        app.panel_build.grid_origin = [10.0, 0.0, 0.0];
+        assert_eq!(app.panel_build.grid_spacing, [20.0, 20.0, 12.0]);
+        app.change_units(sap_units::Units::KnMC);
+        let expect = [0.508, 0.508, 0.3048];
+        for k in 0..3 {
+            assert!((app.panel_build.grid_spacing[k] - expect[k]).abs() < 1e-12, "{k}");
+        }
+        assert!((app.panel_build.grid_origin[0] - 0.254).abs() < 1e-12);
+    }
     use egui::{Pos2, Rect, Vec2};
 
     fn locked_model_is_unchanged(f: impl Fn(&mut SapModel) -> Result<String, String>) {

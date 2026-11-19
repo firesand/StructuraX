@@ -18,9 +18,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_spans = num_spans.max(1);
@@ -149,9 +148,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_bays = x_lines.len() - 1;
@@ -321,9 +319,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_stories = num_stories.max(1);
@@ -498,9 +495,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_bays = num_bays.max(2);
@@ -609,9 +605,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let nz = num_stories.max(1);
@@ -788,9 +783,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let nx = num_x_divs.max(1);
@@ -862,9 +856,8 @@ impl SapModel {
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_theta = num_angular_divs.max(6);

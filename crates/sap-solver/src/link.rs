@@ -73,10 +73,23 @@ pub(crate) fn operator(
     LinkOperator { dofs, b }
 }
 
-pub(crate) fn stiffness(prop: &LinkProp) -> [f64; 6] {
+/// True when some link property has a fixed degree of freedom, which is the case that needs
+/// the scaled penalty `fixed` of [`stiffness`].
+pub(crate) fn has_fixed_dofs(model: &SapModel) -> bool {
+    model
+        .links
+        .values()
+        .any(|l| model.link_props.get(&l.prop).is_some_and(|p| p.dof_fixed.iter().any(|&f| f)))
+}
+
+/// Diagonal stiffness of the six springs of a link. A fixed degree of freedom is "equivalent to
+/// specifying a joint constraint" (Analysis Reference p. 270); like the multipoint constraints
+/// it is a penalty scaled to the model, `fixed` = 1e6 x max(1e6, largest diagonal of the
+/// stiffness before the links) (D110).
+pub(crate) fn stiffness(prop: &LinkProp, fixed: f64) -> [f64; 6] {
     std::array::from_fn(|d| {
         if prop.dof_fixed[d] {
-            1e10
+            fixed
         } else if prop.dof_active[d] {
             prop.ke[d]
         } else {
@@ -137,8 +150,9 @@ fn spring_forces(
     velocity: Option<&[f64]>,
     nonlinear: bool,
     hysteretic: &[Option<f64>; 6],
+    fixed: f64,
 ) -> [f64; 6] {
-    let effective = stiffness(prop);
+    let effective = stiffness(prop, fixed);
     std::array::from_fn(|d| {
         let deformation: f64 = op.dofs.iter().zip(&op.b[d]).map(|(i, b)| u[*i] * b).sum();
         if nonlinear && prop.dof_nonlinear[d] && prop.dof_active[d] && !prop.dof_fixed[d] {
@@ -176,8 +190,9 @@ pub(crate) fn dynamic_spring_forces(
     velocity: &[f64],
     nonlinear: &[Option<f64>; 6],
     beta: f64,
+    fixed: f64,
 ) -> [f64; 6] {
-    let k = stiffness(prop);
+    let k = stiffness(prop, fixed);
     std::array::from_fn(|d| {
         let displacement: f64 = op.dofs.iter().zip(&op.b[d]).map(|(i, b)| u[*i] * b).sum();
         let speed: f64 = op
@@ -207,8 +222,12 @@ pub(crate) fn forces_for_case(
     u: &[f64],
     nonlinear: bool,
     hysteretic: &[Option<f64>; 6],
+    fixed: f64,
 ) -> [f64; 6] {
-    section_at_j(prop, spring_forces(prop, op, u, None, nonlinear, hysteretic))
+    section_at_j(
+        prop,
+        spring_forces(prop, op, u, None, nonlinear, hysteretic, fixed),
+    )
 }
 
 /// Support force applied by one-joint grounded links, expressed at the modeled
@@ -222,6 +241,7 @@ pub(crate) fn grounded_reactions(
     dynamics: Option<(&[f64], f64)>,
     nonlinear: bool,
     hysteretic: &IndexMap<(String, usize), f64>,
+    fixed: f64,
 ) -> IndexMap<String, [f64; 6]> {
     let mut result: IndexMap<String, [f64; 6]> = IndexMap::new();
     for object in model
@@ -238,9 +258,10 @@ pub(crate) fn grounded_reactions(
             dynamics.map(|(v, _)| v),
             nonlinear,
             &hysteretic_overrides(hysteretic, &object.name),
+            fixed,
         );
         if let Some((velocity, beta)) = dynamics {
-            let k = stiffness(prop);
+            let k = stiffness(prop, fixed);
             for d in 0..6 {
                 force[d] += beta
                     * k[d]

@@ -228,9 +228,9 @@ fn test_adversarial_malformed_field_values_rejection() {
         assert_eq!(
             api.database_tables().set_table_for_editing_array_str(
                 "Frame Section Properties 01 - General",
-                &["SectionName", "Material", "Area", "I33", "I22"],
+                &["SectionName", "Material", "Area", "I33", "I22", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "AS2", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22"],
                 1,
-                &["SEC_BAD", "A992Fy50", bad_area, "100.0", "50.0"],
+                &["SEC_BAD", "A992Fy50", bad_area, "100.0", "50.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "4.0", "5.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
             ),
             OAPI_OK
         );
@@ -247,9 +247,9 @@ fn test_adversarial_malformed_field_values_rejection() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &["SectionName", "Material", "Area", "I33", "I22"],
+            &["SectionName", "Material", "Area", "I33", "I22", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "AS2", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22"],
             1,
-            &["SEC_BAD_I", "A992Fy50", "10.0", "-50.0", "50.0"],
+            &["SEC_BAD_I", "A992Fy50", "10.0", "-50.0", "50.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "4.0", "5.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
         ),
         OAPI_OK
     );
@@ -394,9 +394,9 @@ fn test_adversarial_inverted_topological_order_all_tables() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &["SectionName", "Material", "Area", "I33", "I22"],
+            &["SectionName", "Material", "Area", "I33", "I22", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "AS2", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22"],
             1,
-            &["SEC_W14", "MAT_ADV", "20.0", "400.0", "150.0"],
+            &["SEC_W14", "MAT_ADV", "20.0", "400.0", "150.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "4.0", "5.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
         ),
         OAPI_OK
     );
@@ -507,9 +507,9 @@ fn test_adversarial_transactional_atomicity_multi_table_failures() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &["SectionName", "Material", "Area", "I33", "I22"],
+            &["SectionName", "Material", "Area", "I33", "I22", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "AS2", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22"],
             1,
-            &["SEC_FAIL", "GHOST_MAT", "10.0", "100.0", "50.0"],
+            &["SEC_FAIL", "GHOST_MAT", "10.0", "100.0", "50.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "4.0", "5.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
         ),
         OAPI_OK
     );
@@ -815,25 +815,9 @@ fn test_adversarial_numerical_verification_from_scratch_cantilever() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &[
-                "SectionName",
-                "Material",
-                "Area",
-                "I33",
-                "I22",
-                "AS2",
-                "AS3"
-            ],
+            &["SectionName", "Material", "Area", "I33", "I22", "AS2", "AS3", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "S33", "S22", "Z33", "Z22", "R33", "R22"],
             1,
-            &[
-                "RECT_2X4",
-                "STEEL_30K",
-                "8.0",
-                "10.666667",
-                "2.666667",
-                "0.0",
-                "0.0"
-            ],
+            &["RECT_2X4", "STEEL_30K", "8.0", "10.666667", "2.666667", "0.0", "0.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
         ),
         OAPI_OK
     );
@@ -1084,9 +1068,9 @@ fn test_adversarial_numerical_verification_simply_supported_beam() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &["SectionName", "Material", "Area", "I33", "I22", "AS2"],
+            &["SectionName", "Material", "Area", "I33", "I22", "AS2", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22"],
             1,
-            &["W8X31", "A992", "9.13", "110.0", "37.1", "0.0"],
+            &["W8X31", "A992", "9.13", "110.0", "37.1", "0.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "5.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
         ),
         OAPI_OK
     );
@@ -1265,37 +1249,9 @@ fn test_adversarial_vulnerability_dropped_section_shape_and_shear_properties() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &[
-                "SectionName",
-                "Material",
-                "Area",
-                "I33",
-                "I22",
-                "AS2",
-                "AS3",
-                "S33",
-                "S22",
-                "Z33",
-                "Z22",
-                "R33",
-                "R22"
-            ],
+            &["SectionName", "Material", "Area", "I33", "I22", "AS2", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22", "Shape", "t3", "t2", "tf", "tw", "TorsConst"],
             1,
-            &[
-                "SEC_CUSTOM",
-                "MAT1",
-                "15.0",
-                "300.0",
-                "120.0",
-                "4.5",
-                "5.5",
-                "40.0",
-                "20.0",
-                "48.0",
-                "24.0",
-                "4.4",
-                "2.8"
-            ],
+            &["SEC_CUSTOM", "MAT1", "15.0", "300.0", "120.0", "4.5", "5.5", "40.0", "20.0", "48.0", "24.0", "4.4", "2.8", "I", "18.0", "7.5", "0.57", "0.355", "1.0"],
         ),
         OAPI_OK
     );

@@ -818,6 +818,21 @@ pub(super) fn parse_s2k_internal(
                     });
                 }
             }
+            if current_table == "FRAME P-DELTA FORCE ASSIGNMENTS" {
+                // G77: the vendor spelling of the direction column is not in the
+                // vendor material, so the table is kept verbatim, not read.
+                let description = "vendor P-Delta force table not interpreted: direction spelling not established".to_string();
+                if !model
+                    .unmodeled_source
+                    .iter()
+                    .any(|entry| entry.description == description)
+                {
+                    model.unmodeled_source.push(UnmodeledSourceData {
+                        scope: UnmodeledScope::AllCases,
+                        description,
+                    });
+                }
+            }
             unsupported_tables.insert(current_table.clone());
             continue;
         }
@@ -2044,6 +2059,47 @@ pub(super) fn parse_s2k_internal(
                     }
                 }
             }
+            "AREA STIFFNESS MODIFIERS" => {
+                // D119: the vendor name and columns (v19 report keys, RE catalog).
+                const KNOWN: [&str; 12] = [
+                    "AREA", "GUID", "F11", "F22", "F12", "M11", "M22", "M12", "V13", "V23",
+                    "MASSMOD", "WEIGHTMOD",
+                ];
+                let others: Vec<&String> =
+                    row.keys().filter(|k| !KNOWN.contains(&k.as_str())).collect();
+                if !others.is_empty() {
+                    for column in others {
+                        let description = format!(
+                            "area modifier column '{column}' of S2K table 'AREA STIFFNESS MODIFIERS' is not interpreted; its values are not applied"
+                        );
+                        if !model
+                            .unmodeled_source
+                            .iter()
+                            .any(|entry| entry.description == description)
+                        {
+                            model.unmodeled_source.push(UnmodeledSourceData {
+                                scope: UnmodeledScope::AllCases,
+                                description,
+                            });
+                        }
+                    }
+                } else if let Some(aname) = get_str(&row, "Area") {
+                    if let Some(ar) = model.areas.get_mut(aname) {
+                        ar.modifiers = [
+                            get_f64(&row, "f11").unwrap_or(1.0),
+                            get_f64(&row, "f22").unwrap_or(1.0),
+                            get_f64(&row, "f12").unwrap_or(1.0),
+                            get_f64(&row, "m11").unwrap_or(1.0),
+                            get_f64(&row, "m22").unwrap_or(1.0),
+                            get_f64(&row, "m12").unwrap_or(1.0),
+                            get_f64(&row, "v13").unwrap_or(1.0),
+                            get_f64(&row, "v23").unwrap_or(1.0),
+                            get_f64(&row, "MassMod").unwrap_or(1.0),
+                            get_f64(&row, "WeightMod").unwrap_or(1.0),
+                        ];
+                    }
+                }
+            }
             "AREA PROPERTY MODIFIERS" => {
                 if let Some(aname) = get_str(&row, "Area") {
                     if let Some(ar) = model.areas.get_mut(aname) {
@@ -2882,14 +2938,37 @@ pub(super) fn parse_s2k_internal(
                     if let Some(lc) = model.load_cases.get_mut(cname) {
                         lc.case_type = LoadCaseType::ResponseSpectrum;
                         if let Some(mc) = get_str(&row, "ModalCombo") {
-                            lc.modal_combo = match mc.to_ascii_uppercase().as_str() {
+                            let upper = mc.trim().to_ascii_uppercase();
+                            lc.modal_combo = match upper.as_str() {
                                 "SRSS" => ModalComboMethod::Srss,
                                 "ABS" | "ABSSUM" => ModalComboMethod::AbsSum,
                                 _ => ModalComboMethod::Cqc,
                             };
+                            // D141: the model holds CQC, SRSS and Absolute; GMC, NRC 10
+                            // percent and Double Sum would be run as CQC.
+                            if !matches!(upper.as_str(), "CQC" | "SRSS" | "ABS" | "ABSSUM") {
+                                model.unmodeled_source.push(UnmodeledSourceData {
+                                    scope: UnmodeledScope::Case(cname.to_string()),
+                                    description: format!(
+                                        "response-spectrum case '{cname}' combines modes with ModalCombo '{mc}'; the modes would be combined by CQC"
+                                    ),
+                                });
+                            }
                         }
                         if let Some(d) = get_f64(&row, "ConstDamp") {
                             lc.modal_damping = d;
+                        }
+                        // D122: the solver combines directions by SRSS; an absent
+                        // column means SRSS (the RE catalog lists DirCombo and ABSSF).
+                        if let Some(dc) = get_str(&row, "DirCombo") {
+                            if !dc.trim().eq_ignore_ascii_case("SRSS") {
+                                model.unmodeled_source.push(UnmodeledSourceData {
+                                    scope: UnmodeledScope::Case(cname.to_string()),
+                                    description: format!(
+                                        "response-spectrum case '{cname}' combines directions with DirCombo '{dc}'; the directions would be combined by SRSS"
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -2918,6 +2997,18 @@ pub(super) fn parse_s2k_internal(
                             d.to_string()
                         }
                     };
+                    // D141: the case has no field for an angle or a coordinate system
+                    // of a spectrum load; the native reader refuses them too.
+                    let angle = get_f64(&row, "Angle").unwrap_or(0.0);
+                    let csys = get_str(&row, "CoordSys").unwrap_or("GLOBAL");
+                    if angle != 0.0 || !csys.trim().eq_ignore_ascii_case("GLOBAL") {
+                        model.unmodeled_source.push(UnmodeledSourceData {
+                            scope: UnmodeledScope::Case(cname.to_string()),
+                            description: format!(
+                                "response-spectrum case '{cname}' has a load of function '{func}' with Angle {angle} in CoordSys '{csys}'; it would be applied along the global axis without the angle"
+                            ),
+                        });
+                    }
                     if let Some(lc) = model.load_cases.get_mut(cname) {
                         lc.spectrum_loads.push((
                             func.to_string(),
@@ -3710,7 +3801,8 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             .filter(|p| p.local_axes_deg.iter().any(|&a| a != 0.0))
             .collect();
         if !rot_pts.is_empty() {
-            out.push_str("TABLE:  \"JOINT LOCAL AXES ASSIGNMENTS 1 - STANDARD\"\n");
+            // D119: the vendor name of this table (v19 report keys).
+            out.push_str("TABLE:  \"JOINT LOCAL AXES ASSIGNMENTS 1 - TYPICAL\"\n");
             for p in rot_pts {
                 out.push_str(&format!(
                     "   Joint={}   AngleA={}   AngleB={}   AngleC={}\n",
@@ -4079,6 +4171,9 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             .filter(|f| f.pdelta_force != 0.0)
             .collect();
         if !pd_frames.is_empty() {
+            // The vendor form of this table ("Frame P-Delta Force Assignments",
+            // with a hyphen) is not proven for the direction column (G77), so the
+            // project's own name is kept.
             out.push_str("TABLE:  \"FRAME PDELTA FORCE ASSIGNMENTS\"\n");
             for f in pd_frames {
                 out.push_str(&format!(
@@ -4268,10 +4363,11 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             .filter(|a| a.modifiers.iter().any(|&m| (m - 1.0).abs() > 1e-12))
             .collect();
         if !mod_areas.is_empty() {
-            out.push_str("TABLE:  \"AREA PROPERTY MODIFIERS\"\n");
+            // D119: vendor name and columns (v19 report keys, RE catalog).
+            out.push_str("TABLE:  \"AREA STIFFNESS MODIFIERS\"\n");
             for a in mod_areas {
                 out.push_str(&format!(
-                    "   Area={}   F11Mod={}   F22Mod={}   F12Mod={}   M11Mod={}   M22Mod={}   M12Mod={}   V13Mod={}   V23Mod={}   MMod={}   WMod={}\n",
+                    "   Area={}   f11={}   f22={}   f12={}   m11={}   m22={}   m12={}   v13={}   v23={}   MassMod={}   WeightMod={}\n",
                     format_val(&a.name),
                     a.modifiers[0],
                     a.modifiers[1],

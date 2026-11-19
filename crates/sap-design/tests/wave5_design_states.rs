@@ -575,15 +575,24 @@ fn aisc_shear_is_checked_alone() {
 /// reference of the design code, only a guard that one state is designed as it was; the
 /// models have five stations with different moment diagrams, so Cb and the station choice are
 /// in the numbers. (Passes on the baseline by construction.)
+///
+/// D86 changed three pinned values, all of the compression term of the default `FSEC1` (I 18 x 7.5,
+/// tf 0.57, tw 0.355, KL/r = 87.3): its web h/tw = 47.5 is slender (> 1.49 sqrt(E/Fy) = 35.9),
+/// and the effective width of the web now takes f = Fcr with Q = 1 (manual p. 3-33) instead of
+/// Fy. Hand: Fe = pi^2 29000/(144/1.65)^2 = 37.58, f = 28.649, be = 16.7464, Q = 0.99726 (was
+/// 0.92091), phi Pn = 378.566 kip (was 364.768), pr_ratio = 0.5 (48.8)/378.566 = 0.064454
+/// (was 0.066892); the flexural and shear ratios did not change. Old bits of the steel combo:
+/// 0x3fc042a3b9bb88a0 (0.12703), of its pr_ratio 0x3fb11fd24d2ffa52, of the plain cases
+/// 0x3fb2a5fbbe0511eb.
 #[test]
 fn single_valued_combinations_and_plain_cases_are_bitwise_unchanged() {
     let pinned: [(&str, &[u64]); 7] = [
-        ("steel combo", &[0x3fc042a3b9bb88a0]),
+        ("steel combo", &[0x3fbfe57fb4999a0f]),
         (
             "steel combo detail",
             &[
                 0x4052000000000000,
-                0x3fb11fd24d2ffa52,
+                0x3fb0800a8e528322,
                 0x3fa38d4c09cbef36,
                 0x3f967b3c85847d49,
                 0x0000000000000000,
@@ -591,10 +600,15 @@ fn single_valued_combinations_and_plain_cases_are_bitwise_unchanged() {
                 0x40af18be736f02e2,
             ],
         ),
-        ("steel plain cases", &[0x3fb2a5fbbe0511eb]),
+        ("steel plain cases", &[0x3fb243c1ff3df8e9]),
+        // Re-pinned for D102 (2026-11-19): the ACI minimum eccentricity (0.6 + 0.03 h in) now
+        // raises the moment of a column station whose moment is below Pu e_min, so the P-M-M
+        // ratio of this column went from 0x3faa816aa1659ff4 (0.051768619729784776) to the
+        // value below (0.05183388005629001, +0.13 %). The hand-checked tests of that rule
+        // are in `batch_c_repairs.rs`; this entry stays a guard of one state only.
         (
             "column",
-            &[0x4010000000000000, 0x4010000000000000, 0, 0, 0x3faa816aa1659ff4, 0x4010000000000000],
+            &[0x4010000000000000, 0x4010000000000000, 0, 0, 0x3faa89f867554656, 0x4010000000000000],
         ),
         (
             "column plain",

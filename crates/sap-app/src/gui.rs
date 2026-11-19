@@ -793,6 +793,9 @@ impl SapGuiApp {
         self.draw_area_points.clear();
         self.tpl_bays_text = build::scale_lengths_text(&self.tpl_bays_text, fl);
         self.tpl_storeys_text = build::scale_lengths_text(&self.tpl_storeys_text, fl);
+        // D125: the drafts of the seismic window and of the Build window.
+        self.panel_seismic.scale_lengths(fl);
+        self.panel_build.scale_lengths(fl);
     }
 
     fn ensure_unlocked(&mut self) -> bool {
@@ -806,12 +809,39 @@ impl SapGuiApp {
         }
     }
 
+    /// D124: the one way the application clears results: the model's own
+    /// `invalidate_results` (results and the reasons a result is unavailable)
+    /// and a new `results_revision`, which the plot caches key on.
     fn invalidate_results(&mut self) {
         self.results_revision += 1;
         self.model.is_locked = false;
-        self.model.case_results.clear();
-        self.model.steel_design_results.clear();
-        self.model.concrete_design_results.clear();
+        self.model.invalidate_results();
+    }
+
+    /// Sizes of the result stores of the model: case results, reasons a result
+    /// is unavailable, steel and concrete design results.
+    fn result_sizes(&self) -> [usize; 4] {
+        [
+            self.model.case_results.len(),
+            self.model.unavailable_results.len(),
+            self.model.steel_design_results.len(),
+            self.model.concrete_design_results.len(),
+        ]
+    }
+
+    /// D124: runs window code that edits the model through `&mut SapModel`
+    /// functions (panels, workflows, the analysis editor). Those call
+    /// `SapModel::invalidate_results` and cannot reach `results_revision`, so a
+    /// store that held entries before and is empty after counts as a clear and
+    /// bumps the revision.
+    fn track_result_clears<R>(&mut self, run: impl FnOnce(&mut Self) -> R) -> R {
+        let before = self.result_sizes();
+        let out = run(self);
+        let after = self.result_sizes();
+        if (0..4).any(|i| before[i] > 0 && after[i] == 0) {
+            self.results_revision += 1;
+        }
+        out
     }
 
     fn delete_selected_objects(&mut self) {
@@ -2520,14 +2550,6 @@ impl SapGuiApp {
         }
 
         // 2. Draw 3D Hexahedral Solid Objects
-        const HEX_FACES: [[usize; 4]; 6] = [
-            [0, 1, 2, 3],
-            [4, 5, 6, 7],
-            [0, 1, 5, 4],
-            [1, 2, 6, 5],
-            [2, 3, 7, 6],
-            [3, 0, 4, 7],
-        ];
         if let Some(m) = &members {
             // Solid faces in the plane are outlines; solids are not selectable.
             for (sid, k) in &m.solid_faces {
@@ -2598,7 +2620,7 @@ impl SapGuiApp {
             } else {
                 Color32::from_rgb(130, 175, 225)
             };
-            for face in &HEX_FACES {
+            for face in &view::SOLID_FACES {
                 let fpoly = vec![
                     project(corners[face[0]]),
                     project(corners[face[1]]),
@@ -5224,9 +5246,11 @@ impl SapGuiApp {
             self.open_workflow(1);
             self.show_assign_load_modal = false;
         }
-        self.render_workflows(ctx);
-        self.render_analysis_editor(ctx);
-        self.render_panels(ctx);
+        self.track_result_clears(|app| {
+            app.render_workflows(ctx);
+            app.render_analysis_editor(ctx);
+            app.render_panels(ctx);
+        });
     }
 
     /// Windows of the panel modules. A panel returns the outcome of a command
@@ -5815,8 +5839,37 @@ ComboName=ULS ComboType=\"Linear Add\" CaseName=L ScaleFactor=1.6\nEND TABLE DAT
             phi_vn3: 150.0,
             status: "SLENDER".into(),
             eq_name: "KL/r>200".into(),
+            notes: Vec::new(),
         };
         assert_eq!(steel_result_color(&steel_slender), red);
+    }
+
+    #[test]
+    fn window_code_that_clears_results_bumps_the_revision_and_drops_the_reasons() {
+        // D124: a template rebuilds the model through `invalidate_results`; the
+        // application sees the stores go from full to empty and bumps the revision.
+        let mut app = blank_app();
+        app.model
+            .case_results
+            .insert("stale".into(), Default::default());
+        app.model
+            .unavailable_results
+            .insert("COMBO1".into(), "stale reason".into());
+        let before = app.results_revision;
+        app.track_result_clears(|app| app.model.generate_beam(2, 5.0, true, "FSEC1"));
+        assert!(app.model.case_results.is_empty());
+        assert!(app.model.unavailable_results.is_empty());
+        assert_eq!(app.results_revision, before + 1);
+        // Negative: code that clears nothing leaves the revision alone.
+        app.track_result_clears(|app| app.model.add_point("Z", 0.0, 0.0, 9.0));
+        assert_eq!(app.results_revision, before + 1);
+        // The application's own function clears the reasons and bumps as well.
+        app.model
+            .unavailable_results
+            .insert("COMBO2".into(), "stale".into());
+        app.invalidate_results();
+        assert!(app.model.unavailable_results.is_empty());
+        assert_eq!(app.results_revision, before + 2);
     }
 
     #[test]

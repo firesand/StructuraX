@@ -63,7 +63,8 @@ pub fn compute_ec3_major_shear(sec: &FrameSection, mat: &Material) -> Result<f64
         }
         FramePropType::DbChannel => {
             let h = positive(sec, "depth", sec.t3)?;
-            let bf = positive(sec, "flange width", sec.t2)?;
+            // D97: t2 is the total width; the flange of one channel is (t2 - dis) / 2.
+            let bf = double_member_width(sec, "flange width of one channel")?;
             let tf = positive(sec, "flange thickness", sec.tf)?;
             let tw = positive(sec, "web thickness", sec.tw)?;
             let hw = (h - 2.0 * tf).max(0.0);
@@ -150,7 +151,7 @@ pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64
             2.0 * bf * tf
         }
         FramePropType::DbChannel => {
-            let bf = positive(sec, "flange width", sec.t2)?;
+            let bf = double_member_width(sec, "flange width of one channel")?;
             let tf = positive(sec, "flange thickness", sec.tf)?;
             4.0 * bf * tf
         }
@@ -166,7 +167,7 @@ pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64
             b * t
         }
         FramePropType::DblAngle => {
-            let b = positive(sec, "leg 2 length", sec.t2)?;
+            let b = double_member_width(sec, "leg 2 length of one angle")?;
             let t_raw = if sec.tf > 0.0 { sec.tf } else { sec.tw };
             let t = positive(sec, "thickness", t_raw)?;
             2.0 * b * t
@@ -201,6 +202,14 @@ pub fn compute_ec3_minor_shear(sec: &FrameSection, mat: &Material) -> Result<f64
         }
     };
     positive(sec, "EC3 minor shear resistance", av3 * fy / 3.0_f64.sqrt())
+}
+
+/// Width of one member of a double angle or a double channel: `t2` of these sections is the
+/// total width (the sum of the widths of the two members plus the back-to-back distance `dis`;
+/// v19 OAPI help, SetDblAngle and SetDblChannel), so one member is `(t2 - dis) / 2` wide.
+/// An error when that is not positive (an impossible section).
+fn double_member_width(sec: &FrameSection, name: &'static str) -> Result<f64, DesignError> {
+    positive(sec, name, (sec.t2 - sec.dis) / 2.0)
 }
 
 fn positive(sec: &FrameSection, name: &'static str, value: f64) -> Result<f64, DesignError> {
@@ -246,10 +255,17 @@ pub fn compute_aisc_minor_shear(
             0.6 * fy * (flange(sec.t2, sec.tf, true)? + flange(sec.t2b, sec.tfb, true)?)
         }
         FramePropType::Channel => 0.6 * fy * 2.0 * flange(sec.t2, sec.tf, false)?,
-        FramePropType::DbChannel => 0.6 * fy * 4.0 * flange(sec.t2, sec.tf, false)?,
+        FramePropType::DbChannel => {
+            let bf = double_member_width(sec, "flange width of one channel")?;
+            0.6 * fy * 4.0 * flange(bf, sec.tf, false)?
+        }
         FramePropType::T => 0.6 * fy * flange(sec.t2, sec.tf, true)?,
         FramePropType::Angle | FramePropType::DblAngle => {
-            let b = positive(sec, "leg width", sec.t2)?;
+            let b = if sec.prop_type == FramePropType::DblAngle {
+                double_member_width(sec, "leg width of one angle")?
+            } else {
+                positive(sec, "leg width", sec.t2)?
+            };
             let t_raw = if sec.tf > 0.0 { sec.tf } else { sec.tw };
             let t = positive(sec, "leg thickness", t_raw)?;
             let mult = if sec.prop_type == FramePropType::DblAngle {
@@ -311,8 +327,14 @@ mod tests {
         assert!((compute_aisc_minor_shear(&sec, mat, true).unwrap() - 246.0 / 1.67).abs() < 1e-10);
         sec.prop_type = FramePropType::Channel;
         assert!((compute_aisc_minor_shear(&sec, mat, false).unwrap() - 270.0).abs() < 1e-10);
+        // D97: t2 of a double channel is the total width (v19 OAPI SetDblChannel), so two
+        // channels of flange width 10 in with no gap have t2 = 20 in; one flange is
+        // (t2 - dis) / 2 = 10 in and the hand value 540 kip stays.
         sec.prop_type = FramePropType::DbChannel;
+        sec.t2 = 20.0;
+        sec.dis = 0.0;
         assert!((compute_aisc_minor_shear(&sec, mat, false).unwrap() - 540.0).abs() < 1e-10);
+        sec.t2 = 10.0;
         sec.prop_type = FramePropType::T;
         assert!((compute_aisc_minor_shear(&sec, mat, false).unwrap() - 135.0).abs() < 1e-10);
     }
@@ -422,6 +444,9 @@ mod tests {
         let mut dbchan_sec = i_sec.clone();
         dbchan_sec.prop_type = FramePropType::DbChannel;
         dbchan_sec.area = 2.0 * area_i;
+        // t2 is the total width of a double channel (v19 OAPI SetDblChannel): 2 x 10 + gap 0
+        dbchan_sec.t2 = 20.0;
+        dbchan_sec.dis = 0.0;
         let v2_dbchan = compute_ec3_major_shear(&dbchan_sec, mat).unwrap();
         assert!((v2_dbchan - 2.0 * 4.05 * 50.0 / sqrt3).abs() < 1e-10);
         let v3_dbchan = compute_ec3_minor_shear(&dbchan_sec, mat).unwrap();
@@ -451,6 +476,9 @@ mod tests {
         // 6. Double Angle section
         let mut dbl_angle_sec = angle_sec.clone();
         dbl_angle_sec.prop_type = FramePropType::DblAngle;
+        // t2 is the total width of a double angle (v19 OAPI SetDblAngle): 2 x 4 in legs, no gap
+        dbl_angle_sec.t2 = 8.0;
+        dbl_angle_sec.dis = 0.0;
         let v2_dbl_angle = compute_ec3_major_shear(&dbl_angle_sec, mat).unwrap();
         assert!((v2_dbl_angle - 2.0 * 3.0 * 50.0 / sqrt3).abs() < 1e-10);
         let v3_dbl_angle = compute_ec3_minor_shear(&dbl_angle_sec, mat).unwrap();

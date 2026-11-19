@@ -59,6 +59,7 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "CONNECTIVITY - AREA"
             | "AREA SECTION ASSIGNMENTS"
             | "AREA PROPERTY MODIFIERS"
+            | "AREA STIFFNESS MODIFIERS"
             | "AREA LOADS - UNIFORM"
             | "AREA LOADS - SURFACE PRESSURE"
             | "AREA LOADS - TEMPERATURE"

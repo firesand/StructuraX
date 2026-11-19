@@ -625,6 +625,7 @@ pub(crate) struct NonlinearStepper {
     c: Vec<f64>,
     effective_linear: Vec<f64>,
     reference_factor: SymmetricLdlt,
+    structural_diagonal: Vec<f64>,
     mass: Vec<f64>,
     fixed: Vec<bool>,
     dt: f64,
@@ -651,6 +652,7 @@ impl NonlinearStepper {
         indices: &indexmap::IndexMap<String, usize>,
         rotations: &[[[f64; 3]; 3]],
         k_linear: &[f64],
+        k_struct: &[f64],
         mass: &[f64],
         fixed: &[bool],
         case: &LoadCase,
@@ -791,7 +793,19 @@ impl NonlinearStepper {
                 reference[i * n + i] = 1.0;
             }
         }
-        let reference_factor = SymmetricLdlt::factorize(&reference, n)?;
+        // The pivot test is relative to the diagonal without the constraint penalties
+        // (`k_linear - k_struct` on the diagonal, D112); the identity rows keep 1.
+        let structural_diagonal: Vec<f64> = (0..n)
+            .map(|i| {
+                if fixed[i] {
+                    1.0
+                } else {
+                    reference[i * n + i] - (k_linear[i * n + i] - k_struct[i * n + i])
+                }
+            })
+            .collect();
+        let reference_factor =
+            SymmetricLdlt::factorize_with_reference(&reference, n, Some(&structural_diagonal))?;
 
         // Compute initial acceleration at massive DOFs when starting from rest at u0
         let mut a_init = vec![0.0; n];
@@ -813,6 +827,7 @@ impl NonlinearStepper {
             c,
             effective_linear,
             reference_factor,
+            structural_diagonal,
             mass: mass.to_vec(),
             fixed: fixed.to_vec(),
             dt: case.time_step_dt,
@@ -1089,8 +1104,12 @@ impl NonlinearStepper {
             let rhs: Vec<f64> = (0..self.n)
                 .map(|i| if self.fixed[i] { 0.0 } else { -residual[i] })
                 .collect();
-            let mut direction = SymmetricLdlt::factorize(&constrain(tangent), self.n)
-                .and_then(|f| f.solve(&rhs))
+            let mut direction = SymmetricLdlt::factorize_with_reference(
+                &constrain(tangent),
+                self.n,
+                Some(&self.structural_diagonal),
+            )
+            .and_then(|f| f.solve(&rhs))
                 .or_else(|_| self.reference_factor.solve(&rhs))?;
             for i in 0..self.n {
                 if self.fixed[i] {

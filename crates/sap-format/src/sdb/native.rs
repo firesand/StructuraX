@@ -892,6 +892,8 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     let startup = HashMap::from([
         ("m_Units".into(), SdbVal::I32(model.present_units as i32)),
         ("m_DBUnits".into(), SdbVal::I32(model.database_units as i32)),
+        // D123: 3 in all 336 corpus files.
+        ("m_GlobalUp".into(), SdbVal::I32(3)),
     ]);
     w.write_struct("S_ProjectStartUp", &startup)?;
     let mut user_infos = Vec::new();
@@ -1052,10 +1054,17 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     w.write_struct("S_ProjectInfo", &proj_info)?;
     w.write_empty_struct_array(); // Standards
     w.write_empty_struct(); // AnalysisModelDateTimeStamp
-    let run_params = HashMap::from([(
-        "m_dof".into(),
-        SdbVal::ArrI32(model.active_dofs.iter().map(|&b| i32::from(b)).collect()),
-    )]);
+    let run_params = HashMap::from([
+        (
+            "m_dof".into(),
+            SdbVal::ArrI32(model.active_dofs.iter().map(|&b| i32::from(b)).collect()),
+        ),
+        // D123: g in the length unit of the model (386.0886 in/s2 in 264 corpus files).
+        (
+            "m_Gravity".into(),
+            SdbVal::F64(model.present_units.gravity_acceleration()),
+        ),
+    ]);
     w.write_struct("RUNARRAY", &run_params)?;
     w.write_i32(1); // PresentCoordSystem
 
@@ -1167,7 +1176,16 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 "__class_id".into(),
                 SdbVal::Str("S_MaterialPropertiesRebar".into()),
             ),
-            ("m_fy".into(), SdbVal::F64(mat.fys)),
+            // D114: a Rebar material's own yield is `m_RebarProps.m_fy`; the
+            // other types keep the shear-rebar yield `fys` there.
+            (
+                "m_fy".into(),
+                SdbVal::F64(if mat.mat_type == MatType::Rebar {
+                    mat.fy
+                } else {
+                    mat.fys
+                }),
+            ),
             ("m_Fu".into(), SdbVal::F64(mat.fu)),
         ]);
         let is_ortho = mat.e_ortho.is_some()
@@ -1277,6 +1295,44 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_R22".into(), SdbVal::F64(sec.r22)),
             ("m_msf".into(), SdbVal::ArrF64(sec.modifiers.to_vec())),
         ]);
+        if let Some(rebar) = &sec.concrete_rebar {
+            // D114: the rebar record `S_CP`. Only the modelled fields are
+            // written; `total_rebar_area` has no field here (the bar size table is
+            // not modelled), so a section that carries one is refused by the
+            // projection check. `m_lateral` is 1 in every corpus file.
+            let material = |name: &str| mat_index.get(name).copied().unwrap_or(1);
+            s_map.insert(
+                "m_Cp".into(),
+                SdbVal::Obj(HashMap::from([
+                    ("__class_id".into(), SdbVal::Str("S_CP".into())),
+                    ("m_alive".into(), SdbVal::Bool(true)),
+                    (
+                        "m_MindexRebar".into(),
+                        SdbVal::I32(material(&rebar.rebar_mat_long)),
+                    ),
+                    (
+                        "m_MindexRebarShear".into(),
+                        SdbVal::I32(material(&rebar.rebar_mat_confine)),
+                    ),
+                    (
+                        "m_type".into(),
+                        SdbVal::I32(if rebar.is_column { 1 } else { 2 }),
+                    ),
+                    ("m_CoverTop".into(), SdbVal::F64(rebar.cover_top)),
+                    ("m_CoverBot".into(), SdbVal::F64(rebar.cover_bot)),
+                    ("m_Cover".into(), SdbVal::F64(rebar.cover_top)),
+                    ("m_lateral".into(), SdbVal::I32(1)),
+                    (
+                        "m_NumberR3Bars".into(),
+                        SdbVal::I32(rebar.num_bars_3dir as i32),
+                    ),
+                    (
+                        "m_NumberR2Bars".into(),
+                        SdbVal::I32(rebar.num_bars_2dir as i32),
+                    ),
+                ])),
+            );
+        }
         if let Some(ref fnm) = sec.file_name {
             s_map.insert("m_PropertyFile".into(), SdbVal::Str(fnm.clone()));
         }
@@ -1508,7 +1564,9 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
         let p2 = pt_index.get(&fr.point_j).copied().unwrap_or(1);
         let (line_type, san) = if fr.cable_params.is_some() {
             (
-                1,
+                // D123: 2 = cable in all 15 corpus cables (1 is a curved frame; the
+                // reader still accepts 1 from files written before).
+                2,
                 cable_prop_index
                     .get(&fr.section)
                     .or_else(|| fsec_index.get(&fr.section))
@@ -1650,6 +1708,8 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_name".into(), SdbVal::Str(lk.name.clone())),
             ("m_point".into(), SdbVal::ArrI32(vec![p1, p2])),
             ("m_NPR".into(), SdbVal::I32(npr)),
+            // D123: 1.0 in all 82 corpus links.
+            ("m_NPRMultiplier".into(), SdbVal::F64(1.0)),
             ("m_Ang".into(), SdbVal::F64(lk.angle_deg)),
             ("m_Selected".into(), SdbVal::Bool(lk.selected)),
         ]));
@@ -2141,6 +2201,12 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 SdbVal::I32(if matches!(ctype_code, 5 | 6) { 1 } else { 0 }),
             ),
             ("m_SelectedForRun".into(), SdbVal::Bool(lc.run_flag)),
+            // D122: directional combination of a response-spectrum case, 1 = SRSS
+            // (`SetDirComb`); the solver combines directions by SRSS.
+            (
+                "m_dirtype".into(),
+                SdbVal::I32(if ctype_code == 4 { 1 } else { 0 }),
+            ),
             ("m_previous".into(), SdbVal::I32(prev_idx)),
             ("m_NumberLAs".into(), SdbVal::I32(las.len() as i32)),
             ("m_LA".into(), SdbVal::ArrObj(las)),
@@ -2658,7 +2724,9 @@ mod tests {
         assert!(checked >= 336, "Only {} native fixtures checked", checked);
         assert_eq!(
             verified_classes.len(),
-            57,
+            // 57 before D114; `S_CP` (section rebar record) is the 58th, verified here
+            // against the tags of the corpus records.
+            58,
             "Every emitted class tag needs source evidence"
         );
     }
@@ -2805,8 +2873,10 @@ mod tests {
         let mut checked = 0usize;
         let mut rejected_incomplete = 0usize;
         // 45 since wave 5: Example 6-005a NLMHIST1 (nonlinear modal, FNA) is recorded as
-        // unmodeled instead of being integrated directly.
-        const EXPECTED_UNMODELED: usize = 45;
+        // unmodeled instead of being integrated directly. 46 since D141: Example 1-024 has
+        // the response-spectrum case RS-10PCT (modal combination NRC 10 percent), which was
+        // read as CQC.
+        const EXPECTED_UNMODELED: usize = 46;
         let mut rejected_unmodeled: Vec<String> = Vec::new();
         let mut rejected_hinges: Vec<String> = Vec::new();
         let mut native_checked = 0usize;
@@ -2913,6 +2983,7 @@ mod tests {
                 "example_1_009a.sdb",       // tendon object and prestress load
                 "example_1_013a.sdb",       // frame line springs
                 "example_1_015.sdb",        // frame added mass
+                "example_1_024.sdb",        // modal combination NRC 10 percent
                 "example_2_006_thick.sdb",  // area gravity load
                 "example_2_016a_thick.sdb", // area auto-mesh options not modeled
                 "example_2_009a_thick.sdb", // area springs

@@ -350,6 +350,52 @@ mod tests {
     use crate::gui::ViewProjection;
     use sap_units::Units;
 
+    #[test]
+    fn a_crossing_window_over_the_bottom_face_of_a_solid_picks_it() {
+        // Unit cube in the binary corner order. A small window inside the bottom
+        // face touches a real face of the solid.
+        let mut m = SapModel::new(Units::KnMC);
+        for k in 0..8usize {
+            m.add_point(
+                format!("P{k}"),
+                (k & 1) as f64,
+                ((k >> 1) & 1) as f64,
+                ((k >> 2) & 1) as f64,
+            );
+        }
+        let points: [String; 8] = std::array::from_fn(|k| format!("P{k}"));
+        m.solids.insert(
+            "S1".to_string(),
+            sap_model::SolidObj {
+                name: "S1".to_string(),
+                points,
+                section: "SOLID1".to_string(),
+                loads_surface: Vec::new(),
+                loads_temp: Default::default(),
+                selected: false,
+            },
+        );
+        // The default 3D view. The point (0.7, 0.5, 0) of the bottom face lies in
+        // no face of the old bow-tie list (probed once with the old list).
+        let v = ViewTransform {
+            proj: ViewProjection::Perspective3D,
+            center: [0.5, 0.5, 0.5],
+            scale: 200.0,
+            screen_center: Pos2::new(400.0, 300.0),
+            yaw: -0.65,
+            pitch: 0.42,
+        };
+        let c = v.project([0.7, 0.5, 0.0]);
+        let (left, right) = (c - eframe::egui::vec2(2.0, 2.0), c + eframe::egui::vec2(2.0, 2.0));
+        // Window dragged right to left: crossing.
+        assert_eq!(select_window(&mut m, &v, None, right, left), 1);
+        assert!(m.solids["S1"].selected);
+        // Negative: dragged left to right the window must enclose the whole solid.
+        m.solids.get_mut("S1").unwrap().selected = false;
+        assert_eq!(select_window(&mut m, &v, None, left, right), 0);
+        assert!(!m.solids["S1"].selected);
+    }
+
     fn portal() -> SapModel {
         // Two bays, one storey, in the X-Z plane at y = 0.
         let mut m = SapModel::new(Units::KnMC);

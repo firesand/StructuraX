@@ -131,6 +131,29 @@ pub fn compute_area_local_stiffness(
     compute_quad4_local_stiffness(area_obj, sec, mat, local_xy)
 }
 
+/// Penalty factor on the transverse shear law of a thin-plate section (ShellThin, PlateThin):
+/// `clamp(1e4 (tb/h)^2, 1, 1e6)` with `h` the diagonal from node 0 to node 2 of the element in
+/// its plane; 1 for every other section type. The element stiffness multiplies the shear law
+/// by it, so the shear force the element transmits is `boost * ds * gamma`; the recovery of
+/// V13/V23 multiplies by the same factor (D105). Analysis Reference p. 211: the thin-plate
+/// shear force follows from equilibrium with the moments, i.e. it is the force the element
+/// carries, not the unboosted `ds * gamma`.
+fn thin_plate_shear_boost(sec: &AreaSection, tb: f64, xy: &[[f64; 2]]) -> f64 {
+    // Only a section with plate bending has the shear term the boost belongs to: a Plane or
+    // Asolid section keeps the plain law whatever its (unused) shell type says.
+    if !section_behaviours(sec).1
+        || !matches!(sec.shell_type, ShellType::ShellThin | ShellType::PlateThin)
+    {
+        return 1.0;
+    }
+    let dx02 = xy[2][0] - xy[0][0];
+    let dy02 = xy[2][1] - xy[0][1];
+    let h_elem = (dx02 * dx02 + dy02 * dy02).sqrt().max(1e-6);
+    // Ensure Kirchhoff thin-plate limit even for moderate thickness, while avoiding ill-conditioning
+    let ratio_sq = (tb / h_elem).powi(2);
+    (1e4 * ratio_sq).clamp(1.0, 1e6)
+}
+
 fn compute_quad4_local_stiffness(
     area_obj: &AreaObj,
     sec: &AreaSection,
@@ -152,7 +175,6 @@ fn compute_quad4_local_stiffness(
     let tb = sec.thickness_bending;
 
     let (has_membrane, has_bending) = section_behaviours(sec);
-    let is_thin_plate = matches!(sec.shell_type, ShellType::ShellThin | ShellType::PlateThin);
     // The Allman drilling term belongs to the shell element only: a Plane or Asolid section
     // has no drilling stiffness (Analysis Reference p. 217: the plane element has stiffness
     // for the three translations only), whatever `drilling_dof` says, and its R3 is
@@ -164,17 +186,8 @@ fn compute_quad4_local_stiffness(
     let dm = law.dm;
     let db = law.db;
 
-    // Characteristic element size for thin-plate shear penalty scaling
-    let dx02 = xy[2][0] - xy[0][0];
-    let dy02 = xy[2][1] - xy[0][1];
-    let h_elem = (dx02 * dx02 + dy02 * dy02).sqrt().max(1e-6);
-    let thin_boost = if is_thin_plate {
-        // Ensure Kirchhoff thin-plate limit even for moderate thickness, while avoiding ill-conditioning
-        let ratio_sq = (tb / h_elem).powi(2);
-        (1e4 * ratio_sq).clamp(1.0, 1e6)
-    } else {
-        1.0
-    };
+    // Thin-plate shear boost, shared with the recovery of V13/V23 (D105).
+    let thin_boost = thin_plate_shear_boost(sec, tb, xy);
     let ds = [
         [law.ds[0][0] * thin_boost, law.ds[0][1] * thin_boost],
         [law.ds[1][0] * thin_boost, law.ds[1][1] * thin_boost],
@@ -1108,8 +1121,10 @@ pub fn recover_area_result(
             gamma_xz += bs[0][c] * u24[c];
             gamma_yz += bs[1][c] * u24[c];
         }
-        v13 = law.ds[0][0] * gamma_xz + law.ds[0][1] * gamma_yz;
-        v23 = law.ds[1][0] * gamma_xz + law.ds[1][1] * gamma_yz;
+        // The element carries boost * ds * gamma (D105); report that force.
+        let boost = thin_plate_shear_boost(sec, sec.thickness_bending, &xy4);
+        v13 = boost * (law.ds[0][0] * gamma_xz + law.ds[0][1] * gamma_yz);
+        v23 = boost * (law.ds[1][0] * gamma_xz + law.ds[1][1] * gamma_yz);
     }
 
     // CSI Analysis Reference Eqns. 2: positive moments give positive stress at the

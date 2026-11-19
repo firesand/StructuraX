@@ -82,7 +82,13 @@ pub fn check_compactness_aisc(sec: &FrameSection, e: f64, fy: f64) -> SectionCom
         | FramePropType::DbChannel
         | FramePropType::BuiltUpICoverplate
         | FramePropType::BuiltUpIHybrid => {
-            let bf = sec.t2.max(sec.t2b);
+            // D87: for a double channel `t2` is the total width; the flange of one channel is
+            // (t2 - dis)/2.
+            let bf = if sec.prop_type == FramePropType::DbChannel {
+                0.5 * (sec.t2 - sec.dis)
+            } else {
+                sec.t2.max(sec.t2b)
+            };
             let tf = sec.tf.max(1e-9);
             let tw = sec.tw.max(1e-9);
             let h = (sec.t3 - sec.tf - sec.tfb).max(0.0);
@@ -210,7 +216,13 @@ pub fn check_compactness_aisc(sec: &FrameSection, e: f64, fy: f64) -> SectionCom
             }
         }
         FramePropType::Angle | FramePropType::DblAngle => {
-            let b = sec.t3.max(sec.t2);
+            // D87: for a double angle `t2` is the total width; one leg is (t2 - dis)/2.
+            let leg2 = if sec.prop_type == FramePropType::DblAngle {
+                0.5 * (sec.t2 - sec.dis)
+            } else {
+                sec.t2
+            };
+            let b = sec.t3.max(leg2);
             let t = sec.tf.max(sec.tw).max(1e-9);
             let lambda = b / t;
             let flange_compression = if lambda <= 0.45 * root_efy {
@@ -241,48 +253,122 @@ pub fn check_compactness_aisc(sec: &FrameSection, e: f64, fy: f64) -> SectionCom
     }
 }
 
-/// Computes the slender element reduction factor $Q = Q_s Q_a$ per AISC 360-10 Section E7.
-pub fn compute_slender_q_factor(sec: &FrameSection, e: f64, fy: f64) -> f64 {
-    let root_efy = (e / fy.max(1e-12)).sqrt();
+/// Unstiffened-element factor $Q_s$ of three branches (AISC E7-4..6, E7-10..12, E7-13..15):
+/// 1 up to `lo` $\sqrt{E/F_y}$, `a - b x / sqrt(E/Fy)` up to `hi` $\sqrt{E/F_y}$, and
+/// `c E / (Fy x^2)` beyond, with `x` the width-thickness ratio.
+#[allow(clippy::too_many_arguments)]
+fn qs_three_branch(x: f64, e: f64, fy: f64, lo: f64, hi: f64, a: f64, b: f64, c: f64) -> f64 {
+    let r = (e / fy).sqrt();
+    if x <= lo * r {
+        1.0
+    } else if x <= hi * r {
+        a - b * x / r
+    } else {
+        c * e / (fy * x * x)
+    }
+}
+
+/// Effective width of a slender stiffened element (AISC E7-17 for webs of I shapes, channels
+/// and double channels with `k = 0.34` and `lim = 1.49`, E7-18 for box walls with `k = 0.38`
+/// and `lim = 1.40`): `be = 1.92 t sqrt(E/f) [1 - k / (b/t) sqrt(E/f)] <= b` when
+/// `b/t >= lim sqrt(E/f)`, else `b`.
+fn effective_width(b: f64, t: f64, e: f64, f: f64, k: f64, lim: f64) -> f64 {
+    let r = (e / f.max(1e-12)).sqrt();
+    let x = b / t.max(1e-12);
+    if x >= lim * r {
+        (1.92 * t * r * (1.0 - k * r / x)).min(b)
+    } else {
+        b
+    }
+}
+
+/// Computes the slender element reduction factor $Q = Q_s Q_a$ per AISC 360-10 Section E7
+/// (vendor manual 3.5.2.2.3, printed pp. 3-31 to 3-34).
+///
+/// `fcr_q1` is the stress $f$ of the effective width of the stiffened webs of I shapes,
+/// channels and double channels: $F_{cr}$ computed with $Q = 1$ (manual p. 3-33, AISC 7.2a);
+/// the walls of a box use $f = F_y$ as the manual prints it. For double angles and double
+/// channels `t2` is the total width and one member's width is `(t2 - dis)/2`.
+/// A Pipe with $D/t > 0.45 E/F_y$ is "too slender and not designed" (p. 3-34) and is refused
+/// ([`DesignError::SlenderPipeNotDesigned`], with an empty frame name that the caller fills).
+/// This function gives $Q$ only: for T, single angle, double angle and channel the
+/// compression strength still uses flexural buckling alone (E4-5 and E4-6 are not built).
+pub fn compute_slender_q_factor(
+    sec: &FrameSection,
+    e: f64,
+    fy: f64,
+    fcr_q1: f64,
+) -> Result<f64, DesignError> {
     match sec.prop_type {
-        FramePropType::I | FramePropType::Channel | FramePropType::T | FramePropType::DbChannel => {
-            let bf = sec.t2.max(sec.t2b);
+        FramePropType::I | FramePropType::Channel | FramePropType::DbChannel => {
             let tf = sec.tf.max(1e-9);
             let tw = sec.tw.max(1e-9);
             let h = (sec.t3 - sec.tf - sec.tfb).max(0.0);
-            let lambda_f = bf / (2.0 * tf);
-            let qs = if lambda_f <= 0.56 * root_efy {
-                1.0
-            } else if lambda_f < 1.03 * root_efy {
-                1.415 - 0.74 * lambda_f / root_efy
-            } else {
-                0.69 * e / (fy * lambda_f * lambda_f)
+            // b/t of the flange: bf/2tf for I, bf/tf for a channel and a double channel,
+            // whose bf is one channel's flange (p. 3-32, E7.1).
+            let x_f = match sec.prop_type {
+                FramePropType::I => sec.t2.max(sec.t2b) / (2.0 * tf),
+                FramePropType::Channel => sec.t2 / tf,
+                _ => 0.5 * (sec.t2 - sec.dis) / tf,
             };
-
-            let lambda_w = h / tw;
-            let qa = if lambda_w <= 1.49 * root_efy {
-                1.0
+            let qs = qs_three_branch(x_f, e, fy, 0.56, 1.03, 1.415, 0.74, 0.69);
+            let be = effective_width(h, tw, e, fcr_q1, 0.34, 1.49);
+            let a_eff = sec.area - (h - be) * tw;
+            Ok(qs * (a_eff / sec.area.max(1e-12)).min(1.0))
+        }
+        FramePropType::T => {
+            // The flange (bf/2tf) and the stem (d/tw, E7-13..15) are unstiffened elements: the
+            // smaller Qs is used and Qa = 1.
+            let tf = sec.tf.max(1e-9);
+            let tw = sec.tw.max(1e-9);
+            let qs_flange =
+                qs_three_branch(sec.t2 / (2.0 * tf), e, fy, 0.56, 1.03, 1.415, 0.74, 0.69);
+            // The vendor page prints the middle branch as 1.908 - 1.22 sqrt(Fy/E) without the
+            // ratio d/t, a misprint: AISC E7-14 has (d/t), and only then do the branches meet
+            // at 0.75 and 1.03 sqrt(E/Fy).
+            let qs_stem = qs_three_branch(sec.t3 / tw, e, fy, 0.75, 1.03, 1.908, 1.22, 0.69);
+            Ok(qs_flange.min(qs_stem))
+        }
+        FramePropType::Angle | FramePropType::DblAngle => {
+            let t = if sec.tf > 0.0 { sec.tf } else { sec.tw }.max(1e-9);
+            let leg2 = if sec.prop_type == FramePropType::DblAngle {
+                0.5 * (sec.t2 - sec.dis)
             } else {
-                let b_eff = (1.92 * tw * root_efy * (1.0 - (0.34 / lambda_w) * root_efy)).min(h);
-                let a_eff = (sec.area - (h - b_eff) * tw).max(0.1 * sec.area);
-                (a_eff / sec.area).clamp(0.1, 1.0)
+                sec.t2
             };
-            (qs * qa).clamp(0.1, 1.0)
+            // Qs of the leg that gives the largest b/t (E7-10..12).
+            let x = sec.t3.max(leg2) / t;
+            Ok(qs_three_branch(x, e, fy, 0.45, 0.91, 1.34, 0.76, 0.53))
+        }
+        FramePropType::Box | FramePropType::ColdBox => {
+            // E7-18 with f = Fy; four walls: two flanges (b = t2 - 3 tw, t = tf) and two
+            // webs (b = t3 - 3 tf, t = tw). Qs = 1.
+            let tf = sec.tf.max(1e-9);
+            let tw = sec.tw.max(1e-9);
+            let b_f = (sec.t2 - 3.0 * tw).max(0.0);
+            let b_w = (sec.t3 - 3.0 * tf).max(0.0);
+            let lost = 2.0 * (b_f - effective_width(b_f, tf, e, fy, 0.38, 1.40)) * tf
+                + 2.0 * (b_w - effective_width(b_w, tw, e, fy, 0.38, 1.40)) * tw;
+            Ok(((sec.area - lost) / sec.area.max(1e-12)).min(1.0))
         }
         FramePropType::Pipe | FramePropType::ColdPipe => {
-            let d = sec.t3;
             let t = sec.tw.max(sec.tf).max(1e-9);
-            let lambda = d / t;
+            let lambda = sec.t3 / t;
             let efy = e / fy.max(1e-12);
             if lambda <= 0.11 * efy {
-                1.0
+                Ok(1.0)
             } else if lambda <= 0.45 * efy {
-                (0.038 * efy / lambda + 2.0 / 3.0).clamp(0.1, 1.0)
+                Ok(0.038 * efy / lambda + 2.0 / 3.0)
             } else {
-                0.33
+                Err(DesignError::SlenderPipeNotDesigned {
+                    frame: String::new(),
+                    section: sec.name.clone(),
+                    d_over_t: format!("{lambda}"),
+                    limit: format!("{}", 0.45 * efy),
+                })
             }
         }
-        _ => 1.0,
+        _ => Ok(1.0),
     }
 }
 
@@ -594,7 +680,7 @@ pub fn compute_aisc_360_capacities(
     k22: f64,
     cb: f64,
     is_asd: bool,
-) -> (f64, f64, f64, f64, f64, SectionCompactness) {
+) -> Result<(f64, f64, f64, f64, f64, SectionCompactness), DesignError> {
     let e = mat.e.max(1.0);
     let g = if mat.g > 0.0 {
         mat.g
@@ -615,7 +701,6 @@ pub fn compute_aisc_360_capacities(
     };
 
     let compactness = check_compactness_aisc(sec, e, fy);
-    let q = compute_slender_q_factor(sec, e, fy);
 
     // 1. Tensile capacity (AISC D2: Yielding in gross section)
     let p_nt = fy * ag;
@@ -639,6 +724,14 @@ pub fn compute_aisc_360_capacities(
         fe_flex
     };
 
+    // E7: the effective width of a slender web uses f = Fcr computed with Q = 1 (manual
+    // p. 3-33), so Q is evaluated here, after Fe.
+    let fcr_q1 = if kl_r <= 4.71 * (e / fy).sqrt() || fy / fe <= 2.25 {
+        0.658_f64.powf(fy / fe) * fy
+    } else {
+        0.877 * fe
+    };
+    let q = compute_slender_q_factor(sec, e, fy, fcr_q1)?;
     let slenderness_limit = 4.71 * (e / (q * fy)).sqrt();
     let fcr = if kl_r <= slenderness_limit || (q * fy / fe) <= 2.25 {
         q * 0.658_f64.powf((q * fy) / fe) * fy
@@ -778,7 +871,141 @@ pub fn compute_aisc_360_capacities(
         phi_v_lrfd * vn2
     };
 
-    (phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness)
+    Ok((phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness))
+}
+
+/// EC3 section class of a cross section by the vendor's Tables 4-1 (bending only) and 4-2
+/// (compression only), printed pp. 4-6 and 4-7 of the EC3 manual (D90). `class` is 1 to 4;
+/// 5 means "not classifiable from the manual" (Tee stem in bending beyond 9 epsilon).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ec3Class {
+    pub class: u8,
+    /// The element that gives the class (the worst one), its width-to-thickness ratio and the
+    /// limit of the class above its own (the Class 3 limit for Class 4).
+    pub element: &'static str,
+    pub ratio: f64,
+    pub limit: f64,
+}
+
+impl Ec3Class {
+    fn new(class: u8, element: &'static str, ratio: f64, limit: f64) -> Self {
+        Self {
+            class,
+            element,
+            ratio,
+            limit,
+        }
+    }
+}
+
+/// Classifies one element: the limits are the Class 1, 2 and 3 values already multiplied by
+/// epsilon (or epsilon squared); above the Class 3 limit the element is Class 4.
+fn ec3_element(element: &'static str, ratio: f64, limits: [f64; 3]) -> Ec3Class {
+    let class = if ratio <= limits[0] {
+        1
+    } else if ratio <= limits[1] {
+        2
+    } else if ratio <= limits[2] {
+        3
+    } else {
+        4
+    };
+    Ec3Class::new(class, element, ratio, limits[2])
+}
+
+fn ec3_worst(parts: &[Ec3Class]) -> Ec3Class {
+    let mut worst = parts[0].clone();
+    for part in &parts[1..] {
+        if part.class > worst.class {
+            worst = part.clone();
+        }
+    }
+    worst
+}
+
+/// Section class under EC3 for `sec` with `fy` in MPa (epsilon = sqrt(235/fy)): `bending`
+/// selects Table 4-1, otherwise Table 4-2. The widths are the flat widths of the model (no
+/// root radius; conservative against the vendor examples, which subtract r), for Box
+/// `c = b - 3t` as in EN 1993-1-1 Table 5.2 for hollow sections. `None` when the shape is
+/// not in the vendor tables. `ColdBox` and `ColdPipe` are read as Box and Pipe (their shear and
+/// the rest of the design already treat them alike; the manual has no table of their own). Tees in bending: the stem limits need the stress ratio alpha and
+/// k_sigma, which the manual does not give, so only Class 1 (c/t <= 9 epsilon) is classified
+/// and anything above is class 5 (G72); the axial force is not used, so under tension this is
+/// conservative against Table 4-3.
+pub fn classify_ec3_section(sec: &FrameSection, fy_mpa: f64, bending: bool) -> Option<Ec3Class> {
+    let eps = (235.0 / fy_mpa).sqrt();
+    let flange = [9.0 * eps, 10.0 * eps, 14.0 * eps];
+    let web_bend = [72.0 * eps, 83.0 * eps, 124.0 * eps];
+    let web_comp = [33.0 * eps, 38.0 * eps, 42.0 * eps];
+    let tube = [50.0 * eps * eps, 70.0 * eps * eps, 90.0 * eps * eps];
+    let web = if bending { web_bend } else { web_comp };
+    let tf = sec.tf.max(1e-9);
+    let tfb = if sec.tfb > 0.0 { sec.tfb } else { tf };
+    let tw = sec.tw.max(1e-9);
+    match sec.prop_type {
+        FramePropType::I => {
+            let t2b = if sec.t2b > 0.0 { sec.t2b } else { sec.t2 };
+            Some(ec3_worst(&[
+                ec3_element("web", (sec.t3 - sec.tf - tfb).max(0.0) / tw, web),
+                ec3_element("top flange", 0.5 * (sec.t2 - tw) / tf, flange),
+                ec3_element("bottom flange", 0.5 * (t2b - tw) / tfb, flange),
+            ]))
+        }
+        FramePropType::Channel | FramePropType::DbChannel => {
+            let bf = if sec.prop_type == FramePropType::DbChannel {
+                0.5 * (sec.t2 - sec.dis)
+            } else {
+                sec.t2
+            };
+            Some(ec3_worst(&[
+                ec3_element("web", (sec.t3 - 2.0 * tf).max(0.0) / tw, web),
+                ec3_element("flange", (bf - tw).max(0.0) / tf, flange),
+            ]))
+        }
+        FramePropType::T => {
+            let flange_part = ec3_element("flange", 0.5 * (sec.t2 - tw) / tf, flange);
+            let stem_ratio = (sec.t3 - sec.tf).max(0.0) / tw;
+            let stem = if bending {
+                if stem_ratio <= flange[0] {
+                    ec3_element("stem", stem_ratio, flange)
+                } else {
+                    Ec3Class::new(5, "stem", stem_ratio, flange[0])
+                }
+            } else {
+                ec3_element("stem", stem_ratio, flange)
+            };
+            Some(ec3_worst(&[flange_part, stem]))
+        }
+        FramePropType::Angle | FramePropType::DblAngle => {
+            // Table 4-2 for both loadings: Class 3 when h/t <= 15 eps and (b + h)/(2t) <= 11.5 eps,
+            // else Class 4 (no Class 1 or 2).
+            let t = if sec.tf > 0.0 { sec.tf } else { sec.tw }.max(1e-9);
+            let b = if sec.prop_type == FramePropType::DblAngle {
+                0.5 * (sec.t2 - sec.dis)
+            } else {
+                sec.t2
+            };
+            let h = sec.t3;
+            let leg = ec3_element("leg h/t", h / t, [0.0, 0.0, 15.0 * eps]);
+            let sum = ec3_element("legs (b+h)/2t", (b + h) / (2.0 * t), [0.0, 0.0, 11.5 * eps]);
+            Some(ec3_worst(&[leg, sum]))
+        }
+        FramePropType::Box | FramePropType::ColdBox => Some(ec3_worst(&[
+            ec3_element("flange", (sec.t2 - 3.0 * tf).max(0.0) / tf, web),
+            ec3_element("web", (sec.t3 - 3.0 * tw).max(0.0) / tw, web),
+        ])),
+        FramePropType::Pipe | FramePropType::ColdPipe => {
+            let t = if sec.tw > 0.0 { sec.tw } else { sec.tf }.max(1e-9);
+            Some(ec3_element("wall d/t", sec.t3 / t, tube))
+        }
+        FramePropType::Rectangular | FramePropType::Circle => {
+            Some(Ec3Class::new(2, "solid section", 0.0, f64::INFINITY))
+        }
+        FramePropType::General | FramePropType::SD => {
+            Some(Ec3Class::new(3, "general section", 0.0, f64::INFINITY))
+        }
+        _ => None,
+    }
 }
 
 /// Computes Eurocode 3-2005 (`EN 1993-1-1` Section 6.2 & 6.3) design resistances
@@ -792,6 +1019,7 @@ pub fn compute_ec3_capacities(
     k33: f64,
     k22: f64,
     cb: f64,
+    bending_class: u8,
 ) -> (f64, f64, f64, f64, f64, SectionCompactness) {
     let e = mat.e.max(1.0);
     let g = if mat.g > 0.0 { mat.g } else { e / 2.6 };
@@ -841,7 +1069,11 @@ pub fn compute_ec3_capacities(
     let n_brd = (chi * ag * fy) / gamma_m1;
 
     // 3. Lateral-Torsional Buckling resistance Mb,Rd per EN 1993-1-1 6.3.2
-    let wy = if sec.z33 > 1e-9 && !compactness.is_slender() {
+    // D90: Class 1 and 2 use the plastic modulus, Class 3 the elastic modulus (manual p. 6-2).
+    // `bending_class` 4 or 5 never reaches a moment check: the stations that carry a moment
+    // are refused by the caller.
+    let plastic = bending_class <= 2;
+    let wy = if sec.z33 > 1e-9 && plastic {
         sec.z33
     } else {
         sec.s33.max(1e-9)
@@ -860,7 +1092,7 @@ pub fn compute_ec3_capacities(
     let m_brd_33 = (chi_lt * wy * fy) / gamma_m1;
 
     // 4. Minor-axis bending resistance Mc,Rd,z
-    let wz = if sec.z22 > 1e-9 && !compactness.is_slender() {
+    let wz = if sec.z22 > 1e-9 && plastic {
         sec.z22
     } else {
         sec.s22.max(1e-9)
@@ -1438,6 +1670,11 @@ pub fn try_run_steel_design_with_overwrites(
         let Some(frame) = model.frames.get(frame_name) else {
             return false;
         };
+        // D93: cable objects are not frame members; the vendor design manuals design frame
+        // objects only.
+        if frame.cable_params.is_some() {
+            return false;
+        }
         let Some(section) = model.frame_sections.get(&frame.section) else {
             return false;
         };
@@ -1583,6 +1820,10 @@ fn run_steel_design_validated(
     let mut auto_choices: Vec<(String, String)> = Vec::new();
 
     for (frame_name, frame) in &model.frames {
+        // D93: cables are not designed (see `try_run_steel_design_with_overwrites`).
+        if frame.cable_params.is_some() {
+            continue;
+        }
         let Some(sec) = model.frame_sections.get(&frame.section) else {
             continue;
         };
@@ -1693,6 +1934,35 @@ pub(crate) fn design_frame_with_section(
             }
         }
     }
+    // D88: I sections with unequal flanges are refused. The code takes the warping constant
+    // Cw = 0.25 Iy h0^2 of a doubly symmetric section (AISC E4-4, F2-7, EC3 Iw) and pairs the
+    // wider flange with the top thickness; F4 (singly symmetric I, G70) is not built. A zero
+    // bottom flange (t2b or tfb = 0) means "same as the top", as the rest of the code reads it.
+    if sec.prop_type == FramePropType::I {
+        let differs =
+            |top: f64, bottom: f64| bottom > 0.0 && (bottom - top).abs() > 1e-9 * top.abs();
+        if differs(sec.t2, sec.t2b) || differs(sec.tf, sec.tfb) {
+            let has_m3 = combo_forces.iter().any(|(_, frames)| {
+                frames.iter().any(|(name, states)| {
+                    name == frame_name && states.iter().flatten().any(|st| st.m3.abs() > 1e-9)
+                })
+            });
+            if code != SteelCode::Eurocode3 {
+                return Err(DesignError::UnequalFlangeISection {
+                    frame: frame_name.to_string(),
+                    section: sec.name.clone(),
+                    what: "F4 / Cw for unequal flanges",
+                });
+            }
+            if has_m3 {
+                return Err(DesignError::UnequalFlangeISection {
+                    frame: frame_name.to_string(),
+                    section: sec.name.clone(),
+                    what: "Iw for unequal flanges",
+                });
+            }
+        }
+    }
     let l_clear = frame_clear_length(model, frame).max(1e-6);
     let l33 = ow.and_then(|o| o.l_ratio_major).unwrap_or(1.0) * l_clear;
     let l22 = ow.and_then(|o| o.l_ratio_minor).unwrap_or(1.0) * l_clear;
@@ -1750,6 +2020,61 @@ pub(crate) fn design_frame_with_section(
     if phi_tn.is_some() {
         interacting_forces |= interacting::V2 | interacting::V3 | interacting::T;
     }
+    // D90: EC3 section class by the vendor's Tables 4-1 (bending) and 4-2 (compression).
+    let ec3_classes = if code == SteelCode::Eurocode3 {
+        let fy_mpa = mat.fy * model.present_units.stress_factor_to(sap_units::Units::NMmC);
+        let classify = |bending: bool| {
+            classify_ec3_section(sec, fy_mpa, bending).ok_or_else(|| {
+                DesignError::UnsupportedEc3Classification {
+                    frame: frame_name.to_string(),
+                    section: sec.name.clone(),
+                    kind: format!("{:?}", sec.prop_type),
+                }
+            })
+        };
+        Some((classify(false)?, classify(true)?))
+    } else {
+        None
+    };
+    // EC3 6.2.8(5) as the manual prints it (p. 6-2): the reduced plastic resistance moment
+    // (Wpl - n rho Aw^2/(4 tw)) fy, limited by the resistance M_c,Rd of the section's class. For a
+    // Class 3 section M_c,Rd is the elastic one, so the reduction only acts where the reduced
+    // plastic value falls below it; the manual prints no separate Class 3 reduction (G72).
+    let w_major_red = if sec.z33 > 1e-9 {
+        sec.z33
+    } else {
+        sec.s33.max(1e-9)
+    };
+    let w_minor_red = if sec.z22 > 1e-9 {
+        sec.z22
+    } else {
+        sec.s22.max(1e-9)
+    };
+    // D92: EC3 does not design torsion on open shapes (manual 2.2.1: "The effects of torsion are
+    // not considered in the design (EC3 6.2.7)"); Box and Pipe are refused above. Say so in the
+    // result when the member has a torsion that is not zero against its moments.
+    let mut notes: Vec<String> = Vec::new();
+    if code == SteelCode::Eurocode3 {
+        let mut t_max = 0.0_f64;
+        let mut m_max = 0.0_f64;
+        for (_, frames) in combo_forces {
+            for (name, states) in frames {
+                if name != frame_name {
+                    continue;
+                }
+                for st in states.iter().flatten() {
+                    t_max = t_max.max(st.t.abs());
+                    m_max = m_max.max(st.m2.abs()).max(st.m3.abs());
+                }
+            }
+        }
+        if t_max > 1e-6 * m_max && t_max > 0.0 {
+            notes.push(
+                "torsion T is not designed (EC3 manual 2.2.1: effects of torsion are not considered)"
+                    .to_string(),
+            );
+        }
+    }
     let mut best_result: Option<SteelDesignResult> = None;
 
     for (combo_name, frame_map) in combo_forces {
@@ -1782,13 +2107,82 @@ pub(crate) fn design_frame_with_section(
             let (phi_pnc, phi_pnt, phi_mn33, phi_mn22, phi_vn2, compactness) = match code {
                 SteelCode::Aisc360Lrfd | SteelCode::Aisc360Asd => {
                     compute_aisc_360_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb, is_asd)
+                        .map_err(|err| match err {
+                            DesignError::SlenderPipeNotDesigned {
+                                section,
+                                d_over_t,
+                                limit,
+                                ..
+                            } => DesignError::SlenderPipeNotDesigned {
+                                frame: frame_name.to_string(),
+                                section,
+                                d_over_t,
+                                limit,
+                            },
+                            other => other,
+                        })?
                 }
                 SteelCode::Eurocode3 => {
-                    compute_ec3_capacities(sec, mat, l33, l22, l_ltb, k33, k22, cb)
+                    compute_ec3_capacities(
+                        sec,
+                        mat,
+                        l33,
+                        l22,
+                        l_ltb,
+                        k33,
+                        k22,
+                        cb,
+                        ec3_classes.as_ref().map_or(1, |(_, bend)| bend.class),
+                    )
                 }
             };
 
             for st in stations {
+                // D89 (G71): EC3 6.3.3(4) under compression and bending needs the interaction
+                // factors of Annex A or B, which neither vendor manual prints.
+                if code == SteelCode::Eurocode3
+                    && st.p < 0.0
+                    && st.p.abs() / phi_pnc.max(1e-12) > 1e-9
+                    && st.m3.abs() / phi_mn33.max(1e-12) + st.m2.abs() / phi_mn22.max(1e-12) > 1e-9
+                {
+                    return Err(DesignError::Ec3CompressionBendingUnsupported {
+                        frame: frame_name.to_string(),
+                        combo: combo_name.clone(),
+                        station: st.station.to_string(),
+                    });
+                }
+                // D90: a Class 4 (or unclassifiable) element needs effective properties that
+                // are not built (G72): refuse the station that would use them.
+                if let Some((comp, bend)) = &ec3_classes {
+                    // The same roundoff-proof tests as D89 (dimensionless against the resistances),
+                    // so that a compression of 1e-12 of N_b,Rd in a beam does not stop the run.
+                    let compressed = st.p < 0.0 && st.p.abs() / phi_pnc.max(1e-12) > 1e-9;
+                    let bent = st.m3.abs() / phi_mn33.max(1e-12)
+                        + st.m2.abs() / phi_mn22.max(1e-12)
+                        > 1e-9;
+                    for (needed, class, load) in [
+                        (compressed, comp, "compression"),
+                        (bent, bend, "bending"),
+                    ] {
+                        if needed && class.class >= 4 {
+                            return Err(DesignError::Ec3SectionClass {
+                                frame: frame_name.to_string(),
+                                section: sec.name.clone(),
+                                detail: format!(
+                                    "{load} has element '{}' with c/t = {} above the limit {} ({})",
+                                    class.element,
+                                    class.ratio,
+                                    class.limit,
+                                    if class.class == 4 {
+                                        "Class 4, the limit is that of Class 3"
+                                    } else {
+                                        "not classifiable from the manual, the limit is that of Class 1"
+                                    }
+                                ),
+                            });
+                        }
+                    }
+                }
                 let mut reported_phi_mn33 = phi_mn33;
                 let mut reported_phi_mn22 = phi_mn22;
                 let (
@@ -1823,22 +2217,14 @@ pub(crate) fn design_frame_with_section(
                                 let n = 1.0;
                                 let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
                                 let aw = hw * sec.tw;
-                                let wpl = if sec.z33 > 1e-9 {
-                                    sec.z33
-                                } else {
-                                    sec.s33.max(1e-9)
-                                };
+                                let wpl = w_major_red;
                                 (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
                             }
                             FramePropType::T => {
                                 let n = 1.0;
                                 let hw = (sec.t3 - sec.tf).max(1e-6);
                                 let aw = hw * sec.tw;
-                                let wpl = if sec.z33 > 1e-9 {
-                                    sec.z33
-                                } else {
-                                    sec.s33.max(1e-9)
-                                };
+                                let wpl = w_major_red;
                                 (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
                             }
                             FramePropType::Box
@@ -1848,11 +2234,7 @@ pub(crate) fn design_frame_with_section(
                                 let n = 2.0;
                                 let hw = (sec.t3 - 2.0 * sec.tf).max(1e-6);
                                 let aw = hw * sec.tw;
-                                let wpl = if sec.z33 > 1e-9 {
-                                    sec.z33
-                                } else {
-                                    sec.s33.max(1e-9)
-                                };
+                                let wpl = w_major_red;
                                 (wpl - n * rho2 * aw * aw / (4.0 * sec.tw.max(1e-6))) * mat.fy
                             }
                             _ => (1.0 - rho2) * phi_mn33,
@@ -1868,35 +2250,30 @@ pub(crate) fn design_frame_with_section(
                             FramePropType::T => {
                                 let n = 1.0;
                                 let af = sec.t2 * sec.tf;
-                                let wpl = if sec.z22 > 1e-9 {
-                                    sec.z22
-                                } else {
-                                    sec.s22.max(1e-9)
-                                };
+                                let wpl = w_minor_red;
                                 (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
                             }
                             FramePropType::I
                             | FramePropType::Channel
                             | FramePropType::Box
-                            | FramePropType::ColdBox
-                            | FramePropType::DblAngle => {
+                            | FramePropType::ColdBox => {
                                 let n = 2.0;
                                 let af = sec.t2 * sec.tf;
-                                let wpl = if sec.z22 > 1e-9 {
-                                    sec.z22
-                                } else {
-                                    sec.s22.max(1e-9)
-                                };
+                                let wpl = w_minor_red;
+                                (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
+                            }
+                            // D87: `t2` is the total width of a double section; af is one
+                            // member's flange, ((t2 - dis)/2) tf.
+                            FramePropType::DblAngle => {
+                                let n = 2.0;
+                                let af = 0.5 * (sec.t2 - sec.dis) * sec.tf;
+                                let wpl = w_minor_red;
                                 (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
                             }
                             FramePropType::DbChannel => {
                                 let n = 4.0;
-                                let af = sec.t2 * sec.tf;
-                                let wpl = if sec.z22 > 1e-9 {
-                                    sec.z22
-                                } else {
-                                    sec.s22.max(1e-9)
-                                };
+                                let af = 0.5 * (sec.t2 - sec.dis) * sec.tf;
+                                let wpl = w_minor_red;
                                 (wpl - n * rho3 * af * af / (4.0 * sec.tf.max(1e-6))) * mat.fy
                             }
                             _ => (1.0 - rho3) * phi_mn22,
@@ -1964,9 +2341,11 @@ pub(crate) fn design_frame_with_section(
                             sec.prop_type,
                             FramePropType::Pipe | FramePropType::ColdPipe
                         ) {
+                            // D85: the Pipe form of H3-6 (manual p. 3-81, rendered page) is
+                            // Pr/Pc + sqrt[(Mr33/Mc33)^2 + (Mr22/Mc22)^2] + (...)^2; an
+                            // earlier version squared each ratio without the radical.
                             pr_over_pc
-                                + mr3_over_mc3.powi(2)
-                                + mr2_over_mc2.powi(2)
+                                + (mr3_over_mc3.powi(2) + mr2_over_mc2.powi(2)).sqrt()
                                 + shear_torsion_ratio
                         } else {
                             pr_over_pc + mr3_over_mc3 + mr2_over_mc2 + shear_torsion_ratio
@@ -1998,9 +2377,16 @@ pub(crate) fn design_frame_with_section(
                     eq_name
                 };
 
+                // D91: for an I section the flexural limit state of a slender flange is built
+                // (F3-2, `mn_flb`), so a slender flange alone does not make the result
+                // "SLENDER"; a slender web (F5), and every other shape whose noncompact or slender
+                // flexure is taken as Mp, still do.
+                let slender_flange_only_of_i = sec.prop_type == FramePropType::I
+                    && compactness.flange_flexure == CompactnessClass::Slender
+                    && compactness.web_flexure != CompactnessClass::Slender;
                 let status = if gov_ratio > 1.0 {
                     "OVERSTRESSED".to_string()
-                } else if compactness.is_slender() {
+                } else if compactness.is_slender() && !slender_flange_only_of_i {
                     "SLENDER".to_string()
                 } else {
                     "OK".to_string()
@@ -2032,6 +2418,7 @@ pub(crate) fn design_frame_with_section(
                         phi_vn3,
                         status,
                         eq_name: gov_eq.to_string(),
+                        notes: notes.clone(),
                     });
                 }
             }

@@ -1639,6 +1639,9 @@ pub struct SteelDesignResult {
     pub phi_vn3: f64,
     pub status: String,  // "OK", "OVERSTRESSED", "SLENDER"
     pub eq_name: String, // e.g. "H1-1a", "H1-1b", "EC3-6.2"
+    /// Statements about what the check did not cover (D92), e.g. an EC3 torsion that is not designed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
