@@ -223,6 +223,139 @@ pub fn design_aci_column_shear(
     aci_shear_from_vc(vu, vc, bw, d, fc, fyt, units)
 }
 
+/// Torsion strength reduction factor $\phi$ (ACI 318-14 Table 21.2.1, CSI manual p. 3-45).
+const ACI_PHI_TORSION: f64 = 0.75;
+
+/// Threshold torsion $T_{th}$ of ACI 318-14 Table 22.7.4.1a (CSI manual p. 3-44), with the gross
+/// area `acp` and outer perimeter `pcp` of the section, $A_g = A_{cp}$ and $\lambda = 1$:
+/// $T_{th} = \lambda\sqrt{f'_c}\,(A_{cp}^2/p_{cp})\sqrt{1 + P_u/(4A_g\lambda\sqrt{f'_c})}$, $f'_c$ in
+/// psi, $P_u$ compression positive; the root is taken as 0 when its argument is negative (tension).
+/// Returns `(T_th, T_th with P_u = 0)`.
+fn aci_torsion_threshold(acp: f64, pcp: f64, pu_comp: f64, fc: f64, units: Units) -> (f64, f64) {
+    let to_psi = units.stress_factor_to(Units::LbInF);
+    let fc_psi = (fc * to_psi).max(2000.0);
+    let sqrt_fc = fc_psi.sqrt() / to_psi;
+    let base = sqrt_fc * (acp * acp / pcp.max(1e-12));
+    let arg = 1.0 + pu_comp / (4.0 * acp * sqrt_fc).max(1e-12);
+    (base * arg.max(0.0).sqrt(), base)
+}
+
+/// $\phi T_{th}$ of the rectangle `b` x `h` at $P_u = 0$ (ACI 318-14 Table 22.7.4.1a). With a section
+/// that is not rectangular this is the bounding rectangle and serves only as the noise floor (D130).
+fn aci_phi_tth0_rect(b: f64, h: f64, fc: f64, units: Units) -> f64 {
+    ACI_PHI_TORSION * aci_torsion_threshold(b * h, 2.0 * (b + h), 0.0, fc, units).1
+}
+
+/// Result of [`design_aci_beam_torsion`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AciTorsion {
+    /// Torsion is ignored: $T_u \le \max(\phi T_{th}, 10^{-6}\phi T_{th,0})$.
+    pub ignored: bool,
+    /// $A_t/s$ of ACI 318-14 22.7.6.1: one leg of the closed stirrup (manual p. 3-46).
+    pub at_over_s: f64,
+    /// Longitudinal torsion steel $A_l$: the larger of 22.7.6.1 and the minimum 9.6.4.3 (pp. 3-45, 3-46).
+    pub al: f64,
+    /// Minimum of $A_v/s + 2A_t/s$ of ACI 9.6.4.2 (p. 3-46); 0 when torsion is ignored.
+    pub transverse_min: f64,
+    /// The limit on $V_u$ and $T_u$ together is exceeded (p. 3-46).
+    pub section_overstressed: bool,
+}
+
+impl AciTorsion {
+    const IGNORED: AciTorsion = AciTorsion {
+        ignored: true,
+        at_over_s: 0.0,
+        al: 0.0,
+        transverse_min: 0.0,
+        section_overstressed: false,
+    };
+}
+
+/// Torsion design of a rectangular beam `b` x `h` (effective depth `d`, $b_w = b$) under ACI 318-14 as
+/// the CSI manual prints it (pp. 3-42 to 3-46): `tu` and `vu` are the absolute torsion and V2 shear,
+/// `pu_comp` the axial force with compression positive, `fy` and `fys` the longitudinal and stirrup
+/// yield stresses. $\phi = 0.75$, $\lambda = 1$, $\theta = 45^\circ$.
+///
+/// Properties (p. 3-44) with the stirrup centreline $c = 1.75$ in from the surface:
+/// $A_{oh} = (b - 2c)(h - 2c)$, $p_h = 2(b - 2c) + 2(h - 2c)$, $A_o = 0.85A_{oh}$; if the stirrup does
+/// not fit the call returns `Err`. Regimes: $T_u \le \phi T_{th}$ (or the noise floor
+/// $10^{-6}\phi T_{th,0}$, this program's): ignored; $\phi T_{th} < T_u \le \phi T_{cr}$,
+/// $T_{cr} = 4T_{th}$: only the minimum reinforcement ($A_t/s = 0$, $A_l = A_{l,min}$); above
+/// $\phi T_{cr}$: $A_t/s = T_u/(2\phi A_o f_{ys})$, $A_l = T_up_h/(2\phi A_of_y)$ and the minimums.
+/// Following the manual, a torsion between $\phi T_{th}$ and $\phi T_{cr}$ gets minimum
+/// reinforcement only, which is less than ACI 22.7.6 asks: this is the vendor's printed choice (D130).
+/// $A_{l,min}$ is the lesser of 9.6.4.3a and 9.6.4.3b, at least 0. The transverse minimum of 9.6.4.2
+/// is returned in `transverse_min`; the page prints its second term with $f_y$, this uses $f_{ys}$ as
+/// ACI 9.6.4.2 and the vendor's shear minimum (p. 3-41) do. The section limit of p. 3-46 is
+/// $\sqrt{(V_u/(bd))^2 + (T_up_h/(1.7A_{oh}^2))^2} \le \phi(V_c/(bd) + 8\sqrt{f'_c})$, $V_c = 2\sqrt{f'_c}bd$.
+pub fn design_aci_beam_torsion(
+    tu: f64,
+    vu: f64,
+    pu_comp: f64,
+    b: f64,
+    h: f64,
+    d: f64,
+    fc: f64,
+    fy: f64,
+    fys: f64,
+    units: Units,
+) -> Result<AciTorsion, &'static str> {
+    let (tth, tth0) = aci_torsion_threshold(b * h, 2.0 * (b + h), pu_comp, fc, units);
+    let phi = ACI_PHI_TORSION;
+    if tu <= (phi * tth).max(1e-6 * phi * tth0) {
+        return Ok(AciTorsion::IGNORED);
+    }
+    let c = 1.75 * Units::KipInF.length_factor_to(units);
+    if b <= 2.0 * c || h <= 2.0 * c {
+        return Err("the closed stirrup the manual assumes at 1.75 in from the surface does not fit");
+    }
+    let to_psi = units.stress_factor_to(Units::LbInF);
+    let fc_psi = (fc * to_psi).max(2000.0);
+    let sqrt_fc = fc_psi.sqrt() / to_psi;
+    let fys_psi = (fys * to_psi).max(20000.0);
+    let acp = b * h;
+    let aoh = (b - 2.0 * c) * (h - 2.0 * c);
+    let ph = 2.0 * (b - 2.0 * c) + 2.0 * (h - 2.0 * c);
+    let ao = 0.85 * aoh;
+
+    let (at, al_req) = if tu <= phi * 4.0 * tth {
+        (0.0, 0.0)
+    } else {
+        (tu / (phi * 2.0 * ao * fys), tu * ph / (phi * 2.0 * ao * fy))
+    };
+    let al_a = 5.0 * sqrt_fc * acp / fy - at * ph * fys / fy;
+    let al_b = 5.0 * sqrt_fc * acp / fy - (25.0 / fys_psi * b) * ph * fys / fy;
+    let al_min = al_a.min(al_b).max(0.0);
+    let transverse_min = ((0.75 * fc_psi.sqrt()).max(50.0) / fys_psi) * b;
+
+    let vc = 2.0 * sqrt_fc * b * d;
+    let lhs = ((vu / (b * d)).powi(2) + (tu * ph / (1.7 * aoh * aoh)).powi(2)).sqrt();
+    let rhs = phi * (vc / (b * d) + 8.0 * sqrt_fc);
+    Ok(AciTorsion {
+        ignored: false,
+        at_over_s: at,
+        al: al_req.max(al_min),
+        transverse_min,
+        section_overstressed: lhs > rhs,
+    })
+}
+
+/// Stirrup demand $A_v/s$ of a beam from strength alone, $(V_u - \phi V_c)/(\phi f_{ys}d)$ when
+/// $V_u > \phi V_c$ and 0 otherwise: the shear rule of [`design_aci_beam_shear`] without its
+/// minimum, for the combination with torsion (ACI 9.6.4.2 replaces 9.6.3.3; manual pp. 3-42, 3-46).
+fn aci_beam_av_strength(vu: f64, bw: f64, d: f64, fc: f64, fyt: f64, units: Units) -> f64 {
+    let to_psi = units.stress_factor_to(Units::LbInF);
+    let fc_psi = (fc * to_psi).max(2000.0);
+    let vc = (2.0 * fc_psi.sqrt()) / to_psi * bw * d;
+    let phi_v = 0.75;
+    let phi_vc = phi_v * vc;
+    if vu <= phi_vc {
+        0.0
+    } else {
+        ((vu - phi_vc) / phi_v) / (fyt * d).max(1e-12)
+    }
+}
+
 /// Strut inclination $\cot\theta$ of a beam under EN 1992-1-1 6.2.3 as the CSI manual states it
 /// (printed pp. 3-32 and 3-33). With seismic in the design combination $\theta = 45^\circ$
 /// ($\cot\theta = 1$). Otherwise $\theta$ is optimised from
@@ -231,7 +364,9 @@ pub fn design_aci_column_shear(
 /// $V_{Ed} = V_{Rd,max}(\theta)$). With $X = 0.9\nu_1 f_{cd}/v_{Ed}$ the root is
 /// $\cot\theta = (X + \sqrt{X^2 - 4})/2$ clamped to $[1, 2.5]$; for $X < 2$ no angle gives
 /// $V_{Rd,max} \ge V_{Ed}$ and $\cot\theta = 1$ (the station is then overstressed). The manual's
-/// torsion clause ($T_{Ed} > T_{cr}$ gives 45 degrees) is not applied: concrete torsion is not designed.
+/// torsion clause ($T_{Ed} > T_{cr}$ gives 45 degrees) is passed in through `seismic`: the caller
+/// sets the flag when Eq. 6.31 fails above the noise floor (see [`design_ec2_beam_torsion`]). The v24
+/// manual (p. 3-36) prints "or" between that clause and the seismic one; v19 joins them unclearly (D130).
 pub fn ec2_beam_strut_cot(vu: f64, b: f64, d: f64, fck: f64, units: Units, seismic: bool) -> f64 {
     if seismic {
         return 1.0;
@@ -250,6 +385,20 @@ pub fn ec2_beam_strut_cot(vu: f64, b: f64, d: f64, fck: f64, units: Units, seism
     } else {
         (0.5 * (x + (x * x - 4.0).sqrt())).clamp(1.0, 2.5)
     }
+}
+
+/// $V_{Rd,c}$ of EN 1992-1-1 6.2.2(1) as [`ec2_shear_core`] uses it (the formula is in its doc
+/// comment), shared with the torsion rule of [`design_ec2_beam_torsion`] (Eq. 6.31).
+fn ec2_v_rd_c(b: f64, d: f64, rho_l: f64, fck: f64, units: Units) -> f64 {
+    let to_mpa = units.stress_factor_to(Units::NMmC);
+    let to_mm = units.length_factor_to(Units::NMmC);
+    let fck_mpa = (fck * to_mpa).max(12.0);
+    let gamma_c = 1.50;
+    let k = (1.0 + (200.0 / (d * to_mm).max(1e-9)).sqrt()).min(2.0);
+    let rho_l = rho_l.clamp(0.0, 0.02);
+    let v_min = 0.035 * k.powf(1.5) * fck_mpa.sqrt();
+    let v_rd_c_stress = ((0.18 / gamma_c) * k * (100.0 * rho_l * fck_mpa).cbrt()).max(v_min) / to_mpa;
+    v_rd_c_stress * b * d
 }
 
 /// Shear reinforcement $A_{sw}/s$ and the $V_{Rd,max}$ flag of EN 1992-1-1 6.2.3 for the strut
@@ -271,7 +420,6 @@ fn ec2_shear_core(
     units: Units,
 ) -> (f64, bool) {
     let to_mpa = units.stress_factor_to(Units::NMmC);
-    let to_mm = units.length_factor_to(Units::NMmC);
     let fck_mpa = (fck * to_mpa).max(12.0);
     let fytk_mpa = (fytk * to_mpa).max(200.0);
     let gamma_c = 1.50;
@@ -282,11 +430,7 @@ fn ec2_shear_core(
     let z = 0.9 * d;
     let rho_w_min = (0.08 * fck_mpa.sqrt()) / fytk_mpa;
     let asw_s_min = rho_w_min * b;
-    let k = (1.0 + (200.0 / (d * to_mm).max(1e-9)).sqrt()).min(2.0);
-    let rho_l = rho_l.clamp(0.0, 0.02);
-    let v_min = 0.035 * k.powf(1.5) * fck_mpa.sqrt();
-    let v_rd_c_stress = ((0.18 / gamma_c) * k * (100.0 * rho_l * fck_mpa).cbrt()).max(v_min) / to_mpa;
-    let v_rd_c = v_rd_c_stress * b * d;
+    let v_rd_c = ec2_v_rd_c(b, d, rho_l, fck, units);
     let nu1 = 0.6 * (1.0 - fck_mpa / 250.0).max(0.3);
     let v_rd_max = (b * z * nu1 * fcd) / (cot_theta + 1.0 / cot_theta);
 
@@ -298,6 +442,127 @@ fn ec2_shear_core(
     };
     // V_Ed = V_Rd,max holds at the optimised angle: allow for the rounding of that equality
     (av_s, vu > v_rd_max * (1.0 + 1e-9))
+}
+
+/// Torsion of a beam under Eurocode 2-2004 as the CSI manual prints it (manual pp. 3-32 to 3-37,
+/// v24 pp. 3-36 and 3-41), result of [`design_ec2_beam_torsion`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ec2Torsion {
+    /// Torsion is ignored: below the noise floor, or Eq. 6.31 holds (p. 3-36).
+    pub ignored: bool,
+    /// $A_t/s = V_t/(z f_{ywd}\cot\theta)$, $\theta = 45^\circ$ (p. 3-36).
+    pub at_over_s: f64,
+    /// $A_{sl} = T_{Ed} u_k \cot\theta/(2A_k f_{yd})$ (Eq. 6.28, p. 3-36).
+    pub asl: f64,
+    /// Eq. 6.29 is exceeded: $T_{Ed}/T_{Rd,max} + V_{Ed}/V_{Rd,max} > 1$ (p. 3-37).
+    pub overstressed: bool,
+}
+
+impl Ec2Torsion {
+    const IGNORED: Ec2Torsion = Ec2Torsion {
+        ignored: true,
+        at_over_s: 0.0,
+        asl: 0.0,
+        overstressed: false,
+    };
+}
+
+/// Properties of a section for the torsion rules of EN 1992-1-1 6.3.2 (manual pp. 3-34, 3-35):
+/// `(t_ef, A_k, u_k, T_Rd,c)` from the gross area `a`, the outer circumference `u`, the width `bk`
+/// and depth `hk` the core area is taken from, and the concrete strength `fck`:
+/// $t_{ef} = A/u$, $A_k = (b_k - t_{ef})(h_k - t_{ef})$, $u_k = 2(b_k - t_{ef}) + 2(h_k - t_{ef})$,
+/// $T_{Rd,c} = f_{ctd} t_{ef} 2A_k$, $f_{ctd} = \alpha_{ct} f_{ctk0.05}/\gamma_c$, $\alpha_{ct} = 1$,
+/// $f_{ctk0.05} = 0.7 f_{ctm}$, $f_{ctm} = 0.30 f_{ck}^{2/3}$ (MPa), $\gamma_c = 1.5$ (manual p. 3-36).
+fn ec2_torsion_section(
+    a: f64,
+    u: f64,
+    bk: f64,
+    hk: f64,
+    fck: f64,
+    units: Units,
+) -> (f64, f64, f64, f64) {
+    let to_mpa = units.stress_factor_to(Units::NMmC);
+    let fck_mpa = (fck * to_mpa).max(12.0);
+    let fctm_mpa = 0.30 * fck_mpa.powf(2.0 / 3.0);
+    let fctd_mpa = 1.0 * (0.7 * fctm_mpa) / 1.5;
+    let fctd = fctd_mpa / to_mpa;
+    let tef = a / u.max(1e-12);
+    let ak = (bk - tef) * (hk - tef);
+    let uk = 2.0 * (bk - tef) + 2.0 * (hk - tef);
+    (tef, ak, uk, fctd * tef * 2.0 * ak)
+}
+
+/// $T_{Rd,c}$ of the rectangle `b` x `h` (EN 1992-1-1 6.3.2, manual p. 3-36). With a section that
+/// is not rectangular this is the bounding rectangle and serves only as the noise floor (D130).
+fn ec2_trd_c_rect(b: f64, h: f64, fck: f64, units: Units) -> f64 {
+    ec2_torsion_section(b * h, 2.0 * (b + h), b, h, fck, units).3
+}
+
+/// Noise floor of torsion in the EC2 rules: $T_{Ed} \le 10^{-6} T_{Rd,c}$ is a roundoff torsion
+/// (D130; this program's, not the manual's). Relative to the section's own strength, so it does not
+/// depend on the units.
+const TORSION_FLOOR: f64 = 1e-6;
+
+/// Torsion design of a rectangular beam `b` x `h` with effective depth `d` under Eurocode 2-2004 as
+/// the CSI manual prints it (manual pp. 3-32 to 3-37; v24 manual pp. 3-36 and 3-41 for the "or" of the
+/// strut clause). `t_ed` and `v_ed` are the absolute torsion and V2 shear, `rho_l` the flexural steel
+/// ratio the shear design of the same station uses for $V_{Rd,c}$.
+///
+/// Torsion is ignored when $T_{Ed} \le 10^{-6} T_{Rd,c}$ (the noise floor, this program's) or
+/// Eq. 6.31 holds, $T_{Ed}/T_{Rd,c} + V_{Ed}/V_{Rd,c} \le 1$. Otherwise
+/// $T_{con} = (1 - V_{Ed}/V_{Rd,c})T_{Rd,c}$, $V_t = 2(h - t_{ef})(T_{Ed} - T_{con})/(2A_k)$,
+/// $A_t/s = V_t/(z f_{ywd}\cot\theta)$, $A_{sl} = T_{Ed}u_k\cot\theta/(2A_kf_{yd})$ with $\theta = 45^\circ$,
+/// $z = 0.9d$, and Eq. 6.29 with $T_{Rd,max} = 2\nu\alpha_{cw}f_{cd}A_kt_{ef}\sin\theta\cos\theta$
+/// ($\alpha_{cw} = 1$) and $V_{Rd,max}$ at 45 degrees. No minimums (p. 3-37).
+///
+/// D148: with $V_{Ed} > V_{Rd,c}$ the printed $T_{con}$ is negative, so $A_t/s$ does not vanish with
+/// the torsion; this is built as printed and has not been checked in the vendor program.
+pub fn design_ec2_beam_torsion(
+    t_ed: f64,
+    v_ed: f64,
+    b: f64,
+    h: f64,
+    d: f64,
+    rho_l: f64,
+    fck: f64,
+    fyk: f64,
+    fytk: f64,
+    units: Units,
+) -> Ec2Torsion {
+    let (tef, ak, uk, t_rd_c) = ec2_torsion_section(b * h, 2.0 * (b + h), b, h, fck, units);
+    let v_rd_c = ec2_v_rd_c(b, d, rho_l, fck, units);
+    if t_ed <= TORSION_FLOOR * t_rd_c || t_ed / t_rd_c + v_ed / v_rd_c <= 1.0 {
+        return Ec2Torsion::IGNORED;
+    }
+    let to_mpa = units.stress_factor_to(Units::NMmC);
+    let fck_mpa = (fck * to_mpa).max(12.0);
+    let fcd = 0.85 * fck / 1.50;
+    let nu1 = 0.6 * (1.0 - fck_mpa / 250.0).max(0.3);
+    let z = 0.9 * d;
+    let fywd = fytk / 1.15;
+    let fyd = fyk / 1.15;
+    let t_con = (1.0 - v_ed / v_rd_c) * t_rd_c;
+    let v_t = 2.0 * (h - tef) * ((t_ed - t_con) / (2.0 * ak));
+    let cot = 1.0;
+    let at_over_s = v_t / (z * fywd * cot).max(1e-12);
+    let asl = t_ed / (2.0 * ak) * cot * uk / fyd.max(1e-12);
+    let v_rd_max = (b * z * nu1 * fcd) / (cot + 1.0 / cot);
+    let t_rd_max = 2.0 * nu1 * 1.0 * fcd * ak * tef * 0.5;
+    Ec2Torsion {
+        ignored: false,
+        at_over_s,
+        asl,
+        overstressed: t_ed / t_rd_max + v_ed / v_rd_max > 1.0 + 1e-9,
+    }
+}
+
+/// The section of a beam whose torsion the inner step of [`design_ec2_beam_seismic`] weighs: a
+/// rectangle is designed, a T beam is only compared with the printed threshold (G85, D144).
+#[derive(Debug, Clone, Copy)]
+enum Ec2TorsionShape {
+    Rect,
+    /// Flange width, flange thickness, web width of a T beam.
+    T { bf: f64, ds: f64, bw: f64 },
 }
 
 /// Shear reinforcement of a column in one direction, EN 1992-1-1 as the CSI manual states it for
@@ -440,6 +705,29 @@ pub fn design_ec2_beam_seismic(
     units: Units,
     seismic: bool,
 ) -> Ec2BeamDesign {
+    match ec2_beam_with_torsion(mu, vu, b, d, d_prime, fck, fyk, fytk, units, seismic, None) {
+        Ok((design, _)) => design,
+        Err(reason) => unreachable!("no torsion given, no refusal: {reason}"),
+    }
+}
+
+/// [`design_ec2_beam_seismic`] with the torsion `t_ed` of the station and the depth `h` and shape of
+/// the section (D130). With torsion that Eq. 6.31 does not let the design ignore, the strut of the
+/// shear design is at 45 degrees ([`ec2_beam_strut_cot`]) and the torsion result is returned beside
+/// the design; a T beam with such torsion is refused with the reason as text (G85).
+fn ec2_beam_with_torsion(
+    mu: f64,
+    vu: f64,
+    b: f64,
+    d: f64,
+    d_prime: f64,
+    fck: f64,
+    fyk: f64,
+    fytk: f64,
+    units: Units,
+    seismic: bool,
+    torsion: Option<(f64, f64, Ec2TorsionShape)>,
+) -> Result<(Ec2BeamDesign, Ec2Torsion), String> {
     let to_mpa = units.stress_factor_to(Units::NMmC);
     let fck_mpa = (fck * to_mpa).max(12.0);
     let fyk_mpa = (fyk * to_mpa).max(200.0);
@@ -454,15 +742,51 @@ pub fn design_ec2_beam_seismic(
     // Shear design (EN 1992-1-1 6.2.3): rho_l is the tension steel this call designs (0 without
     // a moment), the strut angle follows the manual.
     let rho_l = as_req / (b * d).max(1e-12);
-    let cot_theta = ec2_beam_strut_cot(vu, b, d, fck, units, seismic);
+    let tors = match torsion {
+        None => Ec2Torsion::IGNORED,
+        Some((t_ed, h, Ec2TorsionShape::Rect)) => {
+            design_ec2_beam_torsion(t_ed, vu, b, h, d, rho_l, fck, fyk, fytk, units)
+        }
+        Some((t_ed, h, Ec2TorsionShape::T { bf, ds, bw })) => {
+            // Printed T-beam properties (manual p. 3-35); VRd,c is that of the rectangle the
+            // shear design uses (D144).
+            let (_, _, _, t_rd_c) = ec2_torsion_section(
+                bw * h + (bf - bw) * ds,
+                2.0 * bf + 2.0 * h,
+                bf,
+                h,
+                fck,
+                units,
+            );
+            let v_rd_c = ec2_v_rd_c(b, d, rho_l, fck, units);
+            let sum = t_ed / t_rd_c + vu / v_rd_c;
+            // the noise floor is that of the bounding rectangle b x h (D130)
+            if t_ed <= TORSION_FLOOR * ec2_trd_c_rect(b, h, fck, units) || sum <= 1.0 {
+                Ec2Torsion::IGNORED
+            } else {
+                return Err(format!(
+                    "TEd = {t_ed} is above what Eq. 6.31 lets the design ignore \
+                     (TEd/TRd,c + VEd/VRd,c = {sum} with TRd,c = {t_rd_c} and VRd,c = {v_rd_c}) \
+                     of the T beam; torsion design is implemented for rectangular beams only \
+                     (section type T); G85"
+                ));
+            }
+        }
+    };
+    // Torsion that is not ignored fixes the strut at 45 degrees, as a seismic state does (the v24
+    // manual p. 3-36 prints "or" between the two clauses).
+    let cot_theta = ec2_beam_strut_cot(vu, b, d, fck, units, seismic || !tors.ignored);
     let (av_s, over_shear) = ec2_shear_core(vu, b, d, rho_l, fck, fytk, cot_theta, units);
-    Ec2BeamDesign {
-        as_tension: as_req,
-        as_comp,
-        as_min,
-        av_s,
-        overstressed: over_flex || over_shear,
-    }
+    Ok((
+        Ec2BeamDesign {
+            as_tension: as_req,
+            as_comp,
+            as_min,
+            av_s,
+            overstressed: over_flex || over_shear || tors.overstressed,
+        },
+        tors,
+    ))
 }
 
 /// Point on a uniaxial factored P-M interaction curve $(\phi P_n, \phi M_n)$.
@@ -913,8 +1237,7 @@ pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> 
         },
     )?;
     check_rebar_yield(model)?;
-    run_concrete_design_validated(model, code, combo_forces);
-    Ok(())
+    run_concrete_design_validated(model, code, combo_forces)
 }
 
 /// The longitudinal rebar yield stress of a concrete member: that of the
@@ -961,11 +1284,13 @@ fn check_rebar_yield(model: &SapModel) -> Result<(), DesignError> {
     Ok(())
 }
 
+/// A refused beam torsion (D130, G85) stops the whole run with `Err` and leaves
+/// `concrete_design_results` empty, as the other refusals do (D127: one refused member stops the run).
 fn run_concrete_design_validated(
     model: &mut SapModel,
     code: ConcreteCode,
     combo_forces: crate::steel::ComboForces,
-) {
+) -> Result<(), DesignError> {
     let units = model.present_units;
 
     let mut results = Vec::new();
@@ -1239,6 +1564,32 @@ fn run_concrete_design_validated(
                 "OK".to_string()
             };
 
+            // The vendor designs torsion for beams only (ACI 318-14 manual p. 3-28, EC2 manual
+            // the same split): a column with torsion above the noise floor gets a note (D130).
+            let t_max = combo_forces
+                .iter()
+                .filter_map(|(_, fm)| fm.iter().find(|(fn_k, _)| fn_k == frame_name))
+                .flat_map(|(_, states)| states.iter().flatten())
+                .map(|st| st.t.abs())
+                .fold(0.0_f64, f64::max);
+            let (t_floor, manual) = match code {
+                ConcreteCode::Aci318 => (
+                    1e-6 * aci_phi_tth0_rect(b, h, fc, units),
+                    "ACI 318-14 manual",
+                ),
+                ConcreteCode::Eurocode2 => (
+                    TORSION_FLOOR * ec2_trd_c_rect(b, h, fc, units),
+                    "Eurocode 2-2004 manual",
+                ),
+            };
+            let col_notes = if t_max > t_floor {
+                vec![format!(
+                    "torsion T is not designed for columns ({manual}: columns are designed for P-M-M and shear, torsion for beams only, 3.5)"
+                )]
+            } else {
+                Vec::new()
+            };
+
             results.push((
                 frame_name.clone(),
                 ConcreteDesignResult {
@@ -1251,6 +1602,9 @@ fn run_concrete_design_validated(
                     as_bot: 0.5 * ast,
                     as_side: 0.0,
                     av_over_s: max_av_s,
+                    at_over_s: 0.0,
+                    al_torsion: 0.0,
+                    notes: col_notes,
                     pmm_ratio: max_pmm_ratio,
                     min_rebar_area,
                     status,
@@ -1262,6 +1616,8 @@ fn run_concrete_design_validated(
             let mut max_as_bot = 0.0_f64;
             let mut max_as_side = 0.0_f64;
             let mut max_av_s = 0.0_f64;
+            let mut max_at_s = 0.0_f64;
+            let mut max_al_t = 0.0_f64;
             let mut any_overstressed = false;
             let mut gov_combo = "NONE".to_string();
             let mut max_demand_metric = -1.0_f64;
@@ -1354,6 +1710,58 @@ fn run_concrete_design_validated(
                     let vu2 = st.v2.abs();
                     let vu3 = st.v3.abs();
 
+                    // Torsion (D130). Only a rectangular beam is designed for it; a T beam is
+                    // designed when the torsion is below the printed "may ignore" threshold and
+                    // refused above it, any other shape when it is above the noise floor (G85).
+                    let tu = st.t.abs();
+                    let pu_comp = -st.p;
+                    let refuse = |reason: String| DesignError::ConcreteTorsionNotDesigned {
+                        frame: frame_name.clone(),
+                        combo: combo_name.clone(),
+                        section: sec.name.clone(),
+                        reason,
+                    };
+                    let is_rect = sec.prop_type == FramePropType::Rectangular;
+                    let is_tee = sec.prop_type == FramePropType::T;
+                    if tu > 0.0 && !is_rect && !is_tee {
+                        let floor = match code {
+                            ConcreteCode::Aci318 => 1e-6 * aci_phi_tth0_rect(b, h, fc, units),
+                            ConcreteCode::Eurocode2 => {
+                                TORSION_FLOOR * ec2_trd_c_rect(b, h, fc, units)
+                            }
+                        };
+                        if tu > floor {
+                            return Err(refuse(format!(
+                                "T = {tu} is above the noise floor {floor} of the bounding rectangle; torsion design is implemented for rectangular beams only (section type {:?}); G85",
+                                sec.prop_type
+                            )));
+                        }
+                    }
+                    if tu > 0.0 && is_tee && code == ConcreteCode::Aci318 {
+                        // Printed T-beam properties (manual p. 3-44), Ag = Acp
+                        let (bf, ds, bw_t) = (sec.t2, sec.tf, sec.tw);
+                        let acp_t = bw_t * h + (bf - bw_t) * ds;
+                        let (tth_t, _) =
+                            aci_torsion_threshold(acp_t, 2.0 * bf + 2.0 * h, pu_comp, fc, units);
+                        // the noise floor is that of the bounding rectangle t2 x t3 (D130)
+                        let limit = (ACI_PHI_TORSION * tth_t)
+                            .max(1e-6 * aci_phi_tth0_rect(b, h, fc, units));
+                        if tu > limit {
+                            return Err(refuse(format!(
+                                "T = {tu} is above phi Tth = {limit} of the T beam; torsion design is implemented for rectangular beams only (section type T); G85"
+                            )));
+                        }
+                    }
+                    let ec2_torsion_shape = if is_rect {
+                        Some(Ec2TorsionShape::Rect)
+                    } else if is_tee {
+                        Some(Ec2TorsionShape::T { bf: sec.t2, ds: sec.tf, bw: sec.tw })
+                    } else {
+                        None
+                    };
+                    let mut st_at = 0.0_f64;
+                    let mut st_al = 0.0_f64;
+
                     // A doubly reinforced section also needs compression steel: A's of the
                     // positive moment goes to the top face, A's of the negative moment to the
                     // bottom face (ACI 318-14 manual p. 3-32; EC2 manual p. 3-26).
@@ -1362,14 +1770,39 @@ fn run_concrete_design_validated(
                             let (ab, ac, amin, ob) = design_aci_beam_flexure_doubly(
                                 m_pos, b, d_bot, cover_top, fc, fy, es, units,
                             );
-                            let (avs, ov) =
+                            let (mut avs, mut ov) =
                                 design_aci_beam_shear(vu2, bw2, d2_shear, fc, fyt, units);
+                            if is_rect && tu > 0.0 {
+                                let tor = design_aci_beam_torsion(
+                                    tu, vu2, pu_comp, b, h, d2_shear, fc, fy, fyt, units,
+                                )
+                                .map_err(|reason| refuse(reason.to_string()))?;
+                                if !tor.ignored {
+                                    // ACI 9.6.4.2 replaces the shear minimum 9.6.3.3 (manual p. 3-46)
+                                    let strength =
+                                        aci_beam_av_strength(vu2, bw2, d2_shear, fc, fyt, units);
+                                    avs = strength
+                                        .max(tor.transverse_min - 2.0 * tor.at_over_s)
+                                        .max(0.0);
+                                    ov = ov || tor.section_overstressed;
+                                    st_at = tor.at_over_s;
+                                    st_al = tor.al;
+                                }
+                            }
                             (ab, ac, amin, ob, avs, ov)
                         }
                         ConcreteCode::Eurocode2 => {
-                            let r = design_ec2_beam_seismic(
+                            let torsion = match (ec2_torsion_shape, tu > 0.0) {
+                                (Some(shape), true) => Some((tu, h, shape)),
+                                _ => None,
+                            };
+                            let (r, tor) = ec2_beam_with_torsion(
                                 m_pos, vu2, b, d_bot, cover_top, fc, fy, fyt, units, seismic,
-                            );
+                                torsion,
+                            )
+                            .map_err(refuse)?;
+                            st_at = tor.at_over_s;
+                            st_al = tor.asl;
                             (
                                 r.as_tension,
                                 r.as_comp,
@@ -1459,6 +1892,8 @@ fn run_concrete_design_validated(
                     max_as_top = max_as_top.max(as_top);
                     max_as_side = max_as_side.max(as_side);
                     max_av_s = max_av_s.max(av_s);
+                    max_at_s = max_at_s.max(st_at);
+                    max_al_t = max_al_t.max(st_al);
                     min_rebar = min_rebar.max(as_min_b).max(as_min_t).max(as_min_s);
                     any_overstressed = any_overstressed || over_b || over_t || over_s || over_v;
 
@@ -1488,6 +1923,9 @@ fn run_concrete_design_validated(
                     as_bot: max_as_bot,
                     as_side: max_as_side,
                     av_over_s: max_av_s,
+                    at_over_s: max_at_s,
+                    al_torsion: max_al_t,
+                    notes: Vec::new(),
                     pmm_ratio: 0.0,
                     min_rebar_area: min_rebar,
                     status,
@@ -1500,4 +1938,5 @@ fn run_concrete_design_validated(
     for (k, v) in results {
         model.concrete_design_results.insert(k, v);
     }
+    Ok(())
 }

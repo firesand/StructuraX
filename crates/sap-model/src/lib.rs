@@ -1660,6 +1660,19 @@ pub struct ConcreteDesignResult {
     pub as_side: f64,
     /// Shear stirrup area per unit spacing $A_v / s$
     pub av_over_s: f64,
+    /// Transverse torsion reinforcement At/s as the CSI manual of the design code defines it:
+    /// ACI 318-14 22.7.6.1, one leg of the closed stirrup (manual p. 3-46); Eurocode 2,
+    /// Vt/(z fywd cot theta) (manual p. 3-36). 0 when torsion is ignored (D130).
+    #[serde(default)]
+    pub at_over_s: f64,
+    /// Longitudinal torsion reinforcement: Al of ACI 318-14 22.7.6.1 and 9.6.4.3 (CSI manual
+    /// pp. 3-45 and 3-46) or Asl of EN 1992-1-1 Eq. 6.28 (manual p. 3-36); 0 when torsion is
+    /// ignored (D130).
+    #[serde(default)]
+    pub al_torsion: f64,
+    /// What the design did not cover (D130: torsion on a column).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// Column PMM interaction capacity ratio (if column)
     pub pmm_ratio: f64,
     pub min_rebar_area: f64,

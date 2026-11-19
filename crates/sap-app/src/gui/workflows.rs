@@ -1630,7 +1630,7 @@ mod tests {
         m.is_locked = true;
         m.concrete_design_results.insert("F".into(), sap_model::ConcreteDesignResult {
             frame_name: "F".into(), section_name: String::new(), design_code: String::new(), governing_combo: String::new(),
-            is_column: false, as_top: 0.0, as_bot: 0.0, as_side: 0.0, av_over_s: 0.0, pmm_ratio: 0.0, min_rebar_area: 0.0, status: String::new(),
+            is_column: false, as_top: 0.0, as_bot: 0.0, as_side: 0.0, av_over_s: 0.0, at_over_s: 0.0, al_torsion: 0.0, notes: Vec::new(), pmm_ratio: 0.0, min_rebar_area: 0.0, status: String::new(),
         });
         assert_eq!(m.frames["F"].concrete_framing, Framing::SwaySpecial);
         assign_concrete_framing(&mut m, Framing::SwayOrdinary).unwrap();

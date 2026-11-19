@@ -158,6 +158,39 @@ fn rel(a: f64, b: f64) -> f64 {
     (a - b).abs() / b.abs()
 }
 
+/// AISC E4-5 written out: Fe = (Fa + Fez)/(2H) [1 - sqrt(1 - 4 Fa Fez H/(Fa + Fez)^2)].
+fn e4_5(fa: f64, fez: f64, h: f64) -> f64 {
+    (fa + fez) / (2.0 * h) * (1.0 - (1.0 - 4.0 * fa * fez * h / ((fa + fez) * (fa + fez))).sqrt())
+}
+
+/// D128 hand calculation of phi Pn with flexural-torsional buckling for the shapes of E4-5 (slender
+/// tee and double angle with Fa = Fe22, channel with Fa = Fe33), K = 1, Kz Lz = `lz`:
+/// r0^2 = x0^2 + y0^2 + (I22 + I33)/A (E4-11), H = 1 - (x0^2 + y0^2)/r0^2 (E4-10),
+/// Fez = (pi^2 E Cw/(Kz Lz)^2 + G J)/(A r0^2), G = E/2.6, Fe = min(pi^2 E/(KL/r)max^2, E4-5),
+/// phi Pn = 0.9 Q 0.658^(Q Fy/Fe) Fy A (E7-2, with Q Fy/Fe <= 2.25).
+#[allow(clippy::too_many_arguments)]
+fn phi_pn_e4_5(
+    q: f64,
+    a: f64,
+    i33: f64,
+    i22: f64,
+    j: f64,
+    x0: f64,
+    y0: f64,
+    cw: f64,
+    lz: f64,
+    kl_r_a: f64,
+    kl_r_max: f64,
+) -> f64 {
+    let pi2e = std::f64::consts::PI.powi(2) * E_KSI;
+    let r0sq = x0 * x0 + y0 * y0 + (i22 + i33) / a;
+    let h = 1.0 - (x0 * x0 + y0 * y0) / r0sq;
+    let fez = (pi2e * cw / (lz * lz) + E_KSI / 2.6 * j) / (a * r0sq);
+    let fe = (pi2e / (kl_r_max * kl_r_max)).min(e4_5(pi2e / (kl_r_a * kl_r_a), fez, h));
+    assert!(q * FY_KSI / fe <= 2.25);
+    0.9 * q * 0.658_f64.powf(q * FY_KSI / fe) * FY_KSI * a
+}
+
 /// Box 12 x 12 x 3/16 (sharp corners): b = 12 - 3 (0.1875) = 11.4375, b/t = 61 > 1.40 r = 33.72;
 /// be = 1.92 (0.1875) r [1 - 0.38 r / 61] = 7.3692; Aeff = A - 4 (b - be) t = 5.80817;
 /// Qa = Aeff/A = 0.65560 (E7-18, f = Fy; manual p. 3-33). L = 12 in: Fe = 46235.7, phi Pn = 261.290.
@@ -204,14 +237,29 @@ fn angle8() -> FrameSection {
 }
 
 /// Single angle 8 x 8 x 1/2: b/t = 16, between 0.45 r = 10.84 and 0.91 r = 21.92:
-/// Qs = 1.34 - 0.76 (16)/24.0832 = 0.83508 (E7-11, p. 3-32).
+/// Qs = 1.34 - 0.76 (16)/24.0832 = 0.83508 (E7-11, p. 3-32). D128 (G81): under compression the
+/// single angle is no longer designed (the vendor uses its principal axes, r_z and E4-6), so the
+/// design is refused by name; the Q factor itself is still computed and checked directly.
 #[test]
 fn d86_single_angle_gets_qs_from_the_longest_leg() {
     let q = 1.34 - 0.76 * 16.0 / root_e_fy();
     assert!((q - 0.83508).abs() < 1e-5);
-    let expected = phi_pn(q, 7.75, 2.5, 12.0);
-    let got = designed_phi_pnc(angle8(), 12.0);
-    assert!(rel(got, expected) < 1e-6, "got {got} expected {expected}");
+    let got = sap_design::steel::compute_slender_q_factor(&angle8(), E_KSI, FY_KSI, FY_KSI).unwrap();
+    assert!((got - q).abs() < 1e-9, "got {got} expected {q}");
+    let mut model = one_member(
+        Units::KipInF,
+        "AISC 360-10",
+        angle8(),
+        12.0,
+        vec![st(-1.0, 0.0, 0.0)],
+    );
+    let err = try_run_steel_design(&mut model).unwrap_err();
+    assert!(matches!(
+        err,
+        sap_design::DesignError::AiscLimitStateNotBuilt { .. }
+    ));
+    let msg = err.to_string();
+    assert!(msg.contains("'M1'") && msg.contains("single angle"), "{msg}");
 }
 
 /// Channel t3 = 8, t2 = 4, tf = 0.2, tw = 0.3: bf/tf = 20 (E7.1 for channels, not bf/2tf = 10):
@@ -242,9 +290,37 @@ fn d86_channel_flange_uses_bf_over_tf() {
     };
     let q = 1.415 - 0.74 * 20.0 / root_e_fy();
     assert!((q - 0.80046).abs() < 1e-5);
-    let expected = phi_pn(q, 3.88, 1.25, 12.0);
+    // D128: E4-5 about the symmetry axis 3 with the channel's own shear centre (plates, no
+    // fillets): b' = bf - tw/2 = 3.85, h = d - tf = 7.8, e = 3 b'^2 tf/(6 b' tf + h tw) = 1.277802,
+    // xbar (back of web) = (8 0.3 0.15 + 2 3.7 0.2 2.15)/3.88 = 0.912887, x0 = xbar + e - tw/2 =
+    // 2.040688, Cw = tf b'^3 h^2/12 (3 b' tf + 2 h tw)/(6 b' tf + h tw) = 58.114978, y0 = 0.
+    // Published value of the hand run: r0^2 14.726909, H 0.717225, Fe33 17888.658,
+    // Fez 2031.289179, Fe 1962.877914, Fcr 39.683058, phi Pn = 138.573237 (flexural alone gave
+    // 139.009089). The section inherits t2b = 7.5: the channel code reads t2.
+    let (bp, h): (f64, f64) = (4.0 - 0.15, 7.8);
+    let e_sc: f64 = 3.0 * bp * bp * 0.2 / (6.0 * bp * 0.2 + h * 0.3);
+    let xbar: f64 = (8.0 * 0.3 * 0.15 + 2.0 * 3.7 * 0.2 * (0.3 + 1.85)) / 3.88;
+    let cw: f64 = 0.2 * bp.powi(3) * h * h / 12.0 * (3.0 * bp * 0.2 + 2.0 * h * 0.3)
+        / (6.0 * bp * 0.2 + h * 0.3);
+    assert!((e_sc - 1.277802).abs() < 1e-6 && (xbar - 0.912887).abs() < 1e-6);
+    assert!((cw - 58.114978).abs() < 1e-5);
+    let expected = phi_pn_e4_5(
+        q,
+        3.88,
+        3.88 * 9.0,
+        3.88 * 1.5625,
+        0.05,
+        xbar + e_sc - 0.15,
+        0.0,
+        cw,
+        12.0,
+        12.0 / 3.0,
+        12.0 / 1.25,
+    );
+    assert!((expected - 138.573237).abs() < 1e-4, "hand {expected}");
     let got = designed_phi_pnc(sec, 12.0);
     assert!(rel(got, expected) < 1e-6, "got {got} expected {expected}");
+    assert!(got < 139.009089, "flexural buckling alone is the old, higher value");
 }
 
 fn tee(t3: f64) -> FrameSection {
@@ -279,15 +355,51 @@ fn tee(t3: f64) -> FrameSection {
 fn d86_tee_stem_is_an_unstiffened_element() {
     let q = 0.69 * E_KSI / (FY_KSI * 900.0);
     assert!((q - 0.44467).abs() < 1e-5);
+    // D128: slender tee, E4-5 with Fe22 and Fez (Cw = 0, x0 = 0): ybar from the flange face =
+    // (8 0.5 0.25 + 8.5 0.3 (0.5 + 4.25))/6.55 = 2.001908, y0 = ybar - tf/2 = 1.751908,
+    // r0^2 = y0^2 + 6.25 = 9.319183, H = 0.670660, Fez = G J/(A r0^2) = 54.818451,
+    // Fe = 54.596229, Fcr = 18.749096, phi Pn = 110.525923 (flexural alone: 130.793060).
     let sec = tee(9.0);
-    let expected = phi_pn(q, sec.area, 1.5, 12.0);
+    let ybar: f64 = (8.0 * 0.5 * 0.25 + 8.5 * 0.3 * (0.5 + 4.25)) / 6.55;
+    assert!((ybar - 2.001908).abs() < 1e-6);
+    let expected = phi_pn_e4_5(
+        q,
+        sec.area,
+        sec.i33,
+        sec.i22,
+        0.3,
+        0.0,
+        ybar - 0.25,
+        0.0,
+        12.0,
+        12.0 / 1.5,
+        12.0 / 1.5,
+    );
+    assert!((expected - 110.525923).abs() < 1e-4, "hand {expected}");
     let got = designed_phi_pnc(sec, 12.0);
     assert!(rel(got, expected) < 1e-6, "got {got} expected {expected}");
 
     let q2 = 1.908 - 1.22 * 22.0 / root_e_fy();
     assert!((q2 - 0.79353).abs() < 1e-5);
+    // tee(6.6): ybar = (4 0.25 + 6.1 0.3 (0.5 + 3.05))/5.83 = 1.285849, Fez 78.377121,
+    // Fe 78.173341, Fcr 32.082976, phi Pn = 168.339373 (flexural alone: 207.410890).
     let sec = tee(6.6);
-    let expected = phi_pn(q2, sec.area, 1.5, 12.0);
+    let ybar: f64 = (8.0 * 0.5 * 0.25 + 6.1 * 0.3 * (0.5 + 3.05)) / 5.83;
+    assert!((ybar - 1.285849).abs() < 1e-6);
+    let expected = phi_pn_e4_5(
+        q2,
+        sec.area,
+        sec.i33,
+        sec.i22,
+        0.3,
+        0.0,
+        ybar - 0.25,
+        0.0,
+        12.0,
+        12.0 / 1.5,
+        12.0 / 1.5,
+    );
+    assert!((expected - 168.339373).abs() < 1e-4, "hand {expected}");
     let got = designed_phi_pnc(sec, 12.0);
     assert!(rel(got, expected) < 1e-6, "got {got} expected {expected}");
 }
@@ -318,7 +430,27 @@ fn d86_double_angle_leg_is_half_the_total_width_less_the_gap() {
         ..FrameSection::default()
     };
     let q = 1.34 - 0.76 * 16.0 / root_e_fy();
-    let expected = phi_pn(q, 15.5, 2.5, 12.0);
+    // D128: E4-5 with Fe22 and Fez (Cw = 0): ybar = (16 0.5 0.25 + 2 7.5 0.5 (0.5 + 3.75))/15.5 =
+    // 2.185484, y0 = 1.935484, r0^2 = y0^2 + (I22 + I33)/A = 22.246098, H = 0.831607,
+    // Fez = G J/(A r0^2) = 32.347380, Fe = 32.340137, Fcr = 24.322731,
+    // phi Pn = 339.302102 (flexural alone: 581.651885). The flexural value uses KL/r about 3
+    // (4.8) and Fe22 uses KL/r22 = 12/3.5.
+    let ybar: f64 = (16.0 * 0.5 * 0.25 + 2.0 * 7.5 * 0.5 * (0.5 + 3.75)) / 15.5;
+    assert!((ybar - 2.185484).abs() < 1e-6);
+    let expected = phi_pn_e4_5(
+        q,
+        15.5,
+        15.5 * 6.25,
+        15.5 * 12.25,
+        1.0,
+        0.0,
+        ybar - 0.25,
+        0.0,
+        12.0,
+        12.0 / 3.5,
+        12.0 / 2.5,
+    );
+    assert!((expected - 339.302102).abs() < 1e-4, "hand {expected}");
     let got = designed_phi_pnc(sec, 12.0);
     assert!(rel(got, expected) < 1e-6, "got {got} expected {expected}");
 }

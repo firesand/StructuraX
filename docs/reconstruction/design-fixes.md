@@ -24,6 +24,38 @@ For each design state with a station that has compression and a moment: eq 6.61 
 
 Choices on the safe side: the class of a member in compression and bending is the worse of the two classes of the vendor's Tables 4-1 and 4-2 (Table 4-3 is not built, G72); the equivalent uniform moment factor takes the larger of the uniform and the concentrated column of Table B.3, because the design step does not know the span load; a moment diagram between braced points cannot be read from length ratios, so a factor whose unbraced length ratio is not 1 is 1.0, the largest value of the table; in the sway mode (design overwrite) Cmy and Cmz are 0.9. The note under Table B.1 that k_zy may be 0 for uniaxial bending is an allowance and is not used. The vendor's IS 800 table of moment factors (Table 3-6) prints row (e) as "0.95 - 0.05 alpha_h"; the standard has "+", the only sign that gives 1.0 for a uniform moment, and the code follows the standard. Not built: Annex A (Method 1), other shapes, Class 4, Table 4-3.
 
+## AISC flexural-torsional buckling and flexure of open shapes and HSS (D128, D129)
+
+Under AISC 360-10 (LRFD and ASD) only; EC3 results, statuses and errors and `check_compactness_aisc` are unchanged (D133). Vendor manual pages are printed pages of `sfd_aisc_360_10.pdf` (v19, the baseline); the v24 manual is cited where the v19 page is misprinted.
+
+**Built.**
+
+- *Compression (D128, pp. 3-24 to 3-31).* `Pn = A min(flexural, flexural-torsional)` for T, double angle, channel and double channel (they used flexural buckling alone). Nonslender T and double angle: E4-2/E4-3 on Fcr with Fcrz = GJ/(A r0^2) (p. 3-26). Slender T and double angle: E4-5 with Fe22 and Fez, then E7 (p. 3-30). Channel: E4-5 with Fe33 and the channel Cw (pp. 3-27, 3-30). Double channel: E4-4 with its own Cw. `Kz Lz = K22 L22` (p. 3-28). I is unchanged; closed shapes ignore E4.
+- *Flexure (D129).* Pipe F8 (p. 3-58, both axes); box F7 (pp. 3-56 to 3-58, both axes with the elements swapped; a slender web uses the noncompact formula as the vendor's note says); channel and double channel F2 with the shape's own Cw and c (F2-8a/F2-8b), F3 flange buckling when the web is compact, F6 on the minor axis; T and double angle F9 (yielding, LTB, flange local buckling for M3 >= 0, stem local buckling for M3 < 0) and F6. `phi_mn33` is chosen per station by the sign of M3, with the lateral-torsional sign as decided below (M3 >= 0 compresses the +2 face, the flange of a tee, as the Analysis Reference p. 143 and the concrete design have it).
+- *Status.* "SLENDER" under AISC only where the limit state is still not built: an I with a slender web and the built-up I types.
+
+**Section properties and G86.** The model keeps no centroid or shear centre (`sap-section` reads the library values and drops them), so the design computes them from the plate dimensions, without fillets: channel e = 3 b'^2 tf/(6 b' tf + h tw) with b' = bf - tw/2 and h = d - tf (the library's e0 = e - tw/2 is reproduced within 0.82 % for the 64 channels of the v6 libraries), x-bar from plates, Cw = tf b'^3 h^2/12 (3 b' tf + 2 h tw)/(6 b' tf + h tw) (AISC Design Guide 9; the manual names Cw without a formula); double channel Cw = a^2 tw h^3/6 + h^2 tf [a^3 - (a - b')^3]/3 with a = dis/2 + tw/2 (the thin-walled sectorial integral, centroid as pole; the I-shape 0.25 Iy h0^2 is 2.1 times too large for it); tee and double angle y-bar from the flange face, y0 = y-bar - tf/2, Cw = 0 (a lower bound: the vendor gives no Cw for them and its nonslender form E4-3 has no Cw term). A, I22, I33, J, S and Z are the model's. Keeping the library centroid in the model remains open (G86).
+
+**Misprint decisions.**
+
+- p. 3-30: the double-angle and tee E4-5 prints (Fe33 + Fez)^2 in the denominator; (Fe22 + Fez)^2 is used, as on p. 3-26 and in AISC E4-5, which alone gives min(Fe22, Fez) at H = 1.
+- pp. 3-55/56 print the channel flange ratio bf/2tf; Table 3-1 (p. 3-13) and the definition of b (p. 3-10) give bf/tf, which is used. p. 3-55 prints "35 <= kc", read as 0.35. p. 3-53 prints "if Lp > Lr" for the elastic LTB branch, read as Lb > Lr.
+- v19 p. 3-59 prints S33 (noncompact) and S22 (slender) in the tee flange buckling; the v24 manual (p. 3-59) prints S33c in both, so Sxc = I33/y-bar is used.
+- v19 p. 3-60 prints the tee stem's middle branch as Fy[1.19 - 0.50 (b/t) sqrt(Fy/E)] (the AISC 360-05 flange formula, which meets neither neighbour: 0.77 at 0.84 sqrt(E/Fy) and 0.675 at 1.03 sqrt(E/Fy) against 1.0 and 0.6504) and says "positive"; the v24 manual (p. 3-60) prints Fy[2.55 - 1.84 (d/tw) sqrt(Fy/E)], the elastic S33 and "negative", which is used (stem in compression, M3 < 0).
+- Table 3-1 prints the pipe lambda_p as 0.07 sqrt(E/Fy); the same row's lambda_r and lambda_s, AISC Table B4.1b and `check_compactness_aisc` use E/Fy, which is used.
+- F9 LTB: the page gives the sign of B by the moment (plus for M > 0, stem in tension; minus for M < 0) and does not say which moment decides when the moment changes sign inside the unbraced length. On the safe side every station of a state takes the minus sign when the stem is compressed at any station of that state; a station with M3 >= 0 then has the lower lateral-torsional value (T8x4 over 240 in: 143.4 instead of 230.9 kip-in). No Cb is printed for F9.
+
+**Built as printed.** A slender box web (the vendor's note on pp. 3-57/58 although AISC does not cover it). The double-angle flange buckling rule jumps up at lambda_r: 0.7 E Sxc/(0.91 sqrt(E/Fy))^2 = 0.845 Fy Sxc against 0.7 Fy Sxc, because the vendor prints the double-angle limits 0.54 and 0.91 with the tee's slender formula (Table 3-1 case 12).
+
+**Refused (`AiscLimitStateNotBuilt`)**, where the demand needs the limit state (gates `-P > 1e-9 Fy A`, `|M3| > 1e-9 Fy S33`, `|M2| > 1e-9 Fy S22`, all stations of all states):
+
+- G81: a single angle under compression or bending (the vendor designs it about its principal axes: pp. 3-22, 3-24, 3-27, 3-61 to 3-63, 3-79); tension alone is still designed. The earlier compression was unconservative twice over (geometric r instead of r_z, no flexural-torsional buckling).
+- G82: a box or cold box moment about an axis whose compression flange is slender ((t2 - 3tw)/tf or (t3 - 3tf)/tw above 1.40 sqrt(E/Fy)); the manual names Seff but not how it is computed. Compression alone keeps its D86 Q.
+- G83: a channel or double channel with M3 and h/tw > 3.76 sqrt(E/Fy) (the F4/F5 forms of pp. 3-54/55 are not built).
+- A tee, double angle, channel or double channel with J = 0 under compression or M3, or whose dimensions do not define the section.
+
+D127 consequence: one refused member stops the whole run and leaves no steel results, and Auto Select stops at a refused candidate; a model with a single angle in compression is no longer designed at all. Not in scope here: D142 (I with a noncompact web gets F2/F3), D143 (no F11 for solid rectangles), D145 (E4-4 of I skipped silently when J = 0; `check_compactness_aisc` reads a channel flange as max(t2, t2b)).
+
 ## Validation
 
 `cargo test -p sap-design` and `cargo clippy -p sap-design --all-targets -- -D warnings` are the required checks for this slice. These formula and rejection regressions establish local behavior only; they are not an end-to-end SAP2000 comparison.

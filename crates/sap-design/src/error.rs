@@ -132,6 +132,29 @@ pub enum DesignError {
         component: &'static str,
         value: String,
     },
+    /// D128, D129: an AISC 360-10 limit state that the vendor manual does not give in full, or
+    /// that needs section properties the model does not hold, is not built (G81, G82, G83); or
+    /// an input it needs is missing. The member is refused instead of designed with a wrong
+    /// strength. One refused member stops the run, and Auto Select stops at a refused
+    /// candidate (D127).
+    #[error("steel design of member '{frame}': section '{section}' ({kind}) is not designed: {what}")]
+    AiscLimitStateNotBuilt {
+        frame: String,
+        section: String,
+        kind: String,
+        what: String,
+    },
+    /// D130: concrete beam torsion that the design does not build (G85): a beam that is not
+    /// rectangular, with torsion above what the vendor manual lets the design ignore, or a
+    /// section too small for the closed stirrup the manual assumes. One refused member stops
+    /// the run (D127).
+    #[error("concrete design of beam '{frame}', combination '{combo}': torsion on section '{section}' is not designed: {reason}")]
+    ConcreteTorsionNotDesigned {
+        frame: String,
+        combo: String,
+        section: String,
+        reason: String,
+    },
 }
 
 pub(crate) fn validate_demands<F>(
