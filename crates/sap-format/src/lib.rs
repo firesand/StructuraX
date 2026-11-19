@@ -1,5 +1,7 @@
 //! SAP2000 file format parser and writer (`.s2k` / `.$2k` text tables and `.sdb` binary model container).
 
+pub mod function_file;
+pub mod material_library;
 pub mod s2k;
 pub mod sdb;
 
@@ -122,6 +124,12 @@ pub fn load_model_with_report(path: impl AsRef<Path>) -> Result<ImportReport, Fo
             .filter(|p| !p.nonlinear_data_complete)
         {
             warnings.push(format!("Native link '{}' has verified activation flags but unmapped constitutive/opening data; nonlinear analysis is blocked", prop.name));
+        }
+        for entry in &model.unmodeled_source {
+            warnings.push(format!(
+                "Not modeled: {}. Analysis of the affected cases is refused until this entry is removed from the model's unmodeled source data.",
+                entry.description
+            ));
         }
         return Ok(ImportReport { model, warnings });
     }

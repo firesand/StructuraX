@@ -7,7 +7,7 @@ mod gui;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sap_design::{try_run_concrete_design, try_run_steel_design};
+use sap_design::{run_concrete_design_per_member, run_steel_design_per_member};
 use sap_format::{
     inspect_native_sdb_file, load_model_with_report, save_native_sdb_file,
     save_s2k_file_with_report, save_sdb_file_with_report,
@@ -201,6 +201,32 @@ fn paths_refer_to_same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
     }
 }
 
+/// D127: the lines that tell which members a design run did not design, and why. Empty when
+/// nothing is refused; at most 20 members are listed, then "and K more".
+fn not_designed_lines(report: &sap_design::DesignRunReport) -> Vec<String> {
+    const LISTED: usize = 20;
+    if report.not_designed.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "  {} members not designed:",
+        report.not_designed.len()
+    )];
+    for (frame, error) in report.not_designed.iter().take(LISTED) {
+        lines.push(format!("    {frame}: {error}"));
+    }
+    if report.not_designed.len() > LISTED {
+        lines.push(format!("    and {} more", report.not_designed.len() - LISTED));
+    }
+    lines
+}
+
+fn print_not_designed(report: &sap_design::DesignRunReport) {
+    for line in not_designed_lines(report) {
+        println!("{line}");
+    }
+}
+
 fn run_cli_analyze(
     input: &std::path::Path,
     output: Option<&std::path::Path>,
@@ -232,6 +258,21 @@ fn run_cli_analyze(
         model.load_combos.len()
     );
     analyze_model(&mut model)?;
+    // D78: a combination without complete results has no result; say which and why.
+    // The run is not discarded (the other results are usable) and still exits 0.
+    for (name, reason) in &model.unavailable_results {
+        eprintln!("Warning: result '{name}' is unavailable: {reason}");
+    }
+    // G16: a case that stopped before its target keeps the states it reached and is
+    // "not finished" (v19 words). Like an unavailable combination, this is a warning: the
+    // run is kept, the JSON carries the status, and the exit status stays 0.
+    for (name, status) in sap_model::results::unfinished_cases(&model) {
+        if let sap_model::CaseStatus::NotFinished { reason, steps } = status {
+            eprintln!(
+                "Warning: case '{name}' is not finished: {reason} ({steps} saved steps kept)"
+            );
+        }
+    }
     for (cname, cr) in &model.case_results {
         let mut details = vec![
             format!("{} joint disp", cr.joint_displacements.len()),
@@ -268,6 +309,9 @@ fn run_cli_analyze(
                 cr.base_reactions[0], cr.base_reactions[1], cr.base_reactions[2]
             ));
         }
+        if !cr.status.is_finished() {
+            details.push("not finished".to_string());
+        }
         println!("  Result '{}': {}", cname, details.join(", "));
     }
 
@@ -278,14 +322,15 @@ fn run_cli_analyze(
         model.concrete_design_code = code.to_string();
     }
 
-    let has_steel_frames = model.frames.values().any(|f| {
+    // Cables are not design members (D103), so a cable does not make the model a design model.
+    let has_steel_frames = model.frames.values().filter(|f| f.cable_params.is_none()).any(|f| {
         model
             .frame_sections
             .get(&f.section)
             .and_then(|s| model.materials.get(&s.material))
             .is_some_and(|m| m.mat_type == sap_model::MatType::Steel)
     });
-    let has_concrete_frames = model.frames.values().any(|f| {
+    let has_concrete_frames = model.frames.values().filter(|f| f.cable_params.is_none()).any(|f| {
         model
             .frame_sections
             .get(&f.section)
@@ -304,7 +349,7 @@ fn run_cli_analyze(
         println!("  Design skipped: model contains 0 steel or concrete frame members.");
     }
     if run_steel {
-        try_run_steel_design(&mut model)?;
+        let report = run_steel_design_per_member(&mut model)?;
         let total = model.steel_design_results.len();
         let failed = model
             .steel_design_results
@@ -324,9 +369,10 @@ fn run_cli_analyze(
             failed,
             max_dc
         );
+        print_not_designed(&report);
     }
     if run_concrete {
-        try_run_concrete_design(&mut model)?;
+        let report = run_concrete_design_per_member(&mut model)?;
         let total = model.concrete_design_results.len();
         let failed = model
             .concrete_design_results
@@ -347,6 +393,7 @@ fn run_cli_analyze(
             failed,
             max_pmm
         );
+        print_not_designed(&report);
     }
 
     if let Some(out_path) = output {
@@ -669,6 +716,109 @@ mod tests {
             conc_err.to_string().contains("LEGACY-CONCRETE-99"),
             "{conc_err}"
         );
+
+        let _ = std::fs::remove_file(input);
+        let _ = std::fs::remove_file(json_out);
+    }
+
+    /// D127: a refused member does not stop the CLI design: the designed member is in the saved
+    /// results, the refused one (a single angle in compression, G81) in the error map, and the
+    /// printed lines name it.
+    #[test]
+    fn cli_design_records_a_refused_member_and_goes_on() {
+        let unique = format!(
+            "structurax-cli-d127-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let input = std::env::temp_dir().join(format!("{unique}.s2k"));
+        let json_out = std::env::temp_dir().join(format!("{unique}.json"));
+
+        let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
+        let sec =
+            sap_section::make_i_section("W14_TEST", "A992Fy50", 14.0, 10.0, 0.5, 0.35, 10.0, 0.5);
+        model.frame_sections.insert(sec.name.clone(), sec);
+        let mut angle = sap_section::make_rectangular("L8X8", "A992Fy50", 8.0, 8.0);
+        angle.prop_type = sap_model::FramePropType::Angle;
+        angle.tf = 0.5;
+        angle.tw = 0.5;
+        angle.area = 7.75;
+        angle.i33 = 48.4375;
+        angle.i22 = 48.4375;
+        angle.torsional_j = 0.6;
+        angle.s33 = 8.0;
+        angle.z33 = 14.0;
+        angle.s22 = 8.0;
+        angle.z22 = 14.0;
+        model.frame_sections.insert(angle.name.clone(), angle);
+        for (name, x, y, z, fixed) in [
+            ("1", 0.0, 0.0, 0.0, true),
+            ("2", 120.0, 0.0, 0.0, false),
+            ("3", 0.0, 50.0, 0.0, true),
+            ("4", 0.0, 50.0, 120.0, false),
+        ] {
+            model.add_point(name, x, y, z);
+            let point = model.points.get_mut(name).unwrap();
+            if fixed {
+                point.restraint = [true; 6];
+            } else {
+                point.loads_force.push(sap_model::PointLoadForce {
+                    load_pat: "DEAD".to_string(),
+                    csys: "GLOBAL".to_string(),
+                    force: [0.0, 0.0, -5.0, 0.0, 0.0, 0.0],
+                });
+            }
+        }
+        model.add_frame("BEAM", "1", "2", "W14_TEST");
+        model.add_frame("ANG", "3", "4", "L8X8");
+        save_s2k_file_with_report(&model, &input).unwrap();
+
+        run_cli_analyze(
+            &input,
+            Some(&json_out),
+            AnalyzeDesignOptions {
+                design_steel: true,
+                steel_code: Some("AISC 360-10 ASD"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let saved: sap_model::SapModel =
+            serde_json::from_str(&std::fs::read_to_string(&json_out).unwrap()).unwrap();
+        assert!(saved.steel_design_results.contains_key("BEAM"));
+        assert!(!saved.steel_design_results.contains_key("ANG"));
+        let reason = &saved.steel_design_errors["ANG"];
+        assert!(reason.contains("single angle"), "{reason}");
+
+        // the printed lines
+        let report = sap_design::DesignRunReport {
+            designed: 1,
+            not_designed: (0..22)
+                .map(|i| {
+                    (
+                        format!("F{i}"),
+                        sap_design::DesignError::MissingDemand {
+                            discipline: "steel",
+                            frame: format!("F{i}"),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let lines = not_designed_lines(&report);
+        assert_eq!(lines.len(), 1 + 20 + 1);
+        assert_eq!(lines[0], "  22 members not designed:");
+        assert!(lines[1].starts_with("    F0: "));
+        assert_eq!(lines[20], "    F19: steel design has no frame force demand for member 'F19'");
+        assert_eq!(lines[21], "    and 2 more");
+        assert!(not_designed_lines(&sap_design::DesignRunReport {
+            designed: 3,
+            not_designed: Vec::new()
+        })
+        .is_empty());
 
         let _ = std::fs::remove_file(input);
         let _ = std::fs::remove_file(json_out);

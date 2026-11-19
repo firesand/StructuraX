@@ -9,22 +9,29 @@
 mod cables;
 mod database_tables;
 mod definitions;
+pub mod hinges;
 mod links;
 pub use cables::cCableObj;
 pub use database_tables::{cDatabaseTables, StagedTable, TableCatalogEntry};
 pub use definitions::{
-    cFunctions, set_case_definition, set_function_definition, validate_case_definition,
-    DefinitionError,
+    cFunctions, discard_unmodeled_source, set_case_definition, set_function_definition,
+    validate_case_definition, DefinitionError,
+};
+pub use hinges::{
+    get_hinge_assigns, get_hinge_unloading, pushover_curve, pushover_not_finished, set_hinge_unloading, HingeAssigns,
+    PushoverPoint,
 };
 pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 
-use sap_design::{try_run_concrete_design, try_run_steel_design, ConcreteCode, SteelCode};
+use sap_design::{
+    run_concrete_design_per_member, run_steel_design_per_member, ConcreteCode, SteelCode,
+};
 use sap_format::{
     load_model_with_report, save_native_sdb_file, save_s2k_file_with_report,
     save_sdb_file_with_report,
 };
 use sap_model::{
-    AreaLoadSurfacePressure, AreaLoadUniform, AreaSection, CableParams, ComboType,
+    AreaLoadSurfacePressure, AreaLoadUniform, AreaSection, CableParams, CaseResults, ComboType,
     ConcreteDesignResult, EditError, EditSummary, FrameLoadDistributed, FrameLoadPoint,
     FrameLoadTemperature, FramePropType, FrameSection, FrameStationResult, FrameType2D,
     FrameType3D, LoadCase, LoadCaseAssignment, LoadCaseType, LoadCombo, LoadPattern,
@@ -168,13 +175,21 @@ impl cSapModel {
         OAPI_OK
     }
 
+    /// The first selected output case or combination that has no results after the last
+    /// analysis (D78; G16: a case that could not start), with its reason. A getter that can
+    /// return an error code returns it instead of silently leaving the name out of the rows.
+    fn selected_output_unavailable(&self) -> Option<(String, String)> {
+        self.selected_cases.iter().chain(self.selected_combos.iter()).find_map(|n| {
+            sap_model::results::unavailable_reason(&self.inner, n)
+                .map(|r| (n.clone(), r.to_string()))
+        })
+    }
+
     fn prepare_edit(&mut self) -> bool {
         if self.inner.is_locked {
             return false;
         }
-        self.inner.case_results.clear();
-        self.inner.steel_design_results.clear();
-        self.inner.concrete_design_results.clear();
+        self.inner.invalidate_results();
         true
     }
 
@@ -196,9 +211,12 @@ impl cSapModel {
 
     pub fn set_model_is_locked(&mut self, locked: bool) -> i32 {
         if !locked {
-            self.inner.case_results.clear();
-            self.inner.steel_design_results.clear();
-            self.inner.concrete_design_results.clear();
+            // D78: results and the reasons why some have none go together; locking again
+            // without running must not bring an old reason back.
+            self.inner.invalidate_results();
+        } else if !self.inner.is_locked {
+            // A lock that follows no analysis holds no results, hence no reasons either.
+            self.inner.unavailable_results.clear();
         }
         self.inner.is_locked = locked;
         OAPI_OK
@@ -361,6 +379,9 @@ impl cFile<'_> {
                 let model = report.model;
                 self.api.selected_cases = model.load_cases.keys().cloned().collect();
                 self.api.selected_combos.clear();
+                // D118: tables staged for the previous model must not be applied
+                // to the one just opened (`initialize_new_model` clears them too).
+                self.api.staged_tables.clear();
                 self.api.inner = model;
                 self.api.last_file_path = Some(path.to_path_buf());
                 OAPI_OK
@@ -1095,6 +1116,89 @@ impl cFrameObj<'_> {
             return OAPI_ERR;
         }
         self.edit_frame(name, |f| f.modifiers = modifiers)
+    }
+    /// Insertion point of a frame object (`FrameObj.SetInsertionPoint`): the
+    /// cardinal point `1..=11` (10 is the centroid) and the joint offsets at
+    /// the two ends, in the element local or the global system. With
+    /// `stiff_transform` on, the element is set off from its joints on rigid
+    /// arms; analysis implements that for equal offsets across the member
+    /// axis, doubly symmetric shapes and linear static cases, and refuses the
+    /// rest. With it off the frame is analyzed at its centroid. Mirroring
+    /// about local 2 is not represented and is refused here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_insertion_point(
+        &mut self,
+        name: &str,
+        cardinal_point: i32,
+        mirror2: bool,
+        stiff_transform: bool,
+        offset1: [f64; 3],
+        offset2: [f64; 3],
+        csys: &str,
+    ) -> i32 {
+        let is_global = if csys.eq_ignore_ascii_case("Global") {
+            true
+        } else if csys.eq_ignore_ascii_case("Local") {
+            false
+        } else {
+            return OAPI_ERR;
+        };
+        if !(1..=11).contains(&cardinal_point)
+            || mirror2
+            || offset1.iter().chain(&offset2).any(|v| !v.is_finite())
+        {
+            return OAPI_ERR;
+        }
+        self.edit_frame(name, |f| {
+            f.cardinal_point = cardinal_point;
+            f.stiff_transform = stiff_transform;
+            f.joint_offset_i = offset1;
+            f.joint_offset_j = offset2;
+            f.joint_offset_is_global = is_global;
+        })
+    }
+    /// Automatic subdivision of a frame object for analysis
+    /// (`FrameObj.SetAutoMesh`). Subdivision at joints lying on the object and
+    /// into a number of segments are analyzed. Subdivision at intersections
+    /// with other objects and a maximum segment length are not, and are
+    /// refused here rather than stored and ignored.
+    pub fn set_auto_mesh(
+        &mut self,
+        name: &str,
+        auto_mesh: bool,
+        auto_mesh_at_points: bool,
+        auto_mesh_at_lines: bool,
+        num_segs: i32,
+        auto_mesh_max_length: f64,
+    ) -> i32 {
+        if !(0..=10_000).contains(&num_segs)
+            || auto_mesh_max_length != 0.0
+            || (auto_mesh && auto_mesh_at_lines)
+        {
+            return OAPI_ERR;
+        }
+        if self
+            .api
+            .inner
+            .frames
+            .get(name)
+            .is_some_and(|f| f.cable_params.is_some() && auto_mesh && num_segs > 1)
+        {
+            return OAPI_ERR;
+        }
+        self.edit_frame(name, |f| {
+            f.auto_mesh_segments = if auto_mesh { num_segs as usize } else { 0 };
+            f.auto_mesh_at_joints = auto_mesh && auto_mesh_at_points;
+        })
+    }
+    /// `(auto_mesh, auto_mesh_at_points, num_segs)` of a frame object.
+    pub fn get_auto_mesh(&self, name: &str) -> Option<(bool, bool, i32)> {
+        let frame = self.api.inner.frames.get(name)?;
+        Some((
+            frame.auto_mesh_segments > 0 || frame.auto_mesh_at_joints,
+            frame.auto_mesh_at_joints,
+            i32::try_from(frame.auto_mesh_segments).ok()?,
+        ))
     }
     pub fn set_tc_limits(
         &mut self,
@@ -2221,6 +2325,45 @@ impl cAnalyze<'_> {
         }
     }
 
+    /// The cases and combinations that have no results after the last analysis, with the
+    /// reason each (D78). Empty before an analysis and when every result exists.
+    pub fn unavailable_results(&self) -> Vec<(String, String)> {
+        if !self.api.inner.is_locked {
+            return Vec::new();
+        }
+        self.api
+            .inner
+            .unavailable_results
+            .iter()
+            .map(|(n, r)| (n.clone(), r.clone()))
+            .collect()
+    }
+
+    /// `Analyze.GetCaseStatus`: the status of every load case, v19 codes 1 not run, 2 could
+    /// not start, 3 not finished, 4 finished (G16). Every case is 1 before an analysis.
+    pub fn get_case_status(&self) -> Vec<(String, i32)> {
+        let model = &self.api.inner;
+        model
+            .load_cases
+            .keys()
+            .map(|name| (name.clone(), sap_model::results::case_status_code(model, name)))
+            .collect()
+    }
+
+    /// Why a case is not finished or could not start (project addition: the v19 call has
+    /// no reason); `None` for a case with another status.
+    pub fn case_status_reason(&self, name: &str) -> Option<String> {
+        let model = &self.api.inner;
+        match sap_model::results::case_status_code(model, name) {
+            3 => match &model.case_results.get(name)?.status {
+                sap_model::CaseStatus::NotFinished { reason, .. } => Some(reason.clone()),
+                sap_model::CaseStatus::Finished => None,
+            },
+            2 => model.unavailable_results.get(name).cloned(),
+            _ => None,
+        }
+    }
+
     pub fn set_run_case_flag(&mut self, name: &str, run: bool, all: bool) -> i32 {
         if self.api.inner.is_locked {
             return OAPI_ERR;
@@ -2245,6 +2388,19 @@ impl cAnalyze<'_> {
     }
 }
 
+/// The rows of one result: a multi-valued combination has a Max row (the result itself)
+/// and a Min row (`combo_min`), every other result one row with an empty step type.
+pub fn step_rows(cr: &CaseResults) -> Vec<(&'static str, &CaseResults)> {
+    match cr.combo_min.as_deref() {
+        Some(min) => vec![("Max", cr), ("Min", min)],
+        None => vec![("", cr)],
+    }
+}
+
+fn drop_step<T>(rows: Vec<(String, &'static str, T)>) -> Vec<(String, T)> {
+    rows.into_iter().map(|(name, _, value)| (name, value)).collect()
+}
+
 /// Analysis Results Extraction API (`SAP2000v19.cAnalysisResults`).
 pub struct cAnalysisResults<'a> {
     api: &'a mut cSapModel,
@@ -2257,7 +2413,32 @@ impl cAnalysisResults<'_> {
         OAPI_OK
     }
 
+    /// The selected cases and combinations that have no results after the last analysis,
+    /// each with its reason (D78). Empty when every selected name has results, and before
+    /// an analysis. While this is not empty, every getter below returns the error code or
+    /// no rows, and the database result tables return the error code: none returns the
+    /// rows of the other selected names only, as if the selection had been complete.
+    pub fn selected_unavailable(&self) -> Vec<(String, String)> {
+        self.api
+            .selected_cases
+            .iter()
+            .chain(self.api.selected_combos.iter())
+            .filter_map(|n| {
+                sap_model::results::unavailable_reason(&self.api.inner, n)
+                    .map(|r| (n.clone(), r.to_string()))
+            })
+            .collect()
+    }
+
     pub fn setup_set_case_selected_for_output(&mut self, name: &str, selected: bool) -> i32 {
+        if selected {
+            // G16: a case that could not start has no results; refuse it by name (the
+            // reason is in `unavailable_results`), as for a combination. A refused call
+            // leaves the selection as it was (D78).
+            if sap_model::results::unavailable_reason(&self.api.inner, name).is_some() {
+                return OAPI_ERR;
+            }
+        }
         self.api.selected_cases.retain(|c| c != name);
         if selected {
             self.api.selected_cases.push(name.to_string());
@@ -2266,6 +2447,14 @@ impl cAnalysisResults<'_> {
     }
 
     pub fn setup_set_combo_selected_for_output(&mut self, name: &str, selected: bool) -> i32 {
+        if selected {
+            // D78: an unavailable combination has no results; refuse it by name
+            // (the reason is in `unavailable_results`). A refused call leaves the
+            // selection as it was.
+            if sap_model::results::unavailable_reason(&self.api.inner, name).is_some() {
+                return OAPI_ERR;
+            }
+        }
         self.api.selected_combos.retain(|c| c != name);
         if selected {
             self.api.selected_combos.push(name.to_string());
@@ -2273,9 +2462,33 @@ impl cAnalysisResults<'_> {
         OAPI_OK
     }
 
-    /// Queries joint displacements `[U1, U2, U3, R1, R2, R3]` across selected output cases (`cAnalysisResults.JointDispl`).
-    pub fn joint_displ(&self, name: &str) -> Vec<(String, [f64; 6])> {
+    /// `Results.Setup.SetOptionMultiValuedCombo`: how multi-valued combinations are reported.
+    /// Option 1 (envelopes: a Max row and a Min row per quantity, Analysis Reference
+    /// p. 351) is the only one implemented; 2 (multiple values) and 3 (correspondence) are
+    /// refused with an error, as is any other value.
+    pub fn setup_set_option_multi_valued_combo(&mut self, option: i32) -> i32 {
+        if option == 1 {
+            OAPI_OK
+        } else {
+            OAPI_ERR
+        }
+    }
+
+    /// The results of the selected cases and combinations as `(output case, step type, value)`.
+    /// A multi-valued combination gives its Max row and then its Min row (the order is a
+    /// project choice: the Step Type topic of the OAPI help says only "either Max or Min"),
+    /// both under the name of the combination; every other result gives one row whose step
+    /// type is the empty string. `pick` extracts the value from one row of results.
+    fn selected_rows<T>(
+        &self,
+        mut pick: impl FnMut(&CaseResults) -> Option<T>,
+    ) -> Vec<(String, &'static str, T)> {
         let mut out = Vec::new();
+        // D78: a getter that returns rows only cannot carry an error; it returns none
+        // while the selection holds an unavailable name (see `selected_unavailable`).
+        if self.api.selected_output_unavailable().is_some() {
+            return out;
+        }
         for cname in self
             .api
             .selected_cases
@@ -2283,48 +2496,49 @@ impl cAnalysisResults<'_> {
             .chain(self.api.selected_combos.iter())
         {
             if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(&u) = cr.joint_displacements.get(name) {
-                    out.push((cname.clone(), u));
+                for (step, row) in step_rows(cr) {
+                    if let Some(v) = pick(row) {
+                        out.push((cname.clone(), step, v));
+                    }
                 }
             }
         }
         out
+    }
+
+    /// Queries joint displacements `[U1, U2, U3, R1, R2, R3]` across selected output cases (`cAnalysisResults.JointDispl`).
+    /// A multi-valued combination returns its Max row and then its Min row (see [`Self::joint_displ_step_type`]).
+    pub fn joint_displ(&self, name: &str) -> Vec<(String, [f64; 6])> {
+        drop_step(self.joint_displ_step_type(name))
+    }
+
+    /// `JointDispl` with the Step Type of each row: "Max" or "Min" for a multi-valued
+    /// combination, "" otherwise.
+    pub fn joint_displ_step_type(&self, name: &str) -> Vec<(String, &'static str, [f64; 6])> {
+        self.selected_rows(|cr| cr.joint_displacements.get(name).copied())
     }
 
     /// Queries support reactions `[F1, F2, F3, M1, M2, M3]` across selected output cases (`cAnalysisResults.JointReact`).
     pub fn joint_react(&self, name: &str) -> Vec<(String, [f64; 6])> {
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(&r) = cr.joint_reactions.get(name) {
-                    out.push((cname.clone(), r));
-                }
-            }
-        }
-        out
+        drop_step(self.joint_react_step_type(name))
+    }
+
+    /// `JointReact` with the Step Type of each row.
+    pub fn joint_react_step_type(&self, name: &str) -> Vec<(String, &'static str, [f64; 6])> {
+        self.selected_rows(|cr| cr.joint_reactions.get(name).copied())
     }
 
     /// Queries internal frame station forces across selected output cases (`cAnalysisResults.FrameForce`).
     pub fn frame_force(&self, name: &str) -> Vec<(String, Vec<FrameStationResult>)> {
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(st) = cr.frame_forces.get(name) {
-                    out.push((cname.clone(), st.clone()));
-                }
-            }
-        }
-        out
+        drop_step(self.frame_force_step_type(name))
+    }
+
+    /// `FrameForce` with the Step Type of each row.
+    pub fn frame_force_step_type(
+        &self,
+        name: &str,
+    ) -> Vec<(String, &'static str, Vec<FrameStationResult>)> {
+        self.selected_rows(|cr| cr.frame_forces.get(name).cloned())
     }
 
     /// Queries internal cable station forces across selected output cases (`cAnalysisResults.CableForce`).
@@ -2341,6 +2555,9 @@ impl cAnalysisResults<'_> {
     /// Queries modal periods and frequencies across selected modal cases (`cAnalysisResults.ModalPeriod`).
     pub fn modal_period(&self) -> Vec<(String, Vec<ModalModeResult>)> {
         let mut out = Vec::new();
+        if self.api.selected_output_unavailable().is_some() {
+            return out;
+        }
         for cname in &self.api.selected_cases {
             if let Some(cr) = self.api.inner.case_results.get(cname) {
                 if !cr.modes.is_empty() {
@@ -2351,69 +2568,60 @@ impl cAnalysisResults<'_> {
         out
     }
 
-    /// Queries 3D solid stresses (`cAnalysisResults.SolidStress`).
+    /// Queries 3D solid stresses (`cAnalysisResults.SolidStress`). A multi-valued combination
+    /// returns its Max row and then its Min row; its principal and von Mises values are 0 in
+    /// both (not available for multi-valued results, Analysis Reference p. 213).
     pub fn solid_stress(&self, name: &str) -> Vec<(String, SolidResult)> {
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(sr) = cr.solid_results.get(name) {
-                    out.push((cname.clone(), sr.clone()));
-                }
-            }
-        }
-        out
+        drop_step(self.solid_stress_step_type(name))
+    }
+
+    /// `SolidStress` with the Step Type of each row.
+    pub fn solid_stress_step_type(&self, name: &str) -> Vec<(String, &'static str, SolidResult)> {
+        self.selected_rows(|cr| cr.solid_results.get(name).cloned())
     }
 
     /// Queries shell/area internal forces and stresses across selected output cases (`cAnalysisResults.AreaForceShell`).
+    /// A multi-valued combination returns its Max row and then its Min row; `svm_top` is 0.0
+    /// in both: the von Mises stress is not available for a multi-valued result (p. 213).
     pub fn area_force_shell(&self, name: &str) -> (i32, Vec<(String, sap_model::AreaResult)>) {
-        if self.api.inner.case_results.is_empty() || !self.api.inner.areas.contains_key(name) {
+        let (code, rows) = self.area_force_shell_step_type(name);
+        (code, drop_step(rows))
+    }
+
+    /// `AreaForceShell` with the Step Type of each row.
+    pub fn area_force_shell_step_type(
+        &self,
+        name: &str,
+    ) -> (i32, Vec<(String, &'static str, sap_model::AreaResult)>) {
+        if self.api.inner.case_results.is_empty()
+            || !self.api.inner.areas.contains_key(name)
+            || self.api.selected_output_unavailable().is_some()
+        {
             return (OAPI_ERR, Vec::new());
         }
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(ar) = cr.area_results.get(name) {
-                    out.push((cname.clone(), ar.clone()));
-                }
-            }
-        }
-        (OAPI_OK, out)
+        (OAPI_OK, self.selected_rows(|cr| cr.area_results.get(name).cloned()))
     }
 
     /// Queries link internal forces `[P, V2, V3, T, M2, M3]` across selected output cases (`cAnalysisResults.LinkForce`).
     pub fn link_force(&self, name: &str) -> (i32, Vec<(String, [f64; 6])>) {
-        if self.api.inner.case_results.is_empty() || !self.api.inner.links.contains_key(name) {
+        let (code, rows) = self.link_force_step_type(name);
+        (code, drop_step(rows))
+    }
+
+    /// `LinkForce` with the Step Type of each row.
+    pub fn link_force_step_type(&self, name: &str) -> (i32, Vec<(String, &'static str, [f64; 6])>) {
+        if self.api.inner.case_results.is_empty()
+            || !self.api.inner.links.contains_key(name)
+            || self.api.selected_output_unavailable().is_some()
+        {
             return (OAPI_ERR, Vec::new());
         }
-        let mut out = Vec::new();
-        for cname in self
-            .api
-            .selected_cases
-            .iter()
-            .chain(self.api.selected_combos.iter())
-        {
-            if let Some(cr) = self.api.inner.case_results.get(cname) {
-                if let Some(&lf) = cr.link_forces.get(name) {
-                    out.push((cname.clone(), lf));
-                }
-            }
-        }
-        (OAPI_OK, out)
+        (OAPI_OK, self.selected_rows(|cr| cr.link_forces.get(name).copied()))
     }
 
     /// Queries buckling eigenvalues `(case_name, mode_num, factor)` across selected buckling cases (`cAnalysisResults.BucklingFactor`).
     pub fn buckling_factor(&self) -> (i32, Vec<(String, usize, f64)>) {
-        if self.api.inner.case_results.is_empty() {
+        if self.api.inner.case_results.is_empty() || self.api.selected_output_unavailable().is_some() {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2433,8 +2641,15 @@ impl cAnalysisResults<'_> {
     }
 
     /// Queries global base reactions `[FX, FY, FZ, MX, MY, MZ]` across selected output cases (`cAnalysisResults.BaseReact`).
+    /// A multi-valued combination returns its Max row and then its Min row.
     pub fn base_react(&self) -> (i32, Vec<(String, [f64; 6])>) {
-        if self.api.inner.case_results.is_empty() {
+        let (code, rows) = self.base_react_step_type();
+        (code, drop_step(rows))
+    }
+
+    /// `BaseReact` with the Step Type of each row.
+    pub fn base_react_step_type(&self) -> (i32, Vec<(String, &'static str, [f64; 6])>) {
+        if self.api.inner.case_results.is_empty() || self.api.selected_output_unavailable().is_some() {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2450,7 +2665,9 @@ impl cAnalysisResults<'_> {
                 continue;
             }
             if let Some(cr) = self.api.inner.case_results.get(cname) {
-                out.push((cname.clone(), cr.base_reactions));
+                for (step, row) in step_rows(cr) {
+                    out.push((cname.clone(), step, row.base_reactions));
+                }
             }
         }
         (OAPI_OK, out)
@@ -2458,7 +2675,7 @@ impl cAnalysisResults<'_> {
 
     /// Queries modal participating mass ratios across selected modal cases (`cAnalysisResults.ModalParticipatingMassRatios`).
     pub fn modal_participating_mass_ratios(&self) -> (i32, Vec<(String, ModalModeResult)>) {
-        if self.api.inner.case_results.is_empty() {
+        if self.api.inner.case_results.is_empty() || self.api.selected_output_unavailable().is_some() {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2477,7 +2694,10 @@ impl cAnalysisResults<'_> {
         &self,
         name: &str,
     ) -> (i32, Vec<(String, Vec<f64>, Vec<[f64; 6]>)>) {
-        if self.api.inner.case_results.is_empty() || !self.api.inner.points.contains_key(name) {
+        if self.api.inner.case_results.is_empty()
+            || !self.api.inner.points.contains_key(name)
+            || self.api.selected_output_unavailable().is_some()
+        {
             return (OAPI_ERR, Vec::new());
         }
         let mut out = Vec::new();
@@ -2505,11 +2725,41 @@ pub struct cDesignSteel<'a> {
 }
 
 impl cDesignSteel<'_> {
+    /// Sets (`Some`) or clears (`None`) the steel design overwrites of a frame:
+    /// unbraced length ratios, effective length factors, Cb and the sway flag.
+    /// Items left `None` stay program determined. Design overwrites do not
+    /// change the analysis, so the model may be locked; steel design results
+    /// are cleared.
+    pub fn set_overwrite(
+        &mut self,
+        name: &str,
+        overwrite: Option<sap_model::SteelDesignOverwrite>,
+    ) -> i32 {
+        if let Some(o) = &overwrite {
+            let items = [o.l_ratio_major, o.l_ratio_minor, o.l_ratio_ltb, o.k_major, o.k_minor, o.cb];
+            if items.iter().flatten().any(|v| !v.is_finite() || *v <= 0.0) {
+                return OAPI_ERR;
+            }
+        }
+        let Some(frame) = self.api.inner.frames.get_mut(name) else {
+            return OAPI_ERR;
+        };
+        frame.steel_overwrite = overwrite;
+        self.api.inner.steel_design_results.clear();
+        self.api.inner.steel_design_errors.clear();
+        OAPI_OK
+    }
+
+    pub fn get_overwrite(&self, name: &str) -> Option<&sap_model::SteelDesignOverwrite> {
+        self.api.inner.frames.get(name)?.steel_overwrite.as_ref()
+    }
+
     pub fn set_code(&mut self, code_name: &str) -> i32 {
         if SteelCode::try_from_code_str(code_name).is_err() {
             return OAPI_ERR;
         }
         self.api.inner.steel_design_results.clear();
+        self.api.inner.steel_design_errors.clear();
         self.api.inner.steel_design_code = code_name.to_string();
         OAPI_OK
     }
@@ -2519,10 +2769,18 @@ impl cDesignSteel<'_> {
     }
 
     pub fn start_design(&mut self) -> i32 {
-        match try_run_steel_design(&mut self.api.inner) {
-            Ok(()) => OAPI_OK,
+        // D127: a member the design refuses is recorded and the run completes (`OAPI_OK`);
+        // `get_error_summary` returns the reason. A run error is `OAPI_ERR`.
+        match run_steel_design_per_member(&mut self.api.inner) {
+            Ok(_) => OAPI_OK,
             Err(_) => OAPI_ERR,
         }
+    }
+
+    /// The design error message of a frame the last run did not design (v19 API help,
+    /// `cDesignSteel.GetSummaryResults`, ErrorSummary); `None` for a frame without one.
+    pub fn get_error_summary(&self, name: &str) -> Option<String> {
+        self.api.inner.steel_design_errors.get(name).cloned()
     }
 
     pub fn get_summary_results(&self, name: &str) -> Option<SteelDesignResult> {
@@ -2536,11 +2794,31 @@ pub struct cDesignConcrete<'a> {
 }
 
 impl cDesignConcrete<'_> {
+    /// Sets the framing type of a frame (the "Framing Type" overwrite). For
+    /// ACI beam design, Sway Special and Sway Intermediate apply the end and
+    /// span moment-strength rules; their capacity-based shear, column and
+    /// joint provisions are not implemented. Concrete design results are
+    /// cleared; the model may be locked.
+    pub fn set_framing_type(&mut self, name: &str, framing: sap_model::ConcreteFramingType) -> i32 {
+        let Some(frame) = self.api.inner.frames.get_mut(name) else {
+            return OAPI_ERR;
+        };
+        frame.concrete_framing = framing;
+        self.api.inner.concrete_design_results.clear();
+        self.api.inner.concrete_design_errors.clear();
+        OAPI_OK
+    }
+
+    pub fn get_framing_type(&self, name: &str) -> Option<sap_model::ConcreteFramingType> {
+        Some(self.api.inner.frames.get(name)?.concrete_framing)
+    }
+
     pub fn set_code(&mut self, code_name: &str) -> i32 {
         if ConcreteCode::try_from_code_str(code_name).is_err() {
             return OAPI_ERR;
         }
         self.api.inner.concrete_design_results.clear();
+        self.api.inner.concrete_design_errors.clear();
         self.api.inner.concrete_design_code = code_name.to_string();
         OAPI_OK
     }
@@ -2550,10 +2828,17 @@ impl cDesignConcrete<'_> {
     }
 
     pub fn start_design(&mut self) -> i32 {
-        match try_run_concrete_design(&mut self.api.inner) {
-            Ok(()) => OAPI_OK,
+        // D127: see `cDesignSteel::start_design`.
+        match run_concrete_design_per_member(&mut self.api.inner) {
+            Ok(_) => OAPI_OK,
             Err(_) => OAPI_ERR,
         }
+    }
+
+    /// The design error message of a frame the last run did not design (v19 API help,
+    /// `cDesignConcrete.GetSummaryResults`, ErrorSummary); `None` for a frame without one.
+    pub fn get_error_summary(&self, name: &str) -> Option<String> {
+        self.api.inner.concrete_design_errors.get(name).cloned()
     }
 
     pub fn get_summary_results(&self, name: &str) -> Option<ConcreteDesignResult> {
@@ -2667,6 +2952,7 @@ mod tests {
                 phi_vn3: 0.0,
                 status: "OK".into(),
                 eq_name: String::new(),
+                notes: Vec::new(),
             },
         );
         api.inner.concrete_design_results.insert(
@@ -2681,6 +2967,9 @@ mod tests {
                 as_bot: 0.0,
                 as_side: 0.0,
                 av_over_s: 0.0,
+                at_over_s: 0.0,
+                al_torsion: 0.0,
+                notes: Vec::new(),
                 pmm_ratio: 0.0,
                 min_rebar_area: 0.0,
                 status: "OK".into(),

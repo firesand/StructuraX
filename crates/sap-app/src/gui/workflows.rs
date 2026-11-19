@@ -1,7 +1,7 @@
 //! Model-editing workflows with validation before mutation.
 use super::*;
 use sap_model::{
-    AreaLoadSurfacePressure, AreaSection, CableParams, ComboType, LinkObj, LinkProp, LinkPropType,
+    AreaLoadSurfacePressure, AreaLoadUniform, AreaSection, CableParams, ComboType, LinkObj, LinkProp, LinkPropType,
     LoadCombo, MatType, ShellType,
 };
 
@@ -11,14 +11,32 @@ pub(super) struct Workflows {
     delta: [f64; 3],
     copies: usize,
     segments: usize,
+    /// Ratio of the last to the first length of a divided frame.
+    length_ratio: f64,
     pattern: String,
     pattern_type: LoadPatternType,
     self_weight: f64,
     force: [f64; 6],
     distributed: f64,
     frame_load_dir: i32,
+    /// Trapezoidal frame load: start and end distance, start and end value.
+    trapezoid: [f64; 4],
+    /// Frame point load: distance and value.
+    point_load: [f64; 2],
+    /// Distances are lengths from the I end (`false`: fractions of the length).
+    load_absolute: bool,
+    /// The frame point or trapezoidal load is a moment, not a force.
+    load_moment: bool,
+    framing: sap_model::ConcreteFramingType,
+    /// Steel overwrites being edited: L33, L22 and LTB ratios, K33, K22, Cb
+    /// (`0` = program determined).
+    steel_overwrite: [f64; 6],
+    steel_sway: bool,
     pressure: f64,
     face: i32,
+    /// Area uniform load: intensity and direction code (`AreaLoadUniform::dir`).
+    area_uniform: f64,
+    area_uniform_dir: i32,
     replace_loads: bool,
     area: AreaSection,
     mesh: [usize; 2],
@@ -52,14 +70,24 @@ impl Default for Workflows {
             delta: [0.0; 3],
             copies: 1,
             segments: 2,
+            length_ratio: 1.0,
             pattern: "DEAD".into(),
             pattern_type: LoadPatternType::Dead,
             self_weight: 0.0,
             force: [0.0; 6],
             distributed: 0.0,
             frame_load_dir: 6,
+            trapezoid: [0.0, 1.0, 0.0, 0.0],
+            point_load: [0.5, 0.0],
+            load_absolute: false,
+            load_moment: false,
+            framing: sap_model::ConcreteFramingType::default(),
+            steel_overwrite: [0.0; 6],
+            steel_sway: false,
             pressure: 0.0,
             face: -2,
+            area_uniform: 0.0,
+            area_uniform_dir: 10,
             replace_loads: true,
             area: AreaSection::default(),
             mesh: [1, 1],
@@ -107,6 +135,7 @@ impl Workflows {
         }
         self.distributed *= ff / fl;
         self.pressure *= ff / (fl * fl);
+        self.area_uniform *= ff / (fl * fl);
         self.area.thickness_membrane *= fl;
         self.area.thickness_bending *= fl;
         self.tc_comp_limit *= ff;
@@ -158,9 +187,8 @@ fn editable(model: &SapModel) -> Result<(), String> {
     }
 }
 fn invalidate(model: &mut SapModel) {
-    model.case_results.clear();
-    model.steel_design_results.clear();
-    model.concrete_design_results.clear();
+    // D124: one way to clear results (reasons included).
+    model.invalidate_results();
 }
 fn named(name: &str) -> Result<(), String> {
     if name.trim().is_empty() || name.chars().any(char::is_control) {
@@ -568,11 +596,104 @@ fn delete_combo(model: &mut SapModel, name: &str) -> Result<String, String> {
     invalidate(model);
     Ok(format!("Deleted combination {name}."))
 }
+/// Directions of an area uniform load: `AreaLoadUniform::dir` and its label.
+/// The projected directions (7 to 9 and 11) are not offered: the solver
+/// refuses them.
+const AREA_UNIFORM_DIRECTIONS: [(i32, &str); 7] = [
+    (10, "Gravity (-Z)"),
+    (4, "Global X"),
+    (5, "Global Y"),
+    (6, "Global Z"),
+    (1, "Local 1"),
+    (2, "Local 2"),
+    (3, "Local 3"),
+];
+
+/// Divide the selected frames into `segments` pieces whose last length is
+/// `ratio` times the first.
+fn divide_with_ratio(model: &mut SapModel, segments: usize, ratio: f64) -> Result<String, String> {
+    editable(model)?;
+    model
+        .divide_selected_frames_ratio(segments, ratio)
+        .map(|r| {
+            format!(
+                "Divided selected frames into {segments} segments (last/first length {ratio}); created {} additional segments and {} joints.",
+                r.frames_created.len(),
+                r.points_created.len()
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
+/// Break the selected frames at the selected joints on them and at their
+/// intersections with each other.
+fn break_at_intersections(model: &mut SapModel) -> Result<String, String> {
+    editable(model)?;
+    model
+        .break_selected_frames_at_intersections()
+        .map(|r| {
+            format!(
+                "Broke the selected frames at intersections; created {} additional frames and {} joints.",
+                r.frames_created.len(),
+                r.points_created.len()
+            )
+        })
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Clone, Copy)]
 enum LoadAssignment {
     Joint([f64; 6]),
     FrameDir(i32, f64),
+    /// A force or moment at one position along the selected frames.
+    FramePoint {
+        dir: i32,
+        moment: bool,
+        distance: f64,
+        absolute: bool,
+        value: f64,
+    },
+    /// A linearly varying force or moment per length between two positions.
+    FrameTrapezoid {
+        dir: i32,
+        moment: bool,
+        distances: [f64; 2],
+        absolute: bool,
+        values: [f64; 2],
+    },
     Pressure(i32, f64),
+    /// A uniform load per area in Gravity (10), Global X, Y, Z (4 to 6) or
+    /// Local 1, 2, 3 (1 to 3).
+    AreaUniform(i32, f64),
+}
+
+/// Relative positions of `distances` on every selected frame, or why one of
+/// them is not on the frame. Nothing is assigned unless all frames accept.
+fn frame_load_positions<const N: usize>(
+    model: &SapModel,
+    distances: [f64; N],
+    absolute: bool,
+) -> Result<Vec<(String, [f64; N])>, String> {
+    if distances.iter().any(|d| !d.is_finite()) {
+        return Err("Load positions must be finite.".into());
+    }
+    let mut positions = Vec::new();
+    for frame in model.frames.values().filter(|f| f.selected) {
+        let (Some(i), Some(j)) = (model.points.get(&frame.point_i), model.points.get(&frame.point_j)) else {
+            return Err(format!("Frame {} has a missing joint.", frame.name));
+        };
+        let length = ((j.x - i.x).powi(2) + (j.y - i.y).powi(2) + (j.z - i.z).powi(2)).sqrt();
+        let relative = distances.map(|d| if absolute { d / length } else { d });
+        if length <= 0.0 || relative.iter().any(|r| !(-1e-12..=1.0 + 1e-12).contains(r)) {
+            return Err(if absolute {
+                format!("A load position is beyond frame {} (length {length}).", frame.name)
+            } else {
+                "Relative load positions must be between 0 and 1.".to_string()
+            });
+        }
+        positions.push((frame.name.clone(), relative.map(|r| r.clamp(0.0, 1.0))));
+    }
+    Ok(positions)
 }
 fn assign_load(
     model: &mut SapModel,
@@ -591,6 +712,14 @@ fn assign_load(
             model.frames.values().filter(|p| p.selected).count(),
             w.is_finite(),
         ),
+        LoadAssignment::FramePoint { value, .. } => (
+            model.frames.values().filter(|p| p.selected).count(),
+            value.is_finite(),
+        ),
+        LoadAssignment::FrameTrapezoid { values, .. } => (
+            model.frames.values().filter(|p| p.selected).count(),
+            values.iter().all(|v| v.is_finite()),
+        ),
         LoadAssignment::Pressure(face, p) => {
             if ![-1, -2].contains(&face) {
                 return Err("Choose the top or bottom face.".into());
@@ -598,6 +727,18 @@ fn assign_load(
             (
                 model.areas.values().filter(|p| p.selected).count(),
                 p.is_finite(),
+            )
+        }
+        LoadAssignment::AreaUniform(dir, w) => {
+            if !AREA_UNIFORM_DIRECTIONS.iter().any(|(code, _)| *code == dir) {
+                return Err(
+                    "Choose Gravity, a global direction or a local direction; projected directions are not available because the solver does not implement them."
+                        .into(),
+                );
+            }
+            (
+                model.areas.values().filter(|p| p.selected).count(),
+                w.is_finite(),
             )
         }
     };
@@ -642,6 +783,58 @@ fn assign_load(
                 });
             }
         }
+        LoadAssignment::FramePoint { dir, moment, distance, absolute, value } => {
+            let positions = frame_load_positions(model, [distance], absolute)?;
+            for (name, [rel_dist]) in positions {
+                let frame = &mut model.frames[name.as_str()];
+                if replace {
+                    frame.loads_point.retain(|l| l.load_pat != pattern);
+                }
+                frame.loads_point.push(sap_model::FrameLoadPoint {
+                    load_pat: pattern.into(),
+                    my_type: if moment { 2 } else { 1 },
+                    dir,
+                    csys: if (1..=3).contains(&dir) { "LOCAL" } else { "GLOBAL" }.into(),
+                    rel_dist,
+                    val: value,
+                });
+            }
+        }
+        LoadAssignment::FrameTrapezoid { dir, moment, distances, absolute, values } => {
+            let positions = frame_load_positions(model, distances, absolute)?;
+            if positions.iter().any(|(_, [a, b])| b <= a) {
+                return Err("The load must end after it starts.".into());
+            }
+            for (name, [rel_dist1, rel_dist2]) in positions {
+                let frame = &mut model.frames[name.as_str()];
+                if replace {
+                    frame.loads_dist.retain(|l| l.load_pat != pattern);
+                }
+                frame.loads_dist.push(FrameLoadDistributed {
+                    load_pat: pattern.into(),
+                    my_type: if moment { 2 } else { 1 },
+                    dir,
+                    csys: if (1..=3).contains(&dir) { "LOCAL" } else { "GLOBAL" }.into(),
+                    rel_dist1,
+                    rel_dist2,
+                    val1: values[0],
+                    val2: values[1],
+                });
+            }
+        }
+        LoadAssignment::AreaUniform(dir, val) => {
+            for a in model.areas.values_mut().filter(|a| a.selected) {
+                if replace {
+                    a.loads_uniform.retain(|l| l.load_pat != pattern);
+                }
+                a.loads_uniform.push(AreaLoadUniform {
+                    load_pat: pattern.into(),
+                    csys: if (1..=3).contains(&dir) { "LOCAL" } else { "GLOBAL" }.into(),
+                    dir,
+                    val,
+                });
+            }
+        }
         LoadAssignment::Pressure(face, val) => {
             for a in model.areas.values_mut().filter(|a| a.selected) {
                 if replace {
@@ -660,6 +853,65 @@ fn assign_load(
     invalidate(model);
     Ok(format!("Assigned {pattern} loads to {count} objects."))
 }
+/// Sets the concrete design framing type of the selected frames.
+fn assign_concrete_framing(
+    model: &mut SapModel,
+    framing: sap_model::ConcreteFramingType,
+) -> Result<String, String> {
+    // A design overwrite does not change the analysis: the model may stay
+    // locked and keeps its analysis results; only design results are stale.
+    let count = model.frames.values().filter(|f| f.selected).count();
+    if count == 0 {
+        return Err("No frames are selected.".into());
+    }
+    for frame in model.frames.values_mut().filter(|f| f.selected) {
+        frame.concrete_framing = framing;
+    }
+    model.concrete_design_results.clear();
+    model.concrete_design_errors.clear();
+    Ok(format!("Set the concrete framing type of {count} frames to {framing:?}."))
+}
+
+/// Sets or clears the steel design overwrites of the selected frames. `values`
+/// are the L33, L22 and LTB unbraced length ratios, K33, K22 and Cb; zero
+/// leaves an item program determined.
+fn assign_steel_overwrite(
+    model: &mut SapModel,
+    values: Option<([f64; 6], bool)>,
+) -> Result<String, String> {
+    let count = model.frames.values().filter(|f| f.selected).count();
+    if count == 0 {
+        return Err("No frames are selected.".into());
+    }
+    let overwrite = match values {
+        None => None,
+        Some((values, is_sway)) => {
+            if values.iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return Err("Overwrite values must be finite and not negative (0 = program determined).".into());
+            }
+            let item = |v: f64| (v > 0.0).then_some(v);
+            Some(sap_model::SteelDesignOverwrite {
+                l_ratio_major: item(values[0]),
+                l_ratio_minor: item(values[1]),
+                l_ratio_ltb: item(values[2]),
+                k_major: item(values[3]),
+                k_minor: item(values[4]),
+                cb: item(values[5]),
+                is_sway,
+            })
+        }
+    };
+    for frame in model.frames.values_mut().filter(|f| f.selected) {
+        frame.steel_overwrite = overwrite.clone();
+    }
+    model.steel_design_results.clear();
+    model.steel_design_errors.clear();
+    Ok(match overwrite {
+        Some(_) => format!("Assigned steel design overwrites to {count} frames."),
+        None => format!("Cleared the steel design overwrites of {count} frames."),
+    })
+}
+
 fn vector(ui: &mut egui::Ui, labels: &[&str], values: &mut [f64]) {
     ui.horizontal(|ui| {
         for (label, value) in labels.iter().zip(values) {
@@ -684,7 +936,7 @@ impl SapGuiApp {
         initialize_material(&mut state, &self.model);
         let mut open = state.open;
         if open {
-            egui::Window::new("Model Workflows").open(&mut open).default_width(680.0).vscroll(true).show(ctx,|ui| {
+            egui::Window::new("Model Workflows").open(&mut open).default_size([680.0,560.0]).max_height((ctx.screen_rect().height()-60.0).max(200.0)).vscroll(true).show(ctx,|ui| {
             ui.horizontal_wrapped(|ui| {for (i,title) in ["Geometry","Loads","Areas","Releases / T-C / Cable","Combinations","Materials","Links"].iter().enumerate() {ui.selectable_value(&mut state.tab,i,*title);}});
             ui.label(format!("Units: {}. Selected: {} joints, {} frames, {} areas, {} solids, {} links.",self.model.present_units.s2k_label(),self.model.points.values().filter(|p|p.selected).count(),self.model.frames.values().filter(|p|p.selected).count(),self.model.areas.values().filter(|p|p.selected).count(),self.model.solids.values().filter(|s|s.selected).count(),self.model.links.values().filter(|l|l.selected).count()));
             if self.model.is_locked {ui.colored_label(Color32::YELLOW,"Unlock the model from the Edit menu before applying changes.");}
@@ -704,6 +956,15 @@ impl SapGuiApp {
                     if ui.button("Replicate Selected").clicked() {outcome=Some(self.model.replicate_selected(state.delta,state.copies).map(|r|format!("Created {} joints, {} frames, {} areas.",r.points_created.len(),r.frames_created.len(),r.areas_created.len())).map_err(|e|e.to_string()));}
                     ui.separator();ui.horizontal(|ui| {ui.label("Equal frame segments:");ui.add(egui::DragValue::new(&mut state.segments).range(2..=100));});
                     if ui.button("Divide Selected Frames").clicked() {outcome=Some(self.model.divide_selected_frames(state.segments).map(|r|format!("Divided selected frames; created {} additional segments and {} joints.",r.frames_created.len(),r.points_created.len())).map_err(|e|e.to_string()));}
+                    ui.horizontal(|ui| {
+                        ui.label("Last/first length ratio:");
+                        ui.add(egui::DragValue::new(&mut state.length_ratio).speed(0.05).range(1e-6..=1e6));
+                    });
+                    ui.label("Uses the number of segments above. A ratio of 1 is the equal division; above 1 the pieces grow toward the J end.");
+                    if ui.button("Divide Selected Frames with Ratio").clicked() {outcome=Some(divide_with_ratio(&mut self.model,state.segments,state.length_ratio));}
+                    ui.separator();
+                    ui.label("Break the selected frames at the selected joints on them and where they meet each other (joints and frames only).");
+                    if ui.button("Break Selected at Intersections").clicked() {outcome=Some(break_at_intersections(&mut self.model));}
                 },
                 1=>{
                     ui.horizontal(|ui| {ui.label("Pattern:");ui.text_edit_singleline(&mut state.pattern);});
@@ -744,9 +1005,62 @@ impl SapGuiApp {
                             });
                     });
                     if ui.button("Assign to Selected Frames").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::FrameDir(state.frame_load_dir,state.distributed),state.replace_loads));}
+                    ui.label("Frame point and trapezoidal loads use the direction above.");
+                    ui.horizontal(|ui| {
+                        ui.selectable_value(&mut state.load_moment, false, "Force");
+                        ui.selectable_value(&mut state.load_moment, true, "Moment");
+                        ui.separator();
+                        ui.selectable_value(&mut state.load_absolute, false, "Relative distance (0 to 1)");
+                        ui.selectable_value(&mut state.load_absolute, true, "Absolute distance from end I");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Point load at distance:");
+                        ui.add(egui::DragValue::new(&mut state.point_load[0]).speed(0.01));
+                        ui.label("value:");
+                        ui.add(egui::DragValue::new(&mut state.point_load[1]).speed(0.01));
+                        if ui.button("Assign Point Load to Selected Frames").clicked() {
+                            outcome = Some(assign_load(&mut self.model, &state.pattern, LoadAssignment::FramePoint {
+                                dir: state.frame_load_dir,
+                                moment: state.load_moment,
+                                distance: state.point_load[0],
+                                absolute: state.load_absolute,
+                                value: state.point_load[1],
+                            }, state.replace_loads));
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Trapezoidal load from distance:");
+                        ui.add(egui::DragValue::new(&mut state.trapezoid[0]).speed(0.01));
+                        ui.label("to:");
+                        ui.add(egui::DragValue::new(&mut state.trapezoid[1]).speed(0.01));
+                        ui.label("value at start:");
+                        ui.add(egui::DragValue::new(&mut state.trapezoid[2]).speed(0.01));
+                        ui.label("at end:");
+                        ui.add(egui::DragValue::new(&mut state.trapezoid[3]).speed(0.01));
+                        if ui.button("Assign Trapezoidal Load to Selected Frames").clicked() {
+                            outcome = Some(assign_load(&mut self.model, &state.pattern, LoadAssignment::FrameTrapezoid {
+                                dir: state.frame_load_dir,
+                                moment: state.load_moment,
+                                distances: [state.trapezoid[0], state.trapezoid[1]],
+                                absolute: state.load_absolute,
+                                values: [state.trapezoid[2], state.trapezoid[3]],
+                            }, state.replace_loads));
+                        }
+                    });
+                    ui.label("Replace applies per kind: point loads replace point loads, uniform and trapezoidal loads replace distributed loads.");
                     ui.separator();ui.horizontal(|ui| {ui.label("Area pressure:");ui.add(egui::DragValue::new(&mut state.pressure).speed(0.001));ui.selectable_value(&mut state.face,-2,"Top");ui.selectable_value(&mut state.face,-1,"Bottom");});
                     ui.label("Positive pressure pushes into the selected face: top -local 3, bottom +local 3.");
                     if ui.button("Assign to Selected Areas").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::Pressure(state.face,state.pressure),state.replace_loads));}
+                    ui.horizontal(|ui| {
+                        ui.label("Area uniform load:");
+                        ui.add(egui::DragValue::new(&mut state.area_uniform).speed(0.001));
+                        let label = AREA_UNIFORM_DIRECTIONS.iter().find(|(code, _)| *code == state.area_uniform_dir).map_or("Gravity (-Z)", |(_, l)| *l);
+                        egui::ComboBox::from_id_salt("wf_area_uniform_dir").selected_text(label).show_ui(ui,|ui| {
+                            for (code, lbl) in AREA_UNIFORM_DIRECTIONS {ui.selectable_value(&mut state.area_uniform_dir, code, lbl);}
+                        });
+                    });
+                    ui.label("Force per area in the chosen direction (gravity acts along -Z); projected directions are not offered.");
+                    if ui.button("Assign Uniform Load to Selected Areas").clicked() {outcome=Some(assign_load(&mut self.model,&state.pattern,LoadAssignment::AreaUniform(state.area_uniform_dir,state.area_uniform),state.replace_loads));}
                 },
                 2=>{
                     ui.horizontal(|ui| {ui.label("Section:");ui.text_edit_singleline(&mut state.area.name);});
@@ -777,6 +1091,28 @@ impl SapGuiApp {
                             } else {outcome=Some(Err("Select a frame first.".into()));}
                         }
                         if ui.button("Assign Releases to Selected Frames").clicked() {outcome=Some(assign_releases(&mut self.model,state.release_i,state.release_j));}
+                    });
+                    ui.separator();
+                    ui.label("Concrete design framing type (ACI). Special and Intermediate apply the end and span moment-strength rules to beams; their capacity-based shear, column and joint provisions are not implemented.");
+                    ui.horizontal(|ui| {
+                        use sap_model::ConcreteFramingType as Framing;
+                        for (framing, label) in [(Framing::SwaySpecial, "Sway Special"), (Framing::SwayIntermediate, "Sway Intermediate"), (Framing::SwayOrdinary, "Sway Ordinary"), (Framing::NonSway, "Non-Sway")] {
+                            ui.selectable_value(&mut state.framing, framing, label);
+                        }
+                        if ui.button("Assign Framing Type to Selected Frames").clicked() {outcome=Some(assign_concrete_framing(&mut self.model,state.framing));}
+                    });
+                    ui.separator();
+                    ui.label("Steel design overwrites (0 = program determined). Unbraced length ratios are fractions of the member length.");
+                    ui.horizontal(|ui| {
+                        for (index, label) in ["L33 ratio", "L22 ratio", "LTB ratio", "K33", "K22", "Cb"].iter().enumerate() {
+                            ui.label(*label);
+                            ui.add(egui::DragValue::new(&mut state.steel_overwrite[index]).speed(0.01));
+                        }
+                        ui.checkbox(&mut state.steel_sway, "Sway");
+                    });
+                    ui.horizontal(|ui| {
+                        if ui.button("Assign Steel Overwrites to Selected Frames").clicked() {outcome=Some(assign_steel_overwrite(&mut self.model,Some((state.steel_overwrite,state.steel_sway))));}
+                        if ui.button("Clear Steel Overwrites of Selected Frames").clicked() {outcome=Some(assign_steel_overwrite(&mut self.model,None));}
                     });
                     ui.separator();
                     ui.label("Nonlinear Frame Tension / Compression Axial Limits (evaluated in NonlinearStatic cases):");
@@ -1176,5 +1512,439 @@ mod tests {
             LoadPatternType::Wind
         );
         assert!(app.model.load_cases.contains_key("WIND"));
+    }
+
+    /// The 8 m beam of "Modul SAP2000 v11" sections 3.1 to 3.3 (pin and
+    /// roller, no self weight, kgf and m), with its one frame selected.
+    fn v11_beam() -> SapModel {
+        let mut m = SapModel::new(Units::KgfMC);
+        m.load_cases.clear();
+        m.load_patterns.clear();
+        m.active_dofs = [true, false, true, false, true, false];
+        m.add_point("A", 0.0, 0.0, 0.0);
+        m.add_point("B", 8.0, 0.0, 0.0);
+        m.points["A"].restraint = [true, true, true, false, false, false];
+        m.points["B"].restraint = [false, true, true, false, false, false];
+        let section = m.frame_sections.keys().next().unwrap().clone();
+        m.add_frame("F", "A", "B", section);
+        m.frames["F"].selected = true;
+        define_pattern(&mut m, "DEAD", LoadPatternType::Dead, 0.0).unwrap();
+        m
+    }
+    fn reactions(m: &mut SapModel) -> ([f64; 6], [f64; 6]) {
+        sap_solver::analyze_model(m).unwrap();
+        let r = &m.case_results["DEAD"].joint_reactions;
+        (r["A"], r["B"])
+    }
+    #[test]
+    fn point_and_trapezoidal_loads_reproduce_the_v11_module_beams() {
+        let point = |distance, absolute, dir, value| LoadAssignment::FramePoint { dir, moment: false, distance, absolute, value };
+        // 3.1: 4 kgf at mid-span (relative 0.5) and 2 kgf at 6 m (absolute).
+        // Printed reactions 2.50 and 3.50 kgf.
+        let mut m = v11_beam();
+        assign_load(&mut m, "DEAD", point(0.5, false, 10, 4.0), false).unwrap();
+        assign_load(&mut m, "DEAD", point(6.0, true, 10, 2.0), false).unwrap();
+        assert_eq!(m.frames["F"].loads_point.len(), 2);
+        assert_eq!(m.frames["F"].loads_point[1].rel_dist, 0.75);
+        let (a, b) = reactions(&mut m);
+        assert!((a[2] - 2.5).abs() < 1e-9 && (b[2] - 3.5).abs() < 1e-9, "{a:?} {b:?}");
+
+        // 3.2: 8 kgf/m over the first 6 m. Printed 30.00 and 18.00 kgf.
+        let mut m = v11_beam();
+        let partial = LoadAssignment::FrameTrapezoid { dir: 10, moment: false, distances: [0.0, 6.0], absolute: true, values: [8.0, 8.0] };
+        assign_load(&mut m, "DEAD", partial, false).unwrap();
+        assert_eq!((m.frames["F"].loads_dist[0].rel_dist1, m.frames["F"].loads_dist[0].rel_dist2), (0.0, 0.75));
+        let (a, b) = reactions(&mut m);
+        assert!((a[2] - 30.0).abs() < 1e-9 && (b[2] - 18.0).abs() < 1e-9, "{a:?} {b:?}");
+
+        // 3.3: 1.5 kgf/m over 3.5 m, 2 kgf at 5.5 m, and at 6.5 m 0.75 kgf
+        // down with 1.3 kgf along the beam. Printed A 4.87 and 1.30, B 3.13.
+        let mut m = v11_beam();
+        let partial = LoadAssignment::FrameTrapezoid { dir: 10, moment: false, distances: [0.0, 3.5], absolute: true, values: [1.5, 1.5] };
+        assign_load(&mut m, "DEAD", partial, false).unwrap();
+        assign_load(&mut m, "DEAD", point(5.5, true, 10, 2.0), false).unwrap();
+        assign_load(&mut m, "DEAD", point(6.5, true, 10, 0.75), false).unwrap();
+        assign_load(&mut m, "DEAD", point(6.5, true, 4, -1.3), false).unwrap();
+        let (a, b) = reactions(&mut m);
+        assert!((a[2] - 4.87).abs() < 5e-3 && (a[0] - 1.30).abs() < 1e-9 && (b[2] - 3.13).abs() < 5e-3, "{a:?} {b:?}");
+
+        // A triangular load 0 to 9 over the whole span: total 36, two thirds
+        // of it on the support at the heavy end.
+        let mut m = v11_beam();
+        let triangle = LoadAssignment::FrameTrapezoid { dir: 10, moment: false, distances: [0.0, 1.0], absolute: false, values: [0.0, 9.0] };
+        assign_load(&mut m, "DEAD", triangle, false).unwrap();
+        let (a, b) = reactions(&mut m);
+        assert!((a[2] - 12.0).abs() < 1e-9 && (b[2] - 24.0).abs() < 1e-9, "{a:?} {b:?}");
+    }
+    #[test]
+    fn frame_load_assignment_validates_before_changing_and_replaces_by_kind() {
+        let mut m = v11_beam();
+        m.add_point("C", 12.0, 0.0, 0.0);
+        m.add_frame("SHORT", "B", "C", "FSEC1");
+        m.frames["SHORT"].selected = true;
+        let point = |distance, absolute| LoadAssignment::FramePoint { dir: 10, moment: false, distance, absolute, value: 1.0 };
+        let trapezoid = |distances, absolute| LoadAssignment::FrameTrapezoid { dir: 10, moment: false, distances, absolute, values: [1.0, 2.0] };
+        let before = m.clone();
+        // 6 m is on the 8 m frame and beyond the 4 m one: nothing is assigned.
+        for bad in [
+            point(6.0, true),
+            point(1.5, false),
+            point(-0.1, false),
+            point(f64::NAN, false),
+            trapezoid([0.0, 6.0], true),
+            trapezoid([0.6, 0.6], false),
+            trapezoid([0.8, 0.2], false),
+            LoadAssignment::FramePoint { dir: 10, moment: false, distance: 0.5, absolute: false, value: f64::INFINITY },
+        ] {
+            assert!(assign_load(&mut m, "DEAD", bad, false).is_err());
+            assert_eq!(m, before);
+        }
+        assert!(assign_load(&mut m, "MISSING", point(0.5, false), false).is_err());
+
+        // Replace is per kind: a new point load replaces point loads and
+        // leaves distributed loads, and the other way round.
+        assign_load(&mut m, "DEAD", LoadAssignment::FrameDir(10, 3.0), false).unwrap();
+        assign_load(&mut m, "DEAD", point(0.25, false), false).unwrap();
+        assign_load(&mut m, "DEAD", point(0.5, false), true).unwrap();
+        for frame in ["F", "SHORT"] {
+            assert_eq!(m.frames[frame].loads_point.len(), 1);
+            assert_eq!(m.frames[frame].loads_point[0].rel_dist, 0.5);
+            assert_eq!(m.frames[frame].loads_dist.len(), 1);
+        }
+        assign_load(&mut m, "DEAD", trapezoid([0.0, 0.5], false), true).unwrap();
+        assert_eq!(m.frames["F"].loads_dist.len(), 1);
+        assert_eq!(m.frames["F"].loads_dist[0].val2, 2.0);
+        assert_eq!(m.frames["F"].loads_point.len(), 1);
+        // A moment about a local axis is stored as such.
+        let moment = LoadAssignment::FramePoint { dir: 2, moment: true, distance: 0.5, absolute: false, value: 7.0 };
+        assign_load(&mut m, "DEAD", moment, false).unwrap();
+        let last = m.frames["F"].loads_point.last().unwrap();
+        assert_eq!((last.my_type, last.dir, last.csys.as_str()), (2, 2, "LOCAL"));
+    }
+    #[test]
+    fn design_settings_are_assigned_to_selected_frames_and_validated() {
+        use sap_model::{ConcreteFramingType as Framing, SteelDesignOverwrite};
+        let mut m = model();
+        m.add_frame("OTHER", "2", "3", "FSEC1");
+        // Design settings leave the analysis alone: a locked model keeps its
+        // analysis results and loses only the design results they feed.
+        m.case_results.insert("old".into(), Default::default());
+        m.is_locked = true;
+        m.concrete_design_results.insert("F".into(), sap_model::ConcreteDesignResult {
+            frame_name: "F".into(), section_name: String::new(), design_code: String::new(), governing_combo: String::new(),
+            is_column: false, as_top: 0.0, as_bot: 0.0, as_side: 0.0, av_over_s: 0.0, at_over_s: 0.0, al_torsion: 0.0, notes: Vec::new(), pmm_ratio: 0.0, min_rebar_area: 0.0, status: String::new(),
+        });
+        assert_eq!(m.frames["F"].concrete_framing, Framing::SwaySpecial);
+        assign_concrete_framing(&mut m, Framing::SwayOrdinary).unwrap();
+        assert_eq!(m.frames["F"].concrete_framing, Framing::SwayOrdinary);
+        assert_eq!(m.frames["OTHER"].concrete_framing, Framing::SwaySpecial);
+        assert!(m.is_locked && m.case_results.contains_key("old"));
+        assert!(m.concrete_design_results.is_empty());
+
+        // Zero leaves an item program determined.
+        assign_steel_overwrite(&mut m, Some(([0.0, 0.5, 0.25, 0.0, 0.0, 1.14], true))).unwrap();
+        assert_eq!(
+            m.frames["F"].steel_overwrite,
+            Some(SteelDesignOverwrite { l_ratio_minor: Some(0.5), l_ratio_ltb: Some(0.25), cb: Some(1.14), is_sway: true, ..Default::default() })
+        );
+        assert_eq!(m.frames["OTHER"].steel_overwrite, None);
+        let before = m.clone();
+        for bad in [[-1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 0.0, f64::NAN, 0.0, 0.0, 0.0]] {
+            assert!(assign_steel_overwrite(&mut m, Some((bad, false))).is_err());
+            assert_eq!(m, before);
+        }
+        assign_steel_overwrite(&mut m, None).unwrap();
+        assert_eq!(m.frames["F"].steel_overwrite, None);
+
+        // Nothing selected changes nothing.
+        m.frames["F"].selected = false;
+        assert!(assign_concrete_framing(&mut m, Framing::NonSway).is_err());
+        assert!(assign_steel_overwrite(&mut m, None).is_err());
+        assert_eq!(m.frames["F"].concrete_framing, Framing::SwayOrdinary);
+    }
+
+    // --- divide with ratio, break at intersections, area uniform loads -----
+
+    fn click_button(app: &mut SapGuiApp, ctx: &egui::Context, label: &str, time: f64) {
+        let input = |time| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 3000.0))),
+            time: Some(time),
+            ..Default::default()
+        };
+        let find = |out: &egui::FullOutput| {
+            out.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::epaint::Shape::Text(text) if text.galley.job.text == label => {
+                    Some(text.pos + text.galley.size() * 0.5)
+                }
+                _ => None,
+            })
+        };
+        // The window starts about 400 points high and scrolls: scroll it
+        // with the mouse wheel until the button is drawn.
+        let mut time = time;
+        let mut found = None;
+        for _ in 0..40 {
+            time += 0.1;
+            let _ = ctx.run(input(time), |ctx| app.render_workflows(ctx));
+            time += 0.1;
+            let out = ctx.run(input(time), |ctx| app.render_workflows(ctx));
+            if let Some(pos) = find(&out) {
+                found = Some(pos);
+                break;
+            }
+            time += 0.1;
+            let mut wheel = input(time);
+            wheel.events = vec![
+                egui::Event::PointerMoved(Pos2::new(120.0, 200.0)),
+                egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: Vec2::new(0.0, -150.0),
+                    modifiers: Default::default(),
+                },
+            ];
+            let _ = ctx.run(wheel, |ctx| app.render_workflows(ctx));
+        }
+        let pos = found.unwrap_or_else(|| panic!("button {label:?} must become visible"));
+        let time = time + 0.1;
+        let mut down = input(time + 0.2);
+        down.events = vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: Default::default(),
+            },
+        ];
+        let _ = ctx.run(down, |ctx| app.render_workflows(ctx));
+        let mut up = input(time + 0.3);
+        up.events = vec![egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: Default::default(),
+        }];
+        let _ = ctx.run(up, |ctx| app.render_workflows(ctx));
+    }
+
+    #[test]
+    fn divide_with_ratio_command_makes_the_geometric_series_and_refuses_cleanly() {
+        let mut m = model();
+        // L = 120, 4 segments, ratio 8: q = 2, pieces 8, 16, 32, 64 (units of
+        // L / 15 = 8), so the joints are at x = 8, 24, 56.
+        let message = divide_with_ratio(&mut m, 4, 8.0).unwrap();
+        assert!(message.contains("created 3 additional segments and 3 joints"), "{message}");
+        let mut xs: Vec<f64> = m
+            .points
+            .values()
+            .filter(|p| p.y == 0.0 && p.z == 0.0)
+            .map(|p| p.x)
+            .collect();
+        xs.sort_by(f64::total_cmp);
+        for (got, want) in xs.iter().zip([0.0, 8.0, 24.0, 56.0, 120.0]) {
+            assert!((got - want).abs() < 1e-9, "{xs:?}");
+        }
+        let mut zero = model();
+        let before = zero.clone();
+        assert!(divide_with_ratio(&mut zero, 4, 0.0).is_err());
+        assert_eq!(zero, before);
+        let mut locked = model();
+        locked.is_locked = true;
+        let before = locked.clone();
+        assert!(divide_with_ratio(&mut locked, 4, 2.0).unwrap_err().contains("locked"));
+        assert_eq!(locked, before);
+        let mut one = model();
+        let before = one.clone();
+        assert!(divide_with_ratio(&mut one, 1, 2.0).is_err());
+        assert_eq!(one, before);
+    }
+
+    #[test]
+    fn break_command_splits_crossing_frames_and_refuses_cleanly() {
+        let mut m = model();
+        m.areas["A"].selected = false;
+        m.add_point("5", 60.0, -60.0, 0.0);
+        m.add_point("6", 60.0, 60.0, 0.0);
+        m.add_frame("G", "5", "6", "FSEC1");
+        m.frames["G"].selected = true;
+        let message = break_at_intersections(&mut m).unwrap();
+        assert!(message.contains("created 2 additional frames and 1 joints"), "{message}");
+        assert_eq!(m.frames.len(), 4);
+        // Nothing to break any more.
+        let before = m.clone();
+        assert!(break_at_intersections(&mut m).is_err());
+        assert_eq!(m, before);
+        // A selected area, and a locked model.
+        let mut with_area = model();
+        let before = with_area.clone();
+        let error = break_at_intersections(&mut with_area).unwrap_err();
+        assert!(error.contains("area or solid edges is not implemented"), "{error}");
+        assert_eq!(with_area, before);
+        let mut locked = model();
+        locked.is_locked = true;
+        let before = locked.clone();
+        assert!(break_at_intersections(&mut locked).unwrap_err().contains("locked"));
+        assert_eq!(locked, before);
+    }
+
+    #[test]
+    fn geometry_tab_buttons_divide_with_ratio_and_break() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/workflow-test.s2k")));
+        app.model = model();
+        app.model.areas["A"].selected = false;
+        app.workflows.open = true;
+        app.workflows.tab = 0;
+        app.workflows.segments = 4;
+        app.workflows.length_ratio = 8.0;
+        let ctx = egui::Context::default();
+        click_button(&mut app, &ctx, "Divide Selected Frames with Ratio", 1.0);
+        assert_eq!(app.model.frames.len(), 4, "{}", app.status_msg);
+        assert!(app.status_msg.contains("last/first length 8"), "{}", app.status_msg);
+        // Break: a selected frame crossing the first piece (x = 4 of 0..8).
+        app.model.add_point("20", 4.0, -10.0, 0.0);
+        app.model.add_point("21", 4.0, 10.0, 0.0);
+        app.model.add_frame("X", "20", "21", "FSEC1");
+        app.model.frames["X"].selected = true;
+        click_button(&mut app, &ctx, "Break Selected at Intersections", 10.0);
+        assert!(app.status_msg.starts_with("Broke the selected frames"), "{}", app.status_msg);
+        // The four pieces and X become 7 frames: X and the first piece split.
+        assert_eq!(app.model.frames.len(), 7, "{}", app.status_msg);
+    }
+
+    #[test]
+    fn area_uniform_load_command_assigns_by_direction_and_refuses_projected_ones() {
+        for (dir, csys) in [
+            (10, "GLOBAL"),
+            (4, "GLOBAL"),
+            (5, "GLOBAL"),
+            (6, "GLOBAL"),
+            (1, "LOCAL"),
+            (2, "LOCAL"),
+            (3, "LOCAL"),
+        ] {
+            let mut m = model();
+            let message =
+                assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 0.8), false).unwrap();
+            assert!(message.contains("1 objects"), "{message}");
+            assert_eq!(
+                m.areas["A"].loads_uniform,
+                vec![AreaLoadUniform {
+                    load_pat: "DEAD".into(),
+                    csys: csys.into(),
+                    dir,
+                    val: 0.8
+                }]
+            );
+            // Adding keeps the earlier load; replacing removes the pattern's.
+            assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 1.5), false).unwrap();
+            assert_eq!(m.areas["A"].loads_uniform.len(), 2);
+            assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 2.5), true).unwrap();
+            assert_eq!(m.areas["A"].loads_uniform.len(), 1);
+            assert_eq!(m.areas["A"].loads_uniform[0].val, 2.5);
+        }
+        let mut m = model();
+        let before = m.clone();
+        for dir in [0, 7, 8, 9, 11, 12, -1] {
+            let error =
+                assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(dir, 0.8), false).unwrap_err();
+            assert!(error.contains("projected directions are not available"), "{dir}: {error}");
+            assert_eq!(m, before, "{dir}");
+        }
+        assert!(assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(10, f64::NAN), false).is_err());
+        assert!(assign_load(&mut m, "NOPE", LoadAssignment::AreaUniform(10, 0.8), false).is_err());
+        assert_eq!(m, before);
+        m.areas["A"].selected = false;
+        let before = m.clone();
+        assert!(assign_load(&mut m, "DEAD", LoadAssignment::AreaUniform(10, 0.8), false).is_err());
+        assert_eq!(m, before);
+        let mut locked = model();
+        locked.is_locked = true;
+        let before = locked.clone();
+        assert!(assign_load(&mut locked, "DEAD", LoadAssignment::AreaUniform(10, 0.8), false).is_err());
+        assert_eq!(locked, before);
+    }
+
+    /// A 6 x 5 panel at z = 0, one element, every corner fixed, no weight; the
+    /// sums of the reactions are the loads, reversed.
+    fn panel_reaction_sums(dir: i32, value: f64) -> [f64; 3] {
+        let mut m = SapModel::new(Units::KnMC);
+        m.load_cases.clear();
+        m.load_patterns.clear();
+        m.add_point("1", 0.0, 0.0, 0.0);
+        m.add_point("2", 6.0, 0.0, 0.0);
+        m.add_point("3", 6.0, 5.0, 0.0);
+        m.add_point("4", 0.0, 5.0, 0.0);
+        for j in ["1", "2", "3", "4"] {
+            m.points[j].restraint = [true; 6];
+        }
+        m.add_area("A", vec!["1".into(), "2".into(), "3".into(), "4".into()], "ASEC1");
+        m.areas["A"].auto_mesh = (1, 1);
+        m.areas["A"].selected = true;
+        define_pattern(&mut m, "Q", LoadPatternType::Other, 0.0).unwrap();
+        assign_load(&mut m, "Q", LoadAssignment::AreaUniform(dir, value), false).unwrap();
+        sap_solver::analyze_model(&mut m).unwrap();
+        let mut sum = [0.0; 3];
+        for r in m.case_results["Q"].joint_reactions.values() {
+            for k in 0..3 {
+                sum[k] += r[k];
+            }
+        }
+        sum
+    }
+
+    #[test]
+    fn area_uniform_loads_give_the_resultants_of_their_direction() {
+        let tol = 1e-9 * 30.0;
+        // Gravity 0.8 kN/m2 on 30 m2: 24 kN down, so the reactions add to +24.
+        let s = panel_reaction_sums(10, 0.8);
+        assert!((s[2] - 24.0).abs() < tol && s[0].abs() < tol && s[1].abs() < tol, "{s:?}");
+        // Global X 0.5 kN/m2: 15 kN toward +X, reactions -15.
+        let s = panel_reaction_sums(4, 0.5);
+        assert!((s[0] + 15.0).abs() < tol && s[1].abs() < tol && s[2].abs() < tol, "{s:?}");
+        let s = panel_reaction_sums(5, 0.5);
+        assert!((s[1] + 15.0).abs() < tol && s[0].abs() < tol && s[2].abs() < tol, "{s:?}");
+        let s = panel_reaction_sums(6, 0.5);
+        assert!((s[2] + 15.0).abs() < tol && s[0].abs() < tol && s[1].abs() < tol, "{s:?}");
+        // Local 3 of a panel drawn counter-clockwise from above is +Z.
+        let s = panel_reaction_sums(3, 0.5);
+        assert!((s[2] + 15.0).abs() < tol && s[0].abs() < tol && s[1].abs() < tol, "{s:?}");
+        // Local 1 and 2 lie in the plane of the panel.
+        for dir in [1, 2] {
+            let s = panel_reaction_sums(dir, 0.5);
+            assert!(s[2].abs() < tol, "{s:?}");
+            assert!((s[0].hypot(s[1]) - 15.0).abs() < tol, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn loads_tab_button_assigns_the_area_uniform_load() {
+        let mut app = SapGuiApp::new(Some(PathBuf::from("/nonexistent/workflow-test.s2k")));
+        app.model = model();
+        app.workflows.open = true;
+        app.workflows.tab = 1;
+        app.workflows.area_uniform = 0.8;
+        app.workflows.area_uniform_dir = 6;
+        let ctx = egui::Context::default();
+        click_button(&mut app, &ctx, "Assign Uniform Load to Selected Areas", 1.0);
+        assert_eq!(
+            app.model.areas["A"].loads_uniform,
+            vec![AreaLoadUniform {
+                load_pat: "DEAD".into(),
+                csys: "GLOBAL".into(),
+                dir: 6,
+                val: 0.8
+            }],
+            "{}",
+            app.status_msg
+        );
+        // The offered directions: no projected one.
+        let labels: Vec<&str> = AREA_UNIFORM_DIRECTIONS.iter().map(|(_, l)| *l).collect();
+        assert_eq!(
+            labels,
+            ["Gravity (-Z)", "Global X", "Global Y", "Global Z", "Local 1", "Local 2", "Local 3"]
+        );
+        assert!(AREA_UNIFORM_DIRECTIONS
+            .iter()
+            .all(|(d, _)| !(7..=9).contains(d) && *d != 11));
     }
 }

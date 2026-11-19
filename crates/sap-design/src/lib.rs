@@ -1,4 +1,6 @@
+pub mod auto_select;
 pub mod concrete;
+pub mod default_combos;
 mod error;
 pub mod shear;
 pub use shear::{
@@ -7,19 +9,25 @@ pub use shear::{
 };
 pub mod steel;
 
-pub use error::DesignError;
+pub use auto_select::{verify_all_members_passed, verify_analysis_vs_design};
+pub use default_combos::{
+    add_default_design_combos, DefaultComboOptions, DefaultComboSummary, DesignMethod,
+};
+pub use error::{DesignError, DesignRunReport};
 
 pub use concrete::{
     compute_whitney_beta1, design_aci_beam_flexure, design_aci_beam_shear, design_ec2_beam,
     evaluate_column_biaxial_pmm_ratio, generate_column_pm_curve, interpolate_phi_mn_at_pu,
-    is_concrete_column, run_concrete_design, try_run_concrete_design, ConcreteCode, PmCurvePoint,
+    is_concrete_column, run_concrete_design, run_concrete_design_per_member, try_run_concrete_design, ConcreteCode, PmCurvePoint,
 };
 pub use steel::{
-    check_compactness_aisc, compute_aisc_360_capacities, compute_aisc_torsional_capacity,
+    check_compactness_aisc, classify_ec3_section, compute_aisc_360_capacities,
+    compute_aisc_torsional_capacity,
     compute_cb_from_stations, compute_ec3_capacities, compute_k_braced, compute_k_sway,
     compute_member_k_factors, compute_slender_q_factor, evaluate_station_interaction,
-    frame_clear_length, run_steel_design, run_steel_design_with_overwrites, try_run_steel_design,
-    try_run_steel_design_with_overwrites, CompactnessClass, SectionCompactness, SteelCode,
+    frame_clear_length, run_steel_design, run_steel_design_per_member,
+    run_steel_design_per_member_with_overwrites, run_steel_design_with_overwrites, try_run_steel_design,
+    try_run_steel_design_with_overwrites, CompactnessClass, Ec3Class, SectionCompactness, SteelCode,
     SteelMemberOverwrite,
 };
 
@@ -173,6 +181,7 @@ mod tests {
             1.0,
             false,
         )
+        .unwrap()
         .3;
         assert!((result.phi_mn22 - expected_aisc_mn22).abs() < 1e-10);
         assert!((result.phi_vn3 - 270.0).abs() < 1e-10);
@@ -593,7 +602,7 @@ mod tests {
             vec![FrameStationResult {
                 station: 72.0,
                 rel_dist: 0.5,
-                p: -150.0,
+                p: 150.0,
                 v2: 30.0,
                 m3: 1200.0,
                 ..Default::default()
@@ -919,7 +928,12 @@ mod tests {
         assert!((compute_aisc_minor_shear(&angle, mat, true).unwrap() - 60.0 / 1.67).abs() < 1e-10);
 
         // 2. Double Angle 2L6x4x1/2: Av3 = 2 * 4.0 * 0.5 = 4.0 in^2 -> LRFD = 108.0 kips, ASD = 120.0 / 1.67
+        // D97: t2 of a double angle is the total width (v19 OAPI SetDblAngle: the sum of the
+        // widths of each horizontal leg plus the back-to-back distance): two 4.0 in legs, no
+        // gap, t2 = 8.0, one leg (t2 - dis) / 2 = 4.0 in.
         angle.prop_type = FramePropType::DblAngle;
+        angle.t2 = 8.0;
+        angle.dis = 0.0;
         assert!((compute_aisc_minor_shear(&angle, mat, false).unwrap() - 108.0).abs() < 1e-10);
         assert!(
             (compute_aisc_minor_shear(&angle, mat, true).unwrap() - 120.0 / 1.67).abs() < 1e-10
@@ -956,6 +970,9 @@ mod tests {
 
         let mut dbchan_sec = w_sec.clone();
         dbchan_sec.prop_type = FramePropType::DbChannel;
+        // t2 is the total width of a double channel (v19 OAPI SetDblChannel): 2 x 8.0, no gap
+        dbchan_sec.t2 = 16.0;
+        dbchan_sec.dis = 0.0;
         // For DbChannel: Av3 = 4 * 8.0 * 0.5 = 16.0 in^2 -> Vpl,Rd = 800 / sqrt(3)
         assert!(
             (compute_ec3_minor_shear(&dbchan_sec, mat).unwrap() - 800.0 / 3.0_f64.sqrt()).abs()
@@ -1117,7 +1134,7 @@ mod tests {
         assert!((res.shear_major_ratio - 30.0 / res.phi_vn2).abs() < 1e-10);
         assert!((res.shear_minor_ratio - 10.0 / res.phi_vn3).abs() < 1e-10);
 
-        // Pipe H3-6 has squared individual flexural ratios (manual pp. 3-80) and
+        // Pipe H3-6 has the square root of the sum of the squared flexural ratios (manual p. 3-81) and
         // sums both directional shear ratios with torsion.
         let mut pipe_model = SapModel::new(Units::KipInF);
         pipe_model.steel_design_code = "AISC 360-10".into();
@@ -1151,9 +1168,10 @@ mod tests {
         try_run_steel_design(&mut pipe_model).unwrap();
         let pipe_res = &pipe_model.steel_design_results["PIPE_MEM"];
         assert_eq!(pipe_res.eq_name, "H3-6");
+        // D85: the radical over the two squared flexural ratios (manual p. 3-81); the old
+        // expectation squared each ratio and had been read from text extraction.
         let expected_pipe_h3 = pipe_res.pr_ratio
-            + pipe_res.mr_major_ratio.powi(2)
-            + pipe_res.mr_minor_ratio.powi(2)
+            + (pipe_res.mr_major_ratio.powi(2) + pipe_res.mr_minor_ratio.powi(2)).sqrt()
             + (pipe_res.shear_major_ratio + pipe_res.shear_minor_ratio + 0.50).powi(2);
         assert!((pipe_res.total_ratio - expected_pipe_h3).abs() < 1e-10);
     }
@@ -1239,9 +1257,22 @@ mod tests {
         assert_eq!(bm_aci.status, "OK");
 
         let col_aci = &model.concrete_design_results["COL_CIR"];
-        let (expected_cir_av_s3, _) =
-            design_aci_beam_shear(65.0, 20.0, 16.0, 4.0, 60.0, Units::KipInF);
-        assert!((col_aci.av_over_s - expected_cir_av_s3).abs() < 1e-10);
+        // D94: the column Vc carries the axial force (ACI 318-14 22.5.6.1, CSI manual p. 3-25).
+        // 20 in circle, Ag = pi x 10^2 = 314.159 in2, Pu = 300 kip compression:
+        // Pu/Ag = 954.93 psi, Vc = 2 sqrt(4000) (1 + 954.93/2000) x 20 x 16 / 1000 = 59.80 kip
+        // (cap 3.5 sqrt(4000) sqrt(1 + 954.93/500) x 320 = 120.8 kip is not active),
+        // phi Vc = 44.85 kip, Av/s = (65 - 44.85) / (0.75 x 60 x 16) = 0.027986 in2/in.
+        // The test of this entry formerly used the beam rule (no axial term): 0.048107.
+        let ag_cir = std::f64::consts::PI * 100.0;
+        let vc_cir = 2.0
+            * 4000.0_f64.sqrt()
+            * (1.0 + 300_000.0 / ag_cir / 2000.0)
+            * 20.0
+            * 16.0
+            / 1000.0;
+        let expected_cir_av_s3 = (65.0 - 0.75 * vc_cir) / (0.75 * 60.0 * 16.0);
+        assert!((expected_cir_av_s3 - 0.027986).abs() < 1e-5);
+        assert!((col_aci.av_over_s - expected_cir_av_s3).abs() < 1e-9);
         assert_eq!(col_aci.status, "OK");
 
         // Eurocode 2 check on the same 3D demands:

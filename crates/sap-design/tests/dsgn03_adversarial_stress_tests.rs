@@ -62,7 +62,7 @@ fn test_ec3_high_shear_v2_thresholds_and_continuity() {
 
     let m3_demand = 3000.0;
     let m2_demand = 400.0;
-    let p_demand = -50.0;
+    let p_demand = 50.0;
 
     // 1. Below threshold: V2 = 0.499 * Vpl,2 -> NO reduction
     let res_below = run_design_with_forces(
@@ -196,7 +196,7 @@ fn test_ec3_high_shear_v3_thresholds_and_continuity() {
 
     let m3_demand = 800.0;
     let m2_demand = 700.0;
-    let p_demand = -50.0;
+    let p_demand = 50.0;
 
     // 1. Below threshold: V3 = 0.499 * Vpl,3 -> NO reduction
     let res_below = run_design_with_forces(
@@ -299,7 +299,7 @@ fn test_ec3_biaxial_simultaneous_high_shear_interaction() {
         FrameStationResult {
             station: 10.0,
             rel_dist: 0.5,
-            p: -80.0,
+            p: 80.0,
             v2: 0.20 * v_pl_2,
             v3: 0.20 * v_pl_3,
             m3: 1500.0,
@@ -318,7 +318,7 @@ fn test_ec3_biaxial_simultaneous_high_shear_interaction() {
         FrameStationResult {
             station: 10.0,
             rel_dist: 0.5,
-            p: -80.0,
+            p: 80.0,
             v2: 0.75 * v_pl_2,
             v3: 0.75 * v_pl_3,
             m3: 3500.0,
@@ -350,7 +350,7 @@ fn test_ec3_biaxial_simultaneous_high_shear_interaction() {
     // hw = 14.0 - 2 * 0.71 = 12.58; aw = 12.58 * 0.44 = 5.5352;
     // reduced_m3 = (z33 - rho2 * aw^2 / (4 * tw)) * fy
     // reduced_m2 = (z22 - 2 * rho3 * af^2 / (4 * tf)) * fy where af = 10 * 0.71 = 7.1
-    let pc = res_biaxial_high.phi_pnc;
+    let pc = res_biaxial_high.phi_pnt;
     let expected_total =
         (80.0 / pc) + (3500.0 / res_biaxial_high.phi_mn33) + (900.0 / res_biaxial_high.phi_mn22);
 
@@ -368,7 +368,7 @@ fn test_ec3_biaxial_simultaneous_high_shear_interaction() {
         FrameStationResult {
             station: 10.0,
             rel_dist: 0.5,
-            p: -80.0,
+            p: 80.0,
             v2: 0.75 * v_pl_2,
             v3: 0.75 * v_pl_3,
             m3: 100.0,
@@ -392,7 +392,7 @@ fn test_ec3_biaxial_simultaneous_high_shear_interaction() {
         FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -80.0,
+            p: 80.0,
             v2: 0.75 * v_pl_2,
             v3: 0.75 * v_pl_3,
             m3: 3000.0,
@@ -446,12 +446,12 @@ fn test_ec3_all_10_supported_section_types_under_3d_demands() {
     sections.push(("DbChannel", sec_dbchan));
 
     // 4. Tee section
-    let mut sec_t = make_i_section("SEC_T", mat_name, 7.0, 8.0, 0.5, 0.3, 0.0, 0.0);
+    let mut sec_t = make_i_section("SEC_T", mat_name, 7.0, 8.0, 0.5, 0.9, 0.0, 0.0);
     sec_t.prop_type = FramePropType::T;
     sections.push(("T", sec_t));
 
     // 5. Angle section
-    let mut sec_angle = make_i_section("SEC_ANGLE", mat_name, 6.0, 4.0, 0.5, 0.5, 0.0, 0.0);
+    let mut sec_angle = make_i_section("SEC_ANGLE", mat_name, 6.0, 4.0, 0.6, 0.6, 0.0, 0.0);
     sec_angle.prop_type = FramePropType::Angle;
     sections.push(("Angle", sec_angle));
 
@@ -511,7 +511,7 @@ fn test_ec3_all_10_supported_section_types_under_3d_demands() {
         let st = FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -30.0,
+            p: 30.0,
             v2: 0.15 * v_pl_2,
             v3: 0.15 * v_pl_3,
             m3: 200.0,
@@ -600,7 +600,7 @@ fn test_ec3_circular_and_pipe_srss_quadratic_invariance() {
                 FrameStationResult {
                     station: 60.0,
                     rel_dist: 0.5,
-                    p: -40.0,
+                    p: 40.0,
                     m3,
                     m2,
                     ..Default::default()
@@ -616,7 +616,7 @@ fn test_ec3_circular_and_pipe_srss_quadratic_invariance() {
                 res.phi_mn22
             );
 
-            let expected_ratio = (40.0 / res.phi_pnc)
+            let expected_ratio = (40.0 / res.phi_pnt)
                 + ((m3 / res.phi_mn33).powi(2) + (m2 / res.phi_mn22).powi(2)).sqrt();
 
             assert!(
@@ -700,14 +700,15 @@ fn test_ec3_adversarial_boundaries_and_extreme_conditions() {
     assert!(res_tiny.total_ratio >= 0.0 && res_tiny.total_ratio.is_finite());
     assert_eq!(res_tiny.status, "OK");
 
-    // 3. Boundary: Massive demands exceeding plastic capacity by 10x
+    // 3. Boundary: Massive demands exceeding plastic capacity by 10x (an axial tension, so that the
+    // Annex B member check of D89/G71 plays no part)
     let res_extreme = run_design_with_forces(
         &mut model,
         "F1",
         FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -50000.0,
+            p: 50000.0,
             v2: 10.0 * v_pl_2,
             v3: 10.0 * v_pl_3,
             m3: 1000000.0,
@@ -1012,11 +1013,11 @@ fn test_ec3_high_shear_reduction_across_all_10_shapes() {
     sec_dbchan.z22 *= 2.0;
     sections.push(("DbChannel", sec_dbchan));
 
-    let mut sec_t = make_i_section("SEC_T2", mat_name, 7.0, 8.0, 0.5, 0.3, 0.0, 0.0);
+    let mut sec_t = make_i_section("SEC_T2", mat_name, 7.0, 8.0, 0.5, 0.9, 0.0, 0.0);
     sec_t.prop_type = FramePropType::T;
     sections.push(("T", sec_t));
 
-    let mut sec_angle = make_i_section("SEC_ANGLE2", mat_name, 6.0, 4.0, 0.5, 0.5, 0.0, 0.0);
+    let mut sec_angle = make_i_section("SEC_ANGLE2", mat_name, 6.0, 4.0, 0.6, 0.6, 0.0, 0.0);
     sec_angle.prop_type = FramePropType::Angle;
     sections.push(("Angle", sec_angle));
 
@@ -1060,7 +1061,7 @@ fn test_ec3_high_shear_reduction_across_all_10_shapes() {
             FrameStationResult {
                 station: 5.0,
                 rel_dist: 0.5,
-                p: -20.0,
+                p: 20.0,
                 v2: 0.20 * v_pl_2,
                 v3: 0.20 * v_pl_3,
                 m3: 300.0,
@@ -1077,7 +1078,7 @@ fn test_ec3_high_shear_reduction_across_all_10_shapes() {
             FrameStationResult {
                 station: 5.0,
                 rel_dist: 0.5,
-                p: -20.0,
+                p: 20.0,
                 v2: 0.80 * v_pl_2,
                 v3: 0.20 * v_pl_3,
                 m3: 300.0,
@@ -1094,7 +1095,7 @@ fn test_ec3_high_shear_reduction_across_all_10_shapes() {
             FrameStationResult {
                 station: 5.0,
                 rel_dist: 0.5,
-                p: -20.0,
+                p: 20.0,
                 v2: 0.20 * v_pl_2,
                 v3: 0.80 * v_pl_3,
                 m3: 300.0,
@@ -1104,17 +1105,22 @@ fn test_ec3_high_shear_reduction_across_all_10_shapes() {
         )
         .unwrap();
 
-        // High major shear must reduce major moment capacity
+        // High major shear must reduce major moment capacity. The double angle is Class 3
+        // (Table 4-2 has no Class 1 or 2 for angles), so its capacity is the elastic Wel fy,
+        // and the manual's reduction (6.2.8(5), p. 6-2: Wpl - n rho Aw^2/(4 tw)) fy <= M_c,Rd
+        // is above it at this shear: the capacity is not reduced there (the manual prints no
+        // separate Class 3 reduction; open point G72). It must not rise.
         assert!(
-            res_hs_v2.phi_mn33 < res_base.phi_mn33,
+            res_hs_v2.phi_mn33 < res_base.phi_mn33 || (shape_name == "DblAngle" && res_hs_v2.phi_mn33 <= res_base.phi_mn33),
             "{shape_name}: Major capacity must be reduced under high V2: hs={}, base={}",
             res_hs_v2.phi_mn33,
             res_base.phi_mn33
         );
 
-        // High minor shear must reduce minor moment capacity
+        // High minor shear must reduce minor moment capacity (the double angle: see above).
         assert!(
-            res_hs_v3.phi_mn22 < res_base.phi_mn22,
+            res_hs_v3.phi_mn22 < res_base.phi_mn22
+                || (shape_name == "DblAngle" && res_hs_v3.phi_mn22 <= res_base.phi_mn22),
             "{shape_name}: Minor capacity must be reduced under high V3: hs={}, base={}",
             res_hs_v3.phi_mn22,
             res_base.phi_mn22
@@ -1137,7 +1143,7 @@ fn test_ec3_vs_aisc_code_isolation() {
     let st = FrameStationResult {
         station: 60.0,
         rel_dist: 0.5,
-        p: -100.0,
+        p: 100.0,
         v2: 30.0,
         v3: 20.0,
         m3: 1500.0,

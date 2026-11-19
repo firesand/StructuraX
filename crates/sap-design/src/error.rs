@@ -1,4 +1,4 @@
-use sap_model::{FrameStationResult, SapModel};
+use sap_model::{SapModel};
 use thiserror::Error;
 
 /// Failures that prevent a design run from producing an adequacy result.
@@ -22,6 +22,73 @@ pub enum DesignError {
     UnsupportedSteelMaterial { frame: String, material: String },
     #[error("steel design does not yet implement the closed-section torsion interaction for member '{frame}'")]
     UnsupportedClosedSectionTorsion { frame: String },
+    /// AISC E7.2b (manual p. 3-34): a round HSS with D/t above 0.45 E/Fy is too slender and is not
+    /// designed.
+    #[error("steel design of member '{frame}': Pipe section '{section}' has D/t = {d_over_t}, above the limit 0.45 E/Fy = {limit}; AISC 360-10 considers it too slender and does not design it")]
+    SlenderPipeNotDesigned {
+        frame: String,
+        section: String,
+        d_over_t: String,
+        limit: String,
+    },
+    /// An I section whose flanges differ (D88, G70): the design formulas of the code take the
+    /// warping constant and the flange pairing of an equal-flange section.
+    #[error("steel design of member '{frame}': section '{section}' is a singly symmetric I (unequal flanges); {what} not implemented")]
+    UnequalFlangeISection {
+        frame: String,
+        section: String,
+        what: &'static str,
+    },
+    /// EC3 6.3.3(4) member check under compression and bending for a shape that EN 1993-1-1
+    /// Annex B (Method 2) has no factors for (D89, G71). The Annex has columns for I sections
+    /// (equal flanges) and rectangular hollow sections; the design reads Box and Pipe as the
+    /// latter. Every other shape with compression and a moment at one station is refused.
+    #[error("steel design of member '{frame}', combination '{combo}', station {station}: EC3 6.3.3(4) member check under compression and bending is built from the interaction factors of EN 1993-1-1 Annex B (Method 2) for I (equal flanges), Box and Pipe sections only; section {section} has none")]
+    Ec3CompressionBendingUnsupported {
+        frame: String,
+        combo: String,
+        station: String,
+        /// `'<name>' (<shape>)`, kept in one string so that the error type stays small.
+        section: String,
+    },
+    /// EC3 section whose class needs effective properties (Class 4) or cannot be read from the
+    /// vendor tables (D90, G72): not designed.
+    #[error("steel design of member '{frame}': section '{section}' under {detail}; EC3 Class 4 effective properties are not implemented")]
+    Ec3SectionClass {
+        frame: String,
+        section: String,
+        /// `"<load> has element '<element>' with c/t = <ratio> above the limit <limit> (<class>)"`, kept in one string so that the error type stays small.
+        detail: String,
+    },
+    #[error("steel design of member '{frame}': Eurocode 3 section classification is not defined for section '{section}' of type {kind} (not in the vendor Tables 4-1 and 4-2)")]
+    UnsupportedEc3Classification {
+        frame: String,
+        section: String,
+        kind: String,
+    },
+    #[error("steel design overwrite '{item}' of member '{frame}' is {value}; it must be finite and positive")]
+    InvalidSteelOverwrite {
+        frame: String,
+        item: &'static str,
+        /// The offending value, as text (the error type is `Eq`).
+        value: String,
+    },
+    /// A design combination that has no complete results (D78): design never
+    /// uses the contributors that exist in its place.
+    #[error("{discipline} design cannot use combination '{combo}': it is unavailable because {reason}")]
+    UnavailableCombination {
+        discipline: &'static str,
+        combo: String,
+        reason: String,
+    },
+    /// A case that is not finished (G16) has no complete response to design for, and a case
+    /// that could not start has none at all.
+    #[error("{discipline} design cannot use case '{case}': it did not finish ({reason})")]
+    UnfinishedCase {
+        discipline: &'static str,
+        case: String,
+        reason: String,
+    },
     #[error("{discipline} design has no frame force demand for member '{frame}'")]
     MissingDemand {
         discipline: &'static str,
@@ -45,6 +112,19 @@ pub enum DesignError {
         m3: String,
         t: String,
     },
+    /// A refusal of the steel design workflow (Auto Select lists, default
+    /// design combinations, verification); the text names the offending item.
+    #[error("steel design workflow: {0}")]
+    Workflow(String),
+    /// A concrete member whose rebar yield stress is given nowhere. `material` is the material
+    /// that should carry `fy`: the rebar material the section names, or the concrete itself when
+    /// the section names none.
+    #[error("concrete design of frame '{frame}': section '{section}' has no longitudinal rebar yield stress, because material '{material}' has no positive fy; give that material a positive fy, or name a rebar material with a positive fy in the section's reinforcement")]
+    MissingRebarYield {
+        frame: String,
+        section: String,
+        material: String,
+    },
     #[error("{discipline} design found nonfinite {component} demand/station data on member '{frame}' ({value})")]
     NonFiniteDemand {
         discipline: &'static str,
@@ -52,11 +132,85 @@ pub enum DesignError {
         component: &'static str,
         value: String,
     },
+    /// D128, D129: an AISC 360-10 limit state that the vendor manual does not give in full, or
+    /// that needs section properties the model does not hold, is not built (G81, G82, G83); or
+    /// an input it needs is missing. The member is refused instead of designed with a wrong
+    /// strength. The run goes on with the other members and the reason is recorded for the
+    /// member (D127); Auto Select passes over a refused candidate. The strict entry points still
+    /// stop at the first refused member.
+    #[error("steel design of member '{frame}': section '{section}' ({kind}) is not designed: {what}")]
+    AiscLimitStateNotBuilt {
+        frame: String,
+        section: String,
+        kind: String,
+        what: String,
+    },
+    /// D130: concrete beam torsion that the design does not build (G85): a beam that is not
+    /// rectangular, with torsion above what the vendor manual lets the design ignore, or a
+    /// section too small for the closed stirrup the manual assumes. The run goes on with the
+    /// other members and the reason is recorded for the beam (D127); the strict entry point
+    /// still stops at the first refused member.
+    #[error("concrete design of beam '{frame}', combination '{combo}': torsion on section '{section}' is not designed: {reason}")]
+    ConcreteTorsionNotDesigned {
+        frame: String,
+        combo: String,
+        section: String,
+        reason: String,
+    },
+    /// D127: every section of the Auto Select list is refused for this frame.
+    #[error("steel design of member '{frame}': no section of the Auto Select list '{list}' can be designed; the first is refused with: {first}")]
+    AutoSelectNoSection {
+        frame: String,
+        list: String,
+        first: String,
+    },
+}
+
+/// D127: what a design run did. `not_designed` holds each refused frame with its typed error, in
+/// the order of the frames; the same texts are in the model's `*_design_errors`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesignRunReport {
+    pub designed: usize,
+    pub not_designed: Vec<(String, DesignError)>,
+}
+
+impl DesignError {
+    /// D127: whether the error refuses one member (the tolerant run records it and goes on) or
+    /// the whole run (it stays an `Err`). No wildcard arm: a new variant must be classified.
+    pub fn is_member_refusal(&self) -> bool {
+        match self {
+            DesignError::InvalidShearProperty { .. }
+            | DesignError::UnsupportedShearSection { .. }
+            | DesignError::UnsupportedSteelMaterial { .. }
+            | DesignError::UnsupportedClosedSectionTorsion { .. }
+            | DesignError::SlenderPipeNotDesigned { .. }
+            | DesignError::UnequalFlangeISection { .. }
+            | DesignError::Ec3CompressionBendingUnsupported { .. }
+            | DesignError::Ec3SectionClass { .. }
+            | DesignError::UnsupportedEc3Classification { .. }
+            | DesignError::UnsupportedLocal3Shear { .. }
+            | DesignError::UnsupportedBeamMinorAxisFlexure { .. }
+            | DesignError::UnsupportedEc3MinorShearSection { .. }
+            | DesignError::UnsupportedEc3ShearInteraction { .. }
+            | DesignError::MissingRebarYield { .. }
+            | DesignError::AiscLimitStateNotBuilt { .. }
+            | DesignError::ConcreteTorsionNotDesigned { .. }
+            | DesignError::AutoSelectNoSection { .. } => true,
+            DesignError::UnsupportedSteelCode(_)
+            | DesignError::UnsupportedConcreteCode(_)
+            | DesignError::InvalidSteelOverwrite { .. }
+            | DesignError::UnavailableCombination { .. }
+            | DesignError::UnfinishedCase { .. }
+            | DesignError::MissingDemand { .. }
+            | DesignError::NonFiniteDemand { .. }
+            | DesignError::Workflow(_) => false,
+        }
+    }
 }
 
 pub(crate) fn validate_demands<F>(
     model: &SapModel,
-    combo_forces: &[(String, Vec<(String, Vec<FrameStationResult>)>)],
+    combo_forces: &[(String, Vec<(String, crate::steel::FrameStates)>)],
     discipline: &'static str,
     allow_minor_shear: bool,
     mut is_designable: F,
@@ -71,7 +225,10 @@ where
     {
         let mut has_demand = false;
         for (_, frames) in combo_forces {
-            for (name, stations) in frames {
+            for (name, stations) in frames
+                .iter()
+                .flat_map(|(n, states)| states.iter().map(move |s| (n, s)))
+            {
                 if name != frame_name || stations.is_empty() {
                     continue;
                 }

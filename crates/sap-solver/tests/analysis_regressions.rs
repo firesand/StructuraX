@@ -250,10 +250,13 @@ fn history_forces_and_acceleration_follow_rotated_joint_axes() {
 fn history_self_weight_is_rejected_instead_of_ignored() {
     let mut model = oscillator();
     model.load_patterns["DEAD"].self_wt_multiplier = 1.0;
-    assert!(analyze_model(&mut model)
-        .unwrap_err()
-        .to_string()
-        .contains("only joint forces"));
+    // D82: the reason names the pattern and the load type (it used to say
+    // "only joint forces", which is no longer what a history supports).
+    let error = analyze_model(&mut model).unwrap_err().to_string();
+    assert!(
+        error.contains("history pattern 'DEAD'") && error.contains("self-weight"),
+        "{error}"
+    );
 }
 
 #[test]

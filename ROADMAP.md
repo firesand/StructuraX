@@ -19,6 +19,22 @@ The priority is reliable, explicitly scoped behavior before additional feature c
    coordinates + `LinearDynamic`, `NonlinearHistory`, `NonlinearDynamic` -> static/modal/direct-history)
    are verified; `SteadyState`, `Psd`, `MovingLoad`, `Hyperstatic`, and nonlinear Wilson-theta
    Maxwell integration remain explicitly guarded.
+   Plastic Wen links and displacement-controlled nonlinear static cases are implemented within
+   the bounds in [solver-wen.md](docs/reconstruction/solver-wen.md). Still open: the other link
+   families, Wen reversals inside one case, and frame hinges. Data the native importer does not
+   interpret (hinges, tendons, springs, added masses, several load types) is recorded on import
+   and refused ([unmodeled-source.md](docs/reconstruction/unmodeled-source.md)). The N x N area
+   auto-mesh, area added mass and object-level area modifiers are imported and checked against
+   Example 2-008 ([area-import.md](docs/reconstruction/area-import.md)). Automatic frame
+   subdivision is analyzed and checked against the published per-mesh values of Examples 1-006,
+   1-014, 1-016, 1-017 and 1-019 ([frame-auto-mesh.md](docs/reconstruction/frame-auto-mesh.md)).
+   A frame insertion point with stiffness transformation is modeled for parallel offsets in
+   linear static cases and checked against Example 1-011
+   ([frame-insertion-point.md](docs/reconstruction/frame-insertion-point.md)). Next there:
+   mass and geometric stiffness of the offset, unsymmetric shapes, unstable models the vendor
+   solver tolerates (the concrete design examples), the mesh restraint options, plane
+   incompatible modes, geometric stiffness for area elements, and the penalty-aware
+   singularity test in the modal and nonlinear paths.
 5. Expand verified design-code interactions, element families, and GUI/API workflows
    (concrete beam minor-axis `M2` with `as_side`, EN 1993-1-1 10-shape `V3` shear and multi-axis
    interaction, `cCableObj`, and 19-table `cDatabaseTables` are now verified).

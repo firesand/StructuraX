@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use sap_model::{
-    ComboType, FramePropType, FrameSection, LoadCase, LoadCaseAssignment, LoadCaseType, LoadCombo,
+    ComboType, FramePropType, LoadCase, LoadCaseAssignment, LoadCaseType, LoadCombo,
     LoadPattern, LoadPatternType, MatType, Material, PointObj, SapModel,
 };
 
@@ -356,6 +356,7 @@ static TABLES: &[TableDef] = &[
             field!("Ratio", "Ratio", "Demand/Capacity Ratio", "", false),
             field!("RatioType", "RatioType", "Ratio Type", "", false),
             field!("Status", "Status", "Design Status", "", false),
+            field!("ErrMsg", "ErrMsg", "Design Error Message", "", false),
         ],
     },
     TableDef {
@@ -384,6 +385,7 @@ static TABLES: &[TableDef] = &[
             ),
             field!("PMMRatio", "PMMRatio", "PMM Interaction Ratio", "", false),
             field!("Status", "Status", "Design Status", "", false),
+            field!("ErrMsg", "ErrMsg", "Design Error Message", "", false),
         ],
     },
     TableDef {
@@ -425,6 +427,7 @@ static TABLES: &[TableDef] = &[
                 false
             ),
             field!("Status", "Status", "Design Status", "", false),
+            field!("ErrMsg", "ErrMsg", "Design Error Message", "", false),
         ],
     },
 ];
@@ -486,15 +489,62 @@ fn is_table_empty(model: &SapModel, key: &str) -> bool {
             .case_results
             .values()
             .any(|cr| !cr.buckling_factors.is_empty()),
-        "STEEL DESIGN 1 - SUMMARY DATA" => model.steel_design_results.is_empty(),
+        // D127: a frame the design refused has a row (Status "Not designed"), so it counts.
+        "STEEL DESIGN 1 - SUMMARY DATA" => {
+            model.steel_design_results.is_empty() && model.steel_design_errors.is_empty()
+        }
         "CONCRETE DESIGN 1 - COLUMN SUMMARY DATA" => {
             !model.concrete_design_results.values().any(|r| r.is_column)
+                && !model
+                    .concrete_design_errors
+                    .keys()
+                    .any(|f| refused_concrete_is_column(model, f))
         }
         "CONCRETE DESIGN 2 - BEAM SUMMARY DATA" => {
             !model.concrete_design_results.values().any(|r| !r.is_column)
+                && !model
+                    .concrete_design_errors
+                    .keys()
+                    .any(|f| !refused_concrete_is_column(model, f))
         }
         _ => true,
     }
+}
+
+/// D127: whether a concrete frame that the design refused is a column (the design's own test);
+/// a frame or section that no longer exists reads as a beam.
+fn refused_concrete_is_column(model: &SapModel, frame: &str) -> bool {
+    let Some(f) = model.frames.get(frame) else {
+        return false;
+    };
+    model
+        .frame_sections
+        .get(&f.section)
+        .is_some_and(|sec| sap_design::is_concrete_column(model, f, sec))
+}
+
+/// D127: the row of a frame the design refused: Status "Not designed", the message, the frame and
+/// its section; the numeric cells stay empty.
+fn not_designed_row(
+    model: &SapModel,
+    frame: &str,
+    message: &str,
+    code: &str,
+) -> BTreeMap<&'static str, String> {
+    let mut r = BTreeMap::new();
+    r.insert("Frame", frame.to_string());
+    r.insert(
+        "DesignSect",
+        model
+            .frames
+            .get(frame)
+            .map(|f| f.section.clone())
+            .unwrap_or_default(),
+    );
+    r.insert("DesignCode", code.to_string());
+    r.insert("Status", "Not designed".to_string());
+    r.insert("ErrMsg", message.to_string());
+    r
 }
 
 /// Interactive Database Tables facade (`SAP2000v19.cDatabaseTables`).
@@ -650,6 +700,17 @@ impl<'a> cDatabaseTables<'a> {
             if fields_keys_included.is_empty() {
                 return OAPI_ERR;
             }
+        }
+
+        // D78: a results table of a selection that holds an unavailable case or
+        // combination is not returned with the rows of the other selected names only.
+        if matches!(
+            t.key,
+            "JOINT DISPLACEMENTS" | "JOINT REACTIONS" | "BASE REACTIONS" | "ELEMENT FORCES - FRAMES"
+        ) && self.api.selected_output_unavailable().is_some()
+        {
+            fields_keys_included.clear();
+            return OAPI_ERR;
         }
 
         if !matches_all {
@@ -887,6 +948,17 @@ impl<'a> cDatabaseTables<'a> {
             }
         }
 
+        // D79: an edit that makes one name both a load case and a load combination is
+        // refused as a whole; the model keeps its previous definitions.
+        if *num_fatal_errors == 0 {
+            if let Some(message) = sap_model::results::case_combo_collision_message(&model_clone) {
+                *num_fatal_errors += 1;
+                if fill_import_log {
+                    import_log.push_str(&format!("FATAL ERROR: {message}\n"));
+                }
+            }
+        }
+
         if *num_fatal_errors > 0 {
             self.api.staged_tables.clear();
             return OAPI_ERR;
@@ -949,16 +1021,16 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("Joint", p.name.clone());
                     r.insert("CoordSys", "GLOBAL".to_string());
                     r.insert("CoordType", "Cartesian".to_string());
-                    r.insert("XorR", format!("{:.6}", p.x));
-                    r.insert("Y", format!("{:.6}", p.y));
-                    r.insert("Z", format!("{:.6}", p.z));
+                    r.insert("XorR", format!("{}", p.x));
+                    r.insert("Y", format!("{}", p.y));
+                    r.insert("Z", format!("{}", p.z));
                     r.insert(
                         "SpecialJt",
                         if p.special_point { "Yes" } else { "No" }.to_string(),
                     );
-                    r.insert("GlobalX", format!("{:.6}", p.x));
-                    r.insert("GlobalY", format!("{:.6}", p.y));
-                    r.insert("GlobalZ", format!("{:.6}", p.z));
+                    r.insert("GlobalX", format!("{}", p.x));
+                    r.insert("GlobalY", format!("{}", p.y));
+                    r.insert("GlobalZ", format!("{}", p.z));
                     rows.push(r);
                 }
             }
@@ -1006,16 +1078,16 @@ impl<'a> cDatabaseTables<'a> {
                 for m in model.materials.values() {
                     let mut r = BTreeMap::new();
                     r.insert("Material", m.name.clone());
-                    r.insert("UnitWeight", format!("{:.6}", m.unit_weight));
-                    r.insert("UnitMass", format!("{:.6}", m.unit_mass));
-                    r.insert("E1", format!("{:.6}", m.e));
-                    r.insert("G12", format!("{:.6}", m.g));
-                    r.insert("U12", format!("{:.6}", m.u));
-                    r.insert("A1", format!("{:.6e}", m.a));
-                    r.insert("Fy", format!("{:.6}", m.fy));
-                    r.insert("Fu", format!("{:.6}", m.fu));
-                    r.insert("Fc", format!("{:.6}", m.fc));
-                    r.insert("Fys", format!("{:.6}", m.fys));
+                    r.insert("UnitWeight", format!("{}", m.unit_weight));
+                    r.insert("UnitMass", format!("{}", m.unit_mass));
+                    r.insert("E1", format!("{}", m.e));
+                    r.insert("G12", format!("{}", m.g));
+                    r.insert("U12", format!("{}", m.u));
+                    r.insert("A1", format!("{}", m.a));
+                    r.insert("Fy", format!("{}", m.fy));
+                    r.insert("Fu", format!("{}", m.fu));
+                    r.insert("Fc", format!("{}", m.fc));
+                    r.insert("Fys", format!("{}", m.fys));
                     rows.push(r);
                 }
             }
@@ -1025,22 +1097,22 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("SectionName", s.name.clone());
                     r.insert("Material", s.material.clone());
                     r.insert("Shape", format!("{:?}", s.prop_type));
-                    r.insert("t3", format!("{:.6}", s.t3));
-                    r.insert("t2", format!("{:.6}", s.t2));
-                    r.insert("tf", format!("{:.6}", s.tf));
-                    r.insert("tw", format!("{:.6}", s.tw));
-                    r.insert("Area", format!("{:.6}", s.area));
-                    r.insert("TorsConst", format!("{:.6}", s.torsional_j));
-                    r.insert("I33", format!("{:.6}", s.i33));
-                    r.insert("I22", format!("{:.6}", s.i22));
-                    r.insert("AS2", format!("{:.6}", s.as2));
-                    r.insert("AS3", format!("{:.6}", s.as3));
-                    r.insert("S33", format!("{:.6}", s.s33));
-                    r.insert("S22", format!("{:.6}", s.s22));
-                    r.insert("Z33", format!("{:.6}", s.z33));
-                    r.insert("Z22", format!("{:.6}", s.z22));
-                    r.insert("R33", format!("{:.6}", s.r33));
-                    r.insert("R22", format!("{:.6}", s.r22));
+                    r.insert("t3", format!("{}", s.t3));
+                    r.insert("t2", format!("{}", s.t2));
+                    r.insert("tf", format!("{}", s.tf));
+                    r.insert("tw", format!("{}", s.tw));
+                    r.insert("Area", format!("{}", s.area));
+                    r.insert("TorsConst", format!("{}", s.torsional_j));
+                    r.insert("I33", format!("{}", s.i33));
+                    r.insert("I22", format!("{}", s.i22));
+                    r.insert("AS2", format!("{}", s.as2));
+                    r.insert("AS3", format!("{}", s.as3));
+                    r.insert("S33", format!("{}", s.s33));
+                    r.insert("S22", format!("{}", s.s22));
+                    r.insert("Z33", format!("{}", s.z33));
+                    r.insert("Z22", format!("{}", s.z22));
+                    r.insert("R33", format!("{}", s.r33));
+                    r.insert("R22", format!("{}", s.r22));
                     rows.push(r);
                 }
             }
@@ -1049,7 +1121,7 @@ impl<'a> cDatabaseTables<'a> {
                     let mut r = BTreeMap::new();
                     r.insert("LoadPat", lp.name.clone());
                     r.insert("DesignType", format!("{:?}", lp.pat_type));
-                    r.insert("SelfWtMult", format!("{:.6}", lp.self_wt_multiplier));
+                    r.insert("SelfWtMult", format!("{}", lp.self_wt_multiplier));
                     rows.push(r);
                 }
             }
@@ -1096,7 +1168,7 @@ impl<'a> cDatabaseTables<'a> {
                             r.insert("ComboName", cb.name.clone());
                             r.insert("ComboType", ctype.clone());
                             r.insert("CaseName", cname.clone());
-                            r.insert("ScaleFactor", format!("{:.6}", sf));
+                            r.insert("ScaleFactor", format!("{}", sf));
                             rows.push(r);
                         }
                     }
@@ -1105,19 +1177,23 @@ impl<'a> cDatabaseTables<'a> {
             "JOINT DISPLACEMENTS" => {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
-                        for (jid, u) in &cr.joint_displacements {
-                            let mut r = BTreeMap::new();
-                            r.insert("Joint", jid.clone());
-                            r.insert("OutputCase", cname.clone());
-                            r.insert("StepType", "Static".to_string());
-                            r.insert("StepNum", "1".to_string());
-                            r.insert("U1", format!("{:.6}", u[0]));
-                            r.insert("U2", format!("{:.6}", u[1]));
-                            r.insert("U3", format!("{:.6}", u[2]));
-                            r.insert("R1", format!("{:.6}", u[3]));
-                            r.insert("R2", format!("{:.6}", u[4]));
-                            r.insert("R3", format!("{:.6}", u[5]));
-                            rows.push(r);
+                        for (jid, u_max) in &cr.joint_displacements {
+                            // A multi-valued combination has a Max and then a Min row per joint.
+                            for (step, row) in sap_results_rows(cr) {
+                                let u = row.joint_displacements.get(jid).unwrap_or(u_max);
+                                let mut r = BTreeMap::new();
+                                r.insert("Joint", jid.clone());
+                                r.insert("OutputCase", cname.clone());
+                                r.insert("StepType", step.to_string());
+                                r.insert("StepNum", "1".to_string());
+                                r.insert("U1", format!("{}", u[0]));
+                                r.insert("U2", format!("{}", u[1]));
+                                r.insert("U3", format!("{}", u[2]));
+                                r.insert("R1", format!("{}", u[3]));
+                                r.insert("R2", format!("{}", u[4]));
+                                r.insert("R3", format!("{}", u[5]));
+                                rows.push(r);
+                            }
                         }
                     }
                 }
@@ -1125,19 +1201,22 @@ impl<'a> cDatabaseTables<'a> {
             "JOINT REACTIONS" => {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
-                        for (jid, re) in &cr.joint_reactions {
-                            let mut r = BTreeMap::new();
-                            r.insert("Joint", jid.clone());
-                            r.insert("OutputCase", cname.clone());
-                            r.insert("StepType", "Static".to_string());
-                            r.insert("StepNum", "1".to_string());
-                            r.insert("F1", format!("{:.4}", re[0]));
-                            r.insert("F2", format!("{:.4}", re[1]));
-                            r.insert("F3", format!("{:.4}", re[2]));
-                            r.insert("M1", format!("{:.4}", re[3]));
-                            r.insert("M2", format!("{:.4}", re[4]));
-                            r.insert("M3", format!("{:.4}", re[5]));
-                            rows.push(r);
+                        for (jid, re_max) in &cr.joint_reactions {
+                            for (step, row) in sap_results_rows(cr) {
+                                let re = row.joint_reactions.get(jid).unwrap_or(re_max);
+                                let mut r = BTreeMap::new();
+                                r.insert("Joint", jid.clone());
+                                r.insert("OutputCase", cname.clone());
+                                r.insert("StepType", step.to_string());
+                                r.insert("StepNum", "1".to_string());
+                                r.insert("F1", format!("{}", re[0]));
+                                r.insert("F2", format!("{}", re[1]));
+                                r.insert("F3", format!("{}", re[2]));
+                                r.insert("M1", format!("{}", re[3]));
+                                r.insert("M2", format!("{}", re[4]));
+                                r.insert("M3", format!("{}", re[5]));
+                                rows.push(r);
+                            }
                         }
                     }
                 }
@@ -1145,17 +1224,20 @@ impl<'a> cDatabaseTables<'a> {
             "BASE REACTIONS" => {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
-                        let mut r = BTreeMap::new();
-                        r.insert("OutputCase", cname.clone());
-                        r.insert("StepType", "Static".to_string());
-                        r.insert("StepNum", "1".to_string());
-                        r.insert("GlobalFX", format!("{:.4}", cr.base_reactions[0]));
-                        r.insert("GlobalFY", format!("{:.4}", cr.base_reactions[1]));
-                        r.insert("GlobalFZ", format!("{:.4}", cr.base_reactions[2]));
-                        r.insert("GlobalMX", format!("{:.4}", cr.base_reactions[3]));
-                        r.insert("GlobalMY", format!("{:.4}", cr.base_reactions[4]));
-                        r.insert("GlobalMZ", format!("{:.4}", cr.base_reactions[5]));
-                        rows.push(r);
+                        for (step, row) in sap_results_rows(cr) {
+                            let b = &row.base_reactions;
+                            let mut r = BTreeMap::new();
+                            r.insert("OutputCase", cname.clone());
+                            r.insert("StepType", step.to_string());
+                            r.insert("StepNum", "1".to_string());
+                            r.insert("GlobalFX", format!("{}", b[0]));
+                            r.insert("GlobalFY", format!("{}", b[1]));
+                            r.insert("GlobalFZ", format!("{}", b[2]));
+                            r.insert("GlobalMX", format!("{}", b[3]));
+                            r.insert("GlobalMY", format!("{}", b[4]));
+                            r.insert("GlobalMZ", format!("{}", b[5]));
+                            rows.push(r);
+                        }
                     }
                 }
             }
@@ -1163,20 +1245,28 @@ impl<'a> cDatabaseTables<'a> {
                 for cname in &selected {
                     if let Some(cr) = model.case_results.get(cname) {
                         for (fid, stations) in &cr.frame_forces {
-                            for st in stations {
-                                let mut r = BTreeMap::new();
-                                r.insert("Frame", fid.clone());
-                                r.insert("Station", format!("{:.4}", st.station));
-                                r.insert("OutputCase", cname.clone());
-                                r.insert("StepType", "Static".to_string());
-                                r.insert("StepNum", "1".to_string());
-                                r.insert("P", format!("{:.4}", st.p));
-                                r.insert("V2", format!("{:.4}", st.v2));
-                                r.insert("V3", format!("{:.4}", st.v3));
-                                r.insert("T", format!("{:.4}", st.t));
-                                r.insert("M2", format!("{:.4}", st.m2));
-                                r.insert("M3", format!("{:.4}", st.m3));
-                                rows.push(r);
+                            for (index, st_max) in stations.iter().enumerate() {
+                                // Max row, then Min row, at every station of a multi-valued combination.
+                                for (step, row) in sap_results_rows(cr) {
+                                    let st = row
+                                        .frame_forces
+                                        .get(fid)
+                                        .and_then(|l| l.get(index))
+                                        .unwrap_or(st_max);
+                                    let mut r = BTreeMap::new();
+                                    r.insert("Frame", fid.clone());
+                                    r.insert("Station", format!("{}", st.station));
+                                    r.insert("OutputCase", cname.clone());
+                                    r.insert("StepType", step.to_string());
+                                    r.insert("StepNum", "1".to_string());
+                                    r.insert("P", format!("{}", st.p));
+                                    r.insert("V2", format!("{}", st.v2));
+                                    r.insert("V3", format!("{}", st.v3));
+                                    r.insert("T", format!("{}", st.t));
+                                    r.insert("M2", format!("{}", st.m2));
+                                    r.insert("M3", format!("{}", st.m3));
+                                    rows.push(r);
+                                }
                             }
                         }
                     }
@@ -1189,13 +1279,13 @@ impl<'a> cDatabaseTables<'a> {
                         r.insert("OutputCase", cname.clone());
                         r.insert("StepType", "Mode".to_string());
                         r.insert("StepNum", format!("{}", m.mode_num));
-                        r.insert("Period", format!("{:.6}", m.period_sec));
-                        r.insert("Frequency", format!("{:.4}", m.freq_hz));
+                        r.insert("Period", format!("{}", m.period_sec));
+                        r.insert("Frequency", format!("{}", m.freq_hz));
                         r.insert(
                             "CircFreq",
-                            format!("{:.4}", m.freq_hz * 2.0 * std::f64::consts::PI),
+                            format!("{}", m.freq_hz * 2.0 * std::f64::consts::PI),
                         );
-                        r.insert("Eigenvalue", format!("{:.4}", m.eigenvalue));
+                        r.insert("Eigenvalue", format!("{}", m.eigenvalue));
                         rows.push(r);
                     }
                 }
@@ -1207,7 +1297,7 @@ impl<'a> cDatabaseTables<'a> {
                         r.insert("OutputCase", cname.clone());
                         r.insert("StepType", "Buckling".to_string());
                         r.insert("StepNum", format!("{}", idx + 1));
-                        r.insert("Factor", format!("{:.6}", factor));
+                        r.insert("Factor", format!("{}", factor));
                         rows.push(r);
                     }
                 }
@@ -1219,11 +1309,20 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("DesignSect", res.section_name.clone());
                     r.insert("DesignCode", res.design_code.clone());
                     r.insert("Combo", res.governing_combo.clone());
-                    r.insert("Station", format!("{:.4}", res.governing_station));
-                    r.insert("Ratio", format!("{:.4}", res.total_ratio));
+                    r.insert("Station", format!("{}", res.governing_station));
+                    r.insert("Ratio", format!("{}", res.total_ratio));
                     r.insert("RatioType", "PMM".to_string());
                     r.insert("Status", res.status.clone());
+                    r.insert("ErrMsg", String::new());
                     rows.push(r);
+                }
+                for (frame, message) in &model.steel_design_errors {
+                    rows.push(not_designed_row(
+                        model,
+                        frame,
+                        message,
+                        &model.steel_design_code,
+                    ));
                 }
             }
             "CONCRETE DESIGN 1 - COLUMN SUMMARY DATA" => {
@@ -1240,12 +1339,23 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("Station", "0.0000".to_string());
                     r.insert(
                         "TotalAs",
-                        format!("{:.6}", res.as_top + res.as_bot + res.as_side),
+                        format!("{}", res.as_top + res.as_bot + res.as_side),
                     );
-                    r.insert("TotalAv", format!("{:.6}", res.av_over_s));
-                    r.insert("PMMRatio", format!("{:.4}", res.pmm_ratio));
+                    r.insert("TotalAv", format!("{}", res.av_over_s));
+                    r.insert("PMMRatio", format!("{}", res.pmm_ratio));
                     r.insert("Status", res.status.clone());
+                    r.insert("ErrMsg", String::new());
                     rows.push(r);
+                }
+                for (frame, message) in &model.concrete_design_errors {
+                    if refused_concrete_is_column(model, frame) {
+                        rows.push(not_designed_row(
+                            model,
+                            frame,
+                            message,
+                            &model.concrete_design_code,
+                        ));
+                    }
                 }
             }
             "CONCRETE DESIGN 2 - BEAM SUMMARY DATA" => {
@@ -1260,12 +1370,23 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("DesignCode", res.design_code.clone());
                     r.insert("Combo", res.governing_combo.clone());
                     r.insert("Station", "0.0000".to_string());
-                    r.insert("TopAs", format!("{:.6}", res.as_top));
-                    r.insert("BotAs", format!("{:.6}", res.as_bot));
-                    r.insert("SideAs", format!("{:.6}", res.as_side));
-                    r.insert("TotalAv", format!("{:.6}", res.av_over_s));
+                    r.insert("TopAs", format!("{}", res.as_top));
+                    r.insert("BotAs", format!("{}", res.as_bot));
+                    r.insert("SideAs", format!("{}", res.as_side));
+                    r.insert("TotalAv", format!("{}", res.av_over_s));
                     r.insert("Status", res.status.clone());
+                    r.insert("ErrMsg", String::new());
                     rows.push(r);
+                }
+                for (frame, message) in &model.concrete_design_errors {
+                    if !refused_concrete_is_column(model, frame) {
+                        rows.push(not_designed_row(
+                            model,
+                            frame,
+                            message,
+                            &model.concrete_design_code,
+                        ));
+                    }
                 }
             }
             _ => {}
@@ -1276,6 +1397,131 @@ impl<'a> cDatabaseTables<'a> {
 }
 
 // --- Application logic ---
+
+const ALL_MAT_TYPES: [MatType; 7] = [
+    MatType::Steel,
+    MatType::Concrete,
+    MatType::NoDesign,
+    MatType::Aluminum,
+    MatType::ColdFormed,
+    MatType::Rebar,
+    MatType::Tendon,
+];
+
+const ALL_FRAME_PROP_TYPES: [FramePropType; 34] = [
+    FramePropType::I,
+    FramePropType::Channel,
+    FramePropType::T,
+    FramePropType::Angle,
+    FramePropType::DblAngle,
+    FramePropType::Box,
+    FramePropType::Pipe,
+    FramePropType::Rectangular,
+    FramePropType::Circle,
+    FramePropType::General,
+    FramePropType::DbChannel,
+    FramePropType::Auto,
+    FramePropType::SD,
+    FramePropType::Variable,
+    FramePropType::Joist,
+    FramePropType::Bridge,
+    FramePropType::ColdC,
+    FramePropType::Cold2C,
+    FramePropType::ColdZ,
+    FramePropType::ColdL,
+    FramePropType::Cold2L,
+    FramePropType::ColdHat,
+    FramePropType::BuiltUpICoverplate,
+    FramePropType::PCCGirderI,
+    FramePropType::PCCGirderU,
+    FramePropType::BuiltUpIHybrid,
+    FramePropType::BuiltUpUHybrid,
+    FramePropType::ConcreteL,
+    FramePropType::ColdBox,
+    FramePropType::ColdI,
+    FramePropType::ColdPipe,
+    FramePropType::ColdT,
+    FramePropType::Trapezoidal,
+    FramePropType::PCCGirderSuperT,
+];
+
+const ALL_LOAD_PATTERN_TYPES: [LoadPatternType; 15] = [
+    LoadPatternType::Dead,
+    LoadPatternType::SuperDead,
+    LoadPatternType::Live,
+    LoadPatternType::ReduceLive,
+    LoadPatternType::Quake,
+    LoadPatternType::Wind,
+    LoadPatternType::Snow,
+    LoadPatternType::Other,
+    LoadPatternType::Move,
+    LoadPatternType::Temperature,
+    LoadPatternType::Rooflive,
+    LoadPatternType::Notional,
+    LoadPatternType::PatternLive,
+    LoadPatternType::Wave,
+    LoadPatternType::Prestress,
+];
+
+const ALL_LOAD_CASE_TYPES: [LoadCaseType; 14] = [
+    LoadCaseType::LinearStatic,
+    LoadCaseType::NonlinearStatic,
+    LoadCaseType::Modal,
+    LoadCaseType::ResponseSpectrum,
+    LoadCaseType::LinearHistory,
+    LoadCaseType::NonlinearHistory,
+    LoadCaseType::LinearDynamic,
+    LoadCaseType::NonlinearDynamic,
+    LoadCaseType::MovingLoad,
+    LoadCaseType::Buckling,
+    LoadCaseType::SteadyState,
+    LoadCaseType::PowerSpectralDensity,
+    LoadCaseType::LinearStaticMultiStep,
+    LoadCaseType::HyperStatic,
+];
+
+/// The inverse of the export spelling `format!("{:?}", v)` (D116, D117): the
+/// variant whose debug name equals `name`, ignoring case and underscores.
+fn from_debug_name<T: Copy + std::fmt::Debug>(all: &[T], name: &str) -> Option<T> {
+    let key: String = name.trim().replace('_', "").to_ascii_lowercase();
+    all.iter()
+        .copied()
+        .find(|v| format!("{v:?}").to_ascii_lowercase() == key)
+}
+
+/// The name of a combination that lies on a cycle of combinations (including a
+/// combination that lists itself), or `None`.
+fn combo_in_cycle(model: &SapModel) -> Option<String> {
+    // 0 = unvisited, 1 = on the current path, 2 = finished.
+    fn visit(
+        model: &SapModel,
+        name: &str,
+        state: &mut BTreeMap<String, u8>,
+    ) -> Option<String> {
+        match state.get(name) {
+            Some(1) => return Some(name.to_string()),
+            Some(2) => return None,
+            _ => {}
+        }
+        state.insert(name.to_string(), 1);
+        if let Some(combo) = model.load_combos.get(name) {
+            for (target, _) in &combo.cases {
+                if model.load_combos.contains_key(target) {
+                    if let Some(found) = visit(model, target, state) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        state.insert(name.to_string(), 2);
+        None
+    }
+    let mut state = BTreeMap::new();
+    model
+        .load_combos
+        .keys()
+        .find_map(|name| visit(model, name, &mut state))
+}
 
 fn apply_single_table(
     model: &mut SapModel,
@@ -1455,23 +1701,41 @@ fn apply_single_table(
                 if !is_valid_name(name) {
                     return OAPI_ERR;
                 }
-                let type_str = get_cell(row, "Type").unwrap_or("Steel");
-                let mat_type = match type_str.to_ascii_uppercase().as_str() {
-                    "STEEL" => MatType::Steel,
-                    "CONCRETE" => MatType::Concrete,
-                    "NODESIGN" => MatType::NoDesign,
-                    "ALUMINUM" => MatType::Aluminum,
-                    "COLDFORMED" => MatType::ColdFormed,
-                    "REBAR" => MatType::Rebar,
-                    "TENDON" => MatType::Tendon,
-                    _ => MatType::Steel,
+                let existing = model.materials.contains_key(name);
+                // An omitted Type keeps an existing material's type; a new
+                // material without one is Steel. An unknown Type refuses the edit.
+                let mat_type = match get_cell(row, "Type") {
+                    Some(t) => match from_debug_name(&ALL_MAT_TYPES, t) {
+                        Some(v) => Some(v),
+                        None => {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: Unknown material Type '{}' for material '{}'\n",
+                                    t, name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
+                    },
+                    None => None,
                 };
-                if let Some(m) = model.materials.get_mut(name) {
-                    m.mat_type = mat_type;
+                if existing {
+                    if let Some(t) = mat_type {
+                        model.materials.get_mut(name).unwrap().mat_type = t;
+                    }
                 } else {
-                    let mut m = Material::default_steel_kip_in();
+                    // D117: the kip-in default converted to the model's present
+                    // units with the model's own per-field conversion.
+                    let mut template = SapModel::default();
+                    template.present_units = sap_units::Units::KipInF;
+                    template.materials.clear();
+                    template
+                        .materials
+                        .insert("A992Fy50".to_string(), Material::default_steel_kip_in());
+                    template.convert_units_in_place(model.present_units);
+                    let mut m = template.materials.shift_remove("A992Fy50").unwrap();
                     m.name = name.to_string();
-                    m.mat_type = mat_type;
+                    m.mat_type = mat_type.unwrap_or(MatType::Steel);
                     model.materials.insert(name.to_string(), m);
                 }
             }
@@ -1623,7 +1887,59 @@ fn apply_single_table(
                 if !is_valid_name(name) {
                     return OAPI_ERR;
                 }
-                let mat = get_cell(row, "Material").unwrap_or("A992Fy50");
+                let existing = model.frame_sections.contains_key(name);
+                // D116: a new section must give every column the export writes;
+                // an existing section keeps the value of an omitted column.
+                if !existing {
+                    const ALL_COLUMNS: [&str; 19] = [
+                        "SectionName",
+                        "Material",
+                        "Shape",
+                        "t3",
+                        "t2",
+                        "tf",
+                        "tw",
+                        "Area",
+                        "TorsConst",
+                        "I33",
+                        "I22",
+                        "AS2",
+                        "AS3",
+                        "S33",
+                        "S22",
+                        "Z33",
+                        "Z22",
+                        "R33",
+                        "R22",
+                    ];
+                    let missing: Vec<&str> = ALL_COLUMNS
+                        .iter()
+                        .copied()
+                        .filter(|c| {
+                            !(c.eq_ignore_ascii_case("SectionName")
+                                && get_cell(row, "Section").is_some())
+                                && get_cell(row, c).is_none()
+                        })
+                        .collect();
+                    if !missing.is_empty() {
+                        if fill_log {
+                            log.push_str(&format!(
+                                "ERROR: New frame section '{}' lacks the columns {}\n",
+                                name,
+                                missing.join(", ")
+                            ));
+                        }
+                        return OAPI_ERR;
+                    }
+                }
+                let base = model
+                    .frame_sections
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let base_material = base.material.clone();
+                let mat = get_cell(row, "Material").unwrap_or(base_material.as_str());
                 if !model.materials.contains_key(mat) {
                     if fill_log {
                         log.push_str(&format!(
@@ -1633,6 +1949,21 @@ fn apply_single_table(
                     }
                     return OAPI_ERR;
                 }
+                let prop_type = match get_cell(row, "Shape") {
+                    Some(t) => match from_debug_name(&ALL_FRAME_PROP_TYPES, t) {
+                        Some(v) => v,
+                        None => {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: Unknown Shape '{}' for section '{}'\n",
+                                    t, name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
+                    },
+                    None => base.prop_type,
+                };
 
                 let parse_f64 = |field_name: &str, default_val: f64| -> Result<f64, ()> {
                     if let Some(s) = get_cell(row, field_name) {
@@ -1647,66 +1978,49 @@ fn apply_single_table(
                     }
                 };
 
-                let parse_opt = |field_name: &str| -> Result<Option<f64>, ()> {
+                let parse_opt = |field_name: &str, default_val: f64| -> Result<f64, ()> {
                     if let Some(s) = get_cell(row, field_name) {
                         let v = s.trim().parse::<f64>().map_err(|_| ())?;
                         if v.is_finite() && v >= 0.0 {
-                            Ok(Some(v))
+                            Ok(v)
                         } else {
                             Err(())
                         }
                     } else {
-                        Ok(None)
+                        Ok(default_val)
                     }
                 };
 
-                let Ok(area) = parse_f64("Area", 10.0) else {
+                let (Ok(area), Ok(i33), Ok(i22), Ok(j)) = (
+                    parse_f64("Area", base.area),
+                    parse_f64("I33", base.i33),
+                    parse_f64("I22", base.i22),
+                    parse_f64("TorsConst", base.torsional_j),
+                ) else {
                     return OAPI_ERR;
                 };
-                let Ok(i33) = parse_f64("I33", 100.0) else {
+                let (Ok(t3), Ok(t2), Ok(tf), Ok(tw)) = (
+                    parse_f64("t3", base.t3),
+                    parse_f64("t2", base.t2),
+                    parse_f64("tf", base.tf),
+                    parse_f64("tw", base.tw),
+                ) else {
                     return OAPI_ERR;
                 };
-                let Ok(i22) = parse_f64("I22", 50.0) else {
+                let (Ok(as2), Ok(as3), Ok(s33), Ok(s22)) = (
+                    parse_opt("AS2", base.as2),
+                    parse_opt("AS3", base.as3),
+                    parse_opt("S33", base.s33),
+                    parse_opt("S22", base.s22),
+                ) else {
                     return OAPI_ERR;
                 };
-                let Ok(j) = parse_f64("TorsConst", 1.0) else {
-                    return OAPI_ERR;
-                };
-                let Ok(t3) = parse_f64("t3", 10.0) else {
-                    return OAPI_ERR;
-                };
-                let Ok(t2) = parse_f64("t2", 10.0) else {
-                    return OAPI_ERR;
-                };
-                let Ok(tf) = parse_f64("tf", 0.5) else {
-                    return OAPI_ERR;
-                };
-                let Ok(tw) = parse_f64("tw", 0.5) else {
-                    return OAPI_ERR;
-                };
-
-                let Ok(opt_as2) = parse_opt("AS2") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_as3) = parse_opt("AS3") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_s33) = parse_opt("S33") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_s22) = parse_opt("S22") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_z33) = parse_opt("Z33") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_z22) = parse_opt("Z22") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_r33) = parse_opt("R33") else {
-                    return OAPI_ERR;
-                };
-                let Ok(opt_r22) = parse_opt("R22") else {
+                let (Ok(z33), Ok(z22), Ok(r33), Ok(r22)) = (
+                    parse_opt("Z33", base.z33),
+                    parse_opt("Z22", base.z22),
+                    parse_opt("R33", base.r33),
+                    parse_opt("R22", base.r22),
+                ) else {
                     return OAPI_ERR;
                 };
 
@@ -1714,79 +2028,35 @@ fn apply_single_table(
                     return OAPI_ERR;
                 }
 
-                if let Some(s) = model.frame_sections.get_mut(name) {
-                    s.material = mat.to_string();
-                    s.area = area;
-                    s.i33 = i33;
-                    s.i22 = i22;
-                    s.torsional_j = j;
-                    s.t3 = t3;
-                    s.t2 = t2;
-                    s.tf = tf;
-                    s.tw = tw;
-                    if let Some(v) = opt_as2 {
-                        s.as2 = v;
-                    }
-                    if let Some(v) = opt_as3 {
-                        s.as3 = v;
-                    }
-                    if let Some(v) = opt_s33 {
-                        s.s33 = v;
-                    }
-                    if let Some(v) = opt_s22 {
-                        s.s22 = v;
-                    }
-                    if let Some(v) = opt_z33 {
-                        s.z33 = v;
-                    }
-                    if let Some(v) = opt_z22 {
-                        s.z22 = v;
-                    }
-                    if let Some(v) = opt_r33 {
-                        s.r33 = v;
-                    }
-                    if let Some(v) = opt_r22 {
-                        s.r22 = v;
-                    }
-                } else {
-                    let mut sec = FrameSection::default();
-                    sec.name = name.to_string();
-                    sec.material = mat.to_string();
-                    sec.prop_type = FramePropType::I;
-                    sec.area = area;
-                    sec.i33 = i33;
-                    sec.i22 = i22;
-                    sec.torsional_j = j;
-                    sec.t3 = t3;
-                    sec.t2 = t2;
-                    sec.tf = tf;
-                    sec.tw = tw;
-                    if let Some(v) = opt_as2 {
-                        sec.as2 = v;
-                    }
-                    if let Some(v) = opt_as3 {
-                        sec.as3 = v;
-                    }
-                    if let Some(v) = opt_s33 {
-                        sec.s33 = v;
-                    }
-                    if let Some(v) = opt_s22 {
-                        sec.s22 = v;
-                    }
-                    if let Some(v) = opt_z33 {
-                        sec.z33 = v;
-                    }
-                    if let Some(v) = opt_z22 {
-                        sec.z22 = v;
-                    }
-                    if let Some(v) = opt_r33 {
-                        sec.r33 = v;
-                    }
-                    if let Some(v) = opt_r22 {
-                        sec.r22 = v;
-                    }
-                    model.frame_sections.insert(name.to_string(), sec);
+                let mut sec = base;
+                if !existing {
+                    // The table has no bottom-flange columns: a new section is
+                    // symmetric, as the export of a symmetric section reads.
+                    sec.t2b = t2;
+                    sec.tfb = tf;
+                    sec.dis = 0.0;
+                    sec.i23 = 0.0;
                 }
+                sec.name = name.to_string();
+                sec.material = mat.to_string();
+                sec.prop_type = prop_type;
+                sec.area = area;
+                sec.i33 = i33;
+                sec.i22 = i22;
+                sec.torsional_j = j;
+                sec.t3 = t3;
+                sec.t2 = t2;
+                sec.tf = tf;
+                sec.tw = tw;
+                sec.as2 = as2;
+                sec.as3 = as3;
+                sec.s33 = s33;
+                sec.s22 = s22;
+                sec.z33 = z33;
+                sec.z22 = z22;
+                sec.r33 = r33;
+                sec.r22 = r22;
+                model.frame_sections.insert(name.to_string(), sec);
             }
             OAPI_OK
         }
@@ -1798,22 +2068,47 @@ fn apply_single_table(
                 if !is_valid_name(name) {
                     return OAPI_ERR;
                 };
-                let sw_mult = get_cell(row, "SelfWtMult")
-                    .and_then(|s| s.trim().parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                if !sw_mult.is_finite() {
-                    return OAPI_ERR;
+                // D118: an omitted SelfWtMult keeps an existing pattern's multiplier
+                // (a new pattern starts at 0); a present one must be a number.
+                let sw_mult = match get_cell(row, "SelfWtMult") {
+                    Some(t) => match t.trim().parse::<f64>() {
+                        Ok(v) if v.is_finite() => Some(v),
+                        _ => return OAPI_ERR,
+                    },
+                    None => None,
+                };
+                // The pattern type is the inverse of the export spelling of
+                // `DesignType`; an unknown name refuses the edit.
+                let pat_type = match get_cell(row, "DesignType") {
+                    Some(t) => match from_debug_name(&ALL_LOAD_PATTERN_TYPES, t) {
+                        Some(v) => Some(v),
+                        None => {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: Unknown load pattern DesignType '{}' for '{}'\n",
+                                    t, name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
+                    },
+                    None => None,
                 };
 
                 if let Some(lp) = model.load_patterns.get_mut(name) {
-                    lp.self_wt_multiplier = sw_mult;
+                    if let Some(v) = sw_mult {
+                        lp.self_wt_multiplier = v;
+                    }
+                    if let Some(t) = pat_type {
+                        lp.pat_type = t;
+                    }
                 } else {
                     model.load_patterns.insert(
                         name.to_string(),
                         LoadPattern {
                             name: name.to_string(),
-                            pat_type: LoadPatternType::Dead,
-                            self_wt_multiplier: sw_mult,
+                            pat_type: pat_type.unwrap_or(LoadPatternType::Dead),
+                            self_wt_multiplier: sw_mult.unwrap_or(0.0),
                         },
                     );
                 }
@@ -1866,21 +2161,40 @@ fn apply_single_table(
                     })
                     .unwrap_or_else(|| "DEAD".to_string());
 
-                let case_type = if let Some(t) = get_cell(row, "Type") {
-                    match t.to_ascii_uppercase().as_str() {
-                        "NONLINEARSTATIC" | "NONLINEAR_STATIC" => LoadCaseType::NonlinearStatic,
-                        "MODAL" => LoadCaseType::Modal,
-                        "RESPONSESPECTRUM" | "RESPONSE_SPECTRUM" => LoadCaseType::ResponseSpectrum,
-                        "LINEARHISTORY" | "LINEAR_HISTORY" => LoadCaseType::LinearHistory,
-                        "NONLINEARHISTORY" | "NONLINEAR_HISTORY" => LoadCaseType::NonlinearHistory,
-                        _ => LoadCaseType::LinearStatic,
+                // D117: every LoadCaseType debug name maps back; an unknown name
+                // refuses the edit; an omitted Type keeps an existing case's type
+                // and refuses a new case.
+                let case_type = match get_cell(row, "Type") {
+                    Some(t) => match from_debug_name(&ALL_LOAD_CASE_TYPES, t) {
+                        Some(v) => Some(v),
+                        None => {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: Unknown load case Type '{}' for case '{}'\n",
+                                    t, name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
+                    },
+                    None => {
+                        if !model.load_cases.contains_key(name) {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: New load case '{}' has no Type\n",
+                                    name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
+                        None
                     }
-                } else {
-                    LoadCaseType::LinearStatic
                 };
 
                 if let Some(lc) = model.load_cases.get_mut(name) {
-                    lc.case_type = case_type;
+                    if let Some(t) = case_type {
+                        lc.case_type = t;
+                    }
                     if lc.loads.is_empty() && model.load_patterns.contains_key(&pattern) {
                         lc.loads.push(LoadCaseAssignment {
                             load_name: pattern.clone(),
@@ -1889,7 +2203,7 @@ fn apply_single_table(
                     }
                 } else {
                     let mut lc = LoadCase::linear_static(name, &pattern, 1.0);
-                    lc.case_type = case_type;
+                    lc.case_type = case_type.unwrap_or_default();
                     model.load_cases.insert(name.to_string(), lc);
                 }
             }
@@ -1979,8 +2293,30 @@ fn apply_single_table(
                     combo.cases.push((case_name.to_string(), sf));
                 }
             }
+            // D118: a combination that refers to itself through any chain of
+            // combinations is refused; the model is left unchanged (the caller
+            // works on a copy).
+            if let Some(name) = combo_in_cycle(model) {
+                if fill_log {
+                    log.push_str(&format!(
+                        "ERROR: Combination '{}' refers to itself through its contributors\n",
+                        name
+                    ));
+                }
+                return OAPI_ERR;
+            }
             OAPI_OK
         }
         _ => OAPI_OK,
+    }
+}
+
+/// The Max and Min rows of a multi-valued combination, with the step type the tables print
+/// ("Max", "Min"); every other result has one row of step type "Static". Max comes first
+/// (the vendor's order is not stated: a project choice).
+fn sap_results_rows(cr: &sap_model::CaseResults) -> Vec<(&'static str, &sap_model::CaseResults)> {
+    match cr.combo_min.as_deref() {
+        Some(min) => vec![("Max", cr), ("Min", min)],
+        None => vec![("Static", cr)],
     }
 }

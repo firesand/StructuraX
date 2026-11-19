@@ -803,14 +803,19 @@ impl BinarySdbWriter {
                 "WriteDouble2" => {
                     if let Some(SdbVal::ArrF64(arr)) = val {
                         if !arr.is_empty() {
+                            // Shapes observed in the corpus: per-end values
+                            // are stored [component][end], a nine-value
+                            // array is a 3 x 3 matrix, and every other
+                            // two-dimensional array is a single column.
+                            let (rows, columns) = match (class_id, arr.len()) {
+                                ("TYFFixity", 12) => (6, 2),
+                                ("TYFOffset", 6) => (3, 2),
+                                (_, 9) => (3, 3),
+                                (_, len) => (len as i32, 1),
+                            };
                             self.write_bool(true);
-                            if arr.len() == 9 {
-                                self.write_i32(3);
-                                self.write_i32(3);
-                            } else {
-                                self.write_i32(arr.len() as i32);
-                                self.write_i32(1);
-                            }
+                            self.write_i32(rows);
+                            self.write_i32(columns);
                             for &x in arr {
                                 self.write_f64(x);
                             }
@@ -859,6 +864,18 @@ fn csys_index(coord_index: &HashMap<String, i32>, name: &str) -> i32 {
     }
 }
 
+/// Whether the native writer carries `lc.modal_case`: a linear modal history whose modal case
+/// exists in `model` and is a Modal case.
+fn writes_modal_case(model: &SapModel, lc: &LoadCase) -> bool {
+    lc.case_type == LoadCaseType::LinearHistory
+        && lc.modal_case.as_ref().is_some_and(|modal| {
+            model
+                .load_cases
+                .get(modal)
+                .is_some_and(|m| m.case_type == LoadCaseType::Modal)
+        })
+}
+
 /// Experimental synthesis of a schema-checked v19-style native stream. Vendor
 /// application acceptance is unverified. Unsupported or lossy state is rejected;
 /// analysis/design results and lock state are intentionally not serialized.
@@ -875,6 +892,8 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     let startup = HashMap::from([
         ("m_Units".into(), SdbVal::I32(model.present_units as i32)),
         ("m_DBUnits".into(), SdbVal::I32(model.database_units as i32)),
+        // D123: 3 in all 336 corpus files.
+        ("m_GlobalUp".into(), SdbVal::I32(3)),
     ]);
     w.write_struct("S_ProjectStartUp", &startup)?;
     let mut user_infos = Vec::new();
@@ -1035,10 +1054,17 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     w.write_struct("S_ProjectInfo", &proj_info)?;
     w.write_empty_struct_array(); // Standards
     w.write_empty_struct(); // AnalysisModelDateTimeStamp
-    let run_params = HashMap::from([(
-        "m_dof".into(),
-        SdbVal::ArrI32(model.active_dofs.iter().map(|&b| i32::from(b)).collect()),
-    )]);
+    let run_params = HashMap::from([
+        (
+            "m_dof".into(),
+            SdbVal::ArrI32(model.active_dofs.iter().map(|&b| i32::from(b)).collect()),
+        ),
+        // D123: g in the length unit of the model (386.0886 in/s2 in 264 corpus files).
+        (
+            "m_Gravity".into(),
+            SdbVal::F64(model.present_units.gravity_acceleration()),
+        ),
+    ]);
     w.write_struct("RUNARRAY", &run_params)?;
     w.write_i32(1); // PresentCoordSystem
 
@@ -1150,7 +1176,16 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 "__class_id".into(),
                 SdbVal::Str("S_MaterialPropertiesRebar".into()),
             ),
-            ("m_fy".into(), SdbVal::F64(mat.fys)),
+            // D114: a Rebar material's own yield is `m_RebarProps.m_fy`; the
+            // other types keep the shear-rebar yield `fys` there.
+            (
+                "m_fy".into(),
+                SdbVal::F64(if mat.mat_type == MatType::Rebar {
+                    mat.fy
+                } else {
+                    mat.fys
+                }),
+            ),
             ("m_Fu".into(), SdbVal::F64(mat.fu)),
         ]);
         let is_ortho = mat.e_ortho.is_some()
@@ -1260,6 +1295,44 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_R22".into(), SdbVal::F64(sec.r22)),
             ("m_msf".into(), SdbVal::ArrF64(sec.modifiers.to_vec())),
         ]);
+        if let Some(rebar) = &sec.concrete_rebar {
+            // D114: the rebar record `S_CP`. Only the modelled fields are
+            // written; `total_rebar_area` has no field here (the bar size table is
+            // not modelled), so a section that carries one is refused by the
+            // projection check. `m_lateral` is 1 in every corpus file.
+            let material = |name: &str| mat_index.get(name).copied().unwrap_or(1);
+            s_map.insert(
+                "m_Cp".into(),
+                SdbVal::Obj(HashMap::from([
+                    ("__class_id".into(), SdbVal::Str("S_CP".into())),
+                    ("m_alive".into(), SdbVal::Bool(true)),
+                    (
+                        "m_MindexRebar".into(),
+                        SdbVal::I32(material(&rebar.rebar_mat_long)),
+                    ),
+                    (
+                        "m_MindexRebarShear".into(),
+                        SdbVal::I32(material(&rebar.rebar_mat_confine)),
+                    ),
+                    (
+                        "m_type".into(),
+                        SdbVal::I32(if rebar.is_column { 1 } else { 2 }),
+                    ),
+                    ("m_CoverTop".into(), SdbVal::F64(rebar.cover_top)),
+                    ("m_CoverBot".into(), SdbVal::F64(rebar.cover_bot)),
+                    ("m_Cover".into(), SdbVal::F64(rebar.cover_top)),
+                    ("m_lateral".into(), SdbVal::I32(1)),
+                    (
+                        "m_NumberR3Bars".into(),
+                        SdbVal::I32(rebar.num_bars_3dir as i32),
+                    ),
+                    (
+                        "m_NumberR2Bars".into(),
+                        SdbVal::I32(rebar.num_bars_2dir as i32),
+                    ),
+                ])),
+            );
+        }
         if let Some(ref fnm) = sec.file_name {
             s_map.insert("m_PropertyFile".into(), SdbVal::Str(fnm.clone()));
         }
@@ -1312,13 +1385,14 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     let mut raw_shell_sections = Vec::with_capacity(model.area_sections.len());
     for (idx, asec) in model.area_sections.values().enumerate() {
         asec_index.insert(asec.name.clone(), (idx + 1) as i32);
-        let stype = match asec.shell_type {
-            ShellType::ShellThin => 1,
-            ShellType::ShellThick => 2,
-            ShellType::PlateThin => 3,
-            ShellType::PlateThick => 4,
-            ShellType::Membrane => 5,
-            ShellType::ShellLayered => 6,
+        // Mirror of the importer's table; `export_guard` refuses the section
+        // types whose native code has not been observed.
+        let (element_type, stype) = match (asec.prop_type, asec.shell_type, asec.plane_type) {
+            (AreaPropType::Shell, ShellType::ShellThick, _) => (0, 1),
+            (AreaPropType::Shell, _, _) => (0, 4),
+            (AreaPropType::Plane, _, PlaneType::PlaneStress) => (1, 1),
+            (AreaPropType::Plane, _, PlaneType::PlaneStrain) => (1, 2),
+            (AreaPropType::ASolid, _, _) => (2, 0),
         };
         let mindex = mat_index.get(&asec.material).copied().unwrap_or(1);
         raw_shell_sections.push(HashMap::from([
@@ -1326,12 +1400,14 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_name".into(), SdbVal::Str(asec.name.clone())),
             ("m_Mindex".into(), SdbVal::I32(mindex)),
             ("m_SType".into(), SdbVal::I32(stype)),
+            ("m_ElementType".into(), SdbVal::I32(element_type)),
             ("m_Ang".into(), SdbVal::F64(asec.mat_angle_deg)),
             ("m_Thickness".into(), SdbVal::F64(asec.thickness_membrane)),
             ("m_bending".into(), SdbVal::F64(asec.thickness_bending)),
             (
                 "m_Incompatible".into(),
-                SdbVal::I32(i32::from(asec.incompatible_modes)),
+                // Native polarity: 1 = incompatible modes off.
+                SdbVal::I32(i32::from(!asec.incompatible_modes)),
             ),
             (
                 "m_IncludeDrillingDOF".into(),
@@ -1357,7 +1433,7 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ),
             (
                 "m_Incompatible".into(),
-                SdbVal::I32(i32::from(ssec.incompatible_modes)),
+                SdbVal::I32(i32::from(!ssec.incompatible_modes)),
             ),
         ]));
     }
@@ -1407,6 +1483,9 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             let mut m_param = vec![0.0; 30];
             m_param[0..6].copy_from_slice(&lprop.param1);
             m_param[6..12].copy_from_slice(&lprop.param2);
+            if lprop.link_type == LinkPropType::PlasticWen {
+                m_param[12..18].copy_from_slice(&lprop.param3);
+            }
             lp_map.insert("m_param".into(), SdbVal::ArrF64(m_param));
         }
         raw_link_props.push(lp_map);
@@ -1485,7 +1564,9 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
         let p2 = pt_index.get(&fr.point_j).copied().unwrap_or(1);
         let (line_type, san) = if fr.cable_params.is_some() {
             (
-                1,
+                // D123: 2 = cable in all 15 corpus cables (1 is a curved frame; the
+                // reader still accepts 1 from files written before).
+                2,
                 cable_prop_index
                     .get(&fr.section)
                     .or_else(|| fsec_index.get(&fr.section))
@@ -1499,6 +1580,12 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
         for i in 0..6 {
             ir[i] = i32::from(fr.release_i[i]) | (i32::from(fr.release_j[i]) << 1);
         }
+        let object_length = match (model.points.get(&fr.point_i), model.points.get(&fr.point_j)) {
+            (Some(i), Some(j)) => {
+                ((j.x - i.x).powi(2) + (j.y - i.y).powi(2) + (j.z - i.z).powi(2)).sqrt()
+            }
+            _ => 0.0,
+        };
         let mut l_map = HashMap::from([
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_Name".into(), SdbVal::Str(fr.name.clone())),
@@ -1506,13 +1593,22 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_LineType".into(), SdbVal::I32(line_type)),
             ("m_sanalysis".into(), SdbVal::I32(san)),
             ("m_ang".into(), SdbVal::F64(fr.angle_deg)),
-            ("m_ai".into(), SdbVal::F64(fr.end_offset_i)),
-            ("m_aj".into(), SdbVal::F64(fr.end_offset_j)),
+            ("m_ai".into(), SdbVal::F64(offset_fraction(fr.end_offset_i, object_length))),
+            ("m_aj".into(), SdbVal::F64(offset_fraction(fr.end_offset_j, object_length))),
             ("m_RZ".into(), SdbVal::F64(fr.rigid_zone_factor)),
             ("m_CardinalPoint".into(), SdbVal::I32(fr.cardinal_point)),
             ("m_StiffTransform".into(), SdbVal::Bool(fr.stiff_transform)),
             ("m_IR".into(), SdbVal::ArrI32(ir)),
         ]);
+        // Automatic subdivision for analysis, as the vendor stores it: the
+        // enabling flag (twice), subdivision at joints, and the segment count.
+        let mesh_segments = fr.auto_mesh_segments;
+        if mesh_segments > 0 || fr.auto_mesh_at_joints {
+            l_map.insert("m_AutoMesh".into(), SdbVal::Bool(true));
+            l_map.insert("m_automesh2".into(), SdbVal::Bool(true));
+            l_map.insert("m_AutoMeshAtPoints".into(), SdbVal::Bool(fr.auto_mesh_at_joints));
+            l_map.insert("m_automeshn".into(), SdbVal::I32(mesh_segments as i32));
+        }
         if let Some((lim_c_exists, lim_c, lim_t_exists, lim_t)) = fr.tc_limits {
             l_map.insert(
                 "m_LimitCompressionExists".into(),
@@ -1574,8 +1670,6 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_point".into(), SdbVal::ArrI32(pts)),
             ("m_prop".into(), SdbVal::I32(prop_idx)),
             ("m_Ang".into(), SdbVal::F64(ar.angle_deg)),
-            ("m_meshn1".into(), SdbVal::I32(ar.auto_mesh.0 as i32)),
-            ("m_meshn2".into(), SdbVal::I32(ar.auto_mesh.1 as i32)),
         ]));
     }
     w.write_struct_array("S_AREAOBJECTS", &raw_areas)?;
@@ -1614,6 +1708,8 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_name".into(), SdbVal::Str(lk.name.clone())),
             ("m_point".into(), SdbVal::ArrI32(vec![p1, p2])),
             ("m_NPR".into(), SdbVal::I32(npr)),
+            // D123: 1.0 in all 82 corpus links.
+            ("m_NPRMultiplier".into(), SdbVal::F64(1.0)),
             ("m_Ang".into(), SdbVal::F64(lk.angle_deg)),
             ("m_Selected".into(), SdbVal::Bool(lk.selected)),
         ]));
@@ -1767,6 +1863,7 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
     let mut raw_pd_force = Vec::new();
     let mut raw_fmodifier = Vec::new();
     let mut raw_ffixity = Vec::new();
+    let mut raw_foffset = Vec::new();
     for fr in model.frames.values() {
         let fn_idx = fr_index.get(&fr.name).copied().unwrap_or(1);
         if fr.pdelta_force != 0.0 {
@@ -1795,14 +1892,71 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 ("m_P".into(), SdbVal::ArrF64(p)),
             ]));
         }
+        // Insertion-point joint offsets in the element local system, the one
+        // form the corpus shows: [component][end], coordinate system -1.
+        if fr.joint_offset_i != [0.0; 3] || fr.joint_offset_j != [0.0; 3] {
+            let mut p = Vec::with_capacity(6);
+            for c in 0..3 {
+                p.push(fr.joint_offset_i[c]);
+                p.push(fr.joint_offset_j[c]);
+            }
+            raw_foffset.push(HashMap::from([
+                ("m_alive".into(), SdbVal::Bool(true)),
+                ("m_n".into(), SdbVal::I32(fn_idx)),
+                ("m_P".into(), SdbVal::ArrF64(p)),
+                ("m_csys".into(), SdbVal::I32(-1)),
+            ]));
+        }
     }
     w.write_struct_array("TYPDFORCE", &raw_pd_force)?;
     w.write_struct_array("TYFModifier", &raw_fmodifier)?;
     w.write_struct_array("TYFFixity", &raw_ffixity)?;
-    w.write_empty_struct_array(); // FOffset
-    for _ in 0..8 {
-        w.write_empty_struct_array(); // FSpring..SSpring
+    w.write_struct_array("TYFOffset", &raw_foffset)?;
+    for _ in 0..3 {
+        w.write_empty_struct_array(); // FSpring, FMass, FFireProofing
     }
+    // Object-level area assignments, in the sections where the corpus keeps
+    // them (Example 2-008): property modifiers, added mass, N x N auto-mesh.
+    let mut raw_shmodifier = Vec::new();
+    let mut raw_shmass = Vec::new();
+    let mut raw_shmesh = Vec::new();
+    for ar in model.areas.values() {
+        let an_idx = ar_index.get(&ar.name).copied().unwrap_or(1);
+        if ar.modifiers.iter().any(|&m| m != 1.0) {
+            raw_shmodifier.push(HashMap::from([
+                ("m_alive".into(), SdbVal::Bool(true)),
+                ("m_n".into(), SdbVal::I32(an_idx)),
+                ("m_sf".into(), SdbVal::ArrF64(ar.modifiers.to_vec())),
+            ]));
+        }
+        if ar.mass_per_area != 0.0 {
+            raw_shmass.push(HashMap::from([
+                ("m_alive".into(), SdbVal::Bool(true)),
+                ("m_n".into(), SdbVal::I32(an_idx)),
+                ("m_mpa".into(), SdbVal::F64(ar.mass_per_area)),
+            ]));
+        }
+        if ar.auto_mesh != (1, 1) {
+            raw_shmesh.push(HashMap::from([
+                ("m_alive".into(), SdbVal::Bool(true)),
+                ("m_n".into(), SdbVal::I32(an_idx)),
+                ("m_MeshType".into(), SdbVal::I32(1)),
+                ("m_n1".into(), SdbVal::I32(ar.auto_mesh.0 as i32)),
+                ("m_n2".into(), SdbVal::I32(ar.auto_mesh.1 as i32)),
+                // Group 1 as in every corpus record.
+                ("m_Group".into(), SdbVal::I32(1)),
+                // What the solver does: restrain a new edge joint in the DOFs
+                // restrained at both ends of the edge.
+                ("m_RestraintsOnEdge".into(), SdbVal::Bool(true)),
+                ("m_RestraintsOnFace".into(), SdbVal::Bool(true)),
+            ]));
+        }
+    }
+    w.write_struct_array("TYShModifier", &raw_shmodifier)?;
+    w.write_empty_struct_array(); // ShSpring
+    w.write_struct_array("TYSMass", &raw_shmass)?;
+    w.write_struct_array("TYShMesh", &raw_shmesh)?;
+    w.write_empty_struct_array(); // SSpring
 
     // 8. LoadPattern, AnalysisCase, Combo, Loads, Functions
     let mut func_index = HashMap::new();
@@ -1894,15 +2048,27 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                 ]));
             }
         } else if (5..=8).contains(&ctype_code) {
-            for (func_name, load_name, sf) in &lc.history_loads {
+            for (entry, (func_name, load_name, sf)) in lc.history_loads.iter().enumerate() {
                 let f_idx = func_index.get(func_name).copied().unwrap_or(0);
-                let (ltype, l_idx) = if let Some(u_idx) = load_name
+                let u_idx = load_name
                     .strip_prefix('U')
                     .or_else(|| load_name.strip_prefix('u'))
                     .and_then(|s| s.parse::<i32>().ok())
                     .filter(|&i| (1..=6).contains(&i))
-                    .filter(|_| !lpat_index.contains_key(load_name))
-                {
+                    .or_else(|| {
+                        sap_model::history_acceleration_direction(load_name).map(|d| d as i32 + 1)
+                    });
+                // D77: the stored kind decides the record type; the name only
+                // decides it for a case that does not say (and the export guard
+                // refuses such a name that a pattern shares).
+                let accel = match lc.history_kind(entry) {
+                    sap_model::HistoryLoadKind::Acceleration => u_idx,
+                    sap_model::HistoryLoadKind::Pattern => None,
+                    sap_model::HistoryLoadKind::Unspecified => {
+                        u_idx.filter(|_| !lpat_index.contains_key(load_name))
+                    }
+                };
+                let (ltype, l_idx) = if let Some(u_idx) = accel {
                     (2, u_idx)
                 } else {
                     (1, lpat_index.get(load_name).copied().unwrap_or(0))
@@ -1952,7 +2118,7 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ModalComboMethod::Srss => 2,
             ModalComboMethod::AbsSum => 3,
         };
-        let sol_control = HashMap::from([
+        let mut sol_control = HashMap::from([
             (
                 "__class_id".into(),
                 SdbVal::Str("SOLUTIONCONTROLARRAY".into()),
@@ -1976,6 +2142,27 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_itmax".into(), SdbVal::I32(lc.max_iterations as i32)),
             ("m_TolConvD".into(), SdbVal::F64(lc.convergence_tol)),
         ]);
+        let mut monitored_joints = Vec::new();
+        if let Some(control) = &lc.displacement_control {
+            sol_control.insert("m_control".into(), SdbVal::I32(2));
+            sol_control.insert("m_TargetDisp".into(), SdbVal::F64(control.target));
+            sol_control.insert(
+                "m_DispType".into(),
+                SdbVal::I32(if control.conjugate { 1 } else { 2 }),
+            );
+            if let Some((point, dof)) = &control.monitored {
+                monitored_joints.push(HashMap::from([
+                    ("__class_id".into(), SdbVal::Str("TYNLCDisp".into())),
+                    ("m_DType".into(), SdbVal::I32(1)),
+                    (
+                        "m_jn".into(),
+                        SdbVal::I32(pt_index.get(point).copied().unwrap_or(0)),
+                    ),
+                    ("m_dof".into(), SdbVal::I32(*dof as i32 + 1)),
+                    ("m_sf".into(), SdbVal::F64(1.0)),
+                ]));
+            }
+        }
         let nonlinearity = HashMap::from([
             ("__class_id".into(), SdbVal::Str("NONLINEARITYARRAY".into())),
             (
@@ -1996,12 +2183,58 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
             ("m_alive".into(), SdbVal::Bool(true)),
             ("m_name".into(), SdbVal::Str(lc.name.clone())),
             ("m_casetype".into(), SdbVal::I32(ctype_code)),
+            // The modal case of a linear modal history (1-based; 0 is none) and its motion
+            // type (1 is transient, the only one this program has).
+            (
+                "m_modalcase".into(),
+                SdbVal::I32(if writes_modal_case(model, lc) {
+                    lc.modal_case
+                        .as_ref()
+                        .and_then(|modal| ac_index.get(modal).copied())
+                        .unwrap_or(0)
+                } else {
+                    0
+                }),
+            ),
+            (
+                "m_MotionType".into(),
+                SdbVal::I32(if matches!(ctype_code, 5 | 6) { 1 } else { 0 }),
+            ),
             ("m_SelectedForRun".into(), SdbVal::Bool(lc.run_flag)),
+            // D122: directional combination of a response-spectrum case, 1 = SRSS
+            // (`SetDirComb`); the solver combines directions by SRSS.
+            (
+                "m_dirtype".into(),
+                SdbVal::I32(if ctype_code == 4 { 1 } else { 0 }),
+            ),
             ("m_previous".into(), SdbVal::I32(prev_idx)),
             ("m_NumberLAs".into(), SdbVal::I32(las.len() as i32)),
             ("m_LA".into(), SdbVal::ArrObj(las)),
             ("m_Damp".into(), SdbVal::F64(lc.modal_damping)),
+            // 4 (constant ratio) is the value on every default case in the
+            // corpus. A modal history whose damping is carried as Rayleigh
+            // coefficients is written as 1 (direct coefficients, as in Example
+            // 6-011b) so the coefficients are not read as inactive.
+            (
+                "m_DampType".into(),
+                SdbVal::I32(
+                    if matches!(
+                        lc.case_type,
+                        LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+                    ) && lc.rayleigh_damping != (0.0, 0.0)
+                    {
+                        1
+                    } else {
+                        4
+                    },
+                ),
+            ),
             ("m_modc".into(), SdbVal::I32(modc)),
+            (
+                "m_ndjoints".into(),
+                SdbVal::I32(monitored_joints.len() as i32),
+            ),
+            ("m_djoints".into(), SdbVal::ArrObj(monitored_joints)),
             ("m_SolControl".into(), SdbVal::Obj(sol_control)),
             ("m_Nonlinearity".into(), SdbVal::Obj(nonlinearity)),
             ("m_dd".into(), SdbVal::Obj(dd)),
@@ -2215,7 +2448,15 @@ pub fn pack_model_to_native_sdb(model: &SapModel) -> Result<SdbFile, FormatError
                     ("m_alive".into(), SdbVal::Bool(true)),
                     ("m_n".into(), SdbVal::I32(an_idx)),
                     ("m_lc".into(), SdbVal::I32(lc)),
-                    ("m_LT".into(), SdbVal::I32(lt.my_type)),
+                    // Native numbering: 3 is the gradient the model numbers 2.
+                    (
+                        "m_LT".into(),
+                        SdbVal::I32(match lt.my_type {
+                            2 => 3,
+                            3 => 2,
+                            other => other,
+                        }),
+                    ),
                     ("m_T".into(), SdbVal::F64(lt.val)),
                     ("m_Pattern".into(), SdbVal::I32(p_idx)),
                 ]));
@@ -2380,6 +2621,32 @@ pub fn save_native_sdb_file(model: &SapModel, path: impl AsRef<Path>) -> Result<
     verified_file::write_new(path.as_ref(), &bytes)
 }
 
+/// An end length offset as the fraction of the object length that the native
+/// record stores. The fraction is chosen so that reading it back, as
+/// `fraction * length`, gives the same offset bit for bit where one of the
+/// three nearest fractions does; the projection check refuses the rest.
+fn offset_fraction(offset: f64, length: f64) -> f64 {
+    if offset == 0.0 || length <= 0.0 {
+        return 0.0;
+    }
+    let fraction = offset / length;
+    // The neighbouring doubles: one step in the bit pattern of a finite,
+    // nonzero value (written out because the project's minimum Rust version
+    // predates `f64::next_up`).
+    let neighbours = if fraction.is_finite() && fraction != 0.0 {
+        [
+            f64::from_bits(fraction.to_bits() + 1),
+            f64::from_bits(fraction.to_bits() - 1),
+        ]
+    } else {
+        [fraction; 2]
+    };
+    [fraction, neighbours[0], neighbours[1]]
+        .into_iter()
+        .find(|candidate| candidate * length == offset)
+        .unwrap_or(fraction)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2457,7 +2724,9 @@ mod tests {
         assert!(checked >= 336, "Only {} native fixtures checked", checked);
         assert_eq!(
             verified_classes.len(),
-            52,
+            // 57 before D114; `S_CP` (section rebar record) is the 58th, verified here
+            // against the tags of the corpus records.
+            58,
             "Every emitted class tag needs source evidence"
         );
     }
@@ -2603,6 +2872,13 @@ mod tests {
         }
         let mut checked = 0usize;
         let mut rejected_incomplete = 0usize;
+        // 45 since wave 5: Example 6-005a NLMHIST1 (nonlinear modal, FNA) is recorded as
+        // unmodeled instead of being integrated directly. 46 since D141: Example 1-024 has
+        // the response-spectrum case RS-10PCT (modal combination NRC 10 percent), which was
+        // read as CQC.
+        const EXPECTED_UNMODELED: usize = 46;
+        let mut rejected_unmodeled: Vec<String> = Vec::new();
+        let mut rejected_hinges: Vec<String> = Vec::new();
         let mut native_checked = 0usize;
         let mut nonlinear_links_checked = 0usize;
         let mut cables_checked = 0usize;
@@ -2643,13 +2919,34 @@ mod tests {
                     if model.link_props.iter().any(|(name, prop)| {
                         !prop.nonlinear_data_complete
                             && field == format!("link_props.{name}.nonlinear_data_complete")
-                    }) =>
+                    }) => {
+                        eprintln!("{}: correctly rejected incomplete native source law ({reason})", path.display());
+                        rejected_incomplete += 1;
+                        continue;
+                    }
+                // Hinges, link gravity loads, advanced link axes and per-mode
+                // damping are recorded but not representable; synthesis would
+                // silently omit them, so it must refuse.
+                Err(FormatError::UnsupportedNativeExport { field, .. })
+                    if field == "unmodeled_source" && !model.unmodeled_source.is_empty() =>
                 {
-                    eprintln!(
-                        "{}: correctly rejected incomplete native source law ({reason})",
-                        path.display()
+                    rejected_unmodeled.push(
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
                     );
-                    rejected_incomplete += 1;
+                    continue;
+                }
+                // Imported frame hinges are modeled and kept by S2K (checked
+                // above), but the native writer has no hinge records.
+                Err(FormatError::UnsupportedNativeExport { field, .. })
+                    if model.frames.values().any(|f| !f.hinges.is_empty())
+                        && (field.starts_with("hinge_props.")
+                            || field.ends_with(".hinges")
+                            || field.ends_with(".hinge_overwrite")
+                            || field.contains(".nl_static.")) =>
+                {
+                    rejected_hinges.push(
+                        path.file_name().unwrap().to_string_lossy().into_owned(),
+                    );
                     continue;
                 }
                 Err(e) => panic!("{} native pack failed: {}", path.display(), e),
@@ -2672,8 +2969,44 @@ mod tests {
             );
             native_checked += 1;
         }
-        eprintln!("Vendor projection: {checked} S2K roundtrips, {native_checked} checked native roundtrips, {rejected_incomplete} incomplete-source native rejections");
-        assert_eq!(checked, native_checked + rejected_incomplete);
+        rejected_unmodeled.sort();
+        rejected_hinges.sort();
+        eprintln!("Vendor projection: {checked} S2K roundtrips, {native_checked} checked native roundtrips, {rejected_incomplete} incomplete-source native rejections, unmodeled-source native rejections: {rejected_unmodeled:?}");
+        assert_eq!(
+            checked,
+            native_checked + rejected_incomplete + rejected_unmodeled.len() + rejected_hinges.len()
+        );
+        if checked >= 334 {
+            // One file per kind of recorded data; the full list is printed above.
+            // Files that also have an incomplete link law are counted there.
+            for expected in [
+                "example_1_009a.sdb",       // tendon object and prestress load
+                "example_1_013a.sdb",       // frame line springs
+                "example_1_015.sdb",        // frame added mass
+                "example_1_024.sdb",        // modal combination NRC 10 percent
+                "example_2_006_thick.sdb",  // area gravity load
+                "example_2_016a_thick.sdb", // area auto-mesh options not modeled
+                "example_2_009a_thick.sdb", // area springs
+                "example_3_005.sdb",        // area pore pressure
+                "example_4_003.sdb",        // axisymmetric-solid rotate load
+                "example_5_006.sdb",        // solid gravity load
+                "example_5_012a.sdb",       // solid surface springs
+                "example_5_013.sdb",        // solid pore pressure
+                "example_6_005a.sdb",       // nonlinear modal (FNA) history
+                "example_6_006.sdb",        // per-mode modal damping
+                "example_6_008.sdb",        // link gravity load and advanced axes
+            ] {
+                assert!(
+                    rejected_unmodeled.iter().any(|name| name == expected),
+                    "{expected} should be refused for unmodeled source data"
+                );
+            }
+            assert_eq!(rejected_unmodeled.len(), EXPECTED_UNMODELED);
+            // Example 1-026: the only vendor models with assigned frame hinges.
+            assert_eq!(rejected_hinges, ["example_1_026a.sdb", "example_1_026b.sdb"]);
+            assert_eq!(rejected_incomplete, 5);
+            assert_eq!(native_checked, 334 - 5 - EXPECTED_UNMODELED - 2);
+        }
         assert!(native_checked > 0, "No supported native models checked");
         assert!(checked >= 334, "Only {} vendor models checked", checked);
         assert!(

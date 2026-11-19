@@ -107,15 +107,22 @@ impl ProDatabase {
                 continue;
             }
 
-            let shape_str = String::from_utf8_lossy(&bytes[base + 36..base + 40]);
-            let shape_tok = shape_str.split_whitespace().next().unwrap_or("W");
+            // The vendor reads only the first two characters of the 4-byte type tag
+            // (docs/re/formats_and_sections.md): "W W " and "W   " are W, "2L2L" and "2L  " are
+            // 2L, "WW  " is WW, "CRCR" is CR, "2C2C" is 2C, "G G " is G (ledger D98).
+            let shape_str = String::from_utf8_lossy(&bytes[base + 36..base + 38]);
+            let shape_tok = match shape_str.trim() {
+                "" => "W",
+                tok => tok,
+            };
             let prop_type = match shape_tok {
-                "W" | "I" | "S" | "M" | "HP" => FramePropType::I,
+                "W" | "WW" | "I" | "S" | "M" | "HP" => FramePropType::I,
                 "C" | "MC" => FramePropType::Channel,
                 "T" | "WT" | "MT" | "ST" | "TW" => FramePropType::T,
                 "L" => FramePropType::Angle,
                 "2L" => FramePropType::DblAngle,
-                "B" | "TS" | "HSS" => FramePropType::Box,
+                // "HS" is the first two characters of the former "HSS" arm (no corpus record has it)
+                "B" | "TS" | "HS" => FramePropType::Box,
                 "P" => FramePropType::Pipe,
                 "R" => FramePropType::Rectangular,
                 "CR" => FramePropType::Circle,

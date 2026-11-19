@@ -52,8 +52,11 @@ pub(crate) fn normalize_loads(model: &mut SapModel) -> Result<(), SolverError> {
                 .chain(
                     c.history_loads
                         .iter()
-                        .filter(|(_, _, s)| *s != 0.)
-                        .map(|(_, p, _)| p.clone()),
+                        .enumerate()
+                        .filter(|(i, (_, _, s))| {
+                            *s != 0. && c.history_kind(*i) != sap_model::HistoryLoadKind::Acceleration
+                        })
+                        .map(|(_, (_, p, _))| p.clone()),
                 )
         })
         .collect();

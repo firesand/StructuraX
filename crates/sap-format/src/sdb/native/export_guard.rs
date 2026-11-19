@@ -313,12 +313,83 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         }
     }
     for (name, case) in &model.load_cases {
+        if let Some(control) = &case.displacement_control {
+            // The native record is written only for nonlinear static cases with
+            // one plain joint displacement; anything else would not read back.
+            let monitored_ok = control
+                .monitored
+                .as_ref()
+                .is_some_and(|(point, dof)| model.points.contains_key(point) && *dof < 6);
+            if case.case_type != sap_model::LoadCaseType::NonlinearStatic || !monitored_ok {
+                return Err(unsupported(
+                    format!("load_cases.{name}.displacement_control"),
+                    "displacement control needs a nonlinear static case and one existing monitored joint displacement",
+                ));
+            }
+        }
         if let Some(target) = &case.initial_case {
             reference(
                 model.load_cases.contains_key(target),
                 format!("load_cases.{name}.initial_case"),
                 target,
             )?;
+        }
+        // Nonlinear static parameters: the native solution-control record is
+        // written with its defaults only, so any other value would be lost.
+        let nl = &case.nl_static;
+        let nl_defaults = sap_model::hinge::NonlinearStaticParams::default();
+        for (field, differs, what) in [
+            (
+                "results_saved",
+                nl.results_saved != nl_defaults.results_saved,
+                "saving multiple states",
+            ),
+            (
+                "max_total_steps",
+                nl.max_total_steps != nl_defaults.max_total_steps,
+                "a step limit other than the default",
+            ),
+            (
+                "max_null_steps",
+                nl.max_null_steps != nl_defaults.max_null_steps,
+                "a null step limit other than the default",
+            ),
+            (
+                "hinge_unloading",
+                nl.hinge_unloading != nl_defaults.hinge_unloading,
+                "a hinge unloading method other than unloading the entire structure",
+            ),
+            ("mode_loads", !nl.mode_loads.is_empty(), "modal loads"),
+        ] {
+            if differs {
+                return Err(unsupported(
+                    format!("load_cases.{name}.nl_static.{field}"),
+                    format!("{what} is not written natively; use S2K"),
+                ));
+            }
+        }
+        // Reconstruction data with no native record written here; a
+        // synthesized file would drop it and the case would change meaning.
+        // The one reference the native writer carries (`m_modalcase`): a linear history
+        // whose modal case exists and is a Modal case.
+        if let Some(modal) = &case.modal_case {
+            let carried = case.case_type == sap_model::LoadCaseType::LinearHistory
+                && model
+                    .load_cases
+                    .get(modal)
+                    .is_some_and(|m| m.case_type == sap_model::LoadCaseType::Modal);
+            if !carried {
+                return Err(unsupported(
+                    format!("load_cases.{name}.modal_case"),
+                    "mode superposition is written natively only for a linear history case that names an existing Modal case; use S2K",
+                ));
+            }
+        }
+        if !case.ritz_controls.is_empty() {
+            return Err(unsupported(
+                format!("load_cases.{name}.ritz_controls"),
+                "Ritz generation cycles and participation targets are not written natively; use S2K",
+            ));
         }
         for l in &case.loads {
             reference(
@@ -340,17 +411,37 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                 ));
             }
         }
-        for (function, load, _) in &case.history_loads {
+        for (entry, (function, load, _)) in case.history_loads.iter().enumerate() {
             reference(
                 model.functions.contains_key(function),
                 format!("load_cases.{name}.history_loads.function"),
                 function,
             )?;
-            reference(
-                model.load_patterns.contains_key(load) || acceleration(load),
-                format!("load_cases.{name}.history_loads.load"),
-                load,
-            )?;
+            // D77/D81: what the entry MEANS decides which record is written, and
+            // the guard compares meanings (see `semantic_model`). An explicit
+            // acceleration is written under any direction alias (X, UX, U1): the
+            // record holds the direction index, as the vendor's own file does.
+            let named_direction =
+                sap_model::history_acceleration_direction(load).is_some() || acceleration(load);
+            let ok = match case.history_kind(entry) {
+                sap_model::HistoryLoadKind::Pattern => model.load_patterns.contains_key(load),
+                sap_model::HistoryLoadKind::Acceleration => named_direction,
+                sap_model::HistoryLoadKind::Unspecified => {
+                    match sap_model::resolve_history_load(model, case, entry) {
+                        Err(ambiguity) => {
+                            return Err(unsupported(
+                                format!("load_cases.{name}.history_loads.load"),
+                                format!("{ambiguity}; native export does not guess, set the load type of the entry"),
+                            ));
+                        }
+                        Ok(sap_model::ResolvedHistoryLoad::Pattern) => {
+                            model.load_patterns.contains_key(load)
+                        }
+                        Ok(sap_model::ResolvedHistoryLoad::Acceleration(_)) => true,
+                    }
+                }
+            };
+            reference(ok, format!("load_cases.{name}.history_loads.load"), load)?;
         }
     }
     for (name, combo) in &model.load_combos {
@@ -366,6 +457,59 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
         if !p.nonlinear_data_complete {
             return Err(unsupported(format!("link_props.{name}.nonlinear_data_complete"),"incomplete source law data cannot be certified by synthesizing a parameter vector; use a private snapshot"));
         }
+    }
+    for (name, frame) in &model.frames {
+        if !frame.hinges.is_empty() {
+            return Err(unsupported(
+                format!("frames.{name}.hinges"),
+                "frame hinge assignments are not written natively; use S2K",
+            ));
+        }
+        if frame.hinge_overwrite.is_some() {
+            return Err(unsupported(
+                format!("frames.{name}.hinge_overwrite"),
+                "frame hinge overwrites are not written natively; use S2K",
+            ));
+        }
+    }
+    if let Some(name) = model.hinge_props.keys().next() {
+        return Err(unsupported(
+            format!("hinge_props.{name}"),
+            "frame hinge properties are not written natively; use S2K",
+        ));
+    }
+    if !model.mass_source.is_default() {
+        return Err(unsupported(
+            "mass_source",
+            "a mass source other than element and additional mass is not written natively; use S2K",
+        ));
+    }
+    if let Some(pattern) = model.auto_seismic.keys().next() {
+        return Err(unsupported(
+            format!("auto_seismic.{pattern}"),
+            "automatic seismic loads are not written natively; use S2K",
+        ));
+    }
+    if let Some(pattern) = model.auto_seismic_eccentricity.keys().next() {
+        return Err(unsupported(
+            format!("auto_seismic_eccentricity.{pattern}"),
+            "seismic diaphragm eccentricity overwrites are not written natively; use S2K",
+        ));
+    }
+    if !model.steel_design_prefs.is_default() {
+        return Err(unsupported(
+            "steel_design_prefs",
+            "steel design preferences are not written natively; use S2K",
+        ));
+    }
+    if let Some(entry) = model.unmodeled_source.first() {
+        return Err(unsupported(
+            "unmodeled_source",
+            format!(
+                "the source carried data this model does not represent ({}); a synthesized file would silently omit it",
+                entry.description
+            ),
+        ));
     }
     for (k, v) in &model.project_info {
         if k.is_empty() || v.is_empty() {
@@ -402,6 +546,82 @@ pub(super) fn validate(model: &SapModel) -> Result<(), FormatError> {
                     "nonfinite numeric data is not exportable",
                 ));
             }
+        }
+    }
+    for (name, section) in &model.area_sections {
+        // Only thin and thick shells have an observed native section-type code.
+        if section.prop_type == sap_model::AreaPropType::Shell
+            && !matches!(
+                section.shell_type,
+                sap_model::ShellType::ShellThin | sap_model::ShellType::ShellThick
+            )
+        {
+            return Err(unsupported(
+                format!("area_sections.{name}.shell_type"),
+                "only thin and thick shell sections have an observed native type code",
+            ));
+        }
+    }
+    for (name, area) in &model.areas {
+        // The native auto-mesh record is written for equal counts only; the
+        // vendor edge order for unequal counts is not established.
+        if area.auto_mesh.0 != area.auto_mesh.1 {
+            return Err(unsupported(
+                format!("areas.{name}.auto_mesh"),
+                "unequal auto-mesh counts have no verified native edge order; mesh the area explicitly or use S2K",
+            ));
+        }
+    }
+    for (name, frame) in &model.frames {
+        if frame.auto_mesh_segments > i32::MAX as usize {
+            return Err(unsupported(
+                format!("frames.{name}.auto_mesh_segments"),
+                "requires an i32 segment count",
+            ));
+        }
+        // Design overwrites have no native representation here; a synthesized
+        // file would drop them and the design would silently change.
+        if frame.concrete_framing != sap_model::ConcreteFramingType::default() {
+            return Err(unsupported(
+                format!("frames.{name}.concrete_framing"),
+                "a concrete framing type other than the default is not written natively; use S2K",
+            ));
+        }
+        if frame.steel_overwrite.is_some() {
+            return Err(unsupported(
+                format!("frames.{name}.steel_overwrite"),
+                "steel design overwrites are not written natively; use S2K",
+            ));
+        }
+        if frame.auto_select.is_some() {
+            return Err(unsupported(
+                format!("frames.{name}.auto_select"),
+                "the Auto Select design and analysis sections are not written natively; use S2K",
+            ));
+        }
+        // Joint offsets are written in the one form the corpus shows: element
+        // local, equal at both ends.
+        if frame.joint_offset_i != [0.0; 3] || frame.joint_offset_j != [0.0; 3] {
+            if frame.joint_offset_is_global {
+                return Err(unsupported(
+                    format!("frames.{name}.joint_offset_is_global"),
+                    "global joint offsets have no verified native coordinate-system code; give them in the element local system or use S2K",
+                ));
+            }
+            if frame.joint_offset_i != frame.joint_offset_j {
+                return Err(unsupported(
+                    format!("frames.{name}.joint_offset_j"),
+                    "joint offsets that differ between the ends have no verified native end order; use S2K",
+                ));
+            }
+        }
+        // The segment count of a cable object is its own cable setting; what
+        // an automatic frame subdivision count means on one is not established.
+        if frame.cable_params.is_some() && frame.auto_mesh_segments > 1 {
+            return Err(unsupported(
+                format!("frames.{name}.auto_mesh_segments"),
+                "automatic frame subdivision of a cable object has no verified native meaning",
+            ));
         }
     }
     for (name, m) in &model.materials {
@@ -470,7 +690,55 @@ fn semantic_model(model: &SapModel) -> SapModel {
     copy.s2k_preservation = None;
     copy.case_results.clear();
     copy.steel_design_results.clear();
+    copy.steel_design_errors.clear();
     copy.concrete_design_results.clear();
+    copy.concrete_design_errors.clear();
+    // D120: the reasons a result is unavailable are result state like the maps
+    // above; the projected model never has them, so they must not make the export
+    // look lossy.
+    copy.unavailable_results.clear();
+    // D81: a history entry is compared by what it means, not by its stored tag
+    // or the alias of its direction. An entry without a kind that resolves
+    // without ambiguity is what the writer records (its type code) and the
+    // reader then returns with an explicit kind; an acceleration is read back
+    // as `U<direction>`. An entry that cannot be resolved keeps its tag, so a
+    // real change (and an ambiguous entry) still differs.
+    for case in copy.load_cases.values_mut() {
+        if case.history_loads.is_empty() {
+            continue;
+        }
+        let original = case.clone();
+        let mut kinds = Vec::with_capacity(original.history_loads.len());
+        for i in 0..original.history_loads.len() {
+            let load = original.history_loads[i].1.clone();
+            let kind = match original.history_kind(i) {
+                sap_model::HistoryLoadKind::Pattern => sap_model::HistoryLoadKind::Pattern,
+                sap_model::HistoryLoadKind::Acceleration => {
+                    case.history_loads[i].1 = match sap_model::history_acceleration_direction(&load)
+                    {
+                        Some(d) => format!("U{}", d + 1),
+                        None => load.to_ascii_uppercase(),
+                    };
+                    sap_model::HistoryLoadKind::Acceleration
+                }
+                sap_model::HistoryLoadKind::Unspecified => {
+                    match sap_model::resolve_history_load(model, &original, i) {
+                        Ok(sap_model::ResolvedHistoryLoad::Pattern) => {
+                            sap_model::HistoryLoadKind::Pattern
+                        }
+                        Ok(sap_model::ResolvedHistoryLoad::Acceleration(d)) => {
+                            case.history_loads[i].1 = format!("U{}", d + 1);
+                            sap_model::HistoryLoadKind::Acceleration
+                        }
+                        Err(_) => sap_model::HistoryLoadKind::Unspecified,
+                    }
+                }
+            };
+            kinds.push(kind);
+        }
+        case.history_load_kinds = kinds;
+        case.normalize_history_kinds();
+    }
     copy
 }
 fn semantic_value(model: &SapModel) -> Result<Value, FormatError> {
@@ -579,4 +847,75 @@ pub(super) fn verify_projection(
         return Err(unsupported(field,"native serialization/projection would change represented model data; no file was written"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sap_model::{LoadCase, LoadCaseType};
+
+    fn with_cases(history_type: LoadCaseType, modal_type: LoadCaseType) -> SapModel {
+        let mut m = SapModel::default();
+        m.load_cases.clear();
+        let mut modal = LoadCase::linear_static("MODES", "DEAD", 1.0);
+        modal.case_type = modal_type;
+        modal.loads.clear();
+        m.load_cases.insert("MODES".into(), modal);
+        let mut history = LoadCase::linear_static("HIST", "DEAD", 1.0);
+        history.case_type = history_type;
+        history.loads.clear();
+        history.modal_case = Some("MODES".into());
+        m.load_cases.insert("HIST".into(), history);
+        m
+    }
+
+    fn refused_field(m: &SapModel) -> String {
+        match validate(m) {
+            Err(FormatError::UnsupportedNativeExport { field, .. }) => field,
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The one combination the native writer carries (`m_modalcase`): a linear history that
+    /// names an existing Modal case.
+    #[test]
+    fn a_linear_history_naming_an_existing_modal_case_passes() {
+        validate(&with_cases(LoadCaseType::LinearHistory, LoadCaseType::Modal)).unwrap();
+    }
+
+    #[test]
+    fn every_other_use_of_modal_case_is_refused_naming_the_case() {
+        // A modal case that is not a Modal case, or does not exist.
+        let m = with_cases(LoadCaseType::LinearHistory, LoadCaseType::LinearStatic);
+        assert_eq!(refused_field(&m), "load_cases.HIST.modal_case");
+        let mut m = with_cases(LoadCaseType::LinearHistory, LoadCaseType::Modal);
+        m.load_cases.get_mut("HIST").unwrap().modal_case = Some("NOSUCH".into());
+        assert_eq!(refused_field(&m), "load_cases.HIST.modal_case");
+        // Any other case type that carries the reference, each with a real Modal case.
+        for case_type in [
+            LoadCaseType::LinearStatic,
+            LoadCaseType::NonlinearStatic,
+            LoadCaseType::Modal,
+            LoadCaseType::ResponseSpectrum,
+            LoadCaseType::NonlinearHistory,
+            LoadCaseType::LinearDynamic,
+            LoadCaseType::NonlinearDynamic,
+            LoadCaseType::Buckling,
+        ] {
+            let m = with_cases(case_type, LoadCaseType::Modal);
+            assert_eq!(refused_field(&m), "load_cases.HIST.modal_case", "{case_type:?}");
+        }
+    }
+
+    #[test]
+    fn seismic_eccentricity_overwrites_are_refused_naming_the_pattern() {
+        let mut m = SapModel::default();
+        m.auto_seismic_eccentricity
+            .entry("EQ".into())
+            .or_default()
+            .insert("D1".into(), 0.4);
+        assert_eq!(refused_field(&m), "auto_seismic_eccentricity.EQ");
+        m.auto_seismic_eccentricity.clear();
+        validate(&m).unwrap();
+    }
 }

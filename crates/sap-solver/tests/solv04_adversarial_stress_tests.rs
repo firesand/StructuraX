@@ -131,6 +131,7 @@ fn test_challenge_split_vs_uninterrupted_time_varying_trajectory_overlay() {
     let mut full_case = LoadCase::linear_static("FULL", "DEAD", 1.0);
     full_case.loads.clear();
     full_case.case_type = LoadCaseType::LinearHistory;
+    full_case.modal_damping = 0.0;
     full_case.history_loads = vec![("F_FULL".into(), "DEAD".into(), 1.0)];
     full_case.time_step_dt = dt;
     full_case.num_time_steps = n_steps_full;
@@ -140,6 +141,7 @@ fn test_challenge_split_vs_uninterrupted_time_varying_trajectory_overlay() {
     let mut c1 = LoadCase::linear_static("CASE1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("F_CASE1".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = dt;
     c1.num_time_steps = n_steps_1;
@@ -149,6 +151,7 @@ fn test_challenge_split_vs_uninterrupted_time_varying_trajectory_overlay() {
     let mut c2 = LoadCase::linear_static("CASE2", "DEAD", 1.0);
     c2.loads.clear();
     c2.case_type = LoadCaseType::LinearHistory;
+    c2.modal_damping = 0.0;
     c2.initial_case = Some("CASE1".into());
     c2.history_loads = vec![("F_CASE2".into(), "DEAD".into(), 1.0)];
     c2.time_step_dt = dt;
@@ -360,6 +363,7 @@ fn test_challenge_multi_case_chaining_continuous_frequency_transitions() {
     let mut full_case = LoadCase::linear_static("FULL3", "DEAD", 1.0);
     full_case.loads.clear();
     full_case.case_type = LoadCaseType::LinearHistory;
+    full_case.modal_damping = 0.0;
     full_case.history_loads = vec![("F_FULL3".into(), "DEAD".into(), 1.0)];
     full_case.time_step_dt = dt;
     full_case.num_time_steps = n_total;
@@ -368,6 +372,7 @@ fn test_challenge_multi_case_chaining_continuous_frequency_transitions() {
     let mut c1 = LoadCase::linear_static("C1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("F_C1".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = dt;
     c1.num_time_steps = n1;
@@ -376,6 +381,7 @@ fn test_challenge_multi_case_chaining_continuous_frequency_transitions() {
     let mut c2 = LoadCase::linear_static("C2", "DEAD", 1.0);
     c2.loads.clear();
     c2.case_type = LoadCaseType::LinearHistory;
+    c2.modal_damping = 0.0;
     c2.initial_case = Some("C1".into());
     c2.history_loads = vec![("F_C2".into(), "DEAD".into(), 1.0)];
     c2.time_step_dt = dt;
@@ -385,6 +391,7 @@ fn test_challenge_multi_case_chaining_continuous_frequency_transitions() {
     let mut c3 = LoadCase::linear_static("C3", "DEAD", 1.0);
     c3.loads.clear();
     c3.case_type = LoadCaseType::LinearHistory;
+    c3.modal_damping = 0.0;
     c3.initial_case = Some("C2".into());
     c3.history_loads = vec![("F_C3".into(), "DEAD".into(), 1.0)];
     c3.time_step_dt = dt;
@@ -552,6 +559,7 @@ fn test_challenge_multi_case_chaining_with_step_force_jump() {
     let mut c1 = LoadCase::linear_static("CASE1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("F1".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = dt;
     c1.num_time_steps = 100;
@@ -561,6 +569,7 @@ fn test_challenge_multi_case_chaining_with_step_force_jump() {
     let mut c2 = LoadCase::linear_static("CASE2", "DEAD", 1.0);
     c2.loads.clear();
     c2.case_type = LoadCaseType::LinearHistory;
+    c2.modal_damping = 0.0;
     c2.initial_case = Some("CASE1".into());
     c2.history_loads = vec![("F_STEP".into(), "JUMP".into(), 1.0)];
     c2.time_step_dt = dt;
@@ -668,6 +677,7 @@ fn test_challenge_cross_continuation_modal_to_direct_and_reverse() {
     let mut fwd_m1 = LoadCase::linear_static("FWD_M1", "DEAD", 1.0);
     fwd_m1.loads.clear();
     fwd_m1.case_type = LoadCaseType::LinearHistory;
+    fwd_m1.modal_damping = 0.0;
     fwd_m1.history_loads = vec![("RAMP1".into(), "DEAD".into(), 1.0)];
     fwd_m1.time_step_dt = dt;
     fwd_m1.num_time_steps = n_steps;
@@ -694,6 +704,7 @@ fn test_challenge_cross_continuation_modal_to_direct_and_reverse() {
     let mut rev_m2 = LoadCase::linear_static("REV_M2", "DEAD", 1.0);
     rev_m2.loads.clear();
     rev_m2.case_type = LoadCaseType::LinearHistory;
+    rev_m2.modal_damping = 0.0;
     rev_m2.initial_case = Some("REV_D1".into());
     rev_m2.history_loads = vec![("RAMP2".into(), "DEAD".into(), 1.0)];
     rev_m2.time_step_dt = dt;
@@ -879,6 +890,7 @@ fn test_challenge_modal_to_nonlinear_static_equilibrium_convergence() {
     let mut c1 = LoadCase::linear_static("MODAL_DYN", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("PULSE".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = 0.005;
     c1.num_time_steps = 100; // t = 0.5 s
@@ -1039,6 +1051,7 @@ fn test_challenge_massless_dofs_and_high_order_mode_preservation() {
     let mut full = LoadCase::linear_static("FULL", "DEAD", 1.0);
     full.loads.clear();
     full.case_type = LoadCaseType::LinearHistory;
+    full.modal_damping = 0.0;
     full.history_loads = vec![("F_FULL".into(), "DEAD".into(), 1.0)];
     full.time_step_dt = dt;
     full.num_time_steps = n_full;
@@ -1048,6 +1061,7 @@ fn test_challenge_massless_dofs_and_high_order_mode_preservation() {
     let mut c1 = LoadCase::linear_static("C1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("F_C1".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = dt;
     c1.num_time_steps = n1;
@@ -1057,6 +1071,7 @@ fn test_challenge_massless_dofs_and_high_order_mode_preservation() {
     let mut c2 = LoadCase::linear_static("C2", "DEAD", 1.0);
     c2.loads.clear();
     c2.case_type = LoadCaseType::LinearHistory;
+    c2.modal_damping = 0.0;
     c2.initial_case = Some("C1".into());
     c2.history_loads = vec![("F_C2".into(), "DEAD".into(), 1.0)];
     c2.time_step_dt = dt;
@@ -1207,6 +1222,7 @@ fn test_challenge_explicit_modal_case_and_high_order_modes_continuation() {
     let mut full = LoadCase::linear_static("FULL", "DEAD", 1.0);
     full.loads.clear();
     full.case_type = LoadCaseType::LinearHistory;
+    full.modal_damping = 0.0;
     full.history_loads = vec![("F_FULL".into(), "DEAD".into(), 1.0)];
     full.time_step_dt = dt;
     full.num_time_steps = n_full;
@@ -1216,6 +1232,7 @@ fn test_challenge_explicit_modal_case_and_high_order_modes_continuation() {
     let mut c1 = LoadCase::linear_static("C1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("F_C1".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = dt;
     c1.num_time_steps = n1;
@@ -1225,6 +1242,7 @@ fn test_challenge_explicit_modal_case_and_high_order_modes_continuation() {
     let mut c2 = LoadCase::linear_static("C2", "DEAD", 1.0);
     c2.loads.clear();
     c2.case_type = LoadCaseType::LinearHistory;
+    c2.modal_damping = 0.0;
     c2.initial_case = Some("C1".into());
     c2.history_loads = vec![("F_C2".into(), "DEAD".into(), 1.0)];
     c2.time_step_dt = dt;
@@ -1341,6 +1359,7 @@ fn test_challenge_damped_system_continuation_and_overlay() {
     let mut full = LoadCase::linear_static("FULL", "DEAD", 1.0);
     full.loads.clear();
     full.case_type = LoadCaseType::LinearHistory;
+    full.modal_damping = 0.0;
     full.history_loads = vec![("F_FULL".into(), "DEAD".into(), 1.0)];
     full.time_step_dt = dt;
     full.num_time_steps = n_full;
@@ -1351,6 +1370,7 @@ fn test_challenge_damped_system_continuation_and_overlay() {
     let mut c1 = LoadCase::linear_static("C1", "DEAD", 1.0);
     c1.loads.clear();
     c1.case_type = LoadCaseType::LinearHistory;
+    c1.modal_damping = 0.0;
     c1.history_loads = vec![("F_C1".into(), "DEAD".into(), 1.0)];
     c1.time_step_dt = dt;
     c1.num_time_steps = n1;
@@ -1361,6 +1381,7 @@ fn test_challenge_damped_system_continuation_and_overlay() {
     let mut c2 = LoadCase::linear_static("C2", "DEAD", 1.0);
     c2.loads.clear();
     c2.case_type = LoadCaseType::LinearHistory;
+    c2.modal_damping = 0.0;
     c2.initial_case = Some("C1".into());
     c2.history_loads = vec![("F_C2".into(), "DEAD".into(), 1.0)];
     c2.time_step_dt = dt;
@@ -1470,6 +1491,7 @@ fn test_challenge_hht_and_wilson_integrator_continuation() {
         let mut full = LoadCase::linear_static("FULL", "DEAD", 1.0);
         full.loads.clear();
         full.case_type = LoadCaseType::LinearHistory;
+        full.modal_damping = 0.0;
         full.history_loads = vec![("F_FULL".into(), "DEAD".into(), 1.0)];
         full.time_step_dt = dt;
         full.num_time_steps = n_full;
@@ -1480,6 +1502,7 @@ fn test_challenge_hht_and_wilson_integrator_continuation() {
         let mut c1 = LoadCase::linear_static("C1", "DEAD", 1.0);
         c1.loads.clear();
         c1.case_type = LoadCaseType::LinearHistory;
+        c1.modal_damping = 0.0;
         c1.history_loads = vec![("F_C1".into(), "DEAD".into(), 1.0)];
         c1.time_step_dt = dt;
         c1.num_time_steps = n1;
@@ -1490,6 +1513,7 @@ fn test_challenge_hht_and_wilson_integrator_continuation() {
         let mut c2 = LoadCase::linear_static("C2", "DEAD", 1.0);
         c2.loads.clear();
         c2.case_type = LoadCaseType::LinearHistory;
+        c2.modal_damping = 0.0;
         c2.initial_case = Some("C1".into());
         c2.history_loads = vec![("F_C2".into(), "DEAD".into(), 1.0)];
         c2.time_step_dt = dt;

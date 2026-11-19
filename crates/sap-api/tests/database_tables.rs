@@ -382,9 +382,9 @@ fn test_apply_edited_tables_dependency_ordering() {
     assert_eq!(
         api.database_tables().set_table_for_editing_array_str(
             "Frame Section Properties 01 - General",
-            &["SectionName", "Material", "Area", "I33", "I22"],
+            &["SectionName", "Material", "Area", "I33", "I22", "Shape", "t3", "t2", "tf", "tw", "TorsConst", "AS2", "AS3", "S33", "S22", "Z33", "Z22", "R33", "R22"],
             1,
-            &["SEC_NEW", "MAT_STEEL", "15.0", "200.0", "80.0"],
+            &["SEC_NEW", "MAT_STEEL", "15.0", "200.0", "80.0", "I", "18.0", "7.5", "0.57", "0.355", "1.0", "4.0", "5.0", "50.0", "10.0", "60.0", "15.0", "7.0", "2.0"],
         ),
         OAPI_OK
     );

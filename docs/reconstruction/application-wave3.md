@@ -13,7 +13,7 @@ The function editor accepts two-column whitespace/comma-separated samples and co
 - Eigen cases cannot contain ignored starting loads. Minimum mode count is fixed at one; nonzero frequency shifts are rejected because these controls are not implemented by the solver.
 - Spectrum damping is limited to 0 through 0.99, matching the solver's usable range. Spectrum sources must be modal cases. Initial-state continuation is not exposed.
 - History definitions allow up to one million steps. Wilson theta has an editor stability floor of 1.37; the lower-level solver still supports its separately tested values starting at one. HHT alpha is restricted to [-1/3,0]. Newmark linear acceleration remains conditionally stable; choosing an integration scheme does not establish a suitable time step.
-- History pattern excitation currently supports joint forces only. Self-weight, element loads and support motion are rejected. Global base-acceleration directions are also supported. No nonlinear dynamic solver is claimed.
+- History pattern excitation supported joint forces only when this was written. Since 2026-11-18 frame distributed and point loads are applied and recovered as well (ledger D75, D82 of the tutorial-video tracker). Self-weight, the other element loads and support motion are rejected. Global base-acceleration directions are also supported. No nonlinear dynamic solver is claimed.
 - The application still shows existing simultaneous result summaries; complete velocity/acceleration/force history viewers are not included in this editor slice.
 
 ## Link API

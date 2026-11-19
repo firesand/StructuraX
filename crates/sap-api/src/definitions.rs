@@ -79,7 +79,176 @@ pub fn set_function_definition(
     model.invalidate_results();
     Ok(())
 }
+/// Ritz starting loads and their generation controls (CSI Analysis Reference,
+/// "Ritz-Vector Analysis"): starting loads are load patterns or the
+/// accelerations `UX`, `UY`, `UZ`; a pattern with one of those names would be
+/// ambiguous; controls name listed loads and targets lie in `[0, 1]`.
+fn validate_ritz_controls(model: &SapModel, case: &LoadCase) -> Result<(), DefinitionError> {
+    for (i, load) in case.loads.iter().enumerate() {
+        if sap_model::ritz::acceleration_direction(&load.load_name).is_some()
+            && model.load_patterns.contains_key(&load.load_name)
+        {
+            return Err(invalid(format!(
+                "'{}' is both a load pattern and an acceleration load name; rename the pattern",
+                load.load_name
+            )));
+        }
+        if case.loads[..i].iter().any(|l| l.load_name == load.load_name) {
+            return Err(invalid(format!(
+                "starting load '{}' is listed more than once",
+                load.load_name
+            )));
+        }
+    }
+    if case.modal_sub_type != ModalSubType::Ritz && !case.ritz_controls.is_empty() {
+        return Err(invalid("Eigen cases take no Ritz generation controls"));
+    }
+    for (i, control) in case.ritz_controls.iter().enumerate() {
+        if !case
+            .loads
+            .iter()
+            .any(|l| l.load_name == control.load_name)
+        {
+            return Err(invalid(format!(
+                "generation control names '{}', which is not a listed starting load",
+                control.load_name
+            )));
+        }
+        let target = control.target_dynamic_participation;
+        if !target.is_finite() || !(0.0..=1.0).contains(&target) {
+            return Err(invalid(format!(
+                "dynamic participation target {target} for '{}' must be in [0, 1]",
+                control.load_name
+            )));
+        }
+        if case.ritz_controls[..i]
+            .iter()
+            .any(|c| c.load_name == control.load_name)
+        {
+            return Err(invalid(format!(
+                "two generation controls name '{}'",
+                control.load_name
+            )));
+        }
+    }
+    Ok(())
+}
 /// Validate definitions represented by this native editor; solver applicability checks still apply.
+/// The initial case of a nonlinear static case: an existing, different
+/// nonlinear static case, with no cycle through the initial cases.
+fn validate_static_initial_case(
+    model: &SapModel,
+    case: &LoadCase,
+    initial: &str,
+) -> Result<(), DefinitionError> {
+    let first = model
+        .load_cases
+        .get(initial)
+        .filter(|c| c.name != case.name)
+        .ok_or_else(|| invalid(format!("initial case '{initial}' is not an existing, different case")))?;
+    if first.case_type != LoadCaseType::NonlinearStatic {
+        return Err(invalid(format!(
+            "initial case '{initial}' is not a nonlinear static case; a nonlinear static case can only continue from another nonlinear static case"
+        )));
+    }
+    // Follow the chain by name as the model would hold it with this
+    // definition: a stored case may already continue from this name even
+    // when the case itself is new.
+    let mut seen = vec![case.name.as_str()];
+    let mut current = Some(first.name.as_str());
+    while let Some(next) = current {
+        if seen.contains(&next) {
+            return Err(invalid(format!(
+                "initial case '{initial}' leads back to '{next}': initial cases must not form a cycle"
+            )));
+        }
+        seen.push(next);
+        current = model
+            .load_cases
+            .get(next)
+            .and_then(|c| c.initial_case.as_deref());
+    }
+    Ok(())
+}
+
+/// Settings particular to nonlinear static cases: saved states, step limits,
+/// hinge unloading, and Mode loads.
+fn validate_nl_static(model: &SapModel, case: &LoadCase) -> Result<(), DefinitionError> {
+    use sap_model::hinge::{HingeUnloading, ResultsSaved};
+    let params = &case.nl_static;
+    if let ResultsSaved::MultipleStates {
+        min_saved,
+        max_saved,
+        ..
+    } = params.results_saved
+    {
+        if min_saved == 0 || max_saved < min_saved || max_saved > 100_000 {
+            return Err(invalid(
+                "multiple saved states require 1 <= minimum <= maximum <= 100000",
+            ));
+        }
+    }
+    if params.max_total_steps == 0 || params.max_total_steps > 1_000_000 {
+        return Err(invalid("maximum total steps must be 1..1000000"));
+    }
+    if params.max_null_steps == 0 || params.max_null_steps > 1_000_000 {
+        return Err(invalid("maximum null steps must be 1..1000000"));
+    }
+    if params.hinge_unloading != HingeUnloading::UnloadEntireStructure {
+        return Err(invalid(format!(
+            "hinge unloading {:?} is not implemented; only \"unload entire structure\" is",
+            params.hinge_unloading
+        )));
+    }
+    if params.mode_loads.is_empty() {
+        if case.modal_case.is_some() {
+            return Err(invalid(
+                "a modal case is named but the case has no Mode load",
+            ));
+        }
+        return Ok(());
+    }
+    if !case.loads.is_empty() {
+        return Err(invalid(
+            "Mode loads cannot be mixed with load patterns or Accel loads in one case",
+        ));
+    }
+    let modal_name = case
+        .modal_case
+        .as_ref()
+        .ok_or_else(|| invalid("Mode loads need the Modal case that supplies the modes"))?;
+    let modal = model
+        .load_cases
+        .get(modal_name)
+        .filter(|m| m.case_type == LoadCaseType::Modal && m.name != case.name)
+        .ok_or_else(|| invalid("select an existing Modal case for the Mode loads"))?;
+    if !modal.run_flag {
+        return Err(invalid("the Modal case of the Mode loads must be run"));
+    }
+    for (i, load) in params.mode_loads.iter().enumerate() {
+        if load.mode == 0 || load.mode > modal.max_modes {
+            return Err(invalid(format!(
+                "Mode load {}: mode {} is outside 1..{} (the maximum modes of '{modal_name}')",
+                i + 1,
+                load.mode,
+                modal.max_modes
+            )));
+        }
+        if !load.scale_factor.is_finite() {
+            return Err(invalid(format!(
+                "Mode load {}: scale factor is not finite",
+                i + 1
+            )));
+        }
+        if params.mode_loads[..i].iter().any(|l| l.mode == load.mode) {
+            return Err(invalid(format!(
+                "Mode {} is loaded twice; combine the scale factors",
+                load.mode
+            )));
+        }
+    }
+    Ok(())
+}
 pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(), DefinitionError> {
     name(&case.name)?;
     if model.load_combos.contains_key(&case.name) {
@@ -99,9 +268,53 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
     ) {
         return Err(invalid("case type is not supported by this editor"));
     }
-    if case.case_type != LoadCaseType::ResponseSpectrum && case.initial_case.is_some() {
+    if let Some(initial) = &case.initial_case {
+        match case.case_type {
+            // A spectrum case names its modal source here.
+            LoadCaseType::ResponseSpectrum => {}
+            LoadCaseType::NonlinearStatic => validate_static_initial_case(model, case, initial)?,
+            // "Stiffness at End of Nonlinear Case" (v19 help, "Stiffness to
+            // Use"): a Modal or linear static case names the nonlinear static
+            // case whose end stiffness it uses. Whether the model's hinges
+            // allow it is decided when the case runs (sixth wave, G48).
+            LoadCaseType::Modal | LoadCaseType::LinearStatic => {
+                let source = model
+                    .load_cases
+                    .get(initial)
+                    .filter(|c| c.name != case.name)
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "initial case '{initial}' is not an existing, different case"
+                        ))
+                    })?;
+                if source.case_type != LoadCaseType::NonlinearStatic {
+                    return Err(invalid(format!(
+                        "initial case '{initial}' is not a nonlinear static case; a modal or linear static case can use the stiffness at the end of a nonlinear static case only"
+                    )));
+                }
+            }
+            _ => {
+                return Err(invalid(
+                    "initial-state cases are supported only by nonlinear static cases, by modal and linear static cases that use the stiffness at the end of a nonlinear static case, and as the modal source of a response-spectrum case",
+                ));
+            }
+        }
+    }
+    if case.case_type != LoadCaseType::NonlinearStatic
+        && model.load_cases.values().any(|c| {
+            matches!(
+                c.case_type,
+                LoadCaseType::NonlinearStatic | LoadCaseType::Modal | LoadCaseType::LinearStatic
+            ) && c.initial_case.as_ref() == Some(&case.name)
+        })
+    {
         return Err(invalid(
-            "initial-state cases are not supported by this editor",
+            "case is the initial case of another case and must stay a nonlinear static case",
+        ));
+    }
+    if case.case_type != LoadCaseType::NonlinearStatic && !case.nl_static.is_default() {
+        return Err(invalid(
+            "saved states, step limits and modal loads belong to nonlinear static cases",
         ));
     }
     if case.case_type != LoadCaseType::Modal
@@ -114,7 +327,91 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             "case is referenced as a modal source by a response-spectrum case",
         ));
     }
+    if case.case_type != LoadCaseType::Modal
+        && model
+            .load_cases
+            .values()
+            .any(|c| c.modal_case.as_ref() == Some(&case.name))
+    {
+        return Err(invalid(
+            "case is referenced as a modal source by a modal time-history case",
+        ));
+    }
+    if case.case_type == LoadCaseType::NonlinearStatic {
+        validate_nl_static(model, case)?;
+    }
+    if let Some(modal_name) = case
+        .modal_case
+        .as_ref()
+        .filter(|_| case.case_type != LoadCaseType::NonlinearStatic)
+    {
+        if case.case_type != LoadCaseType::LinearHistory {
+            return Err(invalid(
+                "only a linear modal time-history case can superpose the modes of a modal case, or supply the modes of a nonlinear static case with Mode loads",
+            ));
+        }
+        let modal = model
+            .load_cases
+            .get(modal_name)
+            .filter(|m| m.case_type == LoadCaseType::Modal && m.name != case.name)
+            .ok_or_else(|| invalid("select an existing, different Modal case for superposition"))?;
+        if !modal.run_flag {
+            return Err(invalid("the Modal case for superposition must be run"));
+        }
+        if !case.modal_damping.is_finite() || !(0.0..1.0).contains(&case.modal_damping) {
+            return Err(invalid("modal damping ratio must satisfy 0 <= ratio < 1"));
+        }
+        if case.rayleigh_damping != (0.0, 0.0) {
+            return Err(invalid(
+                "modal superposition uses the modal damping ratio; Rayleigh coefficients must be zero",
+            ));
+        }
+    }
+    if let Some(control) = &case.displacement_control {
+        let monitored_ok = control
+            .monitored
+            .as_ref()
+            .is_some_and(|(point, dof)| model.points.contains_key(point) && *dof < 6);
+        // P-Delta with displacement control is analyzed for models with
+        // frame hinges and for Accel or Mode loads (sixth wave, G14); the
+        // solver refuses the other combinations by name when the case runs.
+        if case.case_type != LoadCaseType::NonlinearStatic
+            || case.nl_geom == NLGeomType::LargeDisplacements
+            || !control.target.is_finite()
+            || control.target <= 0.0
+            || !monitored_ok
+        {
+            return Err(invalid(
+                "displacement control needs a nonlinear static case with small displacements or P-Delta, a positive finite target and an existing monitored joint displacement",
+            ));
+        }
+    }
     for load in &case.loads {
+        let ritz_acceleration = case.case_type == LoadCaseType::Modal
+            && case.modal_sub_type == ModalSubType::Ritz
+            && sap_model::ritz::acceleration_direction(&load.load_name).is_some()
+            && load.scale_factor.is_finite();
+        if ritz_acceleration {
+            continue;
+        }
+        // Nonlinear static: Accel loads UX, UY, UZ (not rotations).
+        if case.case_type == LoadCaseType::NonlinearStatic
+            && sap_model::ritz::acceleration_direction(&load.load_name).is_some()
+        {
+            if !load.scale_factor.is_finite() {
+                return Err(invalid("nonfinite scale factor of an Accel load"));
+            }
+            if let Some(clash) = model
+                .load_patterns
+                .keys()
+                .find(|p| sap_model::ritz::acceleration_direction(p).is_some())
+            {
+                return Err(invalid(format!(
+                    "load pattern '{clash}' is named like an acceleration load; rename it before using Accel loads"
+                )));
+            }
+            continue;
+        }
         if !model.load_patterns.contains_key(&load.load_name) || !load.scale_factor.is_finite() {
             return Err(invalid(format!(
                 "undefined static load pattern or nonfinite scale: '{}'",
@@ -135,9 +432,15 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
             "dynamic/spectrum cases cannot request geometric nonlinearity",
         ));
     }
+    if case.case_type != LoadCaseType::Modal && !case.ritz_controls.is_empty() {
+        return Err(invalid("only modal Ritz cases take generation controls"));
+    }
     match case.case_type {
         LoadCaseType::LinearStatic | LoadCaseType::NonlinearStatic | LoadCaseType::Buckling => {
-            if case.loads.is_empty() {
+            if case.loads.is_empty()
+                && !(case.case_type == LoadCaseType::NonlinearStatic
+                    && !case.nl_static.mode_loads.is_empty())
+            {
                 return Err(invalid("provide at least one static load pattern"));
             }
             if !case.history_loads.is_empty() || !case.spectrum_loads.is_empty() {
@@ -192,8 +495,11 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                 return Err(invalid("nonzero modal frequency shift is not implemented"));
             }
             if case.modal_sub_type == ModalSubType::Ritz && case.loads.is_empty() {
-                return Err(invalid("Ritz analysis requires a starting load pattern"));
+                return Err(invalid(
+                    "Ritz analysis requires a starting load: a load pattern or UX, UY, UZ",
+                ));
             }
+            validate_ritz_controls(model, case)?;
             if !case.history_loads.is_empty()
                 || !case.spectrum_loads.is_empty()
                 || case.nl_geom != NLGeomType::None
@@ -256,6 +562,16 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                     "nonlinear iteration limit must be 1..10000 and tolerance in (0,1)",
                 ));
             }
+            if matches!(
+                case.case_type,
+                LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+            ) && case.modal_damping != 0.0
+                && case.modal_case.is_none()
+            {
+                return Err(invalid(
+                    "modal damping is not implemented for history cases; set it to zero and use Rayleigh damping, or use a direct-integration case type",
+                ));
+            }
             if case.history_loads.is_empty()
                 || !case.loads.is_empty()
                 || !case.spectrum_loads.is_empty()
@@ -294,7 +610,7 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                 }
                 _ => {}
             }
-            for (f, target, sf) in &case.history_loads {
+            for (entry, (f, target, sf)) in case.history_loads.iter().enumerate() {
                 let function = model
                     .functions
                     .get(f)
@@ -305,46 +621,40 @@ pub fn validate_case_definition(model: &SapModel, case: &LoadCase) -> Result<(),
                         "history requires time-history functions and finite scales",
                     ));
                 }
-                if target == target.trim()
-                    && matches!(
-                        target.to_ascii_uppercase().as_str(),
-                        "U1" | "U2" | "U3" | "UX" | "UY" | "UZ" | "X" | "Y" | "Z"
-                    )
+                // D77: the stored kind decides; an entry that does not say is
+                // refused when its name could be a pattern or an acceleration.
+                if sap_model::resolve_history_load(model, case, entry).map_err(invalid)?
+                    != sap_model::ResolvedHistoryLoad::Pattern
                 {
                     continue;
                 }
-                let pattern = model
-                    .load_patterns
-                    .get(target)
-                    .ok_or_else(|| invalid(format!("missing history pattern '{target}'")))?;
-                if pattern.self_wt_multiplier != 0.0
-                    || model.frames.values().any(|f| {
-                        f.loads_dist.iter().any(|l| &l.load_pat == target)
-                            || f.loads_point.iter().any(|l| &l.load_pat == target)
-                            || f.loads_temp.iter().any(|l| &l.load_pat == target)
-                            || f.loads_gravity.contains_key(target)
-                    })
-                    || model.areas.values().any(|a| {
-                        a.loads_uniform.iter().any(|l| &l.load_pat == target)
-                            || a.loads_pressure.iter().any(|l| &l.load_pat == target)
-                            || a.loads_temp.iter().any(|l| &l.load_pat == target)
-                    })
-                    || model.solids.values().any(|s| {
-                        s.loads_surface.iter().any(|l| &l.load_pat == target)
-                            || s.loads_temp.contains_key(target)
-                    })
-                    || model
-                        .points
-                        .values()
-                        .any(|p| p.loads_displ.iter().any(|l| &l.load_pat == target))
-                {
-                    return Err(invalid("history patterns currently support joint forces only, without self-weight, element loads or support motion"));
+                if !model.load_patterns.contains_key(target) {
+                    return Err(invalid(format!("missing history pattern '{target}'")));
+                }
+                // D82: the solver's own rule, not a second list.
+                if let Some(reason) = sap_solver::history_pattern_refusal(model, target) {
+                    return Err(invalid(reason));
                 }
             }
         }
         _ => unreachable!(),
     }
     Ok(())
+}
+/// Remove one entry of the model's unmodeled source data. This is the explicit
+/// decision to analyze the affected cases without that imported data; nothing
+/// removes an entry implicitly.
+pub fn discard_unmodeled_source(
+    model: &mut SapModel,
+    index: usize,
+) -> Result<sap_model::UnmodeledSourceData, DefinitionError> {
+    unlocked(model)?;
+    if index >= model.unmodeled_source.len() {
+        return Err(invalid("no unmodeled source entry at that position"));
+    }
+    let entry = model.unmodeled_source.remove(index);
+    model.invalidate_results();
+    Ok(entry)
 }
 pub fn set_case_definition(model: &mut SapModel, case: LoadCase) -> Result<(), DefinitionError> {
     unlocked(model)?;
@@ -390,5 +700,100 @@ impl cFunctions<'_> {
     }
     pub fn get_definition(&self, name: &str) -> Option<DynamicFunction> {
         self.api.inner.functions.get(name).cloned()
+    }
+}
+
+#[cfg(test)]
+mod ritz_definition_tests {
+    use super::*;
+    use sap_model::ritz::RitzLoadControl;
+    use sap_model::{LoadCaseAssignment, LoadPattern, LoadPatternType};
+
+    fn ritz(loads: &[&str]) -> LoadCase {
+        let mut case = LoadCase::modal_eigen("R", 6);
+        case.modal_sub_type = ModalSubType::Ritz;
+        case.loads = loads
+            .iter()
+            .map(|name| LoadCaseAssignment {
+                load_name: (*name).into(),
+                scale_factor: 1.0,
+            })
+            .collect();
+        case
+    }
+    fn control(name: &str, target: f64) -> RitzLoadControl {
+        RitzLoadControl {
+            load_name: name.into(),
+            max_cycles: 0,
+            target_dynamic_participation: target,
+        }
+    }
+    fn refused(model: &SapModel, case: &LoadCase, needle: &str) {
+        let error = validate_case_definition(model, case)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(needle), "'{error}' should contain '{needle}'");
+    }
+
+    #[test]
+    fn ritz_accepts_patterns_accelerations_and_controls() {
+        let model = SapModel::default();
+        let mut case = ritz(&["DEAD", "UX", "uz", "U2"]);
+        case.ritz_controls = vec![control("UX", 0.9), control("DEAD", 0.0)];
+        assert_eq!(validate_case_definition(&model, &case), Ok(()));
+    }
+
+    #[test]
+    fn ritz_refusals() {
+        let mut model = SapModel::default();
+        refused(&model, &ritz(&["U4"]), "undefined static load pattern");
+        // unknown name that is neither a pattern nor UX/UY/UZ
+        refused(&model, &ritz(&["NOPE"]), "undefined static load pattern");
+        // no starting load
+        refused(&model, &ritz(&[]), "requires a starting load");
+        // duplicate
+        refused(&model, &ritz(&["DEAD", "DEAD"]), "more than once");
+        // control for an unlisted load
+        let mut case = ritz(&["DEAD"]);
+        case.ritz_controls = vec![control("UX", 0.5)];
+        refused(&model, &case, "not a listed starting load");
+        // target outside [0, 1], including NaN
+        for bad in [-0.1, 1.01, f64::NAN] {
+            let mut case = ritz(&["DEAD"]);
+            case.ritz_controls = vec![control("DEAD", bad)];
+            refused(&model, &case, "must be in [0, 1]");
+        }
+        // two controls for one load
+        let mut case = ritz(&["DEAD"]);
+        case.ritz_controls = vec![control("DEAD", 0.5), control("DEAD", 0.6)];
+        refused(&model, &case, "two generation controls");
+        // Eigen cases take no controls and no starting loads
+        let mut eigen = LoadCase::modal_eigen("E", 6);
+        eigen.ritz_controls = vec![control("UX", 0.5)];
+        refused(&model, &eigen, "Eigen");
+        let mut eigen = LoadCase::modal_eigen("E", 6);
+        eigen.loads = ritz(&["DEAD"]).loads;
+        refused(&model, &eigen, "Eigen");
+        // controls on a non-modal case
+        let mut other = LoadCase::linear_static("S", "DEAD", 1.0);
+        other.ritz_controls = vec![control("DEAD", 0.5)];
+        refused(&model, &other, "only modal Ritz cases");
+        // acceleration names are not valid starting loads outside Ritz cases
+        let mut stat = LoadCase::linear_static("S", "DEAD", 1.0);
+        stat.loads.push(LoadCaseAssignment {
+            load_name: "UX".into(),
+            scale_factor: 1.0,
+        });
+        refused(&model, &stat, "undefined static load pattern");
+        // a pattern literally named UX is ambiguous
+        model.load_patterns.insert(
+            "UX".into(),
+            LoadPattern {
+                name: "UX".into(),
+                pat_type: LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+        refused(&model, &ritz(&["UX"]), "both a load pattern and an acceleration");
     }
 }

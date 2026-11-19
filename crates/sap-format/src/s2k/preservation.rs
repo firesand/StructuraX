@@ -59,6 +59,7 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "CONNECTIVITY - AREA"
             | "AREA SECTION ASSIGNMENTS"
             | "AREA PROPERTY MODIFIERS"
+            | "AREA STIFFNESS MODIFIERS"
             | "AREA LOADS - UNIFORM"
             | "AREA LOADS - SURFACE PRESSURE"
             | "AREA LOADS - TEMPERATURE"
@@ -77,6 +78,16 @@ pub(super) fn supported_table(name: &str) -> bool {
             | "CASE - RESPONSE SPECTRUM 2 - LOAD ASSIGNMENTS"
             | "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS"
             | "COMBINATION DEFINITIONS"
+            | "RUST UNMODELED SOURCE DATA"
+            | "RUST CASE - MODAL RITZ CONTROLS"
+            | "RUST MASS SOURCE"
+            | "RUST AUTO SEISMIC - ASCE 7-10"
+            | "RUST AUTO SEISMIC ECCENTRICITY"
+            | "RUST STEEL DESIGN PREFERENCES"
+            | "RUST HINGE PROPERTIES"
+            | "RUST HINGE PROPERTIES - CURVE"
+            | "RUST FRAME HINGE ASSIGNMENTS"
+            | "RUST FRAME HINGE OVERWRITES"
     )
 }
 
@@ -217,6 +228,8 @@ fn identity(table: &str, row: &Row) -> Vec<(String, String)> {
             "COMBONAME",
             "ITEM",
             "DOF",
+            "POINT",
+            "HINGENUM",
             "PATTERN",
             "FUNCTION",
             "TIME",

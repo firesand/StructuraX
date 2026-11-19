@@ -11,14 +11,15 @@ impl SapModel {
         section: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_spans = num_spans.max(1);
@@ -86,6 +87,216 @@ impl SapModel {
         self.model_name = format!("Continuous Beam ({n_spans} Spans)");
     }
 
+    /// Generates a 2D frame in the XZ plane on grid lines at the given X and Z
+    /// coordinates (the template's "Use Custom Grid Spacing and Locate
+    /// Origin"): the origin is wherever the first lines are. Joints, frames,
+    /// names and grid lines (X ids are written as the equal-bay template
+    /// writes them, so that more than 26 X lines repeat the letters) follow [`SapModel::generate_2d_frame`]; braced
+    /// variants put the brace joint at the middle of each bay, with the
+    /// eccentric link `clamp(|e|, 0.1 b, 0.4 b)` long for that bay's width `b`.
+    /// A section that is not defined is replaced by the first defined one, as
+    /// in the equal-spacing template.
+    ///
+    /// Everything is validated before the model changes (at least two strictly
+    /// increasing finite lines per axis, at most 1000, a finite eccentricity),
+    /// so a refused call leaves the model unchanged. Like every template, an
+    /// accepted call replaces the whole model, locked or not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate_2d_frame_custom(
+        &mut self,
+        frame_type: FrameType2D,
+        x_lines: &[f64],
+        z_lines: &[f64],
+        restraint: bool,
+        beam_sec: &str,
+        col_sec: &str,
+        brace_sec: &str,
+        eccentricity: f64,
+    ) -> Result<(), crate::EditError> {
+        for (axis, lines) in [("X", x_lines), ("Z", z_lines)] {
+            if lines.len() < 2 {
+                return Err(crate::editing::invalid(format!(
+                    "the frame needs at least two {axis} grid lines"
+                )));
+            }
+            if lines.len() > 1000 {
+                return Err(crate::editing::invalid(format!(
+                    "at most 1000 {axis} grid lines"
+                )));
+            }
+            if lines.iter().any(|c| !c.is_finite()) {
+                return Err(crate::editing::invalid(format!(
+                    "{axis} grid lines must be finite"
+                )));
+            }
+            if let Some(w) = lines.windows(2).find(|w| w[1] <= w[0]) {
+                return Err(crate::editing::invalid(format!(
+                    "{axis} grid lines must increase strictly, but {} is followed by {}",
+                    w[0], w[1]
+                )));
+            }
+        }
+        if !eccentricity.is_finite() {
+            return Err(crate::editing::invalid("the eccentricity must be finite"));
+        }
+
+        self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
+        self.points.clear();
+        self.frames.clear();
+        self.areas.clear();
+        self.solids.clear();
+        self.links.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
+        self.is_locked = false;
+
+        let n_bays = x_lines.len() - 1;
+        let n_stories = z_lines.len() - 1;
+
+        if let Some(cs) = self.coord_systems.get_mut("GLOBAL") {
+            cs.grids.clear();
+            for (ix, &x) in x_lines.iter().enumerate() {
+                cs.grids.push(GridLine {
+                    axis: "X".to_string(),
+                    // The letters of the equal-bay template up to 26 lines, then
+                    // AA, AB, ... so that no id repeats.
+                    id: crate::generate::column_label(ix),
+                    coordinate: x,
+                    visible: true,
+                    bubble_loc: "End".to_string(),
+                });
+            }
+            for (iz, &z) in z_lines.iter().enumerate() {
+                cs.grids.push(GridLine {
+                    axis: "Z".to_string(),
+                    id: format!("Z{}", iz + 1),
+                    coordinate: z,
+                    visible: true,
+                    bubble_loc: "Start".to_string(),
+                });
+            }
+        }
+
+        let default_sec = self
+            .frame_sections
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "FSEC1".to_string());
+        let pick = |name: &str| {
+            if self.frame_sections.contains_key(name) {
+                name.to_string()
+            } else {
+                default_sec.clone()
+            }
+        };
+        let (b_sec, c_sec, br_sec) = (pick(beam_sec), pick(col_sec), pick(brace_sec));
+
+        let mut pt_id = 1usize;
+        let mut grid_pts = vec![vec![String::new(); n_stories + 1]; n_bays + 1];
+        for (ix, &x) in x_lines.iter().enumerate() {
+            for (iz, &z) in z_lines.iter().enumerate() {
+                let name = format!("{pt_id}");
+                pt_id += 1;
+                self.add_point(&name, x, 0.0, z);
+                if iz == 0 && restraint {
+                    if let Some(p) = self.points.get_mut(&name) {
+                        p.restraint = [true, true, true, true, true, true];
+                    }
+                }
+                grid_pts[ix][iz] = name;
+            }
+        }
+
+        let mut fr_id = 1usize;
+        // Columns
+        for ix in 0..=n_bays {
+            for iz in 0..n_stories {
+                let name = format!("{fr_id}");
+                fr_id += 1;
+                self.add_frame(&name, &grid_pts[ix][iz], &grid_pts[ix][iz + 1], &c_sec);
+            }
+        }
+        // Beams & Braces
+        for iz in 1..=n_stories {
+            let z = z_lines[iz];
+            for ix in 0..n_bays {
+                let bay = x_lines[ix + 1] - x_lines[ix];
+                let mid_x = x_lines[ix] + 0.5 * bay;
+                match frame_type {
+                    FrameType2D::PortalFrame => {
+                        let name = format!("{fr_id}");
+                        fr_id += 1;
+                        self.add_frame(&name, &grid_pts[ix][iz], &grid_pts[ix + 1][iz], &b_sec);
+                    }
+                    FrameType2D::ConcentricBraced => {
+                        let mid_pt = format!("{pt_id}");
+                        pt_id += 1;
+                        self.add_point(&mid_pt, mid_x, 0.0, z);
+
+                        let b1 = format!("{fr_id}");
+                        fr_id += 1;
+                        self.add_frame(&b1, &grid_pts[ix][iz], &mid_pt, &b_sec);
+                        let b2 = format!("{fr_id}");
+                        fr_id += 1;
+                        self.add_frame(&b2, &mid_pt, &grid_pts[ix + 1][iz], &b_sec);
+
+                        // Chevron braces with pinned ends (M3 in-plane major bending released)
+                        let br1 = format!("{fr_id}");
+                        fr_id += 1;
+                        self.add_frame(&br1, &grid_pts[ix][iz - 1], &mid_pt, &br_sec);
+                        if let Some(f) = self.frames.get_mut(&br1) {
+                            f.release_i[5] = true;
+                            f.release_j[5] = true;
+                        }
+                        let br2 = format!("{fr_id}");
+                        fr_id += 1;
+                        self.add_frame(&br2, &grid_pts[ix + 1][iz - 1], &mid_pt, &br_sec);
+                        if let Some(f) = self.frames.get_mut(&br2) {
+                            f.release_i[5] = true;
+                            f.release_j[5] = true;
+                        }
+                    }
+                    FrameType2D::EccentricBraced => {
+                        let e_half = (eccentricity.abs().max(0.1 * bay)).min(0.4 * bay) * 0.5;
+                        let p_left = format!("{pt_id}");
+                        pt_id += 1;
+                        self.add_point(&p_left, mid_x - e_half, 0.0, z);
+                        let p_right = format!("{pt_id}");
+                        pt_id += 1;
+                        self.add_point(&p_right, mid_x + e_half, 0.0, z);
+
+                        for (p1, p2) in [
+                            (&grid_pts[ix][iz], &p_left),
+                            (&p_left, &p_right),
+                            (&p_right, &grid_pts[ix + 1][iz]),
+                        ] {
+                            let b = format!("{fr_id}");
+                            fr_id += 1;
+                            self.add_frame(&b, p1, p2, &b_sec);
+                        }
+                        for (p1, p2) in [
+                            (&grid_pts[ix][iz - 1], &p_left),
+                            (&grid_pts[ix + 1][iz - 1], &p_right),
+                        ] {
+                            let br = format!("{fr_id}");
+                            fr_id += 1;
+                            self.add_frame(&br, p1, p2, &br_sec);
+                            if let Some(f) = self.frames.get_mut(&br) {
+                                f.release_i[5] = true;
+                                f.release_j[5] = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.model_name = format!("2D {:?} ({n_stories} Stories, {n_bays} Bays)", frame_type);
+        Ok(())
+    }
+
     /// Generates a 2D Frame in the XZ plane (`cFile.New2DFrame`).
     pub fn generate_2d_frame(
         &mut self,
@@ -101,14 +312,15 @@ impl SapModel {
         eccentricity: f64,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_stories = num_stories.max(1);
@@ -276,14 +488,15 @@ impl SapModel {
         web_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_bays = num_bays.max(2);
@@ -385,14 +598,15 @@ impl SapModel {
         area_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let nz = num_stories.max(1);
@@ -562,14 +776,15 @@ impl SapModel {
         area_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let nx = num_x_divs.max(1);
@@ -634,14 +849,15 @@ impl SapModel {
         area_sec: &str,
     ) {
         self.s2k_preservation = None;
+        // A generated model has no imported source; old records do not apply.
+        self.unmodeled_source.clear();
         self.points.clear();
         self.frames.clear();
         self.areas.clear();
         self.solids.clear();
         self.links.clear();
-        self.case_results.clear();
-        self.steel_design_results.clear();
-        self.concrete_design_results.clear();
+        // D124: one way to clear results (also the reasons a result is unavailable).
+        self.invalidate_results();
         self.is_locked = false;
 
         let n_theta = num_angular_divs.max(6);

@@ -1,4 +1,12 @@
+pub mod auto_select;
+pub mod draw;
 pub mod editing;
+pub mod generate;
+pub mod hinge;
+pub mod radial;
+pub mod results;
+pub mod ritz;
+pub mod seismic;
 pub mod templates;
 pub use editing::{EditError, EditSummary};
 
@@ -526,6 +534,11 @@ pub struct LinkProp {
     pub param1: [f64; 6],
     /// Post-yield stiffness ratio `[r1..6]`
     pub param2: [f64; 6],
+    /// Third nonlinear parameter row. For `PlasticWen` this is the yield exponent
+    /// `[exp1..6]` (CSI Analysis Reference, "Wen Plasticity Property"); unused by
+    /// Gap/Hook/Damper.
+    #[serde(default)]
+    pub param3: [f64; 6],
     /// Shear distance from J-end `[dj2, dj3]`
     pub dj2: f64,
     pub dj3: f64,
@@ -551,6 +564,7 @@ impl Default for LinkProp {
             k_nl: [0.0; 6],
             param1: [0.0; 6],
             param2: [0.0; 6],
+            param3: [0.0; 6],
             dj2: 0.0,
             dj3: 0.0,
             mass: 0.0,
@@ -711,6 +725,70 @@ pub struct FrameObj {
     /// Gravity load multiplier `[gx, gy, gz]` per load pattern (`load_pat -> [gx, gy, gz]`)
     pub loads_gravity: BTreeMap<String, [f64; 3]>,
     pub selected: bool,
+    /// Automatic subdivision for analysis into this many equal-length frame
+    /// elements (`0` or `1` = one element). Results are reported for the
+    /// object, not for the elements.
+    #[serde(default)]
+    pub auto_mesh_segments: usize,
+    /// Automatic subdivision for analysis at every joint that lies on the
+    /// object between its ends.
+    #[serde(default)]
+    pub auto_mesh_at_joints: bool,
+    /// Concrete frame design framing type (ACI ductility class).
+    #[serde(default)]
+    pub concrete_framing: ConcreteFramingType,
+    /// Steel frame design overwrites; `None` uses the program defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steel_overwrite: Option<SteelDesignOverwrite>,
+    /// Set when `section` names an Auto Select list: the member of the list
+    /// chosen by design and the one the last analysis used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_select: Option<auto_select::AutoSelectState>,
+    /// Hinges assigned to the object, in assignment order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hinges: Vec<hinge::FrameHinge>,
+    /// Frame hinge overwrite; `None` leaves the object undivided.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hinge_overwrite: Option<hinge::FrameHingeOverwrite>,
+}
+
+/// Concrete frame design framing type, as in the SAP2000 concrete design
+/// overwrites. The default is Sway Special, which SAP2000 derives from its
+/// default seismic design category D.
+///
+/// For ACI beam design, Sway Special requires the positive moment strength at
+/// each end to be at least one half of the negative strength there, and both
+/// strengths at every section to be at least one quarter of the largest end
+/// strength (ACI 318-14 18.6.3.2). Sway Intermediate uses one third and one
+/// fifth (18.4.2.2). Capacity-based shear, column and joint provisions of
+/// these framing types are not implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum ConcreteFramingType {
+    #[default]
+    SwaySpecial,
+    SwayIntermediate,
+    SwayOrdinary,
+    NonSway,
+}
+
+/// Steel frame design overwrites of one member, after `cDesignSteel.SetOverwrite`.
+/// `None` in a field keeps the program-determined value.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SteelDesignOverwrite {
+    /// Unbraced length ratio for major-axis buckling ($L_{33} / L$)
+    pub l_ratio_major: Option<f64>,
+    /// Unbraced length ratio for minor-axis buckling ($L_{22} / L$)
+    pub l_ratio_minor: Option<f64>,
+    /// Unbraced length ratio for lateral-torsional buckling ($L_{ltb} / L$)
+    pub l_ratio_ltb: Option<f64>,
+    /// Effective length factor $K_{33}$ (major axis)
+    pub k_major: Option<f64>,
+    /// Effective length factor $K_{22}$ (minor axis)
+    pub k_minor: Option<f64>,
+    /// Moment gradient factor $C_b$ (`None` = computed from the moment diagram)
+    pub cb: Option<f64>,
+    /// Sway frame flag for automatic alignment-chart $K$-factor calculation
+    pub is_sway: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -756,6 +834,13 @@ impl FrameObj {
             loads_temp: Vec::new(),
             loads_gravity: BTreeMap::new(),
             selected: false,
+            auto_mesh_segments: 0,
+            auto_mesh_at_joints: false,
+            concrete_framing: ConcreteFramingType::default(),
+            steel_overwrite: None,
+            auto_select: None,
+            hinges: Vec::new(),
+            hinge_overwrite: None,
         }
     }
 }
@@ -781,7 +866,10 @@ pub struct AreaLoadSurfacePressure {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AreaLoadTemperature {
     pub load_pat: String,
-    /// `1` = Uniform $\Delta T$, `2` = Through-thickness gradient $\Delta T_3$
+    /// `1` = uniform change $\Delta T$; `2` = gradient through the thickness,
+    /// $dT/dx_3$ per unit length, positive when it is warmer toward +local 3.
+    /// (The native file and the OAPI number the gradient 3; the importers
+    /// translate.)
     pub my_type: i32,
     pub val: f64,
     pub pattern_name: Option<String>,
@@ -798,6 +886,11 @@ pub struct AreaObj {
     /// Auto-mesh divisions `(n1, n2)` (`(1, 1)` = unmeshed single element)
     pub auto_mesh: (usize, usize),
     pub edge_constraint: bool,
+    /// Added mass per unit area (the vendor "area mass" assignment). It is
+    /// lumped to the translations of the element joints and is not scaled by
+    /// the mass property modifier, which applies to the section's own mass.
+    #[serde(default)]
+    pub mass_per_area: f64,
     pub loads_uniform: Vec<AreaLoadUniform>,
     pub loads_pressure: Vec<AreaLoadSurfacePressure>,
     pub loads_temp: Vec<AreaLoadTemperature>,
@@ -814,6 +907,7 @@ impl AreaObj {
             modifiers: [1.0; 10],
             auto_mesh: (1, 1),
             edge_constraint: false,
+            mass_per_area: 0.0,
             loads_uniform: Vec::new(),
             loads_pressure: Vec::new(),
             loads_temp: Vec::new(),
@@ -905,6 +999,38 @@ pub enum TimeIntegrationMethod {
     WilsonTheta,
 }
 
+/// What a time-history load assignment names (D77). Imported text or native
+/// inputs say it (S2K `LoadType`, native `m_ltype`); an input that does not is
+/// `Unspecified` and is resolved by `resolve_history_load`, never by guessing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum HistoryLoadKind {
+    #[default]
+    Unspecified,
+    /// A load pattern, whatever its name.
+    Pattern,
+    /// A unit ground acceleration in a global direction.
+    Acceleration,
+}
+
+/// A history assignment once its kind is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedHistoryLoad {
+    Pattern,
+    /// Global direction index 0, 1 or 2.
+    Acceleration(usize),
+}
+
+/// Direction of a history acceleration name: U1, U2, U3, UX, UY, UZ, X, Y, Z
+/// in any case.
+pub fn history_acceleration_direction(name: &str) -> Option<usize> {
+    match name.trim().to_ascii_uppercase().as_str() {
+        "U1" | "UX" | "X" => Some(0),
+        "U2" | "UY" | "Y" => Some(1),
+        "U3" | "UZ" | "Z" => Some(2),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoadCase {
     pub name: String,
@@ -927,6 +1053,12 @@ pub struct LoadCase {
     pub modal_damping: f64,
     /// Time-history parameters: `(function_name, load_pat_or_accel, scale_factor)`
     pub history_loads: Vec<(String, String, f64)>,
+    /// What each entry of `history_loads` names (D77): a load pattern or a
+    /// ground acceleration. Parallel to `history_loads`; a list of another
+    /// length (including the empty list of an input that does not say) leaves
+    /// every entry `Unspecified`. Use `history_kind` and `push_history_load`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_load_kinds: Vec<HistoryLoadKind>,
     pub num_time_steps: usize,
     pub time_step_dt: f64,
     pub time_integration: TimeIntegrationMethod,
@@ -937,9 +1069,139 @@ pub struct LoadCase {
     /// Buckling parameters
     pub num_buckling_modes: usize,
     pub run_flag: bool,
+    /// Nonlinear-static load application control. `None` is full-load control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_control: Option<DisplacementControl>,
+    /// Ritz modal cases: per starting load, the number of generation cycles
+    /// and the target dynamic participation. A load of `loads` without an
+    /// entry has no cycle limit and no target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ritz_controls: Vec<ritz::RitzLoadControl>,
+    /// Linear history cases: the Modal case whose modes are superposed;
+    /// `None` integrates the full equations directly. Nonlinear static
+    /// cases: the Modal case of the modal loads in `nl_static.mode_loads`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modal_case: Option<String>,
+    /// Nonlinear static cases: saved states, step limits and modal loads.
+    #[serde(default, skip_serializing_if = "hinge::NonlinearStaticParams::is_default")]
+    pub nl_static: hinge::NonlinearStaticParams,
+}
+
+/// Displacement-controlled nonlinear static load application (CSI Analysis
+/// Reference, "Load Application Control"). The case load pattern is scaled until
+/// the monitored displacement has moved by `target` (a positive magnitude)
+/// from its value at the start of the case, in the direction the load moves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DisplacementControl {
+    pub target: f64,
+    /// Monitored joint and joint-local DOF `0..6`; `None` records an imported
+    /// control whose monitored quantity is not representable (for example a
+    /// generalized displacement). Such a case cannot be analyzed.
+    pub monitored: Option<(String, usize)>,
+    /// Vendor "use conjugate displacement" option. It selects the internal
+    /// stepping measure only; the monitored displacement still sets the target.
+    #[serde(default)]
+    pub conjugate: bool,
+}
+
+/// Decides what history entry `i` of `lc` names (D77). A stored kind wins and
+/// a name never overrides it. An entry without a kind is a load pattern when
+/// its name is no acceleration name, an acceleration when no pattern has the
+/// name, and otherwise ambiguous: the error names the case, the load and the
+/// two readings.
+pub fn resolve_history_load(
+    model: &SapModel,
+    lc: &LoadCase,
+    i: usize,
+) -> Result<ResolvedHistoryLoad, String> {
+    let name = &lc.history_loads[i].1;
+    let direction = history_acceleration_direction(name);
+    match lc.history_kind(i) {
+        HistoryLoadKind::Pattern => Ok(ResolvedHistoryLoad::Pattern),
+        HistoryLoadKind::Acceleration => direction
+            .map(ResolvedHistoryLoad::Acceleration)
+            .ok_or_else(|| {
+                format!(
+                    "case '{}': history load '{name}' is marked as a ground acceleration but is not U1, U2, U3, UX, UY, UZ, X, Y or Z",
+                    lc.name
+                )
+            }),
+        HistoryLoadKind::Unspecified => match direction {
+            None => Ok(ResolvedHistoryLoad::Pattern),
+            Some(d) if model.load_patterns.contains_key(name) => Err(format!(
+                "case '{}': history load '{name}' is ambiguous: the input does not say whether it is the load pattern '{name}' or a ground acceleration in direction U{}; state the load type (Load pattern or Accel)",
+                lc.name,
+                d + 1
+            )),
+            Some(d) => Ok(ResolvedHistoryLoad::Acceleration(d)),
+        },
+    }
 }
 
 impl LoadCase {
+    /// Kind stored for history entry `i`; `Unspecified` when the kinds list
+    /// does not match `history_loads`.
+    pub fn history_kind(&self, i: usize) -> HistoryLoadKind {
+        if self.history_load_kinds.len() == self.history_loads.len() {
+            self.history_load_kinds.get(i).copied().unwrap_or_default()
+        } else {
+            HistoryLoadKind::Unspecified
+        }
+    }
+
+    /// Whether history entry `i` applies a load pattern, by its resolved kind
+    /// (D81). A ground acceleration does not. An entry that cannot be resolved
+    /// (ambiguous, or marked as an acceleration with no direction name) counts
+    /// as a pattern: a dependency check must not drop a possible dependency.
+    pub fn history_entry_is_pattern(&self, model: &SapModel, i: usize) -> bool {
+        !matches!(
+            resolve_history_load(model, self, i),
+            Ok(ResolvedHistoryLoad::Acceleration(_))
+        )
+    }
+
+    /// Appends a history assignment together with its kind.
+    pub fn push_history_load(
+        &mut self,
+        function: impl Into<String>,
+        load: impl Into<String>,
+        kind: HistoryLoadKind,
+        scale_factor: f64,
+    ) {
+        let mut kinds: Vec<HistoryLoadKind> = (0..self.history_loads.len())
+            .map(|i| self.history_kind(i))
+            .collect();
+        kinds.push(kind);
+        self.history_loads
+            .push((function.into(), load.into(), scale_factor));
+        self.history_load_kinds = kinds;
+        self.normalize_history_kinds();
+    }
+
+    /// An all-`Unspecified` kinds list is stored as the empty list, so a
+    /// legacy case compares equal however it was built.
+    pub fn normalize_history_kinds(&mut self) {
+        if self.history_load_kinds.len() != self.history_loads.len()
+            || self
+                .history_load_kinds
+                .iter()
+                .all(|k| *k == HistoryLoadKind::Unspecified)
+        {
+            self.history_load_kinds.clear();
+        }
+    }
+
+    /// Removes history assignment `i` with its kind.
+    pub fn remove_history_load(&mut self, i: usize) {
+        let mut kinds: Vec<HistoryLoadKind> = (0..self.history_loads.len())
+            .map(|k| self.history_kind(k))
+            .collect();
+        self.history_loads.remove(i);
+        kinds.remove(i);
+        self.history_load_kinds = kinds;
+        self.normalize_history_kinds();
+    }
+
     pub fn linear_static(name: impl Into<String>, pat: impl Into<String>, sf: f64) -> Self {
         let name_s = name.into();
         let pat_s = pat.into();
@@ -962,6 +1224,7 @@ impl LoadCase {
             modal_combo: ModalComboMethod::Cqc,
             modal_damping: 0.05,
             history_loads: Vec::new(),
+            history_load_kinds: Vec::new(),
             num_time_steps: 200,
             time_step_dt: 0.02,
             time_integration: TimeIntegrationMethod::NewmarkAverage,
@@ -970,6 +1233,10 @@ impl LoadCase {
             rayleigh_damping: (0.0, 0.0),
             num_buckling_modes: 6,
             run_flag: true,
+            displacement_control: None,
+            ritz_controls: Vec::new(),
+            modal_case: None,
+            nl_static: hinge::NonlinearStaticParams::default(),
         }
     }
 
@@ -990,6 +1257,7 @@ impl LoadCase {
             modal_combo: ModalComboMethod::Cqc,
             modal_damping: 0.05,
             history_loads: Vec::new(),
+            history_load_kinds: Vec::new(),
             num_time_steps: 0,
             time_step_dt: 0.01,
             time_integration: TimeIntegrationMethod::NewmarkAverage,
@@ -998,6 +1266,10 @@ impl LoadCase {
             rayleigh_damping: (0.0, 0.0),
             num_buckling_modes: 6,
             run_flag: true,
+            displacement_control: None,
+            ritz_controls: Vec::new(),
+            modal_case: None,
+            nl_static: hinge::NonlinearStaticParams::default(),
         }
     }
 }
@@ -1051,7 +1323,8 @@ pub struct FrameStationResult {
     pub v3: f64,
     /// Torsional moment $T$ about local 1-axis
     pub t: f64,
-    /// Minor bending moment $M_2$ about local 2-axis (in 1-3 plane)
+    /// Minor bending moment $M_2$ about local 2-axis (in 1-3 plane); positive
+    /// compresses the positive 3 face, as in SAP2000
     pub m2: f64,
     /// Major bending moment $M_3$ about local 3-axis (in 1-2 plane)
     pub m3: f64,
@@ -1077,6 +1350,10 @@ pub struct AreaResult {
     pub s22_top: f64,
     pub s12_top: f64,
     pub svm_top: f64,
+    /// Thickness-normal stress S33 of a plane-strain section (Analysis Reference
+    /// p. 218); zero for every other section.
+    #[serde(default)]
+    pub s33: f64,
     /// Nodal forces at each corner joint in global coordinates `[FX, FY, FZ, MX, MY, MZ]`
     pub joint_forces: Vec<(String, [f64; 6])>,
 }
@@ -1146,9 +1423,33 @@ pub struct TransientTerminalState {
     pub modal_a: Option<Vec<f64>>,
 }
 
+/// How far a case that has results got (v19 "Set Load Cases to Run": a case that "was
+/// unable to reach its requested final state" is "Not Finished"). A case that could not
+/// start because a prerequisite case did not finish has no results at all and is listed in
+/// `SapModel::unavailable_results` ("could not start: ..."), never stored with an empty
+/// `CaseResults`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum CaseStatus {
+    #[default]
+    Finished,
+    /// The case stopped before its target. Its results are the states it reached: keeping
+    /// them is a project choice (v19 does not say which results a case that is not
+    /// finished keeps). `steps` is the number of saved states kept in `static_steps`.
+    NotFinished { reason: String, steps: usize },
+}
+
+impl CaseStatus {
+    pub fn is_finished(&self) -> bool {
+        matches!(self, CaseStatus::Finished)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct CaseResults {
     pub case_name: String,
+    /// Whether the case reached its requested final state; old files read as `Finished`.
+    #[serde(default, skip_serializing_if = "CaseStatus::is_finished")]
+    pub status: CaseStatus,
     /// Joint displacements `joint_name -> [U1, U2, U3, R1, R2, R3]`
     pub joint_displacements: IndexMap<String, [f64; 6]>,
     /// Support/Spring reactions `joint_name -> [F1, F2, F3, M1, M2, M3]`
@@ -1173,6 +1474,144 @@ pub struct CaseResults {
     /// Terminal dynamic state for chained `initial_case` continuation
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transient_state: Option<TransientTerminalState>,
+    /// Terminal hysteretic state of path-dependent nonlinear link DOFs, used by
+    /// a following case that names this one as its `initial_case`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub link_hysteresis: Vec<LinkHysteresisState>,
+    /// Load factor reached by a displacement-controlled nonlinear static case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement_control_factor: Option<f64>,
+    /// Modal cases: static and dynamic participation of each starting load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub load_participation: Vec<ritz::LoadParticipation>,
+    /// What each automatic lateral load pattern applied in this case computed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub auto_lateral: Vec<seismic::AutoSeismicReport>,
+    /// History cases: joint accelerations relative to the ground at each
+    /// output step, `joint_name -> Vec<[U1, U2, U3, R1, R2, R3]>`.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub time_history_accel: IndexMap<String, Vec<[f64; 6]>>,
+    /// Nonlinear static cases that save multiple states: every saved state,
+    /// step 0 first. Empty when only the final state is kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub static_steps: Vec<hinge::NonlinearStaticStep>,
+    /// Frame hinge results at the end of a nonlinear static case, also the
+    /// starting hinge state of a case that continues from it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hinge_results: Vec<hinge::FrameHingeResult>,
+    /// Combinations: the minimum of every quantity when the combination is
+    /// multi-valued (Analysis Reference p. 351); the ordinary fields then hold the
+    /// maximum. `None` for a single-valued result, whose maximum and minimum are equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub combo_min: Option<Box<CaseResults>>,
+}
+
+/// One piece of imported source data that the importer recognized, could not
+/// represent, and that would change analysis results if ignored (for example
+/// frame hinges or a link gravity load). It is recorded so analysis fails
+/// closed instead of silently solving a different model. Removing the entry is
+/// the explicit decision to analyze without that data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnmodeledSourceData {
+    pub scope: UnmodeledScope,
+    pub description: String,
+}
+
+/// Which analysis cases an [`UnmodeledSourceData`] entry affects.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnmodeledScope {
+    /// Stiffness, mass or geometry data: every case.
+    AllCases,
+    /// Nonlinear element behavior: nonlinear cases and cases continuing from them.
+    NonlinearCases,
+    /// Mass data: modal, response-spectrum and history cases, and cases
+    /// continuing from them.
+    DynamicCases,
+    /// Data that leaves a linear static solution from zero unchanged but
+    /// affects everything else (for example how finely a frame is subdivided):
+    /// every case except linear static cases with no initial case.
+    AllButLinearStatic,
+    /// A load in this load pattern: cases that apply or inherit the pattern.
+    LoadPattern(String),
+    /// A setting of this case: the case and cases continuing from it.
+    Case(String),
+}
+
+impl SapModel {
+    /// Entries of `unmodeled_source` that affect the named analysis case,
+    /// following its `initial_case` chain.
+    pub fn unmodeled_source_for_case(&self, case_name: &str) -> Vec<&UnmodeledSourceData> {
+        let mut chain = Vec::new();
+        let mut current = self.load_cases.get(case_name);
+        while let Some(case) = current {
+            if chain.iter().any(|c: &&LoadCase| c.name == case.name) {
+                break;
+            }
+            chain.push(case);
+            current = case
+                .initial_case
+                .as_ref()
+                .and_then(|name| self.load_cases.get(name));
+        }
+        self.unmodeled_source
+            .iter()
+            .filter(|entry| match &entry.scope {
+                UnmodeledScope::AllCases => true,
+                UnmodeledScope::NonlinearCases => chain.iter().any(|c| {
+                    matches!(
+                        c.case_type,
+                        LoadCaseType::NonlinearStatic
+                            | LoadCaseType::NonlinearHistory
+                            | LoadCaseType::NonlinearDynamic
+                    )
+                }),
+                UnmodeledScope::AllButLinearStatic => {
+                    chain.len() != 1
+                        || !matches!(
+                            chain[0].case_type,
+                            LoadCaseType::LinearStatic | LoadCaseType::LinearStaticMultiStep
+                        )
+                }
+                UnmodeledScope::DynamicCases => chain.iter().any(|c| {
+                    !matches!(
+                        c.case_type,
+                        LoadCaseType::LinearStatic
+                            | LoadCaseType::NonlinearStatic
+                            | LoadCaseType::LinearStaticMultiStep
+                            | LoadCaseType::Buckling
+                    )
+                }),
+                UnmodeledScope::LoadPattern(pattern) => chain.iter().any(|c| {
+                    c.loads
+                        .iter()
+                        .any(|l| &l.load_name == pattern && l.scale_factor != 0.0)
+                        // D81: a history entry depends on a load pattern only when
+                        // it is one; an explicit ground acceleration U1 does not
+                        // use the pattern that happens to be called U1.
+                        || c.history_loads
+                            .iter()
+                            .enumerate()
+                            .any(|(i, (_, p, scale))| {
+                                p == pattern
+                                    && *scale != 0.0
+                                    && c.history_entry_is_pattern(self, i)
+                            })
+                }),
+                UnmodeledScope::Case(name) => chain.iter().any(|c| &c.name == name),
+            })
+            .collect()
+    }
+}
+
+/// Internal state of one path-dependent link DOF at the end of a case.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LinkHysteresisState {
+    pub link: String,
+    pub dof: usize,
+    /// Internal deformation at which `z` was reached.
+    pub deformation: f64,
+    /// Wen hysteretic variable, `|z| <= 1`.
+    pub z: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1200,6 +1639,9 @@ pub struct SteelDesignResult {
     pub phi_vn3: f64,
     pub status: String,  // "OK", "OVERSTRESSED", "SLENDER"
     pub eq_name: String, // e.g. "H1-1a", "H1-1b", "EC3-6.2"
+    /// Statements about what the check did not cover (D92), e.g. an EC3 torsion that is not designed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1218,6 +1660,19 @@ pub struct ConcreteDesignResult {
     pub as_side: f64,
     /// Shear stirrup area per unit spacing $A_v / s$
     pub av_over_s: f64,
+    /// Transverse torsion reinforcement At/s as the CSI manual of the design code defines it:
+    /// ACI 318-14 22.7.6.1, one leg of the closed stirrup (manual p. 3-46); Eurocode 2,
+    /// Vt/(z fywd cot theta) (manual p. 3-36). 0 when torsion is ignored (D130).
+    #[serde(default)]
+    pub at_over_s: f64,
+    /// Longitudinal torsion reinforcement: Al of ACI 318-14 22.7.6.1 and 9.6.4.3 (CSI manual
+    /// pp. 3-45 and 3-46) or Asl of EN 1992-1-1 Eq. 6.28 (manual p. 3-36); 0 when torsion is
+    /// ignored (D130).
+    #[serde(default)]
+    pub al_torsion: f64,
+    /// What the design did not cover (D130: torsion on a column).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// Column PMM interaction capacity ratio (if column)
     pub pmm_ratio: f64,
     pub min_rebar_area: f64,
@@ -1237,6 +1692,11 @@ pub struct S2kPreservation {
 pub struct SapModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub s2k_preservation: Option<S2kPreservation>,
+    /// Imported source data that changes analysis results but has no model
+    /// representation. Analysis of every case in an entry's scope is refused
+    /// until the entry is removed. See [`UnmodeledSourceData`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmodeled_source: Vec<UnmodeledSourceData>,
     pub model_name: String,
     pub program_version: String,
     pub present_units: Units,
@@ -1268,8 +1728,43 @@ pub struct SapModel {
 
     pub is_locked: bool,
     pub case_results: IndexMap<String, CaseResults>,
+    /// Cases and combinations that were requested but have no results, each with
+    /// the reason (D78): a combination one of whose contributors has no results is
+    /// listed here and is absent from `case_results`; it is never published with
+    /// the contributors that exist. Meaningful only while `is_locked` (see
+    /// `results::unavailable_reason`).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub unavailable_results: IndexMap<String, String>,
     pub steel_design_results: IndexMap<String, SteelDesignResult>,
     pub concrete_design_results: IndexMap<String, ConcreteDesignResult>,
+    /// D127: frames the last steel design run did not design, with the reason (the text of the
+    /// design error). SAP2000 reports design error messages per frame (v19 API help,
+    /// cDesignSteel.GetSummaryResults, ErrorSummary). A frame is in this map or in
+    /// `steel_design_results`, never in both.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub steel_design_errors: IndexMap<String, String>,
+    /// D127: the same for concrete design.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub concrete_design_errors: IndexMap<String, String>,
+
+    /// Where the mass of the model comes from.
+    #[serde(default, skip_serializing_if = "seismic::MassSource::is_default")]
+    pub mass_source: seismic::MassSource,
+    /// Automatic seismic load definitions, keyed by load pattern name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub auto_seismic: IndexMap<String, seismic::AutoSeismicAsce710>,
+    /// Overwrites of the diaphragm eccentricity of an automatic seismic load
+    /// (Lateral Loads Manual, section 2.2.3): load pattern name, then
+    /// diaphragm constraint name, to the eccentricity distance in model length
+    /// units (replaces ratio times width; measured perpendicular to the load).
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub auto_seismic_eccentricity: IndexMap<String, IndexMap<String, f64>>,
+    /// Steel frame design preferences.
+    #[serde(default, skip_serializing_if = "auto_select::SteelDesignPreferences::is_default")]
+    pub steel_design_prefs: auto_select::SteelDesignPreferences,
+    /// User-defined frame hinge properties, keyed by name.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub hinge_props: IndexMap<String, hinge::HingeProp>,
 }
 
 impl Default for SapModel {
@@ -1353,6 +1848,7 @@ impl SapModel {
 
         Self {
             s2k_preservation: None,
+            unmodeled_source: Vec::new(),
             model_name: "Untitled".to_string(),
             program_version: "19.0.0".to_string(),
             present_units: units,
@@ -1379,8 +1875,16 @@ impl SapModel {
             load_combos: IndexMap::new(),
             is_locked: false,
             case_results: IndexMap::new(),
+            unavailable_results: IndexMap::new(),
             steel_design_results: IndexMap::new(),
             concrete_design_results: IndexMap::new(),
+            steel_design_errors: IndexMap::new(),
+            concrete_design_errors: IndexMap::new(),
+            mass_source: seismic::MassSource::default(),
+            auto_seismic: IndexMap::new(),
+            auto_seismic_eccentricity: IndexMap::new(),
+            steel_design_prefs: auto_select::SteelDesignPreferences::default(),
+            hinge_props: IndexMap::new(),
         }
     }
 
@@ -1436,6 +1940,9 @@ impl SapModel {
         let f_mass = src.mass_factor_to(target_units);
         let f_temp = src.temp_delta_factor_to(target_units);
         let f_alpha = src.thermal_expansion_factor_to(target_units);
+
+        seismic::scale_units(self, src, target_units);
+        hinge::scale_units(self, src, target_units);
 
         for cs in self.coord_systems.values_mut() {
             for c in &mut cs.origin {
@@ -1544,6 +2051,17 @@ impl SapModel {
             }
         }
 
+        for case in self.load_cases.values_mut() {
+            // A monitored translation target is a length; a rotation target is
+            // in radians. An unrepresented monitored quantity has no known unit
+            // and is left unchanged (such a case cannot be analyzed).
+            if let Some(control) = &mut case.displacement_control {
+                if control.monitored.as_ref().is_some_and(|(_, dof)| *dof < 3) {
+                    control.target *= fl;
+                }
+            }
+        }
+
         for p in self.points.values_mut() {
             p.x *= fl;
             p.y *= fl;
@@ -1631,6 +2149,7 @@ impl SapModel {
         }
 
         for ar in self.areas.values_mut() {
+            ar.mass_per_area *= f_mass / (fl * fl);
             for lu in &mut ar.loads_uniform {
                 lu.val *= f_stress;
             }
@@ -1655,6 +2174,7 @@ impl SapModel {
             }
         }
 
+        let patterns: Vec<String> = self.load_patterns.keys().cloned().collect();
         for lc in self.load_cases.values_mut() {
             for (_, dir, sf) in &mut lc.spectrum_loads {
                 let upper = dir.trim().to_ascii_uppercase();
@@ -1665,13 +2185,23 @@ impl SapModel {
                     *sf *= fl;
                 }
             }
-            for (_, pat_or_acc, sf) in &mut lc.history_loads {
-                let upper = pat_or_acc.trim().to_ascii_uppercase();
-                if matches!(
-                    upper.as_str(),
-                    "U1" | "UX" | "X" | "U2" | "UY" | "Y" | "U3" | "UZ" | "Z"
-                ) {
-                    *sf *= fl;
+            // D77: only a ground acceleration scales with length; a pattern
+            // named like one keeps its factor. An entry that cannot be told
+            // apart is scaled as an acceleration only when no pattern of that
+            // name exists; otherwise the conversion is refused by the analysis
+            // later, so the factor is left alone here.
+            for i in 0..lc.history_loads.len() {
+                let name = lc.history_loads[i].1.clone();
+                let is_accel = match lc.history_kind(i) {
+                    HistoryLoadKind::Acceleration => true,
+                    HistoryLoadKind::Pattern => false,
+                    HistoryLoadKind::Unspecified => {
+                        history_acceleration_direction(&name).is_some()
+                            && !patterns.contains(&name)
+                    }
+                };
+                if is_accel {
+                    lc.history_loads[i].2 *= fl;
                 }
             }
         }
@@ -1681,8 +2211,11 @@ impl SapModel {
         // Stored outputs use the previous units. Until every result component has
         // a dimensional conversion, require analysis again rather than relabeling it.
         self.case_results.clear();
+        self.unavailable_results.clear();
         self.steel_design_results.clear();
+        self.steel_design_errors.clear();
         self.concrete_design_results.clear();
+        self.concrete_design_errors.clear();
         self.is_locked = false;
     }
 }
@@ -1796,6 +2329,7 @@ mod tests {
             k_nl: [240.0, 0.0, 0.0, 50.0, 0.0, 0.0],
             param1: [0.1; 6],
             param2: [0.0; 6],
+            param3: [0.0; 6],
             dj2: 0.5,
             dj3: 0.5,
             mass: 1.0,
@@ -1862,6 +2396,40 @@ mod tests {
         assert!((model.load_cases["HIST"].history_loads[1].2 - 2.0).abs() < 1e-12);
     }
 
+    /// D77: a unit change scales the factor of a ground acceleration (a length
+    /// per time squared) and leaves the factor of a force pattern alone, even
+    /// when the pattern is named X, U1 or UX. kip-ft to kip-in: lengths x 12.
+    #[test]
+    fn convert_units_scales_a_history_entry_by_its_kind_not_its_name() {
+        let mut model = SapModel::new(Units::KipFtF);
+        for name in ["X", "U1"] {
+            model.load_patterns.insert(
+                name.into(),
+                LoadPattern {
+                    name: name.into(),
+                    pat_type: LoadPatternType::Other,
+                    self_wt_multiplier: 0.0,
+                },
+            );
+        }
+        let mut hist = LoadCase::linear_static("HIST", "DEAD", 1.0);
+        hist.case_type = LoadCaseType::LinearHistory;
+        hist.loads.clear();
+        hist.push_history_load("TH1", "X", HistoryLoadKind::Pattern, 3.0);
+        hist.push_history_load("TH1", "U1", HistoryLoadKind::Acceleration, 3.0);
+        hist.push_history_load("TH1", "UZ", HistoryLoadKind::Acceleration, 3.0);
+        // No kind stated and a pattern of that name exists: left alone (the
+        // analysis refuses it as ambiguous).
+        hist.push_history_load("TH1", "U1", HistoryLoadKind::Unspecified, 3.0);
+        model.load_cases.insert("HIST".into(), hist);
+        model.convert_units_in_place(Units::KipInF);
+        let f = &model.load_cases["HIST"].history_loads;
+        assert!((f[0].2 - 3.0).abs() < 1e-12, "pattern X keeps its factor");
+        assert!((f[1].2 - 36.0).abs() < 1e-12, "acceleration U1 x 12");
+        assert!((f[2].2 - 36.0).abs() < 1e-12, "acceleration UZ x 12");
+        assert!((f[3].2 - 3.0).abs() < 1e-12, "ambiguous entry untouched");
+    }
+
     #[test]
     fn template_generation_clears_stale_s2k_preservation_and_transient_json_roundtrips() {
         let mut model = SapModel::new(Units::KipInF);
@@ -1869,8 +2437,14 @@ mod tests {
             source_text: "TABLE: \"OPAQUE\"".into(),
             canonical_baseline: String::new(),
         });
+        model.unmodeled_source.push(UnmodeledSourceData {
+            scope: UnmodeledScope::AllCases,
+            description: "advanced local axes of link '1'".into(),
+        });
         model.generate_beam(2, 120.0, true, "FSEC1");
         assert!(model.s2k_preservation.is_none());
+        // Records about a previously imported file do not describe the new model.
+        assert!(model.unmodeled_source.is_empty());
 
         let mut cr = CaseResults::default();
         cr.transient_state = Some(TransientTerminalState {

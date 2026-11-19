@@ -4,7 +4,7 @@
 //! used by the CLI (`sap2000-rs verify`) and GUI (`Help -> Verification Suite`) to compare
 //! `sap2000-rs` against CSI SAP2000 v19 reference benchmarks.
 
-use crate::analyze_model;
+use crate::SolverError;
 use sap_model::{
     FrameLoadDistributed, FrameLoadPoint, FrameLoadTemperature, FrameSection, LoadCase,
     LoadCaseType, LoadPattern, LoadPatternType, Material, NLGeomType, PointLoadForce, SapModel,
@@ -12,6 +12,28 @@ use sap_model::{
 use sap_section::make_rectangular;
 use sap_units::Units;
 use serde::{Deserialize, Serialize};
+
+/// Analyzes the model of a verification row. A case that is not finished or could not
+/// start (G16) is a failure of the row, never a result to compare: `analyze_model` returns
+/// `Ok` for such a model, but a verification value read from its states would be one the
+/// case did not reach.
+pub(crate) fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
+    crate::analyze_model(model)?;
+    if let Some((name, status)) = crate::unfinished_cases(model).into_iter().next() {
+        let sap_model::CaseStatus::NotFinished { reason, .. } = status else {
+            unreachable!("unfinished_cases lists cases that are not finished");
+        };
+        return Err(SolverError::InvalidInput(format!(
+            "verification case '{name}' is not finished ({reason})"
+        )));
+    }
+    if let Some((name, reason)) = crate::could_not_start_cases(model).into_iter().next() {
+        return Err(SolverError::InvalidInput(format!(
+            "verification case '{name}' {reason}"
+        )));
+    }
+    Ok(())
+}
 
 /// A single verification comparison row between SAP2000 v19 reference and `sap2000-rs`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,12 +84,22 @@ pub fn run_verification_suite() -> Vec<BenchmarkVerificationRow> {
     rows.extend(verify_example_1_008());
     rows.extend(verify_example_1_010());
     rows.extend(verify_example_1_016());
+    rows.extend(verify_frame_auto_subdivision());
+    rows.extend(verify_example_1_011());
+    rows.extend(verify_example_1_021());
+    rows.extend(verify_example_1_026());
     rows.extend(verify_example_5_001());
     rows.extend(verify_example_6_003());
     rows.extend(verify_example_6_005());
+    rows.extend(verify_example_6_008());
     rows.extend(verify_example_7_001());
     rows.extend(verify_example_7_002());
     rows.extend(verify_example_7_003());
+    rows.extend(verify_shell_cantilever_strip());
+    rows.extend(verify_modal_participation_global());
+    rows.extend(crate::bench_w5_p1::rows());
+    rows.extend(crate::bench_w5_p2::rows());
+    rows.extend(crate::bench_w5_p3::rows());
     rows
 }
 
@@ -1093,6 +1125,464 @@ pub fn verify_example_1_016() -> Vec<BenchmarkVerificationRow> {
     rows
 }
 
+/// Automatic frame subdivision: the published SAP2000 value for each mesh of
+/// Examples 1-014 (cantilever periods), 1-016 (tension stiffening), 1-017
+/// (string frequencies) and 1-019 (frame buckling). Each frame object is one
+/// object assigned a number of segments.
+pub fn verify_frame_auto_subdivision() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::{FramePropType, FrameSection};
+
+    let bare = |active_dofs: [bool; 6], e: f64, unit_mass: f64, area: f64, inertia: [f64; 2]| {
+        let mut model = SapModel::new(Units::KipInF);
+        model.load_cases.clear();
+        model.load_patterns.clear();
+        model.active_dofs = active_dofs;
+        let mut material = Material::default_steel_kip_in();
+        material.name = "MAT".into();
+        material.e = e;
+        material.g = e / 2.6;
+        material.unit_mass = unit_mass;
+        material.unit_weight = 0.0;
+        model.materials.insert("MAT".into(), material);
+        model.frame_sections.insert(
+            "SEC".into(),
+            FrameSection {
+                name: "SEC".into(),
+                material: "MAT".into(),
+                prop_type: FramePropType::General,
+                area,
+                i33: inertia[0],
+                i22: inertia[1],
+                as2: 0.0,
+                as3: 0.0,
+                modifiers: [1.0; 8],
+                ..FrameSection::default()
+            },
+        );
+        model
+    };
+    let pattern = |model: &mut SapModel, name: &str| {
+        model.load_patterns.insert(
+            name.into(),
+            LoadPattern {
+                name: name.into(),
+                pat_type: LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+    };
+    let joint_force = |model: &mut SapModel, joint: &str, pat: &str, force: [f64; 6]| {
+        model.points[joint].loads_force.push(PointLoadForce {
+            load_pat: pat.into(),
+            csys: "GLOBAL".into(),
+            force,
+        });
+    };
+    let mut rows = Vec::new();
+
+    // Example 1-014: first period of a 96 in concrete cantilever.
+    for (label, segments, period) in
+        [("Ex 1-014b", 2, 0.042333), ("Ex 1-014f", 10, 0.038175), ("Ex 1-014g", 96, 0.038003)]
+    {
+        let mut model =
+            bare([false, true, true, false, true, true], 3600.0, 2.3e-7, 216.0, [5832.0, 2592.0]);
+        model.add_point("1", 0.0, 0.0, 0.0);
+        model.add_point("2", 96.0, 0.0, 0.0);
+        model.points["1"].restraint = [true; 6];
+        model.add_frame("1", "1", "2", "SEC");
+        model.frames["1"].auto_mesh_segments = segments;
+        model
+            .load_cases
+            .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 5));
+        analyze_model(&mut model).expect("Example 1-014 analysis failed");
+        rows.push(BenchmarkVerificationRow::new(
+            label,
+            &format!("{segments} elements"),
+            "T1 [s]",
+            period,
+            model.case_results["MODAL"].modes[0].period_sec,
+            0.002,
+        ));
+    }
+
+    // Example 1-016: midpoint deflection with an assigned P-Delta force.
+    for (label, segments, uz) in [("Ex 1-016c", 2, -0.54343), ("Ex 1-016d", 16, -0.54330)] {
+        let mut model = bare([true; 6], 30_000.0, 0.0, 9.0, [6.75, 6.75]);
+        model.add_point("1", 0.0, 0.0, 0.0);
+        model.add_point("2", 150.0, 0.0, 0.0);
+        model.add_point("3", 300.0, 0.0, 0.0);
+        model.points["1"].restraint = [true, true, true, true, false, true];
+        model.points["3"].restraint = [false, true, true, true, false, true];
+        pattern(&mut model, "Q");
+        for (frame, i, j) in [("1", "1", "2"), ("2", "2", "3")] {
+            model.add_frame(frame, i, j, "SEC");
+            let object = &mut model.frames[frame];
+            object.auto_mesh_segments = segments;
+            object.pdelta_force = 20.25;
+            object.loads_dist.push(FrameLoadDistributed {
+                load_pat: "Q".into(),
+                my_type: 1,
+                dir: 10,
+                csys: "GLOBAL".into(),
+                rel_dist1: 0.0,
+                rel_dist2: 1.0,
+                val1: 0.002,
+                val2: 0.002,
+            });
+        }
+        model
+            .load_cases
+            .insert("Q".into(), LoadCase::linear_static("Q", "Q", 1.0));
+        analyze_model(&mut model).expect("Example 1-016 analysis failed");
+        rows.push(BenchmarkVerificationRow::new(
+            label,
+            &format!("P-Delta force, {segments} elements"),
+            "Uz (Midspan) [in]",
+            uz,
+            model.case_results["Q"].joint_displacements["2"][2],
+            0.002,
+        ));
+    }
+
+    // Example 1-017: frequencies of a string tensioned by a P-Delta case.
+    {
+        let (area, inertia) = (0.0030679615757712823, 7.490140565847857e-7);
+        let mut model = bare(
+            [true, false, true, false, true, false],
+            30_000.0,
+            7.324e-7,
+            area,
+            [inertia, inertia],
+        );
+        model.frame_sections["SEC"].as2 = 0.9 * area;
+        model.frame_sections["SEC"].as3 = 0.9 * area;
+        model.add_point("1", -50.0, 0.0, 0.0);
+        model.add_point("2", 50.0, 0.0, 0.0);
+        model.points["1"].restraint = [true, true, true, true, false, true];
+        model.points["2"].restraint = [false, false, true, false, false, false];
+        model.add_frame("1", "1", "2", "SEC");
+        model.frames["1"].auto_mesh_segments = 10;
+        pattern(&mut model, "T");
+        joint_force(&mut model, "2", "T", [0.5, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let mut tension = LoadCase::linear_static("T", "T", 1.0);
+        tension.case_type = LoadCaseType::NonlinearStatic;
+        tension.nl_geom = NLGeomType::PDelta;
+        model.load_cases.insert("T".into(), tension);
+        let mut modal = LoadCase::modal_eigen("MODAL", 3);
+        modal.initial_case = Some("T".into());
+        model.load_cases.insert("MODAL".into(), modal);
+        analyze_model(&mut model).expect("Example 1-017 analysis failed");
+        for (mode, frequency) in [(0, 74.579), (2, 222.06)] {
+            rows.push(BenchmarkVerificationRow::new(
+                "Ex 1-017a",
+                "10 elements",
+                &format!("f{} [Hz]", mode + 1),
+                frequency,
+                model.case_results["MODAL"].modes[mode].freq_hz,
+                0.003,
+            ));
+        }
+    }
+
+    // Example 1-019: buckling load of a pinned-base portal frame. E is 29000
+    // ksi as in the vendor model and its published numbers (the problem
+    // statement prints 29,900).
+    for (label, segments, load) in [("Ex 1-019b", 2, 280.24), ("Ex 1-019c", 4, 280.19)] {
+        let mut model =
+            bare([true, false, true, false, true, false], 29_000.0, 0.0, 9.12, [110.0, 37.1]);
+        model.frame_sections["SEC"].modifiers[0] = 100_000.0;
+        for (name, x, z) in
+            [("1", 0.0, 0.0), ("2", 0.0, 144.0), ("5", 144.0, 144.0), ("6", 144.0, 0.0)]
+        {
+            model.add_point(name, x, 0.0, z);
+        }
+        for base in ["1", "6"] {
+            model.points[base].restraint = [true, true, true, true, false, true];
+        }
+        for (frame, i, j) in [("1", "1", "2"), ("3", "2", "5"), ("5", "6", "5")] {
+            model.add_frame(frame, i, j, "SEC");
+            model.frames[frame].auto_mesh_segments = segments;
+        }
+        pattern(&mut model, "P");
+        for top in ["2", "5"] {
+            joint_force(&mut model, top, "P", [0.0, 0.0, -1.0, 0.0, 0.0, 0.0]);
+        }
+        let mut case = LoadCase::linear_static("BUCK", "P", 1.0);
+        case.case_type = LoadCaseType::Buckling;
+        case.num_buckling_modes = 1;
+        model.load_cases.insert("BUCK".into(), case);
+        analyze_model(&mut model).expect("Example 1-019 analysis failed");
+        rows.push(BenchmarkVerificationRow::new(
+            label,
+            &format!("{segments} elements per object"),
+            "Buckling load [kip]",
+            load,
+            model.case_results["BUCK"].buckling_factors[0],
+            0.002,
+        ));
+    }
+    rows
+}
+
+/// Example 1-011: Frame Insertion Point. A 12 x 18 in cantilever inserted at
+/// its bottom left corner (cardinal point 1) with +12 in joint offsets along
+/// local 2, under 10 kip of compression on the end joint (case 1) and on the
+/// end of the frame object (case 2).
+pub fn verify_example_1_011() -> Vec<BenchmarkVerificationRow> {
+    let mut model = SapModel::new(Units::KipInF);
+    model.load_cases.clear();
+    model.load_patterns.clear();
+    let mut material = Material::default_steel_kip_in();
+    material.name = "CONC".into();
+    material.e = 3600.0;
+    material.g = 1500.0;
+    model.materials.insert("CONC".into(), material);
+    model
+        .frame_sections
+        .insert("FSEC1".into(), make_rectangular("FSEC1", "CONC", 18.0, 12.0));
+    model.add_point("1", 0.0, 0.0, 0.0);
+    model.add_point("2", 120.0, 0.0, 0.0);
+    model.points["1"].restraint = [true; 6];
+    model.add_frame("1", "1", "2", "FSEC1");
+    let frame = &mut model.frames["1"];
+    frame.cardinal_point = 1;
+    frame.stiff_transform = true;
+    frame.joint_offset_is_global = false;
+    frame.joint_offset_i = [0.0, 12.0, 0.0];
+    frame.joint_offset_j = [0.0, 12.0, 0.0];
+    frame.loads_point.push(FrameLoadPoint {
+        load_pat: "2".into(),
+        my_type: 1,
+        dir: 4,
+        csys: "GLOBAL".into(),
+        rel_dist: 1.0,
+        val: -10.0,
+    });
+    for name in ["1", "2"] {
+        model.load_patterns.insert(
+            name.into(),
+            LoadPattern {
+                name: name.into(),
+                pat_type: LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+        model
+            .load_cases
+            .insert(name.into(), LoadCase::linear_static(name, name, 1.0));
+    }
+    model.points["2"].loads_force.push(PointLoadForce {
+        load_pat: "1".into(),
+        csys: "GLOBAL".into(),
+        force: [-10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    });
+    analyze_model(&mut model).expect("Example 1-011 analysis failed");
+    let beam = &model.case_results["1"].frame_forces["1"][4];
+    let support = model.case_results["2"].joint_reactions["1"];
+    vec![
+        BenchmarkVerificationRow::new("Ex 1-011", "1 (load on joint)", "M3 (beam) [k-in]", -210.0, beam.m3, 0.001),
+        BenchmarkVerificationRow::new("Ex 1-011", "1 (load on joint)", "M2 (beam) [k-in]", -60.0, beam.m2, 0.001),
+        BenchmarkVerificationRow::new("Ex 1-011", "2 (load on frame)", "My (fixed end) [k-in]", 210.0, support[4], 0.001),
+        BenchmarkVerificationRow::new("Ex 1-011", "2 (load on frame)", "Mz (fixed end) [k-in]", 60.0, support[5], 0.001),
+    ]
+}
+
+/// Example 1-021: eigenvalues of the Bathe and Wilson plane frame, ten 20 ft
+/// bays and nine 10 ft storeys with a fixed base (E = 432000 k/ft2, A = 3 ft2,
+/// I = 1 ft4, mass 3 k-s2/ft per unit length, no shear deformation). The
+/// reference values are the independent ones the problem prints (Peterson
+/// 1981). The numbers are in feet whatever the model's unit label, which no
+/// part of an eigenvalue analysis reads.
+pub fn verify_example_1_021() -> Vec<BenchmarkVerificationRow> {
+    let (bays, storeys) = (10usize, 9usize);
+    let mut model = SapModel::new(Units::KipFtF);
+    model.load_cases.clear();
+    model.active_dofs = [true, false, true, false, true, false];
+    let mut material = Material::default_steel_kip_in();
+    material.name = "BW".into();
+    material.e = 432_000.0;
+    material.unit_weight = 0.0;
+    material.unit_mass = 1.0;
+    model.materials.insert("BW".into(), material);
+    let mut section = make_rectangular("BW", "BW", 1.0, 3.0);
+    section.area = 3.0;
+    section.i33 = 1.0;
+    section.i22 = 1.0;
+    section.torsional_j = 1.0;
+    section.as2 = 0.0;
+    section.as3 = 0.0;
+    model.frame_sections.insert("BW".into(), section);
+    for j in 0..=storeys {
+        for i in 0..=bays {
+            let name = format!("{i}_{j}");
+            model.add_point(name.clone(), 20.0 * i as f64, 0.0, 10.0 * j as f64);
+            if j == 0 {
+                model.points[&name].restraint = [true; 6];
+            }
+        }
+    }
+    for j in 1..=storeys {
+        for i in 0..bays {
+            model.add_frame(format!("B{i}_{j}"), format!("{i}_{j}"), format!("{}_{j}", i + 1), "BW");
+        }
+    }
+    for j in 0..storeys {
+        for i in 0..=bays {
+            model.add_frame(format!("C{i}_{j}"), format!("{i}_{j}"), format!("{i}_{}", j + 1), "BW");
+        }
+    }
+    model
+        .load_cases
+        .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 3));
+    analyze_model(&mut model).expect("Example 1-021 analysis failed");
+    let modes = &model.case_results["MODAL"].modes;
+    [0.589541, 5.52696, 16.5879]
+        .into_iter()
+        .enumerate()
+        .map(|(index, reference)| {
+            BenchmarkVerificationRow::new(
+                "Ex 1-021",
+                "MODAL (Eigen)",
+                &format!("Eigenvalue {} [rad2/s2]", index + 1),
+                reference,
+                modes[index].eigenvalue,
+                0.001,
+            )
+        })
+        .collect()
+}
+
+/// Example 1-026: a 24 in cantilever with a moment hinge and a shear hinge
+/// at its fixed end, pushed by a tip load until the tip has moved 2 in
+/// (E = 3600 ksi, G = 1500 ksi, A = 216 in2, I = 5832 in4, Av = 180 in2).
+/// Model A leaves the object whole; model B applies the default hinge
+/// overwrite, which puts the hinge in an element of 1 % of the length.
+///
+/// The references are the SAP2000 values the problem prints for the state
+/// after the moment hinge has dropped to its residual strength (P = 20 kips).
+/// The printed tables are mislabelled: the first is model A although headed
+/// "Model B", and at this state their SAP2000 and Independent columns are
+/// exchanged, as the problem's own hand calculation (1.36617 in, 0.04027 rad
+/// for a vertical drop) shows. The tolerances are the rounding of the
+/// printed values.
+pub fn verify_example_1_026() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::hinge::{
+        FrameHinge, FrameHingeOverwrite, HingeDof, HingePoint, HingeProp, ResultsSaved,
+    };
+    let build = |overwrite: Option<FrameHingeOverwrite>| {
+        let mut model = SapModel::new(Units::KipInF);
+        model.load_cases.clear();
+        model.load_patterns.clear();
+        model.active_dofs = [true, false, true, false, true, false];
+        let mut material = Material::default_steel_kip_in();
+        material.name = "CONC".into();
+        material.e = 3600.0;
+        material.g = 1500.0;
+        material.u = 0.2;
+        material.unit_weight = 0.0;
+        material.unit_mass = 0.0;
+        model.materials.insert("CONC".into(), material);
+        let mut section = make_rectangular("BEAM", "CONC", 12.0, 18.0);
+        section.area = 216.0;
+        section.i33 = 5832.0;
+        section.as2 = 180.0;
+        model.frame_sections.insert("BEAM".into(), section);
+        model.add_point("1", 0.0, 0.0, 0.0);
+        model.add_point("2", 24.0, 0.0, 0.0);
+        model.points["1"].restraint = [true; 6];
+        model.add_frame("1", "1", "2", "BEAM");
+        model.load_patterns.insert(
+            "P".into(),
+            LoadPattern {
+                name: "P".into(),
+                pat_type: LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+        model.points["2"].loads_force.push(PointLoadForce {
+            load_pat: "P".into(),
+            csys: "GLOBAL".into(),
+            force: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        });
+        let point = HingePoint::new;
+        model.hinge_props.insert(
+            "Moment".into(),
+            HingeProp::symmetric(
+                "Moment",
+                HingeDof::M3,
+                [point(1440.0, 0.0), point(1920.0, 0.04), point(480.0, 0.04), point(480.0, 0.4)],
+            ),
+        );
+        model.hinge_props.insert(
+            "Shear".into(),
+            HingeProp::symmetric(
+                "Shear",
+                HingeDof::V2,
+                [point(70.0, 0.0), point(80.0, 0.4), point(90.0, 0.8), point(100.0, 1.2)],
+            ),
+        );
+        let frame = &mut model.frames["1"];
+        frame.hinges = ["Moment", "Shear"]
+            .map(|prop| FrameHinge {
+                prop: prop.into(),
+                rel_dist: 0.0,
+            })
+            .to_vec();
+        frame.hinge_overwrite = overwrite;
+        let mut push = LoadCase::linear_static("PUSH", "P", 1.0);
+        push.case_type = LoadCaseType::NonlinearStatic;
+        push.displacement_control = Some(sap_model::DisplacementControl {
+            target: 2.0,
+            monitored: Some(("2".into(), 2)),
+            conjugate: false,
+        });
+        push.nl_static.results_saved = ResultsSaved::MultipleStates {
+            min_saved: 6,
+            max_saved: 10,
+            positive_only: false,
+        };
+        model.load_cases.insert("PUSH".into(), push);
+        model
+    };
+    let mut rows = Vec::new();
+    for (label, overwrite, uz, ry) in [
+        ("A, no overwrite", None, 1.7612, -0.0567),
+        ("B, hinge overwrite", Some(FrameHingeOverwrite::default()), 1.3701, -0.0404),
+    ] {
+        let mut model = build(overwrite);
+        analyze_model(&mut model).expect("Example 1-026 analysis failed");
+        let steps = &model.case_results["PUSH"].static_steps;
+        // The first saved state at P = 20 kips after the peak of 80 kips.
+        let peak = steps
+            .iter()
+            .position(|s| (s.load_factor - 80.0).abs() < 1e-6)
+            .expect("Example 1-026 never reaches 80 kips");
+        let state = steps[peak..]
+            .iter()
+            .find(|s| (s.load_factor - 20.0).abs() < 1e-6)
+            .expect("Example 1-026 never drops to 20 kips");
+        let tip = state.joint_displacements["2"];
+        let case = format!("PUSH ({label})");
+        rows.push(BenchmarkVerificationRow::new(
+            "Ex 1-026",
+            &case,
+            "Uz (tip) at P = 20 k [in]",
+            uz,
+            tip[2],
+            0.005,
+        ));
+        rows.push(BenchmarkVerificationRow::new(
+            "Ex 1-026",
+            &case,
+            "Ry (tip) at P = 20 k [rad]",
+            ry,
+            tip[4],
+            0.15,
+        ));
+    }
+    rows
+}
+
 /// Example 5-001: Solid Element Patch Test (MacNeal & Harder 1985, 7-Element Irregular Unit Cube).
 pub fn verify_example_5_001() -> Vec<BenchmarkVerificationRow> {
     use sap_model::{PointLoadDispl, SolidObj, SolidSection};
@@ -1370,7 +1860,8 @@ pub fn verify_example_6_003() -> Vec<BenchmarkVerificationRow> {
     let bk = 2.0 * zeta / (w1 + w2);
 
     let mut nldhist1 = LoadCase::linear_static("NLDHIST1", "P", 1.0);
-    nldhist1.case_type = LoadCaseType::NonlinearHistory;
+    // The vendor case is a direct-integration history (NLDHIST).
+    nldhist1.case_type = LoadCaseType::NonlinearDynamic;
     nldhist1.loads.clear();
     nldhist1.history_loads = vec![("RAMP20".to_string(), "P".to_string(), 1.0)];
     nldhist1.num_time_steps = 400;
@@ -1446,6 +1937,108 @@ pub fn verify_example_6_003() -> Vec<BenchmarkVerificationRow> {
     ]
 }
 
+/// Example 6-008: Plastic Wen link pushed to +10 in and back to -10 in under
+/// displacement-controlled nonlinear static analysis (kip, in).
+///
+/// The published model loads the link by its own weight as a link gravity
+/// load and orients it with advanced link axes. Neither assignment is modeled,
+/// so this is an equivalent single-joint model: the same link property on a
+/// grounded link along global Z, pushed by a unit joint force that displacement
+/// control scales. The compared quantity is the published link force at each
+/// link deformation, which depends only on the link property.
+pub fn verify_example_6_008() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::{DisplacementControl, LinkObj, LinkProp, LinkPropType};
+
+    // (case label, push of NLSTAT1, push back of NLSTAT2, deformation, published force)
+    let points: [(&str, f64, Option<f64>, f64, f64); 6] = [
+        ("NLSTAT1", 0.2, None, 0.2, 16.836),
+        ("NLSTAT1", 0.8, None, 0.8, 43.915),
+        ("NLSTAT1", 9.6, None, 9.6, 141.000),
+        ("NLSTAT2", 10.0, Some(0.4), 9.6, 105.000),
+        ("NLSTAT2", 10.0, Some(1.4), 8.6, 48.438),
+        ("NLSTAT2", 10.0, Some(19.6), -9.6, -141.000),
+    ];
+    let mut rows = Vec::new();
+    for (label, push, back, deformation, published) in points {
+        let mut model = SapModel::new(Units::KipInF);
+        model.load_cases.clear();
+        model.load_patterns.clear();
+        model.load_patterns.insert(
+            "PUSH".into(),
+            LoadPattern {
+                name: "PUSH".into(),
+                pat_type: LoadPatternType::Other,
+                self_wt_multiplier: 0.0,
+            },
+        );
+        model.active_dofs = [false, false, true, false, false, false];
+        model.add_point("1", 0.0, 0.0, 0.0);
+        model.points["1"].loads_force.push(PointLoadForce {
+            load_pat: "PUSH".into(),
+            csys: "GLOBAL".into(),
+            force: [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+        });
+        let mut prop = LinkProp {
+            name: "PLAW1".into(),
+            link_type: LinkPropType::PlasticWen,
+            ..LinkProp::default()
+        };
+        prop.ke = [0.0; 6];
+        prop.dof_nonlinear[0] = true;
+        prop.k_nl[0] = 100.0;
+        prop.param1[0] = 50.0;
+        prop.param2[0] = 0.1;
+        prop.param3[0] = 1.0;
+        model.link_props.insert("PLAW1".into(), prop);
+        model.links.insert(
+            "1".into(),
+            LinkObj {
+                name: "1".into(),
+                point_i: "1".into(),
+                point_j: None,
+                prop: "PLAW1".into(),
+                angle_deg: 0.0,
+                selected: false,
+            },
+        );
+        let case = |name: &str, scale: f64, target: f64, initial: Option<&str>| {
+            let mut lc = LoadCase::linear_static(name, "PUSH", scale);
+            lc.case_type = LoadCaseType::NonlinearStatic;
+            lc.max_iterations = 100;
+            lc.convergence_tol = 1e-10;
+            lc.initial_case = initial.map(str::to_owned);
+            lc.displacement_control = Some(DisplacementControl {
+                target,
+                monitored: Some(("1".into(), 2)),
+                conjugate: true,
+            });
+            lc
+        };
+        model
+            .load_cases
+            .insert("NLSTAT1".into(), case("NLSTAT1", 1.0, push, None));
+        if let Some(back) = back {
+            model.load_cases.insert(
+                "NLSTAT2".into(),
+                case("NLSTAT2", -1.0, back, Some("NLSTAT1")),
+            );
+        }
+        let computed = match analyze_model(&mut model) {
+            Ok(()) => model.case_results[label].link_forces["1"][0],
+            Err(_) => f64::NAN,
+        };
+        rows.push(BenchmarkVerificationRow::new(
+            "Ex 6-008 (Plastic Wen)",
+            label,
+            &format!("Link force at d = {deformation} in [kips]"),
+            published,
+            computed,
+            0.01,
+        ));
+    }
+    rows
+}
+
 /// Example 6-005: Maxwell Viscoelastic Damper Under Harmonic Sinusoidal Excitation.
 pub fn verify_example_6_005() -> Vec<BenchmarkVerificationRow> {
     use sap_model::{DynamicFunction, LinkObj, LinkProp, LinkPropType};
@@ -1516,7 +2109,8 @@ pub fn verify_example_6_005() -> Vec<BenchmarkVerificationRow> {
         },
     );
     let mut lc = LoadCase::linear_static("NLDHIST1", "P", 1.0);
-    lc.case_type = LoadCaseType::NonlinearHistory;
+    // The vendor case is a direct-integration history (NLDHIST).
+    lc.case_type = LoadCaseType::NonlinearDynamic;
     lc.loads.clear();
     lc.history_loads = vec![("SINE".into(), "P".into(), 1.0)];
     lc.num_time_steps = 1100;
@@ -1828,10 +2422,214 @@ pub fn verify_example_7_003() -> Vec<BenchmarkVerificationRow> {
     ]
 }
 
+/// Cantilever plate strip under an axial force and an end moment (kN, m).
+///
+/// Closed form: L = 4, b = 1, t = 0.2, E = 2.5e7, nu = 0, N = 50 and M0 = 10 about +Y at the
+/// tip. Rotation about +Y moves +X points down, so the strip hogs: by the CSI sign convention
+/// (Analysis Reference, Eqns. 2: positive moments give positive stress at the bottom face)
+/// M11 = -M0/b = -10, and at the top face s11 = N/(b t) + 6 M0/(b t^2) = 250 + 1500 = 1750.
+pub fn verify_shell_cantilever_strip() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::{
+        AreaSection, LoadCase, LoadPattern, LoadPatternType, Material, PointLoadForce, SapModel,
+    };
+    use sap_units::Units;
+    let mut m = SapModel::new(Units::KnMC);
+    let mut mat = Material::default_steel_kip_in();
+    mat.name = "MAT".into();
+    mat.e = 2.5e7;
+    mat.u = 0.0;
+    mat.g = 2.5e7 / 2.0;
+    mat.unit_weight = 0.0;
+    mat.unit_mass = 0.0;
+    m.materials.insert("MAT".into(), mat);
+    let mut sec = AreaSection::default();
+    sec.name = "PL".into();
+    sec.material = "MAT".into();
+    sec.thickness_membrane = 0.2;
+    sec.thickness_bending = 0.2;
+    m.area_sections.insert("PL".into(), sec);
+    m.load_cases.clear();
+    m.load_patterns.clear();
+    m.load_patterns.insert(
+        "D".into(),
+        LoadPattern {
+            name: "D".into(),
+            pat_type: LoadPatternType::Dead,
+            self_wt_multiplier: 0.0,
+        },
+    );
+    m.load_cases
+        .insert("D".into(), LoadCase::linear_static("D", "D", 1.0));
+    for i in 0..=4 {
+        for (j, y) in [0.0, 1.0].iter().enumerate() {
+            let name = format!("J{i}{j}");
+            m.add_point(name.clone(), i as f64, *y, 0.0);
+            if i == 0 {
+                m.points[&name].restraint = [true; 6];
+            }
+            if i == 4 {
+                m.points[&name].loads_force.push(PointLoadForce {
+                    load_pat: "D".into(),
+                    csys: "GLOBAL".into(),
+                    force: [25.0, 0.0, 0.0, 0.0, 5.0, 0.0],
+                });
+            }
+        }
+    }
+    for i in 0..4 {
+        m.add_area(
+            format!("A{i}"),
+            vec![
+                format!("J{i}0"),
+                format!("J{}0", i + 1),
+                format!("J{}1", i + 1),
+                format!("J{i}1"),
+            ],
+            "PL",
+        );
+    }
+    analyze_model(&mut m).expect("cantilever strip analyzes");
+    let area = &m.case_results["D"].area_results["A0"];
+    vec![
+        BenchmarkVerificationRow::new(
+            "Shell Cantilever Strip (CSI Eqns. 2)",
+            "D",
+            "S11 top [kN/m2]",
+            1750.0,
+            area.s11_top,
+            1e-6,
+        ),
+        BenchmarkVerificationRow::new(
+            "Shell Cantilever Strip (CSI Eqns. 2)",
+            "D",
+            "M11 [kN-m/m]",
+            -10.0,
+            area.m11,
+            1e-6,
+        ),
+    ]
+}
+
+/// Modal participating mass ratios about the centre of mass and along rotated joint axes
+/// (CSI Analysis Reference Manual, "Acceleration Loads" p. 339 and "Modal Analysis Output"
+/// pp. 376-378). Closed forms:
+///
+/// - Two offset masses: A at x = -2 (m = 1) and B at x = +2 (m = 3), only UY free, ky = 1 and
+///   12, so w^2 = 1 and 4. The UY centroid is x = 1, M_rz = 1*9 + 3*1 = 12; mode 1 moves A only
+///   (f_rz = -3) so the RZ ratio is 9/12 = 0.75.
+/// - A joint with local axes turned 30 degrees about Z, mass 2, global springs kx = 50 and
+///   ky = 200: mode 1 (w^2 = 25) moves along global X only, so its UX ratio is 1.
+pub fn verify_modal_participation_global() -> Vec<BenchmarkVerificationRow> {
+    use sap_model::{LoadCase, SapModel};
+    let setup = |m: &mut SapModel| {
+        m.load_patterns.clear();
+        m.load_cases.clear();
+        m.load_cases
+            .insert("MODAL".into(), LoadCase::modal_eigen("MODAL", 2));
+    };
+    let mut offset = SapModel::new(Units::KipInF);
+    setup(&mut offset);
+    for (name, x, mass, k) in [("A", -2.0, 1.0, 1.0), ("B", 2.0, 3.0, 12.0)] {
+        offset.add_point(name, x, 0.0, 0.0);
+        let p = offset.points.get_mut(name).unwrap();
+        p.restraint = [true, false, true, true, true, true];
+        p.mass = [mass, mass, mass, 0.0, 0.0, 0.0];
+        p.spring = [0.0, k, 0.0, 0.0, 0.0, 0.0];
+    }
+    analyze_model(&mut offset).expect("modal participation: offset masses failed");
+    let rz = offset.case_results["MODAL"].modes[0].modal_mass_ratios[5];
+
+    let mut turned = SapModel::new(Units::KipInF);
+    setup(&mut turned);
+    turned.add_point("C", 0.0, 0.0, 0.0);
+    {
+        let c = turned.points.get_mut("C").unwrap();
+        c.restraint = [false, false, true, true, true, true];
+        c.mass = [2.0, 2.0, 2.0, 0.0, 0.0, 0.0];
+        c.spring = [50.0, 200.0, 0.0, 0.0, 0.0, 0.0];
+        c.spring_is_local = false;
+        c.local_axes_deg = [30.0, 0.0, 0.0];
+    }
+    analyze_model(&mut turned).expect("modal participation: rotated joint failed");
+    let ux = turned.case_results["MODAL"].modes[0].modal_mass_ratios[0];
+    vec![
+        BenchmarkVerificationRow::new(
+            "Modal participation",
+            "Two offset masses",
+            "RZ participating mass ratio, mode 1",
+            0.75,
+            rz,
+            1e-6,
+        ),
+        BenchmarkVerificationRow::new(
+            "Modal participation",
+            "Joint axes turned 30 degrees",
+            "UX participating mass ratio, mode 1",
+            1.0,
+            ux,
+            1e-6,
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use sap_model::{AreaLoadUniform, AreaSection, DynamicFunction, ModalComboMethod, ShellType};
+
+    /// G16: the analysis of the model of a verification row fails when a case is not
+    /// finished or could not start, so no row is ever compared against states the case did
+    /// not reach. A steel cantilever (kip, in) with an elastic-perfectly-plastic root hinge
+    /// of 2000 kip in carries a tip load by load control: the limit load is
+    /// 2000 / 120 = 16.67 kip; a push of 100 kip stops at it, a push of 10 kip finishes.
+    #[test]
+    fn a_verification_model_with_a_case_that_is_not_finished_fails() {
+        use sap_model::hinge::{FrameHinge, HingeDof, HingePoint, HingeProp};
+        let build = |push: f64| {
+            let mut m = SapModel::new(Units::KipInF);
+            m.load_cases.clear();
+            m.load_patterns.clear();
+            m.load_patterns.insert(
+                "P".into(),
+                LoadPattern {
+                    name: "P".into(),
+                    pat_type: LoadPatternType::Other,
+                    self_wt_multiplier: 0.0,
+                },
+            );
+            let sec = sap_section::make_i_section("W14X90", "A992Fy50", 14.0, 14.5, 0.710, 0.440, 14.5, 0.710);
+            m.frame_sections.insert(sec.name.clone(), sec);
+            m.add_point("A", 0.0, 0.0, 0.0);
+            m.add_point("B", 120.0, 0.0, 0.0);
+            m.points.get_mut("A").unwrap().restraint = [true; 6];
+            m.points.get_mut("B").unwrap().loads_force.push(PointLoadForce {
+                load_pat: "P".into(),
+                csys: "GLOBAL".into(),
+                force: [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+            });
+            m.add_frame("BM", "A", "B", "W14X90");
+            let mut prop = HingeProp::symmetric(
+                "H",
+                HingeDof::M3,
+                [(1.0, 0.0), (1.0, 0.01), (1.0, 0.02), (1.0, 0.03)].map(|(f, d)| HingePoint::new(f, d)),
+            );
+            prop.force_sf = 2000.0;
+            prop.force_sf_negative = 2000.0;
+            m.hinge_props.insert("H".into(), prop);
+            m.frames.get_mut("BM").unwrap().hinges = vec![FrameHinge { prop: "H".into(), rel_dist: 0.0 }];
+            let mut case = LoadCase::linear_static("PUSH", "P", push);
+            case.case_type = LoadCaseType::NonlinearStatic;
+            m.load_cases.insert("PUSH".into(), case);
+            m
+        };
+        let mut finished = build(10.0);
+        analyze_model(&mut finished).expect("a push below the limit load finishes");
+        let mut short = build(100.0);
+        crate::analyze_model(&mut short).expect("the solver itself returns Ok");
+        assert!(!short.case_results["PUSH"].status.is_finished());
+        let e = analyze_model(&mut build(100.0)).unwrap_err().to_string();
+        assert!(e.contains("verification case 'PUSH' is not finished") && e.contains("limit"), "{e}");
+    }
 
     #[test]
     fn test_official_sap2000_verification_suite() {

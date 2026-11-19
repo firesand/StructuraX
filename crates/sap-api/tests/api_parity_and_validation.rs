@@ -64,6 +64,7 @@ fn populated_model_with_results() -> cSapModel {
             phi_vn3: 80.0,
             status: "OK".into(),
             eq_name: "H1-1b".into(),
+            notes: Vec::new(),
         },
     );
     api.inner.concrete_design_results.insert(
@@ -78,6 +79,9 @@ fn populated_model_with_results() -> cSapModel {
             as_bot: 1.5,
             as_side: 0.0,
             av_over_s: 0.05,
+            at_over_s: 0.0,
+            al_torsion: 0.0,
+            notes: Vec::new(),
             pmm_ratio: 0.0,
             min_rebar_area: 0.8,
             status: "OK".into(),
@@ -734,6 +738,8 @@ fn damper_link_spectrum_directions_and_expanded_results_queries() {
     );
     let mut nlh = LoadCase::linear_static("NLH", "DEAD", 1.0);
     nlh.case_type = LoadCaseType::NonlinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    nlh.modal_damping = 0.;
     nlh.loads.clear();
     nlh.history_loads = vec![("STEP".into(), "DEAD".into(), 1.0)];
     nlh.num_time_steps = 40;

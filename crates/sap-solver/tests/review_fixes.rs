@@ -34,6 +34,8 @@ fn history(m: &mut SapModel, name: &str, steps: usize) {
     let mut c = LoadCase::linear_static(name, "DEAD", 1.);
     c.loads.clear();
     c.case_type = LoadCaseType::NonlinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    c.modal_damping = 0.;
     c.history_loads = vec![("RAMP".into(), "DEAD".into(), 1.)];
     c.time_step_dt = 0.01;
     c.num_time_steps = steps;
@@ -169,6 +171,8 @@ fn history_origin_continuation_fails_without_stale_results() {
     m.points["J"].spring[0] = 100.;
     history(&mut m, "H1", 10);
     m.load_cases["H1"].case_type = LoadCaseType::LinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    m.load_cases["H1"].modal_damping = 0.;
     analyze_model(&mut m).unwrap();
     assert!(m.case_results["H1"].transient_state.is_some());
 
@@ -176,6 +180,7 @@ fn history_origin_continuation_fails_without_stale_results() {
     m.load_cases["H2"].history_loads.clear();
     m.load_cases["H2"].initial_case = Some("H1".into());
     m.load_cases["H2"].case_type = LoadCaseType::LinearHistory;
+    m.load_cases["H2"].modal_damping = 0.;
     analyze_model(&mut m).unwrap();
     assert!(m.case_results["H2"].transient_state.is_some());
 
@@ -712,6 +717,8 @@ fn nonlinear_gap_hook_maxwell_split_history_and_terminal_static_continuation() {
     let mut h_full = LoadCase::linear_static("H_FULL", "DEAD", 1.);
     h_full.loads.clear();
     h_full.case_type = LoadCaseType::NonlinearHistory;
+    // Modal history types are integrated directly; they take no modal damping.
+    h_full.modal_damping = 0.;
     h_full.time_integration = TimeIntegrationMethod::HilberHughesTaylor;
     h_full.hht_alpha = -0.1;
     h_full.rayleigh_damping = (2.5, 0.02);
@@ -855,6 +862,15 @@ fn topological_nested_load_combinations_and_skipped_first_envelope_case() {
             ],
         },
     );
+    // D78: the same envelope without the unrun case is complete and keeps the old values.
+    m.load_combos.insert(
+        "ENV_RUN".into(),
+        LoadCombo {
+            name: "ENV_RUN".into(),
+            combo_type: ComboType::Envelope,
+            cases: vec![("CASE_B".into(), 0.2), ("CASE_A".into(), 0.3)],
+        },
+    );
     // Combo with 0 solved constituent cases must NOT be inserted
     m.load_combos.insert(
         "EMPTY_COMBO".into(),
@@ -892,12 +908,19 @@ fn topological_nested_load_combinations_and_skipped_first_envelope_case() {
     close(m.case_results["C1"].frame_forces["B"][0].p, -100.0);
     close(m.case_results["C1"].base_reactions[0], 100.0);
 
-    // ENV_SKIP: first contributed case is 0.2 * CASE_B (-0.10), which beats 0.3 * CASE_A (+0.06)
-    close(
-        m.case_results["ENV_SKIP"].joint_displacements["J"][0],
-        -0.10,
-    );
-    close(m.case_results["ENV_SKIP"].frame_forces["B"][0].p, -10.0);
+    // D78: ENV_SKIP names the unrun case UNRUN; before, it was published as the envelope
+    // of the other two (+0.06 / -0.10). It is now unavailable, with the reason.
+    assert!(!m.case_results.contains_key("ENV_SKIP"));
+    assert!(m.unavailable_results["ENV_SKIP"].contains("'UNRUN'"));
+    // ENV_RUN (Analysis Reference p. 352: maximum of the maxima, minimum of the
+    // minima): the contributions are 0.2 * CASE_B = -0.10 (P = -10) and
+    // 0.3 * CASE_A = +0.06 (P = +6). Maximum +0.06 and +6, minimum -0.10 and -10.
+    let env = &m.case_results["ENV_RUN"];
+    close(env.joint_displacements["J"][0], 0.06);
+    close(env.frame_forces["B"][0].p, 6.0);
+    let lo = env.combo_min.as_ref().expect("an envelope is multi-valued");
+    close(lo.joint_displacements["J"][0], -0.10);
+    close(lo.frame_forces["B"][0].p, -10.0);
 
     assert!(!m.case_results.contains_key("EMPTY_COMBO"));
     assert!(!m.case_results.contains_key("CYC_A"));

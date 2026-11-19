@@ -4,15 +4,30 @@ StructuraX is an experimental native structural-analysis and member-design appli
 
 **Development status:** selected analytical checks pass; full SAP2000 compatibility and engineering acceptance have not been established. The `1.0.0` package version is inherited metadata, not a certification or declaration of production readiness. See [review follow-up](docs/review/structurax-followup/REVIEW.md) before relying on the newer solver and export paths.
 
+## Screenshots
+
+The program's own windows, with a generated test model (a three-storey concrete frame), captured on 2026-11-19 on a private display. They show what the windows draw, not a comparison with SAP2000.
+
+| Deformed shape | Moment diagram M3 | Concrete design (Eurocode 2) |
+| --- | --- | --- |
+| ![Deformed shape of the test frame under dead load](docs/screenshots/deformed-shape.png) | ![Bending moment diagram M3 of the test frame](docs/screenshots/moment-diagram.png) | ![Required reinforcement and column interaction ratios of the test frame](docs/screenshots/concrete-design.png) |
+
 ## Implemented areas
 
-- Frame, area/shell, and solid element analysis, plus selected cable and nonlinear link formulations.
-- Static, modal, buckling, response-spectrum, and selected direct-integration history cases.
-- Selected AISC 360-10, EC3, ACI 318-14, and EC2 member checks.
-- Geometry/load/material editing, case/function definitions, result displays, and Rust API access.
+- Frame, area/shell, and solid element analysis, plus selected cable and nonlinear link formulations; frame end offsets, insertion points and automatic subdivision.
+- Static, modal (eigenvectors and Ritz vectors), buckling, response-spectrum, modal and direct-integration history cases; P-Delta; nonlinear static cases with user-defined frame hinges, saved states and a pushover curve, for the combinations the capability inventory lists.
+- Mass source and ASCE 7-10 automatic seismic loads with entered coefficients.
+- Selected AISC 360-10, EC3, ACI 318-14, and EC2 member checks, with Auto Select section lists and default design combinations. A member the design cannot handle is reported with its reason, and the other members are designed.
+- Geometry/load/material editing with grid and plane views, case/function definitions, result displays (deformed shapes, shell stresses, contours, plot functions, hinge results), and Rust API access with interactive tables.
 - Selected S2K text interchange with source preservation; native SDB inspection, import, exact copying, and experimental export.
 
 These are scoped implementations. Unsupported combinations and known defects are documented in the review and [capability inventory](docs/reconstruction/CAPABILITIES.md). Native export passing this project's parser does not prove that SAP2000 will accept the file. Layered sections, general large-displacement behavior, full design-code coverage, complete history continuation, and broad GUI/API parity must not be inferred from the feature list.
+
+## Recent changes to results
+
+Design results and several analysis results changed on 2026-11-19, after an outside audit of the whole program. [The audit note](docs/reconstruction/audit-2026-11-19.md) lists what moved, what is now refused by name, and what was not verified. Nothing was run in SAP2000: agreement rests on the vendor's manuals and published examples and on hand calculations.
+
+[The progress ledger](docs/reconstruction/tutorial-video-progress.md) tracks every known defect and missing feature with its status and a timeline of the work. It has open defects, two of them unconservative: an I section with a noncompact web takes the plastic moment, and a concrete beam that is not rectangular is designed as a rectangle.
 
 ## Build and run
 
@@ -50,7 +65,7 @@ cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo run --locked --bin structurax -- verify
 ```
 
-The built-in comparisons are selected synthetic/reference examples, not the complete vendor verification suite. Several legacy tests use locally supplied vendor fixtures and skip when absent. The seven newer solver fixture tests require explicit opt-in: `cargo test -p sap-solver --features vendor-fixtures --test wave4_vendor_regressions`. Set `STRUCTURAX_VENDOR_FIXTURES` to the fixture directory, or use the local `extracted/files/` directory. CI runs without vendor assets. Historical reports under `docs/reconstruction/` describe their own checkpoints and may refer to local-only evidence under `target/`.
+The built-in comparisons are selected synthetic/reference examples, not the complete vendor verification suite. Several legacy tests use locally supplied vendor fixtures and skip when absent. The fourteen newer solver fixture tests (one of them slow and ignored by default) require explicit opt-in: `cargo test -p sap-solver --features vendor-fixtures --test wave4_vendor_regressions`. Set `STRUCTURAX_VENDOR_FIXTURES` to the fixture directory, or use the local `extracted/files/` directory. CI runs without vendor assets. Historical reports under `docs/reconstruction/` describe their own checkpoints and may refer to local-only evidence under `target/`.
 
 ## Packages
 

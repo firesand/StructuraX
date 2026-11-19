@@ -15,6 +15,7 @@ use sap_model::{
 use sap_units::Units;
 
 use crate::{FormatError, ImportReport};
+use sap_model::{UnmodeledScope, UnmodeledSourceData};
 
 thread_local! {
     static COLUMN_READS: std::cell::RefCell<(String, BTreeMap<String, std::collections::BTreeSet<String>>)> = const { std::cell::RefCell::new((String::new(), BTreeMap::new())) };
@@ -128,6 +129,149 @@ fn get_bool(row: &BTreeMap<String, String>, key: &str) -> Option<bool> {
     })
 }
 
+/// A missing column is `None`; a present column that is not a finite number
+/// is an import error naming the table, the column and the value.
+fn strict_f64(
+    row: &BTreeMap<String, String>,
+    table: &str,
+    key: &str,
+) -> Result<Option<f64>, FormatError> {
+    match get_str(row, key) {
+        None => Ok(None),
+        Some(text) => text
+            .replace(',', ".")
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
+            .map(Some)
+            .ok_or_else(|| {
+                FormatError::ParseS2k(format!("{table}: {key} '{text}' is not a finite number"))
+            }),
+    }
+}
+
+fn strict_usize(
+    row: &BTreeMap<String, String>,
+    table: &str,
+    key: &str,
+) -> Result<Option<usize>, FormatError> {
+    match get_str(row, key) {
+        None => Ok(None),
+        Some(text) => text.trim().parse::<usize>().map(Some).map_err(|_| {
+            FormatError::ParseS2k(format!(
+                "{table}: {key} '{text}' is not a non-negative whole number"
+            ))
+        }),
+    }
+}
+
+fn strict_bool(
+    row: &BTreeMap<String, String>,
+    table: &str,
+    key: &str,
+) -> Result<Option<bool>, FormatError> {
+    match get_str(row, key) {
+        None => Ok(None),
+        Some(text) => match text.trim().to_ascii_uppercase().as_str() {
+            "YES" | "TRUE" | "1" | "Y" | "ON" => Ok(Some(true)),
+            "NO" | "FALSE" | "0" | "N" | "OFF" => Ok(Some(false)),
+            _ => Err(FormatError::ParseS2k(format!(
+                "{table}: {key} '{text}' is not Yes or No"
+            ))),
+        },
+    }
+}
+
+fn required_str<'a>(
+    row: &'a BTreeMap<String, String>,
+    table: &str,
+    key: &str,
+) -> Result<&'a str, FormatError> {
+    get_str(row, key)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| FormatError::ParseS2k(format!("{table} row needs {key}")))
+}
+
+/// Genuine SAP2000 hinge tables (names evidenced in the vendor report schema)
+/// whose columns are not known: their rows stay verbatim in the source text
+/// and the nonlinear cases that depend on them are refused.
+fn is_vendor_hinge_table(name: &str) -> bool {
+    name.starts_with("HINGES DEF")
+        || name.starts_with("HINGE DEF")
+        || name.starts_with("FRAME HINGE ASSIGN")
+}
+
+/// Point labels of the "RUST HINGE PROPERTIES - CURVE" table in storage order:
+/// `positive[0..4]` then `negative[0..4]`.
+const HINGE_POINT_LABELS: [&str; 8] = ["B", "C", "D", "E", "-B", "-C", "-D", "-E"];
+
+/// Reads the reconstruction columns of "LOAD CASE DEFINITIONS" that hold the
+/// nonlinear static parameters. Absent columns keep the defaults.
+fn parse_nl_static_columns(
+    row: &BTreeMap<String, String>,
+    lc: &mut LoadCase,
+) -> Result<(), FormatError> {
+    use sap_model::hinge::{HingeUnloading, ResultsSaved};
+    const TABLE: &str = "LOAD CASE DEFINITIONS";
+    let case = lc.name.clone();
+    let min = strict_usize(row, TABLE, "RustMinSaved")?;
+    let max = strict_usize(row, TABLE, "RustMaxSaved")?;
+    let positive_only = strict_bool(row, TABLE, "RustPositiveOnly")?;
+    let saved = get_str(row, "RustResultsSaved").map(str::to_ascii_uppercase);
+    match saved.as_deref() {
+        None | Some("FINAL") => {
+            if min.is_some() || max.is_some() || positive_only.is_some() {
+                return Err(FormatError::ParseS2k(format!(
+                    "{TABLE}: case '{case}' gives RustMinSaved, RustMaxSaved or RustPositiveOnly without RustResultsSaved=Multiple"
+                )));
+            }
+        }
+        Some("MULTIPLE") => {
+            let (min_saved, max_saved) = (min.unwrap_or(10), max.unwrap_or(100));
+            if min_saved < 1 || max_saved < min_saved {
+                return Err(FormatError::ParseS2k(format!(
+                    "{TABLE}: case '{case}' has RustMinSaved {min_saved} and RustMaxSaved {max_saved}; need 1 <= min <= max"
+                )));
+            }
+            lc.nl_static.results_saved = ResultsSaved::MultipleStates {
+                min_saved,
+                max_saved,
+                positive_only: positive_only.unwrap_or(true),
+            };
+        }
+        Some(_) => {
+            return Err(FormatError::ParseS2k(format!(
+                "{TABLE}: RustResultsSaved '{}' of case '{case}' is not Final or Multiple",
+                get_str(row, "RustResultsSaved").unwrap_or("")
+            )));
+        }
+    }
+    if let Some(steps) = strict_usize(row, TABLE, "RustMaxTotalSteps")? {
+        if steps < 1 {
+            return Err(FormatError::ParseS2k(format!(
+                "{TABLE}: RustMaxTotalSteps 0 of case '{case}' must be at least 1"
+            )));
+        }
+        lc.nl_static.max_total_steps = steps;
+    }
+    if let Some(steps) = strict_usize(row, TABLE, "RustMaxNullSteps")? {
+        lc.nl_static.max_null_steps = steps;
+    }
+    if let Some(text) = get_str(row, "RustHingeUnloading") {
+        lc.nl_static.hinge_unloading = match text.to_ascii_uppercase().as_str() {
+            "UNLOADENTIRESTRUCTURE" => HingeUnloading::UnloadEntireStructure,
+            "APPLYLOCALREDISTRIBUTION" => HingeUnloading::ApplyLocalRedistribution,
+            "RESTARTUSINGSECANTSTIFFNESS" => HingeUnloading::RestartUsingSecantStiffness,
+            _ => {
+                return Err(FormatError::ParseS2k(format!(
+                    "{TABLE}: RustHingeUnloading '{text}' of case '{case}' is not UnloadEntireStructure, ApplyLocalRedistribution or RestartUsingSecantStiffness"
+                )));
+            }
+        };
+    }
+    Ok(())
+}
+
 // Do not turn malformed physical input into zero/default values. Missing optional fields
 // still retain their existing defaults; a supplied invalid number is an import error.
 fn validate_physical_fields(
@@ -205,8 +349,10 @@ fn validate_physical_fields(
     for key in keys {
         if get_str(row, key).is_some() && !get_f64(row, key).is_some_and(f64::is_finite) {
             return Err(FormatError::ParseS2k(format!(
-                "Invalid finite number for {} in {}",
-                key, table
+                "Invalid finite number for {} in {}: '{}'",
+                key,
+                table,
+                get_str(row, key).unwrap_or("")
             )));
         }
     }
@@ -447,6 +593,10 @@ fn table_priority(name: &str) -> u8 {
         | "LOAD PATTERN DEFINITIONS"
         | "LOAD CASE DEFINITIONS" => 7,
         "JOINT COORDINATES" => 9,
+        // Hinge curves follow their properties; assignments follow both and
+        // the frame objects (priority 10).
+        "RUST HINGE PROPERTIES - CURVE" => 12,
+        "RUST FRAME HINGE ASSIGNMENTS" | "RUST FRAME HINGE OVERWRITES" => 13,
         _ if name.starts_with("MATERIAL PROPERTIES") => 4,
         _ if name.starts_with("FRAME SECTION PROPERTIES") => 6,
         _ if name.starts_with("LINK PROPERTY DEFINITIONS") => 8,
@@ -558,6 +708,9 @@ pub(super) fn parse_s2k_internal(
     let mut cleared_lcases = false;
     let mut saw_table = false;
     let mut saw_case_loads_table = false;
+    // Which of the eight curve points each hinge property has been given.
+    let mut hinge_points_seen: BTreeMap<String, std::collections::BTreeSet<usize>> =
+        BTreeMap::new();
     let mut unsupported_tables = std::collections::BTreeSet::new();
     let mut explicit_nonlinear_rows: BTreeMap<String, std::collections::BTreeSet<usize>> =
         BTreeMap::new();
@@ -650,6 +803,36 @@ pub(super) fn parse_s2k_internal(
             )));
         }
         if !preservation::supported_table(&current_table) {
+            if is_vendor_hinge_table(&current_table) {
+                let description = format!(
+                    "frame hinge data in S2K table '{current_table}', which is kept verbatim but not interpreted"
+                );
+                if !model
+                    .unmodeled_source
+                    .iter()
+                    .any(|entry| entry.description == description)
+                {
+                    model.unmodeled_source.push(UnmodeledSourceData {
+                        scope: UnmodeledScope::NonlinearCases,
+                        description,
+                    });
+                }
+            }
+            if current_table == "FRAME P-DELTA FORCE ASSIGNMENTS" {
+                // G77: the vendor spelling of the direction column is not in the
+                // vendor material, so the table is kept verbatim, not read.
+                let description = "vendor P-Delta force table not interpreted: direction spelling not established".to_string();
+                if !model
+                    .unmodeled_source
+                    .iter()
+                    .any(|entry| entry.description == description)
+                {
+                    model.unmodeled_source.push(UnmodeledSourceData {
+                        scope: UnmodeledScope::AllCases,
+                        description,
+                    });
+                }
+            }
             unsupported_tables.insert(current_table.clone());
             continue;
         }
@@ -1237,6 +1420,9 @@ pub(super) fn parse_s2k_internal(
                             if let Some(p2) = get_f64(&row, "Param2") {
                                 lp.param2[i] = p2;
                             }
+                            if let Some(p3) = get_f64(&row, "Param3") {
+                                lp.param3[i] = p3;
+                            }
                         }
                     }
                 }
@@ -1497,6 +1683,44 @@ pub(super) fn parse_s2k_internal(
                     }
                     if let Some(ms) = get_i32(&row, "MinSta") {
                         fr.min_stations = ms.max(1) as usize;
+                    }
+                    if let Some(segments) = get_i32(&row, "MeshSegments") {
+                        fr.auto_mesh_segments = segments.max(0) as usize;
+                    }
+                    if let Some(at_joints) = get_bool(&row, "MeshAtJoints") {
+                        fr.auto_mesh_at_joints = at_joints;
+                    }
+                    if let Some(framing) = get_str(&row, "ConcFraming") {
+                        fr.concrete_framing = match framing.to_ascii_uppercase().as_str() {
+                            "SPECIAL" => sap_model::ConcreteFramingType::SwaySpecial,
+                            "INTERMEDIATE" => sap_model::ConcreteFramingType::SwayIntermediate,
+                            "ORDINARY" => sap_model::ConcreteFramingType::SwayOrdinary,
+                            "NONSWAY" => sap_model::ConcreteFramingType::NonSway,
+                            other => {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "frame '{fname}' has an unknown ConcFraming value '{other}'"
+                                )))
+                            }
+                        };
+                    }
+                    let auto_design = get_str(&row, "AutoSelDesign");
+                    let auto_analysis = get_str(&row, "AutoSelAnalysis");
+                    if auto_design.is_some() || auto_analysis.is_some() {
+                        fr.auto_select = Some(sap_model::auto_select::AutoSelectState {
+                            design: auto_design.unwrap_or("").to_string(),
+                            analysis: auto_analysis.map(str::to_owned),
+                        });
+                    }
+                    if get_bool(&row, "SteelOverwrite") == Some(true) {
+                        fr.steel_overwrite = Some(sap_model::SteelDesignOverwrite {
+                            l_ratio_major: get_f64(&row, "SteelL33"),
+                            l_ratio_minor: get_f64(&row, "SteelL22"),
+                            l_ratio_ltb: get_f64(&row, "SteelLtb"),
+                            k_major: get_f64(&row, "SteelK33"),
+                            k_minor: get_f64(&row, "SteelK22"),
+                            cb: get_f64(&row, "SteelCb"),
+                            is_sway: get_bool(&row, "SteelSway") == Some(true),
+                        });
                     }
                 }
             }
@@ -1821,6 +2045,9 @@ pub(super) fn parse_s2k_internal(
                     if let Some(ec) = get_bool(&row, "EdgeConstraint") {
                         ar.edge_constraint = ec;
                     }
+                    if let Some(mass) = get_f64(&row, "MassPerArea") {
+                        ar.mass_per_area = mass;
+                    }
                 }
             }
             "AREA SECTION ASSIGNMENTS" => {
@@ -1829,6 +2056,47 @@ pub(super) fn parse_s2k_internal(
                         if let Some(sec) = get_str(&row, "Section") {
                             ar.section = sec.to_string();
                         }
+                    }
+                }
+            }
+            "AREA STIFFNESS MODIFIERS" => {
+                // D119: the vendor name and columns (v19 report keys, RE catalog).
+                const KNOWN: [&str; 12] = [
+                    "AREA", "GUID", "F11", "F22", "F12", "M11", "M22", "M12", "V13", "V23",
+                    "MASSMOD", "WEIGHTMOD",
+                ];
+                let others: Vec<&String> =
+                    row.keys().filter(|k| !KNOWN.contains(&k.as_str())).collect();
+                if !others.is_empty() {
+                    for column in others {
+                        let description = format!(
+                            "area modifier column '{column}' of S2K table 'AREA STIFFNESS MODIFIERS' is not interpreted; its values are not applied"
+                        );
+                        if !model
+                            .unmodeled_source
+                            .iter()
+                            .any(|entry| entry.description == description)
+                        {
+                            model.unmodeled_source.push(UnmodeledSourceData {
+                                scope: UnmodeledScope::AllCases,
+                                description,
+                            });
+                        }
+                    }
+                } else if let Some(aname) = get_str(&row, "Area") {
+                    if let Some(ar) = model.areas.get_mut(aname) {
+                        ar.modifiers = [
+                            get_f64(&row, "f11").unwrap_or(1.0),
+                            get_f64(&row, "f22").unwrap_or(1.0),
+                            get_f64(&row, "f12").unwrap_or(1.0),
+                            get_f64(&row, "m11").unwrap_or(1.0),
+                            get_f64(&row, "m22").unwrap_or(1.0),
+                            get_f64(&row, "m12").unwrap_or(1.0),
+                            get_f64(&row, "v13").unwrap_or(1.0),
+                            get_f64(&row, "v23").unwrap_or(1.0),
+                            get_f64(&row, "MassMod").unwrap_or(1.0),
+                            get_f64(&row, "WeightMod").unwrap_or(1.0),
+                        ];
                     }
                 }
             }
@@ -2055,6 +2323,214 @@ pub(super) fn parse_s2k_internal(
                     }
                 }
             }
+            "RUST HINGE PROPERTIES" => {
+                const TABLE: &str = "RUST HINGE PROPERTIES";
+                use sap_model::hinge::{
+                    HingeAcceptance, HingeBehavior, HingeBeyondE, HingeDof, HingePoint, HingeProp,
+                };
+                let name = required_str(&row, TABLE, "Name")?;
+                if model.hinge_props.contains_key(name) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: property '{name}' is defined twice"
+                    )));
+                }
+                let dof_text = required_str(&row, TABLE, "DOF")?;
+                let dof = HingeDof::from_label(dof_text).ok_or_else(|| {
+                    FormatError::ParseS2k(format!(
+                        "{TABLE}: DOF '{dof_text}' of property '{name}' is not P, V2, V3, T, M2 or M3"
+                    ))
+                })?;
+                let behavior = match get_str(&row, "Behavior").map(str::to_ascii_uppercase) {
+                    None => HingeBehavior::default(),
+                    Some(v) if v == "DEFORMATIONCONTROLLED" => HingeBehavior::DeformationControlled,
+                    Some(v) if v == "FORCECONTROLLED" => HingeBehavior::ForceControlled,
+                    Some(_) => {
+                        return Err(FormatError::ParseS2k(format!(
+                            "{TABLE}: Behavior '{}' of property '{name}' is not DeformationControlled or ForceControlled",
+                            get_str(&row, "Behavior").unwrap_or("")
+                        )));
+                    }
+                };
+                let beyond_e = match get_str(&row, "BeyondE").map(str::to_ascii_uppercase) {
+                    None => Some(HingeBeyondE::DropsToZero),
+                    Some(v) if v == "DROPSTOZERO" => Some(HingeBeyondE::DropsToZero),
+                    Some(v) if v == "EXTRAPOLATED" => Some(HingeBeyondE::Extrapolated),
+                    Some(v) if v == "NOTESTABLISHED" => None,
+                    Some(_) => {
+                        return Err(FormatError::ParseS2k(format!(
+                            "{TABLE}: BeyondE '{}' of property '{name}' is not DropsToZero, Extrapolated or NotEstablished",
+                            get_str(&row, "BeyondE").unwrap_or("")
+                        )));
+                    }
+                };
+                let symmetric = strict_bool(&row, TABLE, "Symmetric")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE} row of '{name}' needs Symmetric"))
+                })?;
+                let number = |key: &str, default: f64| -> Result<f64, FormatError> {
+                    Ok(strict_f64(&row, TABLE, key)?.unwrap_or(default))
+                };
+                let prop = HingeProp {
+                    name: name.to_string(),
+                    dof,
+                    behavior,
+                    symmetric,
+                    positive: [HingePoint::default(); 4],
+                    negative: [HingePoint::default(); 4],
+                    force_sf: number("ForceSF", 1.0)?,
+                    deformation_sf: number("DeformSF", 1.0)?,
+                    force_sf_negative: number("ForceSFNeg", 1.0)?,
+                    deformation_sf_negative: number("DeformSFNeg", 1.0)?,
+                    acceptance_positive: HingeAcceptance {
+                        io: number("IO", 0.0)?,
+                        ls: number("LS", 0.0)?,
+                        cp: number("CP", 0.0)?,
+                    },
+                    acceptance_negative: HingeAcceptance {
+                        io: number("IONeg", 0.0)?,
+                        ls: number("LSNeg", 0.0)?,
+                        cp: number("CPNeg", 0.0)?,
+                    },
+                    beyond_e,
+                };
+                model.hinge_props.insert(name.to_string(), prop);
+            }
+            "RUST HINGE PROPERTIES - CURVE" => {
+                const TABLE: &str = "RUST HINGE PROPERTIES - CURVE";
+                let name = required_str(&row, TABLE, "Name")?;
+                let label = required_str(&row, TABLE, "Point")?;
+                let index = HINGE_POINT_LABELS
+                    .iter()
+                    .position(|l| l.eq_ignore_ascii_case(label))
+                    .ok_or_else(|| {
+                        FormatError::ParseS2k(format!(
+                            "{TABLE}: Point '{label}' of property '{name}' is not B, C, D, E, -B, -C, -D or -E"
+                        ))
+                    })?;
+                let force = strict_f64(&row, TABLE, "Force")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE} row {label} of '{name}' needs Force"))
+                })?;
+                let deformation = strict_f64(&row, TABLE, "Deform")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE} row {label} of '{name}' needs Deform"))
+                })?;
+                let Some(prop) = model.hinge_props.get_mut(name) else {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: names unknown hinge property '{name}'"
+                    )));
+                };
+                if !hinge_points_seen
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(index)
+                {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: point {label} of property '{name}' is given twice"
+                    )));
+                }
+                let point = sap_model::hinge::HingePoint { force, deformation };
+                if index < 4 {
+                    prop.positive[index] = point;
+                } else {
+                    prop.negative[index - 4] = point;
+                }
+            }
+            "RUST FRAME HINGE ASSIGNMENTS" => {
+                const TABLE: &str = "RUST FRAME HINGE ASSIGNMENTS";
+                let frame = required_str(&row, TABLE, "Frame")?;
+                let prop = required_str(&row, TABLE, "Prop")?;
+                let number = strict_usize(&row, TABLE, "HingeNum")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE} row of frame '{frame}' needs HingeNum"))
+                })?;
+                let rel_dist = strict_f64(&row, TABLE, "RelDist")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE} row of frame '{frame}' needs RelDist"))
+                })?;
+                if !(0.0..=1.0).contains(&rel_dist) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: RelDist {rel_dist} of frame '{frame}' is outside 0 to 1"
+                    )));
+                }
+                if !model.hinge_props.contains_key(prop) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: frame '{frame}' names unknown hinge property '{prop}'"
+                    )));
+                }
+                let Some(obj) = model.frames.get_mut(frame) else {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: names unknown frame '{frame}'"
+                    )));
+                };
+                if number != obj.hinges.len() + 1 {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: HingeNum {number} of frame '{frame}' must be {} (hinges are numbered 1, 2, ... in order)",
+                        obj.hinges.len() + 1
+                    )));
+                }
+                obj.hinges.push(sap_model::hinge::FrameHinge {
+                    prop: prop.to_string(),
+                    rel_dist,
+                });
+            }
+            "RUST FRAME HINGE OVERWRITES" => {
+                const TABLE: &str = "RUST FRAME HINGE OVERWRITES";
+                let frame = required_str(&row, TABLE, "Frame")?;
+                let auto_subdivide =
+                    strict_bool(&row, TABLE, "AutoSubdivide")?.ok_or_else(|| {
+                        FormatError::ParseS2k(format!(
+                            "{TABLE} row of frame '{frame}' needs AutoSubdivide"
+                        ))
+                    })?;
+                let relative_length = strict_f64(&row, TABLE, "RelLength")?.unwrap_or(0.02);
+                if !(relative_length > 0.0 && relative_length <= 1.0) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: RelLength {relative_length} of frame '{frame}' must lie in (0, 1]"
+                    )));
+                }
+                let do_not_drop_load = strict_bool(&row, TABLE, "DoNotDropLoad")?.unwrap_or(false);
+                let Some(obj) = model.frames.get_mut(frame) else {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: names unknown frame '{frame}'"
+                    )));
+                };
+                if obj.hinge_overwrite.is_some() {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: frame '{frame}' has two hinge overwrites"
+                    )));
+                }
+                obj.hinge_overwrite = Some(sap_model::hinge::FrameHingeOverwrite {
+                    auto_subdivide,
+                    relative_length,
+                    do_not_drop_load,
+                });
+            }
+            "RUST UNMODELED SOURCE DATA" => {
+                let target = get_str(&row, "Target").unwrap_or("").to_string();
+                let scope = match get_str(&row, "Scope")
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "ALL" => UnmodeledScope::AllCases,
+                    "NONLINEAR" => UnmodeledScope::NonlinearCases,
+                    "DYNAMIC" => UnmodeledScope::DynamicCases,
+                    "NOTLINEARSTATIC" => UnmodeledScope::AllButLinearStatic,
+                    "PATTERN" if !target.is_empty() => UnmodeledScope::LoadPattern(target),
+                    "CASE" if !target.is_empty() => UnmodeledScope::Case(target),
+                    // An unreadable entry must not turn into "nothing is missing".
+                    _ => {
+                        return Err(FormatError::ParseS2k(
+                            "Invalid RUST UNMODELED SOURCE DATA row: Scope must be All, Nonlinear, Dynamic, NotLinearStatic, Pattern or Case, with a Target for Pattern and Case".into(),
+                        ));
+                    }
+                };
+                let description = get_str(&row, "Description").unwrap_or("").to_string();
+                if description.is_empty() {
+                    return Err(FormatError::ParseS2k(
+                        "RUST UNMODELED SOURCE DATA row needs a Description".into(),
+                    ));
+                }
+                model
+                    .unmodeled_source
+                    .push(UnmodeledSourceData { scope, description });
+            }
             "LOAD PATTERN DEFINITIONS" => {
                 if !cleared_lpats {
                     model.load_patterns.clear();
@@ -2101,6 +2577,14 @@ pub(super) fn parse_s2k_internal(
                     };
                     let mut lc = LoadCase::linear_static(name, name, 1.0);
                     lc.case_type = ctype;
+                    // Modal history types carry no modal damping unless the row
+                    // states one; the general 0.05 default is for spectra.
+                    if matches!(
+                        ctype,
+                        LoadCaseType::LinearHistory | LoadCaseType::NonlinearHistory
+                    ) {
+                        lc.modal_damping = 0.0;
+                    }
                     lc.loads.clear();
                     lc.run_flag = get_bool(&row, "RunCase").unwrap_or(true);
                     if let Some(ic) = get_str(&row, "InitialCond") {
@@ -2180,13 +2664,219 @@ pub(super) fn parse_s2k_internal(
                     if let Some(nbm) = get_i32(&row, "NumBucklingModes") {
                         lc.num_buckling_modes = nbm.max(0) as usize;
                     }
+                    if let Some(target) = get_f64(&row, "RustDisplTarget") {
+                        let dof = match get_str(&row, "RustDisplDOF")
+                            .map(|v| v.to_ascii_uppercase())
+                            .as_deref()
+                        {
+                            Some("U1") => Some(0),
+                            Some("U2") => Some(1),
+                            Some("U3") => Some(2),
+                            Some("R1") => Some(3),
+                            Some("R2") => Some(4),
+                            Some("R3") => Some(5),
+                            Some(_) => {
+                                return Err(FormatError::ParseS2k(
+                                    "Invalid RustDisplDOF; expected U1..U3 or R1..R3".into(),
+                                ));
+                            }
+                            None => None,
+                        };
+                        lc.displacement_control = Some(sap_model::DisplacementControl {
+                            target,
+                            monitored: get_str(&row, "RustDisplJoint").map(str::to_owned).zip(dof),
+                            conjugate: get_bool(&row, "RustDisplConjugate").unwrap_or(false),
+                        });
+                    }
+                    if let Some(modal) = get_str(&row, "RustModalCase") {
+                        lc.modal_case = Some(modal.to_string());
+                    }
+                    parse_nl_static_columns(&row, &mut lc)?;
                     model.load_cases.insert(name.to_string(), lc);
                 }
             }
+            "RUST CASE - MODAL RITZ CONTROLS" => {
+                let (Some(case), Some(load)) = (get_str(&row, "Case"), get_str(&row, "LoadName"))
+                else {
+                    return Err(FormatError::ParseS2k(
+                        "RUST CASE - MODAL RITZ CONTROLS row needs Case and LoadName".into(),
+                    ));
+                };
+                let max_cycles = get_i32(&row, "MaxCycles").unwrap_or(0);
+                let target = get_f64(&row, "TargetPar").unwrap_or(0.0);
+                if max_cycles < 0 || !target.is_finite() {
+                    return Err(FormatError::ParseS2k(format!(
+                        "RUST CASE - MODAL RITZ CONTROLS row of case '{case}' has an invalid MaxCycles or TargetPar"
+                    )));
+                }
+                let Some(lc) = model.load_cases.get_mut(case) else {
+                    return Err(FormatError::ParseS2k(format!(
+                        "RUST CASE - MODAL RITZ CONTROLS names unknown case '{case}'"
+                    )));
+                };
+                lc.ritz_controls.push(sap_model::ritz::RitzLoadControl {
+                    load_name: load.to_string(),
+                    max_cycles: max_cycles as usize,
+                    target_dynamic_participation: target,
+                });
+            }
+            "RUST MASS SOURCE" => {
+                let item = get_str(&row, "Item").unwrap_or("").to_ascii_uppercase();
+                match item.as_str() {
+                    "OPTIONS" => {
+                        let (Some(elements), Some(masses)) =
+                            (get_bool(&row, "Elements"), get_bool(&row, "Masses"))
+                        else {
+                            return Err(FormatError::ParseS2k(
+                                "RUST MASS SOURCE Options row needs Elements and Masses".into(),
+                            ));
+                        };
+                        model.mass_source.element_self_mass = elements;
+                        model.mass_source.additional_mass = masses;
+                    }
+                    "PATTERN" => {
+                        let (Some(pattern), Some(multiplier)) =
+                            (get_str(&row, "LoadPat"), get_f64(&row, "Multiplier"))
+                        else {
+                            return Err(FormatError::ParseS2k(
+                                "RUST MASS SOURCE Pattern row needs LoadPat and Multiplier".into(),
+                            ));
+                        };
+                        model
+                            .mass_source
+                            .load_patterns
+                            .push((pattern.to_string(), multiplier));
+                    }
+                    _ => {
+                        return Err(FormatError::ParseS2k(
+                            "RUST MASS SOURCE row: Item must be Options or Pattern".into(),
+                        ))
+                    }
+                }
+            }
+            "RUST AUTO SEISMIC - ASCE 7-10" => {
+                use sap_model::seismic::{AutoSeismicAsce710, SeismicDirection, SeismicPeriod};
+                let bad = |what: &str| {
+                    FormatError::ParseS2k(format!("RUST AUTO SEISMIC - ASCE 7-10 row: {what}"))
+                };
+                let pattern = get_str(&row, "LoadPat").ok_or_else(|| bad("LoadPat is missing"))?;
+                let need = |key: &str| {
+                    get_f64(&row, key)
+                        .ok_or_else(|| bad(&format!("{key} is missing or not a number")))
+                };
+                let direction = match get_str(&row, "Dir")
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "X" => SeismicDirection::X,
+                    "Y" => SeismicDirection::Y,
+                    _ => return Err(bad("Dir must be X or Y")),
+                };
+                let period = match get_str(&row, "PeriodType")
+                    .unwrap_or("")
+                    .to_ascii_uppercase()
+                    .as_str()
+                {
+                    "APPROXIMATE" => SeismicPeriod::Approximate {
+                        ct: need("Ct")?,
+                        x: need("Exponent")?,
+                    },
+                    "USER" => SeismicPeriod::User { t: need("UserT")? },
+                    "PROGRAMCALC" => SeismicPeriod::ProgramCalculated,
+                    _ => return Err(bad("PeriodType must be Approximate, User or ProgramCalc")),
+                };
+                model.auto_seismic.insert(
+                    pattern.to_string(),
+                    AutoSeismicAsce710 {
+                        direction,
+                        eccentricity_ratio: need("EccRatio")?,
+                        period,
+                        r: need("R")?,
+                        omega0: need("Omega")?,
+                        cd: need("Cd")?,
+                        ie: need("I")?,
+                        ss: need("Ss")?,
+                        s1: need("S1")?,
+                        tl: need("TL")?,
+                        fa: get_f64(&row, "Fa"),
+                        fv: get_f64(&row, "Fv"),
+                        z_min: get_f64(&row, "MinZ"),
+                        z_max: get_f64(&row, "MaxZ"),
+                    },
+                );
+            }
+            "RUST AUTO SEISMIC ECCENTRICITY" => {
+                const TABLE: &str = "RUST AUTO SEISMIC ECCENTRICITY";
+                let pattern = required_str(&row, TABLE, "LoadPat")?;
+                let diaphragm = required_str(&row, TABLE, "Diaphragm")?;
+                let distance = strict_f64(&row, TABLE, "Distance")?.ok_or_else(|| {
+                    FormatError::ParseS2k(format!("{TABLE}: line '{line}' needs Distance"))
+                })?;
+                if !model.load_patterns.contains_key(pattern) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: line '{line}' names unknown load pattern '{pattern}'"
+                    )));
+                }
+                if !model.constraints.contains_key(diaphragm) {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: line '{line}' names unknown joint constraint '{diaphragm}'"
+                    )));
+                }
+                if model
+                    .auto_seismic_eccentricity
+                    .get(pattern)
+                    .is_some_and(|t| t.contains_key(diaphragm))
+                {
+                    return Err(FormatError::ParseS2k(format!(
+                        "{TABLE}: line '{line}' repeats the overwrite of pattern '{pattern}' for '{diaphragm}'"
+                    )));
+                }
+                model
+                    .auto_seismic_eccentricity
+                    .entry(pattern.to_string())
+                    .or_default()
+                    .insert(diaphragm.to_string(), distance);
+            }
+            "RUST STEEL DESIGN PREFERENCES" => {
+                let Some(limit) = get_f64(&row, "DCLimit") else {
+                    return Err(FormatError::ParseS2k(
+                        "RUST STEEL DESIGN PREFERENCES row needs DCLimit".into(),
+                    ));
+                };
+                model.steel_design_prefs.dc_ratio_limit = limit;
+            }
             "CASE - STATIC 1 - LOAD ASSIGNMENTS" => {
+                const TABLE: &str = "CASE - STATIC 1 - LOAD ASSIGNMENTS";
                 if let (Some(cname), Some(lname)) =
                     (get_str(&row, "Case"), get_str(&row, "LoadName"))
                 {
+                    // Load pattern (the default), Accel (a ground acceleration
+                    // name) or Mode (LoadName is the mode number). The Accel and
+                    // Mode spellings are reconstruction choices, not verified.
+                    let load_type = match get_str(&row, "LoadType")
+                        .unwrap_or("Load pattern")
+                        .trim()
+                        .to_ascii_uppercase()
+                        .as_str()
+                    {
+                        "LOAD PATTERN" | "LOADPATTERN" => 'P',
+                        "ACCEL" => 'A',
+                        "MODE" => 'M',
+                        _ => {
+                            return Err(FormatError::ParseS2k(format!(
+                                "{TABLE}: LoadType '{}' of case '{cname}' is not Load pattern, Accel or Mode",
+                                get_str(&row, "LoadType").unwrap_or("")
+                            )));
+                        }
+                    };
+                    let scale_factor = get_f64(&row, "LoadSF").unwrap_or(1.0);
+                    if load_type == 'A' && sap_model::ritz::acceleration_direction(lname).is_none()
+                    {
+                        return Err(FormatError::ParseS2k(format!(
+                            "{TABLE}: Accel load '{lname}' of case '{cname}' is not UX, UY, UZ, U1, U2 or U3"
+                        )));
+                    }
                     let lc = model
                         .load_cases
                         .entry(cname.to_string())
@@ -2195,10 +2885,26 @@ pub(super) fn parse_s2k_internal(
                             c.loads.clear();
                             c
                         });
-                    lc.loads.push(LoadCaseAssignment {
-                        load_name: lname.to_string(),
-                        scale_factor: get_f64(&row, "LoadSF").unwrap_or(1.0),
-                    });
+                    if load_type == 'M' {
+                        let mode = lname
+                            .trim()
+                            .parse::<usize>()
+                            .ok()
+                            .filter(|mode| *mode >= 1)
+                            .ok_or_else(|| {
+                                FormatError::ParseS2k(format!(
+                                    "{TABLE}: Mode load '{lname}' of case '{cname}' is not a mode number of 1 or more"
+                                ))
+                            })?;
+                        lc.nl_static
+                            .mode_loads
+                            .push(sap_model::hinge::ModeLoad { mode, scale_factor });
+                    } else {
+                        lc.loads.push(LoadCaseAssignment {
+                            load_name: lname.to_string(),
+                            scale_factor,
+                        });
+                    }
                 }
             }
             "CASE - MODAL 1 - GENERAL" => {
@@ -2232,14 +2938,37 @@ pub(super) fn parse_s2k_internal(
                     if let Some(lc) = model.load_cases.get_mut(cname) {
                         lc.case_type = LoadCaseType::ResponseSpectrum;
                         if let Some(mc) = get_str(&row, "ModalCombo") {
-                            lc.modal_combo = match mc.to_ascii_uppercase().as_str() {
+                            let upper = mc.trim().to_ascii_uppercase();
+                            lc.modal_combo = match upper.as_str() {
                                 "SRSS" => ModalComboMethod::Srss,
                                 "ABS" | "ABSSUM" => ModalComboMethod::AbsSum,
                                 _ => ModalComboMethod::Cqc,
                             };
+                            // D141: the model holds CQC, SRSS and Absolute; GMC, NRC 10
+                            // percent and Double Sum would be run as CQC.
+                            if !matches!(upper.as_str(), "CQC" | "SRSS" | "ABS" | "ABSSUM") {
+                                model.unmodeled_source.push(UnmodeledSourceData {
+                                    scope: UnmodeledScope::Case(cname.to_string()),
+                                    description: format!(
+                                        "response-spectrum case '{cname}' combines modes with ModalCombo '{mc}'; the modes would be combined by CQC"
+                                    ),
+                                });
+                            }
                         }
                         if let Some(d) = get_f64(&row, "ConstDamp") {
                             lc.modal_damping = d;
+                        }
+                        // D122: the solver combines directions by SRSS; an absent
+                        // column means SRSS (the RE catalog lists DirCombo and ABSSF).
+                        if let Some(dc) = get_str(&row, "DirCombo") {
+                            if !dc.trim().eq_ignore_ascii_case("SRSS") {
+                                model.unmodeled_source.push(UnmodeledSourceData {
+                                    scope: UnmodeledScope::Case(cname.to_string()),
+                                    description: format!(
+                                        "response-spectrum case '{cname}' combines directions with DirCombo '{dc}'; the directions would be combined by SRSS"
+                                    ),
+                                });
+                            }
                         }
                     }
                 }
@@ -2248,10 +2977,42 @@ pub(super) fn parse_s2k_internal(
                 if let (Some(cname), Some(func)) =
                     (get_str(&row, "Case"), get_str(&row, "Function"))
                 {
+                    // A missing CoordDir column keeps meaning U1 (the program's
+                    // default direction; the vendor corpus has no text S2K file to
+                    // show otherwise). A present value must name a direction, or the
+                    // import fails: it would otherwise silently become U1.
+                    let direction = match get_str(&row, "CoordDir") {
+                        None => "U1".to_string(),
+                        Some(d) => {
+                            let upper = d.trim().to_ascii_uppercase();
+                            if !matches!(
+                                upper.as_str(),
+                                "U1" | "UX" | "X" | "1" | "U2" | "UY" | "Y" | "2" | "U3"
+                                    | "UZ" | "Z" | "3" | "R1" | "R2" | "R3" | "RX" | "RY" | "RZ"
+                            ) {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "response spectrum case '{cname}' has unknown direction CoordDir={d}; expected U1, U2 or U3"
+                                )));
+                            }
+                            d.to_string()
+                        }
+                    };
+                    // D141: the case has no field for an angle or a coordinate system
+                    // of a spectrum load; the native reader refuses them too.
+                    let angle = get_f64(&row, "Angle").unwrap_or(0.0);
+                    let csys = get_str(&row, "CoordSys").unwrap_or("GLOBAL");
+                    if angle != 0.0 || !csys.trim().eq_ignore_ascii_case("GLOBAL") {
+                        model.unmodeled_source.push(UnmodeledSourceData {
+                            scope: UnmodeledScope::Case(cname.to_string()),
+                            description: format!(
+                                "response-spectrum case '{cname}' has a load of function '{func}' with Angle {angle} in CoordSys '{csys}'; it would be applied along the global axis without the angle"
+                            ),
+                        });
+                    }
                     if let Some(lc) = model.load_cases.get_mut(cname) {
                         lc.spectrum_loads.push((
                             func.to_string(),
-                            get_str(&row, "CoordDir").unwrap_or("U1").to_string(),
+                            direction,
                             get_f64(&row, "TransAccSF")
                                 .or_else(|| get_f64(&row, "SF"))
                                 .unwrap_or(1.0),
@@ -2265,12 +3026,40 @@ pub(super) fn parse_s2k_internal(
                     get_str(&row, "Function"),
                     get_str(&row, "LoadName"),
                 ) {
+                    // The LoadType column (Load pattern or Accel, as in the static
+                    // table) says what LoadName is (D77). A table without it is a
+                    // legacy input: the kind stays unspecified and the analysis
+                    // refuses a name that could be either.
+                    let kind = match get_str(&row, "LoadType")
+                        .map(|t| t.trim().to_ascii_uppercase())
+                        .as_deref()
+                    {
+                        None => sap_model::HistoryLoadKind::Unspecified,
+                        Some("LOAD PATTERN" | "LOADPATTERN") => {
+                            sap_model::HistoryLoadKind::Pattern
+                        }
+                        Some("ACCEL") => {
+                            if sap_model::history_acceleration_direction(lname).is_none() {
+                                return Err(FormatError::ParseS2k(format!(
+                                    "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS: Accel load '{lname}' of case '{cname}' is not U1, U2, U3, UX, UY, UZ, X, Y or Z"
+                                )));
+                            }
+                            sap_model::HistoryLoadKind::Acceleration
+                        }
+                        Some(_) => {
+                            return Err(FormatError::ParseS2k(format!(
+                                "CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS: LoadType '{}' of case '{cname}' is not Load pattern or Accel",
+                                get_str(&row, "LoadType").unwrap_or("")
+                            )));
+                        }
+                    };
                     if let Some(lc) = model.load_cases.get_mut(cname) {
-                        lc.history_loads.push((
-                            func.to_string(),
-                            lname.to_string(),
+                        lc.push_history_load(
+                            func,
+                            lname,
+                            kind,
                             get_f64(&row, "SF").unwrap_or(1.0),
-                        ));
+                        );
                     }
                 }
             }
@@ -2311,6 +3100,31 @@ pub(super) fn parse_s2k_internal(
         return Err(FormatError::ParseS2k(
             "No valid TABLE headers found in .s2k input".into(),
         ));
+    }
+
+    // Every hinge property needs its curve. A symmetric property takes the
+    // mirror image of the positive point it was not given a negative for.
+    for (name, prop) in &mut model.hinge_props {
+        let seen = hinge_points_seen.get(name).cloned().unwrap_or_default();
+        for index in 0..8 {
+            if seen.contains(&index) {
+                continue;
+            }
+            if index >= 4 && prop.symmetric && seen.contains(&(index - 4)) {
+                let p = prop.positive[index - 4];
+                prop.negative[index - 4] = sap_model::hinge::HingePoint {
+                    force: -p.force,
+                    deformation: -p.deformation,
+                };
+                continue;
+            }
+            return Err(FormatError::ParseS2k(format!(
+                "RUST HINGE PROPERTIES - CURVE: property '{name}' has no point {}",
+                HINGE_POINT_LABELS[index]
+            )));
+        }
+        prop.validate()
+            .map_err(|reason| FormatError::ParseS2k(format!("RUST HINGE PROPERTIES: {reason}")))?;
     }
 
     // If CASE - STATIC 1 - LOAD ASSIGNMENTS was not present in the file, default LinearStatic cases to matching pattern
@@ -2363,6 +3177,16 @@ pub(super) fn parse_s2k_internal(
             source_text: input.into(),
             canonical_baseline: canonical,
         });
+    }
+    // D79: refuse a name that is both a load case and a load combination. The result of
+    // the case and that of the combination would share one entry, and a combination that
+    // lists the name would be ambiguous. Refusing the import (rather than importing and
+    // refusing the analysis) keeps an ambiguous model from reaching any consumer; the
+    // solver and the API refuse the same names for models that do not come from here.
+    if let Some(message) = sap_model::results::case_combo_collision_message(&model) {
+        return Err(FormatError::ParseS2k(format!(
+            "COMBINATION DEFINITIONS / LOAD CASE DEFINITIONS: {message}"
+        )));
     }
     Ok((ImportReport { model, warnings }, columns))
 }
@@ -2709,6 +3533,13 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             ShellType::Membrane => "Membrane",
             ShellType::ShellLayered => "Shell-Layered",
         };
+        // A plane section's type is stress or strain; the reader takes the
+        // plane type from this column, so the shell wording would lose "strain".
+        let stype = match (a.prop_type, a.plane_type) {
+            (AreaPropType::Plane, PlaneType::PlaneStrain) => "Plane-Strain",
+            (AreaPropType::Plane, PlaneType::PlaneStress) => "Plane-Stress",
+            _ => stype,
+        };
         out.push_str(&format!(
             "   Section={}   Material={}   MatAngle={}   AreaType={}   Type={}   DrillDOF={} _\n     Thickness={}   BendThick={}   InComp={}   F11Mod={}   F22Mod={}   F12Mod={} _\n     M11Mod={}   M22Mod={}   M12Mod={}   V13Mod={}   V23Mod={}   MMod={}   WMod={}\n",
             format_val(&a.name),
@@ -2795,7 +3626,7 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
         for lp in model.link_props.values() {
             for i in 0..6 {
                 out.push_str(&format!(
-                    "   Link={}   DOF={}   Active={}   Fixed={}   RustNonlinear={}   Ke={}   Ce={}   Knl={}   Param1={}   Param2={}\n",
+                    "   Link={}   DOF={}   Active={}   Fixed={}   RustNonlinear={}   Ke={}   Ce={}   Knl={}   Param1={}   Param2={}",
                     format_val(&lp.name),
                     dof_names[i],
                     format_bool(lp.dof_active[i]),
@@ -2807,6 +3638,12 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                     lp.param1[i],
                     lp.param2[i],
                 ));
+                // Third parameter row (Wen yield exponent); a reconstruction
+                // extension like Knl/Param1/Param2, written only where used.
+                if lp.link_type == LinkPropType::PlasticWen || lp.param3[i] != 0.0 {
+                    out.push_str(&format!("   Param3={}", lp.param3[i]));
+                }
+                out.push('\n');
             }
         }
         out.push('\n');
@@ -2964,7 +3801,8 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             .filter(|p| p.local_axes_deg.iter().any(|&a| a != 0.0))
             .collect();
         if !rot_pts.is_empty() {
-            out.push_str("TABLE:  \"JOINT LOCAL AXES ASSIGNMENTS 1 - STANDARD\"\n");
+            // D119: the vendor name of this table (v19 report keys).
+            out.push_str("TABLE:  \"JOINT LOCAL AXES ASSIGNMENTS 1 - TYPICAL\"\n");
             for p in rot_pts {
                 out.push_str(&format!(
                     "   Joint={}   AngleA={}   AngleB={}   AngleC={}\n",
@@ -3079,13 +3917,59 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
         out.push_str("TABLE:  \"CONNECTIVITY - FRAME\"\n");
         for f in model.frames.values() {
             out.push_str(&format!(
-                "   Frame={}   JointI={}   JointJ={}   IsCurved=No   Selected={}   MinSta={}\n",
+                "   Frame={}   JointI={}   JointJ={}   IsCurved=No   Selected={}   MinSta={}",
                 format_val(&f.name),
                 format_val(&f.point_i),
                 format_val(&f.point_j),
                 format_bool(f.selected),
                 f.min_stations,
             ));
+            // Automatic subdivision for analysis, written only where assigned
+            // (reconstruction extension columns, like MeshN1/MeshN2 on areas).
+            if f.auto_mesh_segments > 0 {
+                out.push_str(&format!("   MeshSegments={}", f.auto_mesh_segments));
+            }
+            if f.auto_mesh_at_joints {
+                out.push_str("   MeshAtJoints=Yes");
+            }
+            // Design overwrites, written only where they differ from the
+            // defaults (reconstruction extension columns).
+            match f.concrete_framing {
+                sap_model::ConcreteFramingType::SwaySpecial => {}
+                sap_model::ConcreteFramingType::SwayIntermediate => {
+                    out.push_str("   ConcFraming=Intermediate")
+                }
+                sap_model::ConcreteFramingType::SwayOrdinary => {
+                    out.push_str("   ConcFraming=Ordinary")
+                }
+                sap_model::ConcreteFramingType::NonSway => out.push_str("   ConcFraming=NonSway"),
+            }
+            if let Some(o) = &f.steel_overwrite {
+                out.push_str("   SteelOverwrite=Yes");
+                for (column, value) in [
+                    ("SteelL33", o.l_ratio_major),
+                    ("SteelL22", o.l_ratio_minor),
+                    ("SteelLtb", o.l_ratio_ltb),
+                    ("SteelK33", o.k_major),
+                    ("SteelK22", o.k_minor),
+                    ("SteelCb", o.cb),
+                ] {
+                    if let Some(value) = value {
+                        out.push_str(&format!("   {column}={value}"));
+                    }
+                }
+                if o.is_sway {
+                    out.push_str("   SteelSway=Yes");
+                }
+            }
+            // Auto Select list state (reconstruction extension columns).
+            if let Some(state) = &f.auto_select {
+                out.push_str(&format!("   AutoSelDesign={}", format_val(&state.design)));
+                if let Some(analysis) = &state.analysis {
+                    out.push_str(&format!("   AutoSelAnalysis={}", format_val(analysis)));
+                }
+            }
+            out.push('\n');
         }
         out.push('\n');
 
@@ -3287,6 +4171,9 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             .filter(|f| f.pdelta_force != 0.0)
             .collect();
         if !pd_frames.is_empty() {
+            // The vendor form of this table ("Frame P-Delta Force Assignments",
+            // with a hyphen) is not proven for the direction column (G77), so the
+            // project's own name is kept.
             out.push_str("TABLE:  \"FRAME PDELTA FORCE ASSIGNMENTS\"\n");
             for f in pd_frames {
                 out.push_str(&format!(
@@ -3443,13 +4330,19 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                 line.push_str(&format!("   Joint{}={}", idx + 1, format_val(pt)));
             }
             line.push_str(&format!(
-                "   Selected={}   Angle={}   MeshN1={}   MeshN2={}   EdgeConstraint={}\n",
+                "   Selected={}   Angle={}   MeshN1={}   MeshN2={}   EdgeConstraint={}",
                 format_bool(a.selected),
                 a.angle_deg,
                 a.auto_mesh.0,
                 a.auto_mesh.1,
                 format_bool(a.edge_constraint),
             ));
+            // Added mass per area, written only where assigned (a reconstruction
+            // extension column, like MeshN1/MeshN2 on this row).
+            if a.mass_per_area != 0.0 {
+                line.push_str(&format!("   MassPerArea={}", a.mass_per_area));
+            }
+            line.push('\n');
             out.push_str(&line);
         }
         out.push('\n');
@@ -3470,10 +4363,11 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             .filter(|a| a.modifiers.iter().any(|&m| (m - 1.0).abs() > 1e-12))
             .collect();
         if !mod_areas.is_empty() {
-            out.push_str("TABLE:  \"AREA PROPERTY MODIFIERS\"\n");
+            // D119: vendor name and columns (v19 report keys, RE catalog).
+            out.push_str("TABLE:  \"AREA STIFFNESS MODIFIERS\"\n");
             for a in mod_areas {
                 out.push_str(&format!(
-                    "   Area={}   F11Mod={}   F22Mod={}   F12Mod={}   M11Mod={}   M22Mod={}   M12Mod={}   V13Mod={}   V23Mod={}   MMod={}   WMod={}\n",
+                    "   Area={}   f11={}   f22={}   f12={}   m11={}   m22={}   m12={}   v13={}   v23={}   MassMod={}   WeightMod={}\n",
                     format_val(&a.name),
                     a.modifiers[0],
                     a.modifiers[1],
@@ -3736,8 +4630,66 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             TimeIntegrationMethod::WilsonTheta => "WilsonTheta",
         };
         let ic = lc.initial_case.as_deref().unwrap_or("Zero");
+        // Displacement control is a reconstruction extension of this table,
+        // written only for cases that use it.
+        let control = lc
+            .displacement_control
+            .as_ref()
+            .map_or_else(String::new, |c| {
+                let mut text = format!(
+                    "   RustDisplTarget={}   RustDisplConjugate={}",
+                    c.target,
+                    format_bool(c.conjugate)
+                );
+                if let Some((joint, dof)) = &c.monitored {
+                    text.push_str(&format!(
+                        "   RustDisplJoint={}   RustDisplDOF={}",
+                        format_val(joint),
+                        ["U1", "U2", "U3", "R1", "R2", "R3"]
+                            .get(*dof)
+                            .copied()
+                            .unwrap_or("?")
+                    ));
+                }
+                text
+            });
+        let control = {
+            use sap_model::hinge::{HingeUnloading, NonlinearStaticParams, ResultsSaved};
+            let defaults = NonlinearStaticParams::default();
+            let nl = &lc.nl_static;
+            let mut text = control;
+            if let ResultsSaved::MultipleStates {
+                min_saved,
+                max_saved,
+                positive_only,
+            } = nl.results_saved
+            {
+                text.push_str(&format!(
+                    "   RustResultsSaved=Multiple   RustMinSaved={min_saved}   RustMaxSaved={max_saved}   RustPositiveOnly={}",
+                    format_bool(positive_only)
+                ));
+            }
+            if nl.max_total_steps != defaults.max_total_steps {
+                text.push_str(&format!("   RustMaxTotalSteps={}", nl.max_total_steps));
+            }
+            if nl.max_null_steps != defaults.max_null_steps {
+                text.push_str(&format!("   RustMaxNullSteps={}", nl.max_null_steps));
+            }
+            if nl.hinge_unloading != defaults.hinge_unloading {
+                text.push_str(&format!(
+                    "   RustHingeUnloading={}",
+                    match nl.hinge_unloading {
+                        HingeUnloading::UnloadEntireStructure => "UnloadEntireStructure",
+                        HingeUnloading::ApplyLocalRedistribution => "ApplyLocalRedistribution",
+                        HingeUnloading::RestartUsingSecantStiffness =>
+                            "RestartUsingSecantStiffness",
+                    }
+                ));
+            }
+            text
+        };
         out.push_str(&format!(
-            "   Case={}   Type={}   InitialCond={}   RunCase={}   ModeType={}   MaxNumModes={}   MinNumModes={}   EigenShift={} _\n     GeomNonLin={}   MaxIter={}   ConvTol={}   ModalCombo={}   ConstDamp={}   NumSteps={}   StepSize={} _\n     TimeInteg={}   HHTAlpha={}   WilsonTheta={}   RayleighMass={}   RayleighStiff={}   NumBucklingModes={}\n",
+            "   Case={}   Type={}   InitialCond={}   RunCase={}   ModeType={}   MaxNumModes={}   MinNumModes={}   EigenShift={} _\n     GeomNonLin={}   MaxIter={}   ConvTol={}   ModalCombo={}   ConstDamp={}   NumSteps={}   StepSize={} _\n     TimeInteg={}   HHTAlpha={}   WilsonTheta={}   RayleighMass={}   RayleighStiff={}   NumBucklingModes={}{}\n",
             format_val(&lc.name),
             ctype,
             format_val(ic),
@@ -3759,18 +4711,43 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
             lc.rayleigh_damping.0,
             lc.rayleigh_damping.1,
             lc.num_buckling_modes,
+            control,
         ));
+        // Mode superposition is a reconstruction extension of this table.
+        if let Some(modal) = &lc.modal_case {
+            let end = out.trim_end_matches('\n').len();
+            out.truncate(end);
+            out.push_str(&format!("   RustModalCase={}\n", format_val(modal)));
+        }
     }
     out.push('\n');
 
     out.push_str("TABLE:  \"CASE - STATIC 1 - LOAD ASSIGNMENTS\"\n");
     for lc in model.load_cases.values() {
         for asgn in &lc.loads {
+            // Ground accelerations of a nonlinear static case are a load type
+            // of their own; elsewhere the name stays a load pattern name.
+            let load_type = if lc.case_type == LoadCaseType::NonlinearStatic
+                && sap_model::ritz::acceleration_direction(&asgn.load_name).is_some()
+            {
+                "Accel"
+            } else {
+                "\"Load pattern\""
+            };
             out.push_str(&format!(
-                "   Case={}   LoadType=\"Load pattern\"   LoadName={}   LoadSF={}\n",
+                "   Case={}   LoadType={}   LoadName={}   LoadSF={}\n",
                 format_val(&lc.name),
+                load_type,
                 format_val(&asgn.load_name),
                 asgn.scale_factor,
+            ));
+        }
+        for load in &lc.nl_static.mode_loads {
+            out.push_str(&format!(
+                "   Case={}   LoadType=Mode   LoadName={}   LoadSF={}\n",
+                format_val(&lc.name),
+                load.mode,
+                load.scale_factor,
             ));
         }
     }
@@ -3827,10 +4804,18 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
     if has_hist_loads {
         out.push_str("TABLE:  \"CASE - TIME HISTORY 2 - LOAD ASSIGNMENTS\"\n");
         for lc in model.load_cases.values() {
-            for (func, lname, sf) in &lc.history_loads {
+            for (entry, (func, lname, sf)) in lc.history_loads.iter().enumerate() {
+                // The load type is written whenever it is known; a legacy
+                // entry without one stays without (D77).
+                let load_type = match lc.history_kind(entry) {
+                    sap_model::HistoryLoadKind::Pattern => "   LoadType=\"Load pattern\"",
+                    sap_model::HistoryLoadKind::Acceleration => "   LoadType=Accel",
+                    sap_model::HistoryLoadKind::Unspecified => "",
+                };
                 out.push_str(&format!(
-                    "   Case={}   Function={}   LoadName={}   SF={}\n",
+                    "   Case={}{}   Function={}   LoadName={}   SF={}\n",
                     format_val(&lc.name),
+                    load_type,
                     format_val(func),
                     format_val(lname),
                     sf,
@@ -3866,6 +4851,222 @@ pub(super) fn write_s2k_canonical(model: &SapModel) -> String {
                         sf,
                     ));
                 }
+            }
+        }
+        out.push('\n');
+    }
+
+    // Reconstruction extension: imported data that is not modeled. Keeping it
+    // in the text model keeps analysis refused after a save and reopen.
+    if !model.unmodeled_source.is_empty() {
+        out.push_str("TABLE:  \"RUST UNMODELED SOURCE DATA\"\n");
+        for (index, entry) in model.unmodeled_source.iter().enumerate() {
+            let (scope, target) = match &entry.scope {
+                UnmodeledScope::AllCases => ("All", ""),
+                UnmodeledScope::NonlinearCases => ("Nonlinear", ""),
+                UnmodeledScope::DynamicCases => ("Dynamic", ""),
+                UnmodeledScope::AllButLinearStatic => ("NotLinearStatic", ""),
+                UnmodeledScope::LoadPattern(name) => ("Pattern", name.as_str()),
+                UnmodeledScope::Case(name) => ("Case", name.as_str()),
+            };
+            out.push_str(&format!(
+                "   Item={}   Scope={}   Target={}   Description={}\n",
+                index + 1,
+                scope,
+                format_val(target),
+                format_val(&entry.description),
+            ));
+        }
+        out.push('\n');
+    }
+
+    // Reconstruction extensions written only where they differ from the
+    // defaults: Ritz generation controls, the mass source, automatic seismic
+    // loads and the steel design preferences.
+    if model
+        .load_cases
+        .values()
+        .any(|lc| !lc.ritz_controls.is_empty())
+    {
+        out.push_str("TABLE:  \"RUST CASE - MODAL RITZ CONTROLS\"\n");
+        for lc in model.load_cases.values() {
+            for control in &lc.ritz_controls {
+                out.push_str(&format!(
+                    "   Case={}   LoadName={}   MaxCycles={}   TargetPar={}\n",
+                    format_val(&lc.name),
+                    format_val(&control.load_name),
+                    control.max_cycles,
+                    control.target_dynamic_participation,
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if !model.mass_source.is_default() {
+        out.push_str("TABLE:  \"RUST MASS SOURCE\"\n");
+        out.push_str(&format!(
+            "   Item=Options   Elements={}   Masses={}\n",
+            format_bool(model.mass_source.element_self_mass),
+            format_bool(model.mass_source.additional_mass),
+        ));
+        for (pattern, multiplier) in &model.mass_source.load_patterns {
+            out.push_str(&format!(
+                "   Item=Pattern   LoadPat={}   Multiplier={}\n",
+                format_val(pattern),
+                multiplier,
+            ));
+        }
+        out.push('\n');
+    }
+    if !model.auto_seismic.is_empty() {
+        use sap_model::seismic::{SeismicDirection, SeismicPeriod};
+        out.push_str("TABLE:  \"RUST AUTO SEISMIC - ASCE 7-10\"\n");
+        for (pattern, def) in &model.auto_seismic {
+            let direction = match def.direction {
+                SeismicDirection::X => "X",
+                SeismicDirection::Y => "Y",
+            };
+            let period = match def.period {
+                SeismicPeriod::Approximate { ct, x } => {
+                    format!("PeriodType=Approximate   Ct={ct}   Exponent={x}")
+                }
+                SeismicPeriod::User { t } => format!("PeriodType=User   UserT={t}"),
+                SeismicPeriod::ProgramCalculated => "PeriodType=ProgramCalc".to_string(),
+            };
+            out.push_str(&format!(
+                "   LoadPat={}   Dir={}   EccRatio={}   {}   R={}   Omega={}   Cd={}   I={}   Ss={}   S1={}   TL={}",
+                format_val(pattern),
+                direction,
+                def.eccentricity_ratio,
+                period,
+                def.r,
+                def.omega0,
+                def.cd,
+                def.ie,
+                def.ss,
+                def.s1,
+                def.tl,
+            ));
+            for (column, value) in [
+                ("Fa", def.fa),
+                ("Fv", def.fv),
+                ("MinZ", def.z_min),
+                ("MaxZ", def.z_max),
+            ] {
+                if let Some(value) = value {
+                    out.push_str(&format!("   {column}={value}"));
+                }
+            }
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if model
+        .auto_seismic_eccentricity
+        .values()
+        .any(|table| !table.is_empty())
+    {
+        // Distances are lengths in the units of the file, like MinZ and MaxZ above.
+        out.push_str("TABLE:  \"RUST AUTO SEISMIC ECCENTRICITY\"\n");
+        for (pattern, table) in &model.auto_seismic_eccentricity {
+            for (diaphragm, distance) in table {
+                out.push_str(&format!(
+                    "   LoadPat={}   Diaphragm={}   Distance={}\n",
+                    format_val(pattern),
+                    format_val(diaphragm),
+                    distance
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if !model.steel_design_prefs.is_default() {
+        out.push_str("TABLE:  \"RUST STEEL DESIGN PREFERENCES\"\n");
+        out.push_str(&format!(
+            "   DCLimit={}\n\n",
+            model.steel_design_prefs.dc_ratio_limit
+        ));
+    }
+
+    // Frame hinges: reconstruction tables, written only when the model has
+    // hinge data. Every field is written, including the negative branch of a
+    // symmetric property, so that reopening gives back an equal model.
+    if !model.hinge_props.is_empty() {
+        use sap_model::hinge::{HingeBehavior, HingeBeyondE};
+        out.push_str("TABLE:  \"RUST HINGE PROPERTIES\"\n");
+        for prop in model.hinge_props.values() {
+            let behavior = match prop.behavior {
+                HingeBehavior::DeformationControlled => "DeformationControlled",
+                HingeBehavior::ForceControlled => "ForceControlled",
+            };
+            let beyond = match prop.beyond_e {
+                Some(HingeBeyondE::DropsToZero) => "DropsToZero",
+                Some(HingeBeyondE::Extrapolated) => "Extrapolated",
+                None => "NotEstablished",
+            };
+            out.push_str(&format!(
+                "   Name={}   DOF={}   Behavior={}   Symmetric={}   ForceSF={}   DeformSF={}   ForceSFNeg={}   DeformSFNeg={} _\n     BeyondE={}   IO={}   LS={}   CP={}   IONeg={}   LSNeg={}   CPNeg={}\n",
+                format_val(&prop.name),
+                prop.dof.label(),
+                behavior,
+                format_bool(prop.symmetric),
+                prop.force_sf,
+                prop.deformation_sf,
+                prop.force_sf_negative,
+                prop.deformation_sf_negative,
+                beyond,
+                prop.acceptance_positive.io,
+                prop.acceptance_positive.ls,
+                prop.acceptance_positive.cp,
+                prop.acceptance_negative.io,
+                prop.acceptance_negative.ls,
+                prop.acceptance_negative.cp,
+            ));
+        }
+        out.push('\n');
+        out.push_str("TABLE:  \"RUST HINGE PROPERTIES - CURVE\"\n");
+        for prop in model.hinge_props.values() {
+            for (label, point) in HINGE_POINT_LABELS
+                .iter()
+                .zip(prop.positive.iter().chain(prop.negative.iter()))
+            {
+                out.push_str(&format!(
+                    "   Name={}   Point={}   Force={}   Deform={}\n",
+                    format_val(&prop.name),
+                    format_val(label),
+                    point.force,
+                    point.deformation,
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if model.frames.values().any(|f| !f.hinges.is_empty()) {
+        out.push_str("TABLE:  \"RUST FRAME HINGE ASSIGNMENTS\"\n");
+        for frame in model.frames.values() {
+            for (index, hinge) in frame.hinges.iter().enumerate() {
+                out.push_str(&format!(
+                    "   Frame={}   HingeNum={}   Prop={}   RelDist={}\n",
+                    format_val(&frame.name),
+                    index + 1,
+                    format_val(&hinge.prop),
+                    hinge.rel_dist,
+                ));
+            }
+        }
+        out.push('\n');
+    }
+    if model.frames.values().any(|f| f.hinge_overwrite.is_some()) {
+        out.push_str("TABLE:  \"RUST FRAME HINGE OVERWRITES\"\n");
+        for frame in model.frames.values() {
+            if let Some(overwrite) = &frame.hinge_overwrite {
+                out.push_str(&format!(
+                    "   Frame={}   AutoSubdivide={}   RelLength={}   DoNotDropLoad={}\n",
+                    format_val(&frame.name),
+                    format_bool(overwrite.auto_subdivide),
+                    overwrite.relative_length,
+                    format_bool(overwrite.do_not_drop_load),
+                ));
             }
         }
         out.push('\n');

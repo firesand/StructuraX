@@ -53,6 +53,20 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
                 case.name
             )));
         }
+        if matches!(
+            case.case_type,
+            LoadCaseType::NonlinearHistory | LoadCaseType::NonlinearDynamic
+        ) && case.time_integration == sap_model::TimeIntegrationMethod::WilsonTheta
+            && model.link_props.values().any(|p| {
+                p.link_type == sap_model::LinkPropType::PlasticWen
+                    && (0..6).any(|d| p.dof_active[d] && p.dof_nonlinear[d] && !p.dof_fixed[d])
+            })
+        {
+            return Err(unsupported(format!(
+                "case '{}' Wilson-theta integration of plastic Wen links is not implemented",
+                case.name
+            )));
+        }
         if history && case.nl_geom != NLGeomType::None {
             return Err(unsupported(format!(
                 "case '{}' requests geometric nonlinearity in history integration",
@@ -63,8 +77,9 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             let mut patterns: Vec<String> = case
                 .history_loads
                 .iter()
-                .filter(|(_, _, sf)| *sf != 0.)
-                .map(|(_, p, _)| p.clone())
+                .enumerate()
+                .filter(|(i, (_, _, sf))| *sf != 0. && case.history_entry_is_pattern(model, *i))
+                .map(|(_, (_, p, _))| p.clone())
                 .collect();
             if let Some(initial) = case
                 .initial_case
@@ -72,7 +87,7 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
                 .and_then(|n| model.load_cases.get(n))
             {
                 patterns.extend(
-                    super::accumulated_nonlinear_static_loads(model, initial)
+                    super::accumulated_nonlinear_static_loads(model, initial)?
                         .into_iter()
                         .filter(|(_, sf)| *sf != 0.)
                         .map(|(p, _)| p),
@@ -124,7 +139,7 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             }) {
                 return Err(unsupported("cable-only analysis does not support joint springs, multipoint constraints or rotated joint axes".into()));
             }
-            let loads = super::accumulated_nonlinear_static_loads(model, case);
+            let loads = super::accumulated_nonlinear_static_loads(model, case)?;
             let active = |p: &str| loads.iter().any(|(name, sf)| name == p && *sf != 0.);
             for p in model.points.values() {
                 if p.loads_force
@@ -234,7 +249,110 @@ pub(crate) fn validate(model: &SapModel) -> Result<(), SolverError> {
             {
                 return Err(unsupported(format!("frame '{}' member limits with releases, offsets or nonprismatic properties are not implemented", f.name)));
             }
+            if let Some(reason) = tc_axial_span_load_refusal(model, case, f)? {
+                return Err(unsupported(reason));
+            }
         }
     }
     Ok(())
+}
+
+/// D111 (G75): the tension/compression limits of a frame are treated per extension and
+/// shortening (Analysis Reference p. 133, which says nothing about span loads). The solver
+/// estimates the extreme axial forces of a member as `p_avg +- |W|/2`, which is exact only when
+/// the axial span load keeps one sign, and the limit law is discontinuous when the resultant
+/// `|W|` exceeds `T + |C|`. Both cases are refused by name instead of approximated.
+fn tc_axial_span_load_refusal(
+    model: &SapModel,
+    case: &sap_model::LoadCase,
+    frame: &sap_model::FrameObj,
+) -> Result<Option<String>, SolverError> {
+    use crate::frame::{frame_local_axes, resolve_load_dir_to_local};
+    let (Some(pi), Some(pj)) = (
+        model.points.get(&frame.point_i),
+        model.points.get(&frame.point_j),
+    ) else {
+        return Ok(None);
+    };
+    let (length, e_axes) = frame_local_axes(
+        [pi.x, pi.y, pi.z],
+        [pj.x, pj.y, pj.z],
+        frame.angle_deg,
+    );
+    let weight_per_len = model
+        .frame_sections
+        .get(&frame.section)
+        .and_then(|sec| {
+            model.materials.get(&sec.material).map(|mat| {
+                mat.unit_weight * sec.area * sec.modifiers[7] * frame.modifiers[7]
+            })
+        })
+        .unwrap_or(0.0);
+    // Axial components (local 1) of the active span loads: the values that set the sign, and
+    // the resultant W.
+    let mut values: Vec<f64> = Vec::new();
+    let mut resultant = 0.0f64;
+    for (pattern, scale) in super::accumulated_nonlinear_static_loads(model, case)? {
+        if scale == 0.0 {
+            continue;
+        }
+        let self_weight = model
+            .load_patterns
+            .get(&pattern)
+            .map_or(0.0, |lp| lp.self_wt_multiplier);
+        if self_weight != 0.0 {
+            // self weight acts along -Z: component on local 1
+            let q = -e_axes[0][2] * self_weight * weight_per_len * scale;
+            values.push(q);
+            resultant += q * length;
+        }
+        if let Some(g) = frame.loads_gravity.get(&pattern) {
+            let q: f64 = (0..3).map(|d| e_axes[0][d] * g[d]).sum::<f64>() * weight_per_len * scale;
+            values.push(q);
+            resultant += q * length;
+        }
+        for ld in frame
+            .loads_dist
+            .iter()
+            .filter(|l| l.load_pat == pattern && l.my_type == 1)
+        {
+            let q1 = resolve_load_dir_to_local(ld.dir, ld.val1 * scale, &e_axes, true)[0];
+            let q2 = resolve_load_dir_to_local(ld.dir, ld.val2 * scale, &e_axes, true)[0];
+            values.push(q1);
+            values.push(q2);
+            resultant += 0.5 * (q1 + q2) * (ld.rel_dist2 - ld.rel_dist1) * length;
+        }
+        for lp in frame
+            .loads_point
+            .iter()
+            .filter(|l| l.load_pat == pattern && l.my_type == 1)
+        {
+            let p = resolve_load_dir_to_local(lp.dir, lp.val * scale, &e_axes, false)[0];
+            values.push(p);
+            resultant += p;
+        }
+    }
+    let largest = values.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let eps = 1e-12 * largest;
+    let positive = values.iter().any(|v| *v > eps);
+    let negative = values.iter().any(|v| *v < -eps);
+    if positive && negative {
+        return Ok(Some(format!(
+            "frame '{}' has tension/compression limits and axial span loads of both signs in case '{}': the extreme axial force inside the member is not implemented (G75)",
+            frame.name, case.name
+        )));
+    }
+    if let Some((true, c, true, t)) = frame.tc_limits {
+        if resultant.abs() > t.abs() + c.abs() * (1.0 + 1e-12) {
+            return Ok(Some(format!(
+                "frame '{}' has tension limit {} and compression limit {} but the axial span load of case '{}' has resultant {}, more than their sum: the member has no admissible state (G75)",
+                frame.name,
+                t.abs(),
+                c.abs(),
+                case.name,
+                resultant.abs()
+            )));
+        }
+    }
+    Ok(None)
 }

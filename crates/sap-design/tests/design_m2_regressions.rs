@@ -200,7 +200,7 @@ fn test_dsgn03_ec3_multi_axis_concurrent_demands_succeed() {
         vec![FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -100.0,
+            p: 100.0,
             v2: 25.0,
             v3: 15.0,
             m3: 1200.0,
@@ -239,7 +239,7 @@ fn test_dsgn03_ec3_high_shear_reductions_and_governing_equations() {
         vec![FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -50.0,
+            p: 50.0,
             v2: 0.60 * v_pl_2,
             v3: 0.10 * v_pl_3,
             m3: 3500.0,
@@ -263,7 +263,7 @@ fn test_dsgn03_ec3_high_shear_reductions_and_governing_equations() {
         vec![FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -50.0,
+            p: 50.0,
             v2: 0.10 * v_pl_2,
             v3: 0.80 * v_pl_3,
             m3: 400.0,
@@ -324,7 +324,7 @@ fn test_dsgn03_ec3_pipe_and_circle_srss_interaction() {
         vec![FrameStationResult {
             station: 60.0,
             rel_dist: 0.5,
-            p: -50.0,
+            p: 50.0,
             m3: 300.0,
             m2: 400.0,
             ..Default::default()
@@ -338,7 +338,7 @@ fn test_dsgn03_ec3_pipe_and_circle_srss_interaction() {
 
     // Circular section interaction uses SRSS of normalized moments:
     // Pr / Pc + sqrt((M3 / Mc3)^2 + (M2 / Mc2)^2)
-    let pc = res.phi_pnc;
+    let pc = res.phi_pnt;
     let mc = res.phi_mn33; // for pipe, mc3 == mc2
     let expected_srss_ratio = (50.0 / pc) + ((300.0 / mc).powi(2) + (400.0 / mc).powi(2)).sqrt();
     assert!(
