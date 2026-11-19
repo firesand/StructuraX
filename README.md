@@ -4,6 +4,14 @@ StructuraX is an experimental native structural-analysis and member-design appli
 
 **Development status:** selected analytical checks pass; full SAP2000 compatibility and engineering acceptance have not been established. The `1.0.0` package version is inherited metadata, not a certification or declaration of production readiness. See [review follow-up](docs/review/structurax-followup/REVIEW.md) before relying on the newer solver and export paths.
 
+## Screenshots
+
+The program's own windows, with a generated test model (a three-storey concrete frame), captured on 2026-11-19 on a private display. They show what the windows draw, not a comparison with SAP2000.
+
+| Deformed shape | Moment diagram M3 | Concrete design (Eurocode 2) |
+| --- | --- | --- |
+| ![Deformed shape of the test frame under dead load](docs/screenshots/deformed-shape.png) | ![Bending moment diagram M3 of the test frame](docs/screenshots/moment-diagram.png) | ![Required reinforcement and column interaction ratios of the test frame](docs/screenshots/concrete-design.png) |
+
 ## Implemented areas
 
 - Frame, area/shell, and solid element analysis, plus selected cable and nonlinear link formulations; frame end offsets, insertion points and automatic subdivision.
