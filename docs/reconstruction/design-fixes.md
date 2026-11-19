@@ -54,7 +54,7 @@ Under AISC 360-10 (LRFD and ASD) only; EC3 results, statuses and errors and `che
 - G83: a channel or double channel with M3 and h/tw > 3.76 sqrt(E/Fy) (the F4/F5 forms of pp. 3-54/55 are not built).
 - A tee, double angle, channel or double channel with J = 0 under compression or M3, or whose dimensions do not define the section.
 
-D127 consequence: one refused member stops the whole run and leaves no steel results, and Auto Select stops at a refused candidate; a model with a single angle in compression is no longer designed at all. Not in scope here: D142 (I with a noncompact web gets F2/F3), D143 (no F11 for solid rectangles), D145 (E4-4 of I skipped silently when J = 0; `check_compactness_aisc` reads a channel flange as max(t2, t2b)).
+D127 consequence: a refused member is recorded with its reason (`steel_design_errors`, never a result) and the run goes on with the other members; Auto Select passes over a refused candidate. The strict entry points (`try_run_steel_design`) still stop at the first refused member; the applications call the tolerant ones (`run_steel_design_per_member`). Not in scope here: D142 (I with a noncompact web gets F2/F3), D143 (no F11 for solid rectangles), D145 (E4-4 of I skipped silently when J = 0; `check_compactness_aisc` reads a channel flange as max(t2, t2b)).
 
 ## Validation
 

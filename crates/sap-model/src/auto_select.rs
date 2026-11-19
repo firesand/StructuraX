@@ -271,6 +271,7 @@ impl SapModel {
         list_members(&trial, name)?;
         self.frame_sections.insert(name.to_string(), list);
         self.steel_design_results.clear();
+        self.steel_design_errors.clear();
         Ok(())
     }
 
@@ -298,6 +299,7 @@ impl SapModel {
             }
         }
         self.steel_design_results.clear();
+        self.steel_design_errors.clear();
         Ok(())
     }
 
@@ -311,6 +313,7 @@ impl SapModel {
         if self.steel_design_prefs != prefs {
             self.steel_design_prefs = prefs;
             self.steel_design_results.clear();
+            self.steel_design_errors.clear();
         }
         Ok(())
     }

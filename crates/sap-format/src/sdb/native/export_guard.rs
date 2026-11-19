@@ -690,7 +690,9 @@ fn semantic_model(model: &SapModel) -> SapModel {
     copy.s2k_preservation = None;
     copy.case_results.clear();
     copy.steel_design_results.clear();
+    copy.steel_design_errors.clear();
     copy.concrete_design_results.clear();
+    copy.concrete_design_errors.clear();
     // D120: the reasons a result is unavailable are result state like the maps
     // above; the projected model never has them, so they must not make the export
     // look lossy.

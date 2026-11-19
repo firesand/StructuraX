@@ -532,5 +532,6 @@ pub fn add_default_design_combos(
         summary.created.push(name);
     }
     model.steel_design_results.clear();
+    model.steel_design_errors.clear();
     Ok(summary)
 }

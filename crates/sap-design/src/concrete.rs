@@ -1209,8 +1209,28 @@ pub fn run_concrete_design(model: &mut SapModel) {
 
 /// Checked concrete design entry point. Unsupported code names or demands return an error and
 /// leave `concrete_design_results` empty, preventing stale/incomplete ratios from appearing valid.
+/// Strict: the first refused member returns its typed error and leaves both maps empty.
 pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> {
+    run_concrete_design_core(model, true).map(|_| ())
+}
+
+/// D127: the concrete design that the applications call. A member the design refuses (a missing
+/// rebar yield stress, a torsion that is not designed, ...) is recorded (typed in the report, as
+/// text in `model.concrete_design_errors`) and the run goes on with the other members; a run
+/// error returns `Err` and leaves both maps empty. Use `try_run_concrete_design` for the strict
+/// form that stops at the first refused member.
+pub fn run_concrete_design_per_member(
+    model: &mut SapModel,
+) -> Result<crate::DesignRunReport, DesignError> {
+    run_concrete_design_core(model, false)
+}
+
+fn run_concrete_design_core(
+    model: &mut SapModel,
+    strict: bool,
+) -> Result<crate::DesignRunReport, DesignError> {
     model.concrete_design_results.clear();
+    model.concrete_design_errors.clear();
     let code = ConcreteCode::try_from_code_str(&model.concrete_design_code)?;
     crate::steel::refuse_unavailable_combos(model, "concrete")?;
     let combo_forces = collect_design_combo_forces(model);
@@ -1236,8 +1256,10 @@ pub fn try_run_concrete_design(model: &mut SapModel) -> Result<(), DesignError> 
                 .is_some_and(|material| material.mat_type == MatType::Concrete)
         },
     )?;
-    check_rebar_yield(model)?;
-    run_concrete_design_validated(model, code, combo_forces)
+    if strict {
+        check_rebar_yield(model)?;
+    }
+    run_concrete_design_validated(model, code, combo_forces, strict)
 }
 
 /// The longitudinal rebar yield stress of a concrete member: that of the
@@ -1270,55 +1292,72 @@ fn check_rebar_yield(model: &SapModel) -> Result<(), DesignError> {
         if mat.mat_type != MatType::Concrete || resolve_rebar_fy(model, sec, mat).is_some() {
             continue;
         }
-        // The material that lacks the yield stress: the named rebar material, else the concrete.
-        let material = sec
-            .concrete_rebar
-            .as_ref()
-            .map_or_else(|| mat.name.clone(), |cfg| cfg.rebar_mat_long.clone());
-        return Err(DesignError::MissingRebarYield {
-            frame: frame_name.clone(),
-            section: sec.name.clone(),
-            material,
-        });
+        return Err(rebar_yield_error(frame_name, sec, mat));
     }
     Ok(())
 }
 
-/// A refused beam torsion (D130, G85) stops the whole run with `Err` and leaves
-/// `concrete_design_results` empty, as the other refusals do (D127: one refused member stops the run).
+/// The `MissingRebarYield` error of a concrete member: the material that lacks the yield stress
+/// is the named rebar material, else the concrete.
+fn rebar_yield_error(
+    frame_name: &str,
+    sec: &FrameSection,
+    mat: &Material,
+) -> DesignError {
+    let material = sec
+        .concrete_rebar
+        .as_ref()
+        .map_or_else(|| mat.name.clone(), |cfg| cfg.rebar_mat_long.clone());
+    DesignError::MissingRebarYield {
+        frame: frame_name.to_string(),
+        section: sec.name.clone(),
+        material,
+    }
+}
+
+/// A refused beam torsion (D130, G85) or a member without a rebar yield stress is recorded with
+/// its reason and the run goes on with the other members (D127); the refused member has no result
+/// at all. With `strict` the first refused member returns its typed error instead and nothing is
+/// stored (`check_rebar_yield` has then already run over all members, as before).
 fn run_concrete_design_validated(
     model: &mut SapModel,
     code: ConcreteCode,
     combo_forces: crate::steel::ComboForces,
-) -> Result<(), DesignError> {
+    strict: bool,
+) -> Result<crate::DesignRunReport, DesignError> {
     let units = model.present_units;
 
     let mut results = Vec::new();
+    let mut not_designed: Vec<(String, DesignError)> = Vec::new();
 
     // Standard steel modulus Es = 29,000 ksi converted to present units
     let es_default = 29_000.0 * Units::KipInF.stress_factor_to(units);
     let default_cover = 2.5 * Units::KipInF.length_factor_to(units);
 
-    for (frame_name, frame) in &model.frames {
+    // The design of one member: its result, or the error that refuses it (a refused beam leaves
+    // no half-accumulated result); `None` for a frame that is not a concrete design member.
+    let design_member = |frame_name: &String,
+                         frame: &FrameObj|
+     -> Result<Option<ConcreteDesignResult>, DesignError> {
         // A cable is not designed (D103): SAP2000 designs no cable members.
         if frame.cable_params.is_some() {
-            continue;
+            return Ok(None);
         }
         let Some(sec) = model.frame_sections.get(&frame.section) else {
-            continue;
+            return Ok(None);
         };
         let Some(mat) = model.materials.get(&sec.material) else {
-            continue;
+            return Ok(None);
         };
         if mat.mat_type != MatType::Concrete {
-            continue;
+            return Ok(None);
         }
 
         // Resolve longitudinal and confinement rebar yield stresses fy, fyt.
-        // `check_rebar_yield` has refused a member without a yield stress, so
-        // no default value is ever assumed here.
+        // A member without a yield stress is refused (D127), so no default value is ever
+        // assumed here.
         let Some(fy) = resolve_rebar_fy(model, sec, mat) else {
-            continue;
+            return Err(rebar_yield_error(frame_name, sec, mat));
         };
         let mut fyt = if mat.fys > 0.0 { mat.fys } else { fy };
         let mut es = es_default;
@@ -1590,8 +1629,7 @@ fn run_concrete_design_validated(
                 Vec::new()
             };
 
-            results.push((
-                frame_name.clone(),
+            Ok(Some(
                 ConcreteDesignResult {
                     frame_name: frame_name.clone(),
                     section_name: sec.name.clone(),
@@ -1609,7 +1647,7 @@ fn run_concrete_design_validated(
                     min_rebar_area,
                     status,
                 },
-            ));
+            ))
         } else {
             // Concrete Beam Design
             let mut max_as_top = 0.0_f64;
@@ -1911,8 +1949,7 @@ fn run_concrete_design_validated(
                 "OK".to_string()
             };
 
-            results.push((
-                frame_name.clone(),
+            Ok(Some(
                 ConcreteDesignResult {
                     frame_name: frame_name.clone(),
                     section_name: sec.name.clone(),
@@ -1930,13 +1967,34 @@ fn run_concrete_design_validated(
                     min_rebar_area: min_rebar,
                     status,
                 },
-            ));
+            ))
+        }
+    };
+
+    for (frame_name, frame) in &model.frames {
+        match design_member(frame_name, frame) {
+            Ok(Some(result)) => results.push((frame_name.clone(), result)),
+            Ok(None) => {}
+            Err(e) if !strict && e.is_member_refusal() => {
+                not_designed.push((frame_name.clone(), e));
+            }
+            Err(e) => return Err(e),
         }
     }
 
     model.concrete_design_results.clear();
+    model.concrete_design_errors.clear();
+    let designed = results.len();
     for (k, v) in results {
         model.concrete_design_results.insert(k, v);
     }
-    Ok(())
+    for (frame_name, error) in &not_designed {
+        model
+            .concrete_design_errors
+            .insert(frame_name.clone(), error.to_string());
+    }
+    Ok(crate::DesignRunReport {
+        designed,
+        not_designed,
+    })
 }

@@ -113,7 +113,9 @@ pub fn analyze_model(model: &mut SapModel) -> Result<(), SolverError> {
     model.case_results.clear();
     model.unavailable_results.clear();
     model.steel_design_results.clear();
+    model.steel_design_errors.clear();
     model.concrete_design_results.clear();
+    model.concrete_design_errors.clear();
     // Analyze a working copy so coordinate normalization never rewrites assignments.
     let mut working = model.clone();
     let result = sap_model::auto_select::resolve_analysis_sections(&mut working)

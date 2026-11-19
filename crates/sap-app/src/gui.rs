@@ -49,7 +49,7 @@ mod view;
 mod workflows;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Rect, RichText, Sense, Shape, Stroke, Vec2};
-use sap_design::{try_run_concrete_design, try_run_steel_design};
+use sap_design::{run_concrete_design_per_member, run_steel_design_per_member};
 use sap_format::{
     load_model_with_report, save_native_sdb_file, save_s2k_file_with_report,
     save_sdb_file_with_report,
@@ -437,7 +437,7 @@ impl SapGuiApp {
             }
             match analyze_model(&mut model) {
                 Ok(()) => {
-                    if let Err(error) = try_run_steel_design(&mut model) {
+                    if let Err(error) = run_steel_design_per_member(&mut model) {
                         status_msg = format!("Default model analyzed; design unavailable: {error}");
                     }
                 }
@@ -917,7 +917,8 @@ impl SapGuiApp {
             return;
         }
         if steel {
-            if let Err(error) = try_run_steel_design(&mut self.model) {
+            let steel_report = run_steel_design_per_member(&mut self.model);
+            if let Err(error) = steel_report {
                 self.status_msg = format!("Design Error: {error}");
                 return;
             }
@@ -929,18 +930,20 @@ impl SapGuiApp {
                 .values()
                 .filter(|r| r.status != "OK")
                 .count();
-            self.status_msg = if count == 0 {
+            let refused = not_designed_note(self.model.steel_design_errors.values());
+            self.status_msg = if count == 0 && refused.is_empty() {
                 "No applicable steel members with analysis forces were available for design."
                     .to_string()
             } else {
                 format!(
-                    "Steel design ({}) complete: {count} members ({} OK, {failed} failed).",
+                    "Steel design ({}) complete: {count} members ({} OK, {failed} failed){refused}.",
                     self.model.steel_design_code,
                     count - failed
                 )
             };
         } else {
-            if let Err(error) = try_run_concrete_design(&mut self.model) {
+            let concrete_report = run_concrete_design_per_member(&mut self.model);
+            if let Err(error) = concrete_report {
                 self.status_msg = format!("Design Error: {error}");
                 return;
             }
@@ -952,12 +955,13 @@ impl SapGuiApp {
                 .values()
                 .filter(|r| r.status != "OK")
                 .count();
-            self.status_msg = if count == 0 {
+            let refused = not_designed_note(self.model.concrete_design_errors.values());
+            self.status_msg = if count == 0 && refused.is_empty() {
                 "No applicable concrete members with analysis forces were available for design."
                     .to_string()
             } else {
                 format!(
-                    "Concrete design ({}) complete: {count} members ({} OK, {failed} failed).",
+                    "Concrete design ({}) complete: {count} members ({} OK, {failed} failed){refused}.",
                     self.model.concrete_design_code,
                     count - failed
                 )
@@ -2191,13 +2195,21 @@ impl SapGuiApp {
                 }
             }
 
-            if !self.model.steel_design_results.is_empty() {
+            if !self.model.steel_design_results.is_empty()
+                || !self.model.steel_design_errors.is_empty()
+            {
                 egui::CollapsingHeader::new(format!(
                     "Steel Design ({})",
                     self.model.steel_design_code
                 ))
                 .default_open(true)
                 .show(ui, |ui| {
+                    for (fid, reason) in &self.model.steel_design_errors {
+                        ui.colored_label(
+                            Color32::from_rgb(220, 140, 40),
+                            format!("Fr {fid}: not designed: {reason}"),
+                        );
+                    }
                     for (fid, res) in &self.model.steel_design_results {
                         let col = steel_result_color(res);
                         ui.horizontal(|ui| {
@@ -2213,13 +2225,21 @@ impl SapGuiApp {
                 });
             }
 
-            if !self.model.concrete_design_results.is_empty() {
+            if !self.model.concrete_design_results.is_empty()
+                || !self.model.concrete_design_errors.is_empty()
+            {
                 egui::CollapsingHeader::new(format!(
                     "Concrete Design ({})",
                     self.model.concrete_design_code
                 ))
                 .default_open(true)
                 .show(ui, |ui| {
+                    for (fid, reason) in &self.model.concrete_design_errors {
+                        ui.colored_label(
+                            Color32::from_rgb(220, 140, 40),
+                            format!("Fr {fid}: not designed: {reason}"),
+                        );
+                    }
                     for (fid, res) in &self.model.concrete_design_results {
                         let col = concrete_result_color(res);
                         let detail = if res.is_column {
@@ -5425,6 +5445,22 @@ impl eframe::App for SapGuiApp {
 /// Width the status bar keeps free for the controls on its right.
 const STATUS_RIGHT_CONTROLS_WIDTH: f32 = 780.0;
 
+
+/// D127: the part of a design status message that tells how many members were not designed and
+/// the first reason; empty when nothing is refused.
+pub(crate) fn not_designed_note<'a>(
+    errors: impl ExactSizeIterator<Item = &'a String>,
+) -> String {
+    let count = errors.len();
+    match errors.into_iter().next() {
+        None => String::new(),
+        Some(first) => format!(
+            "; {count} member{} not designed (first: {first})",
+            if count == 1 { "" } else { "s" }
+        ),
+    }
+}
+
 fn resolve_pro_database_path(pro_name: &str) -> Option<PathBuf> {
     let direct = PathBuf::from(pro_name);
     if direct.is_file() {
@@ -5763,6 +5799,73 @@ ComboName=ULS ComboType=\"Linear Add\" CaseName=L ScaleFactor=1.6\nEND TABLE DAT
         );
         assert!(app.model.steel_design_results.is_empty());
         assert!(!app.model.is_locked);
+    }
+
+    /// D127: the design status message says how many members were not designed and the first
+    /// reason; the results panel lists the refused frame; an analysis run clears the reason.
+    #[test]
+    fn design_status_names_the_members_that_were_not_designed() {
+        let mut app = blank_app();
+        let mut model = sap_model::SapModel::new(sap_units::Units::KipInF);
+        let sec =
+            sap_section::make_i_section("W14_TEST", "A992Fy50", 14.0, 10.0, 0.5, 0.35, 10.0, 0.5);
+        model.frame_sections.insert(sec.name.clone(), sec);
+        let mut angle = sap_section::make_rectangular("L8X8", "A992Fy50", 8.0, 8.0);
+        angle.prop_type = sap_model::FramePropType::Angle;
+        angle.tf = 0.5;
+        angle.tw = 0.5;
+        angle.area = 7.75;
+        angle.i33 = 48.4375;
+        angle.i22 = 48.4375;
+        angle.torsional_j = 0.6;
+        angle.s33 = 8.0;
+        angle.z33 = 14.0;
+        angle.s22 = 8.0;
+        angle.z22 = 14.0;
+        model.frame_sections.insert(angle.name.clone(), angle);
+        for (name, x, y, z, fixed) in [
+            ("1", 0.0, 0.0, 0.0, true),
+            ("2", 120.0, 0.0, 0.0, false),
+            ("3", 0.0, 50.0, 0.0, true),
+            ("4", 0.0, 50.0, 120.0, false),
+        ] {
+            model.add_point(name, x, y, z);
+            let point = model.points.get_mut(name).unwrap();
+            if fixed {
+                point.restraint = [true; 6];
+            } else {
+                point.loads_force.push(sap_model::PointLoadForce {
+                    load_pat: "DEAD".to_string(),
+                    csys: "GLOBAL".to_string(),
+                    force: [0.0, 0.0, -5.0, 0.0, 0.0, 0.0],
+                });
+            }
+        }
+        model.add_frame("BEAM", "1", "2", "W14_TEST");
+        model.add_frame("ANG", "3", "4", "L8X8");
+        app.model = sap_format::s2k::parse_s2k(&sap_format::s2k::write_s2k(&model)).unwrap();
+        app.execute_design(true);
+        assert!(
+            app.status_msg.contains("1 members (1 OK, 0 failed); 1 member not designed (first: steel design of member 'ANG'"),
+            "{}",
+            app.status_msg
+        );
+        assert!(app.model.steel_design_results.contains_key("BEAM"));
+        assert!(!app.model.steel_design_results.contains_key("ANG"));
+        assert!(app.model.steel_design_errors.contains_key("ANG"));
+        // a new analysis clears the reasons with the results
+        assert!(app.execute_analysis());
+        assert!(app.model.steel_design_errors.is_empty());
+        // nothing refused: the text of the message is the old one
+        app.model.frames.shift_remove("ANG");
+        app.model.points.shift_remove("3");
+        app.model.points.shift_remove("4");
+        app.execute_design(true);
+        assert!(
+            app.status_msg.ends_with("complete: 1 members (1 OK, 0 failed)."),
+            "{}",
+            app.status_msg
+        );
     }
 
     #[test]
@@ -6974,9 +7077,11 @@ ComboName=ULS ComboType=\"Linear Add\" CaseName=L ScaleFactor=1.6\nEND TABLE DAT
         let frame = app.model.frames.keys().next().unwrap().clone();
         app.execute_design(false);
         let msg = app.status_msg.clone();
-        assert!(msg.starts_with("Design Error"), "{msg}");
+        // D127: the refused member is recorded and named in the status message; no result.
+        assert!(msg.starts_with("Concrete design") && msg.contains("not designed (first: "), "{msg}");
         assert!(msg.contains(&format!("frame '{frame}'")) && msg.contains("section 'RC1'") && msg.contains("material 'C4'"), "{msg}");
         assert!(app.model.concrete_design_results.is_empty());
+        assert!(app.model.concrete_design_errors.contains_key(&frame));
     }
 
     #[test]

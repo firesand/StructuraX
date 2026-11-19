@@ -123,7 +123,7 @@ pub(super) fn start_design(model: &mut SapModel) -> Result<String, String> {
     if !model.is_locked || model.case_results.is_empty() {
         return Err("Run the analysis first; the design uses its forces.".into());
     }
-    sap_design::steel::try_run_steel_design(model).map_err(|e| e.to_string())?;
+    sap_design::run_steel_design_per_member(model).map_err(|e| e.to_string())?;
     let changed = model
         .frames
         .values()
@@ -134,8 +134,9 @@ pub(super) fn start_design(model: &mut SapModel) -> Result<String, String> {
         })
         .count();
     Ok(format!(
-        "Designed {} frames; {changed} Auto Select frames now differ from their analysis section.",
-        model.steel_design_results.len()
+        "Designed {} frames; {changed} Auto Select frames now differ from their analysis section{}.",
+        model.steel_design_results.len(),
+        super::not_designed_note(model.steel_design_errors.values())
     ))
 }
 

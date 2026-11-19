@@ -129,7 +129,9 @@ impl SapModel {
         self.case_results.clear();
         self.unavailable_results.clear();
         self.steel_design_results.clear();
+        self.steel_design_errors.clear();
         self.concrete_design_results.clear();
+        self.concrete_design_errors.clear();
     }
 
     pub(crate) fn check_edit(&self) -> Result<(), EditError> {

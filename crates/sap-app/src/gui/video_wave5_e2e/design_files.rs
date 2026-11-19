@@ -175,9 +175,11 @@ fn concrete_design_of_a_dialog_section_with_a_rebar_material_runs_and_one_withou
     run.settle();
     run.click_text("🧱 Concrete Design");
     let msg = run.app.status_msg.clone();
-    assert!(msg.starts_with("Design Error: "), "{msg}");
+    // D127: the refused member is recorded and named in the status message; the run completes.
+    assert!(msg.starts_with("Concrete design (") && msg.contains("not designed (first: "), "{msg}");
     for part in ["'F1'", "'RB0'", "'CONC'", "yield stress"] {
         assert!(msg.contains(part), "the refusal must name {part}: {msg}");
     }
-    assert!(run.app.model.concrete_design_results.is_empty(), "a refused design leaves no results");
+    assert!(run.app.model.concrete_design_results.is_empty(), "a refused member has no result");
+    assert!(run.app.model.concrete_design_errors.contains_key("F1"));
 }

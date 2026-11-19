@@ -868,6 +868,7 @@ fn assign_concrete_framing(
         frame.concrete_framing = framing;
     }
     model.concrete_design_results.clear();
+    model.concrete_design_errors.clear();
     Ok(format!("Set the concrete framing type of {count} frames to {framing:?}."))
 }
 
@@ -904,6 +905,7 @@ fn assign_steel_overwrite(
         frame.steel_overwrite = overwrite.clone();
     }
     model.steel_design_results.clear();
+    model.steel_design_errors.clear();
     Ok(match overwrite {
         Some(_) => format!("Assigned steel design overwrites to {count} frames."),
         None => format!("Cleared the steel design overwrites of {count} frames."),

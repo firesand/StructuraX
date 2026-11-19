@@ -23,7 +23,9 @@ pub use hinges::{
 };
 pub use links::{cLinkObj, cPropLink, set_link_object, set_link_property};
 
-use sap_design::{try_run_concrete_design, try_run_steel_design, ConcreteCode, SteelCode};
+use sap_design::{
+    run_concrete_design_per_member, run_steel_design_per_member, ConcreteCode, SteelCode,
+};
 use sap_format::{
     load_model_with_report, save_native_sdb_file, save_s2k_file_with_report,
     save_sdb_file_with_report,
@@ -2744,6 +2746,7 @@ impl cDesignSteel<'_> {
         };
         frame.steel_overwrite = overwrite;
         self.api.inner.steel_design_results.clear();
+        self.api.inner.steel_design_errors.clear();
         OAPI_OK
     }
 
@@ -2756,6 +2759,7 @@ impl cDesignSteel<'_> {
             return OAPI_ERR;
         }
         self.api.inner.steel_design_results.clear();
+        self.api.inner.steel_design_errors.clear();
         self.api.inner.steel_design_code = code_name.to_string();
         OAPI_OK
     }
@@ -2765,10 +2769,18 @@ impl cDesignSteel<'_> {
     }
 
     pub fn start_design(&mut self) -> i32 {
-        match try_run_steel_design(&mut self.api.inner) {
-            Ok(()) => OAPI_OK,
+        // D127: a member the design refuses is recorded and the run completes (`OAPI_OK`);
+        // `get_error_summary` returns the reason. A run error is `OAPI_ERR`.
+        match run_steel_design_per_member(&mut self.api.inner) {
+            Ok(_) => OAPI_OK,
             Err(_) => OAPI_ERR,
         }
+    }
+
+    /// The design error message of a frame the last run did not design (v19 API help,
+    /// `cDesignSteel.GetSummaryResults`, ErrorSummary); `None` for a frame without one.
+    pub fn get_error_summary(&self, name: &str) -> Option<String> {
+        self.api.inner.steel_design_errors.get(name).cloned()
     }
 
     pub fn get_summary_results(&self, name: &str) -> Option<SteelDesignResult> {
@@ -2793,6 +2805,7 @@ impl cDesignConcrete<'_> {
         };
         frame.concrete_framing = framing;
         self.api.inner.concrete_design_results.clear();
+        self.api.inner.concrete_design_errors.clear();
         OAPI_OK
     }
 
@@ -2805,6 +2818,7 @@ impl cDesignConcrete<'_> {
             return OAPI_ERR;
         }
         self.api.inner.concrete_design_results.clear();
+        self.api.inner.concrete_design_errors.clear();
         self.api.inner.concrete_design_code = code_name.to_string();
         OAPI_OK
     }
@@ -2814,10 +2828,17 @@ impl cDesignConcrete<'_> {
     }
 
     pub fn start_design(&mut self) -> i32 {
-        match try_run_concrete_design(&mut self.api.inner) {
-            Ok(()) => OAPI_OK,
+        // D127: see `cDesignSteel::start_design`.
+        match run_concrete_design_per_member(&mut self.api.inner) {
+            Ok(_) => OAPI_OK,
             Err(_) => OAPI_ERR,
         }
+    }
+
+    /// The design error message of a frame the last run did not design (v19 API help,
+    /// `cDesignConcrete.GetSummaryResults`, ErrorSummary); `None` for a frame without one.
+    pub fn get_error_summary(&self, name: &str) -> Option<String> {
+        self.api.inner.concrete_design_errors.get(name).cloned()
     }
 
     pub fn get_summary_results(&self, name: &str) -> Option<ConcreteDesignResult> {

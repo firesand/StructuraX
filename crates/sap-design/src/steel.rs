@@ -1,6 +1,6 @@
 use crate::{
     compute_aisc_minor_shear, compute_ec3_minor_shear, compute_ec3_rectangular_minor_shear,
-    error::validate_demands, DesignError,
+    error::validate_demands, error::DesignRunReport, DesignError,
 };
 use sap_model::{
     ComboType, FrameObj, FramePropType, FrameSection, FrameStationResult, LoadCombo, MatType,
@@ -2457,12 +2457,39 @@ pub fn run_steel_design_with_overwrites(
     let _ = try_run_steel_design_with_overwrites(model, overwrites);
 }
 
-/// Checked steel design entry point with optional per-member overwrites.
+/// Checked steel design entry point with optional per-member overwrites. Strict: the first
+/// refused member returns its typed error and leaves both result maps empty.
 pub fn try_run_steel_design_with_overwrites(
     model: &mut SapModel,
     overwrites: &std::collections::HashMap<String, SteelMemberOverwrite>,
 ) -> Result<(), DesignError> {
+    run_steel_design_core(model, overwrites, true).map(|_| ())
+}
+
+/// D127: the steel design that the applications call. A member the design refuses is recorded
+/// (typed in the report, as text in `model.steel_design_errors`) and the run goes on with the
+/// other members; a run error (code, combinations, demands, overwrites) returns `Err` and leaves
+/// both maps empty. Use `try_run_steel_design` for the strict form that stops at the first
+/// refused member.
+pub fn run_steel_design_per_member(model: &mut SapModel) -> Result<DesignRunReport, DesignError> {
+    run_steel_design_per_member_with_overwrites(model, &std::collections::HashMap::new())
+}
+
+/// D127: `run_steel_design_per_member` with optional per-member overwrites.
+pub fn run_steel_design_per_member_with_overwrites(
+    model: &mut SapModel,
+    overwrites: &std::collections::HashMap<String, SteelMemberOverwrite>,
+) -> Result<DesignRunReport, DesignError> {
+    run_steel_design_core(model, overwrites, false)
+}
+
+fn run_steel_design_core(
+    model: &mut SapModel,
+    overwrites: &std::collections::HashMap<String, SteelMemberOverwrite>,
+    strict: bool,
+) -> Result<DesignRunReport, DesignError> {
     model.steel_design_results.clear();
+    model.steel_design_errors.clear();
     let code = SteelCode::try_from_code_str(&model.steel_design_code)?;
     refuse_unavailable_combos(model, "steel")?;
     let combo_forces = collect_design_combo_forces(model);
@@ -2491,7 +2518,7 @@ pub fn try_run_steel_design_with_overwrites(
                 )
             })
     })?;
-    run_steel_design_validated(model, overwrites, code, combo_forces)
+    run_steel_design_validated(model, overwrites, code, combo_forces, strict)
 }
 
 /// Computes available torsional strength $T_c$ ($\phi_T T_n$ for LRFD, $T_n / \Omega_T$ for ASD)
@@ -2595,7 +2622,8 @@ fn run_steel_design_validated(
     overwrites: &std::collections::HashMap<String, SteelMemberOverwrite>,
     code: SteelCode,
     combo_forces: ComboForces,
-) -> Result<(), DesignError> {
+    strict: bool,
+) -> Result<DesignRunReport, DesignError> {
     let _ = compute_ec3_rectangular_minor_shear;
 
     // Frames assigned an Auto Select list are designed from the list; the
@@ -2618,6 +2646,9 @@ fn run_steel_design_validated(
 
     let mut results = Vec::new();
     let mut auto_choices: Vec<(String, String)> = Vec::new();
+    let mut not_designed: Vec<(String, DesignError)> = Vec::new();
+    // Frames refused in an Auto Select list: their design section is reset below.
+    let mut refused_lists: Vec<String> = Vec::new();
 
     for (frame_name, frame) in &model.frames {
         // D93: cables are not designed (see `try_run_steel_design_with_overwrites`).
@@ -2628,7 +2659,7 @@ fn run_steel_design_validated(
             continue;
         };
         if crate::auto_select::is_auto_list_section(sec) {
-            if let Some((res, chosen)) = crate::auto_select::design_frame_from_list(
+            match crate::auto_select::design_frame_from_list(
                 model,
                 k_model,
                 frame_name,
@@ -2638,9 +2669,18 @@ fn run_steel_design_validated(
                 code,
                 &combo_forces,
                 dc_limit,
-            )? {
-                results.push((frame_name.clone(), res));
-                auto_choices.push((frame_name.clone(), chosen));
+                strict,
+            ) {
+                Ok(Some((res, chosen))) => {
+                    results.push((frame_name.clone(), res));
+                    auto_choices.push((frame_name.clone(), chosen));
+                }
+                Ok(None) => {}
+                Err(e) if !strict && e.is_member_refusal() => {
+                    refused_lists.push(frame_name.clone());
+                    not_designed.push((frame_name.clone(), e));
+                }
+                Err(e) => return Err(e),
             }
             continue;
         }
@@ -2654,30 +2694,55 @@ fn run_steel_design_validated(
             continue;
         }
 
-        if mat.mat_type != MatType::Steel {
-            return Err(DesignError::UnsupportedSteelMaterial {
+        let designed = if mat.mat_type != MatType::Steel {
+            Err(DesignError::UnsupportedSteelMaterial {
                 frame: frame_name.clone(),
                 material: mat.name.clone(),
-            });
-        }
-        if let Some(res) = design_frame_with_section(
-            model,
-            k_model,
-            frame_name,
-            frame,
-            sec,
-            mat,
-            overwrites,
-            code,
-            &combo_forces,
-        )? {
-            results.push((frame_name.clone(), res));
+            })
+        } else {
+            design_frame_with_section(
+                model,
+                k_model,
+                frame_name,
+                frame,
+                sec,
+                mat,
+                overwrites,
+                code,
+                &combo_forces,
+            )
+        };
+        match designed {
+            Ok(Some(res)) => results.push((frame_name.clone(), res)),
+            Ok(None) => {}
+            Err(e) if !strict && e.is_member_refusal() => {
+                not_designed.push((frame_name.clone(), e));
+            }
+            Err(e) => return Err(e),
         }
     }
 
+    let designed = results.len();
     model.steel_design_results.clear();
+    model.steel_design_errors.clear();
     for (k, v) in results {
         model.steel_design_results.insert(k, v);
+    }
+    for (frame_name, error) in &not_designed {
+        model
+            .steel_design_errors
+            .insert(frame_name.clone(), error.to_string());
+    }
+    // A frame refused in its Auto Select list has no design section, as a frame that was never
+    // designed has none (the state starts with an empty design section).
+    for frame_name in refused_lists {
+        if let Some(state) = model
+            .frames
+            .get_mut(&frame_name)
+            .and_then(|f| f.auto_select.as_mut())
+        {
+            state.design = String::new();
+        }
     }
     for (frame_name, chosen) in auto_choices {
         if let Some(frame) = model.frames.get_mut(&frame_name) {
@@ -2685,13 +2750,16 @@ fn run_steel_design_validated(
             state.design = chosen;
         }
     }
-    Ok(())
+    Ok(DesignRunReport {
+        designed,
+        not_designed,
+    })
 }
 
 /// D128, D129: the AISC 360-10 limit states that are refused instead of designed (all
-/// `AiscLimitStateNotBuilt`, AISC only). One refused member stops the whole run and leaves no
-/// steel results, and Auto Select stops at a refused candidate (D127): a model with a single
-/// angle in compression is no longer designed at all. Demand gates are dimensionless, so a
+/// `AiscLimitStateNotBuilt`, AISC only). A refused member is recorded with its reason and the run
+/// goes on with the other members; Auto Select passes over a refused candidate (D127). The strict
+/// entry points (`try_run_steel_design`) still stop at the first refused member. Demand gates are dimensionless, so a
 /// roundoff value neither refuses nor designs: compression `-P > 1e-9 Fy A`, `|M3| > 1e-9 Fy S33`,
 /// `|M2| > 1e-9 Fy S22`; every station of every state of the frame is scanned (as D88 does).
 fn refuse_aisc_limit_states_not_built(

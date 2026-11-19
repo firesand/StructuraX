@@ -135,8 +135,9 @@ pub enum DesignError {
     /// D128, D129: an AISC 360-10 limit state that the vendor manual does not give in full, or
     /// that needs section properties the model does not hold, is not built (G81, G82, G83); or
     /// an input it needs is missing. The member is refused instead of designed with a wrong
-    /// strength. One refused member stops the run, and Auto Select stops at a refused
-    /// candidate (D127).
+    /// strength. The run goes on with the other members and the reason is recorded for the
+    /// member (D127); Auto Select passes over a refused candidate. The strict entry points still
+    /// stop at the first refused member.
     #[error("steel design of member '{frame}': section '{section}' ({kind}) is not designed: {what}")]
     AiscLimitStateNotBuilt {
         frame: String,
@@ -146,8 +147,9 @@ pub enum DesignError {
     },
     /// D130: concrete beam torsion that the design does not build (G85): a beam that is not
     /// rectangular, with torsion above what the vendor manual lets the design ignore, or a
-    /// section too small for the closed stirrup the manual assumes. One refused member stops
-    /// the run (D127).
+    /// section too small for the closed stirrup the manual assumes. The run goes on with the
+    /// other members and the reason is recorded for the beam (D127); the strict entry point
+    /// still stops at the first refused member.
     #[error("concrete design of beam '{frame}', combination '{combo}': torsion on section '{section}' is not designed: {reason}")]
     ConcreteTorsionNotDesigned {
         frame: String,
@@ -155,6 +157,55 @@ pub enum DesignError {
         section: String,
         reason: String,
     },
+    /// D127: every section of the Auto Select list is refused for this frame.
+    #[error("steel design of member '{frame}': no section of the Auto Select list '{list}' can be designed; the first is refused with: {first}")]
+    AutoSelectNoSection {
+        frame: String,
+        list: String,
+        first: String,
+    },
+}
+
+/// D127: what a design run did. `not_designed` holds each refused frame with its typed error, in
+/// the order of the frames; the same texts are in the model's `*_design_errors`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesignRunReport {
+    pub designed: usize,
+    pub not_designed: Vec<(String, DesignError)>,
+}
+
+impl DesignError {
+    /// D127: whether the error refuses one member (the tolerant run records it and goes on) or
+    /// the whole run (it stays an `Err`). No wildcard arm: a new variant must be classified.
+    pub fn is_member_refusal(&self) -> bool {
+        match self {
+            DesignError::InvalidShearProperty { .. }
+            | DesignError::UnsupportedShearSection { .. }
+            | DesignError::UnsupportedSteelMaterial { .. }
+            | DesignError::UnsupportedClosedSectionTorsion { .. }
+            | DesignError::SlenderPipeNotDesigned { .. }
+            | DesignError::UnequalFlangeISection { .. }
+            | DesignError::Ec3CompressionBendingUnsupported { .. }
+            | DesignError::Ec3SectionClass { .. }
+            | DesignError::UnsupportedEc3Classification { .. }
+            | DesignError::UnsupportedLocal3Shear { .. }
+            | DesignError::UnsupportedBeamMinorAxisFlexure { .. }
+            | DesignError::UnsupportedEc3MinorShearSection { .. }
+            | DesignError::UnsupportedEc3ShearInteraction { .. }
+            | DesignError::MissingRebarYield { .. }
+            | DesignError::AiscLimitStateNotBuilt { .. }
+            | DesignError::ConcreteTorsionNotDesigned { .. }
+            | DesignError::AutoSelectNoSection { .. } => true,
+            DesignError::UnsupportedSteelCode(_)
+            | DesignError::UnsupportedConcreteCode(_)
+            | DesignError::InvalidSteelOverwrite { .. }
+            | DesignError::UnavailableCombination { .. }
+            | DesignError::UnfinishedCase { .. }
+            | DesignError::MissingDemand { .. }
+            | DesignError::NonFiniteDemand { .. }
+            | DesignError::Workflow(_) => false,
+        }
+    }
 }
 
 pub(crate) fn validate_demands<F>(

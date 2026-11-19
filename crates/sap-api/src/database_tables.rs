@@ -356,6 +356,7 @@ static TABLES: &[TableDef] = &[
             field!("Ratio", "Ratio", "Demand/Capacity Ratio", "", false),
             field!("RatioType", "RatioType", "Ratio Type", "", false),
             field!("Status", "Status", "Design Status", "", false),
+            field!("ErrMsg", "ErrMsg", "Design Error Message", "", false),
         ],
     },
     TableDef {
@@ -384,6 +385,7 @@ static TABLES: &[TableDef] = &[
             ),
             field!("PMMRatio", "PMMRatio", "PMM Interaction Ratio", "", false),
             field!("Status", "Status", "Design Status", "", false),
+            field!("ErrMsg", "ErrMsg", "Design Error Message", "", false),
         ],
     },
     TableDef {
@@ -425,6 +427,7 @@ static TABLES: &[TableDef] = &[
                 false
             ),
             field!("Status", "Status", "Design Status", "", false),
+            field!("ErrMsg", "ErrMsg", "Design Error Message", "", false),
         ],
     },
 ];
@@ -486,15 +489,62 @@ fn is_table_empty(model: &SapModel, key: &str) -> bool {
             .case_results
             .values()
             .any(|cr| !cr.buckling_factors.is_empty()),
-        "STEEL DESIGN 1 - SUMMARY DATA" => model.steel_design_results.is_empty(),
+        // D127: a frame the design refused has a row (Status "Not designed"), so it counts.
+        "STEEL DESIGN 1 - SUMMARY DATA" => {
+            model.steel_design_results.is_empty() && model.steel_design_errors.is_empty()
+        }
         "CONCRETE DESIGN 1 - COLUMN SUMMARY DATA" => {
             !model.concrete_design_results.values().any(|r| r.is_column)
+                && !model
+                    .concrete_design_errors
+                    .keys()
+                    .any(|f| refused_concrete_is_column(model, f))
         }
         "CONCRETE DESIGN 2 - BEAM SUMMARY DATA" => {
             !model.concrete_design_results.values().any(|r| !r.is_column)
+                && !model
+                    .concrete_design_errors
+                    .keys()
+                    .any(|f| !refused_concrete_is_column(model, f))
         }
         _ => true,
     }
+}
+
+/// D127: whether a concrete frame that the design refused is a column (the design's own test);
+/// a frame or section that no longer exists reads as a beam.
+fn refused_concrete_is_column(model: &SapModel, frame: &str) -> bool {
+    let Some(f) = model.frames.get(frame) else {
+        return false;
+    };
+    model
+        .frame_sections
+        .get(&f.section)
+        .is_some_and(|sec| sap_design::is_concrete_column(model, f, sec))
+}
+
+/// D127: the row of a frame the design refused: Status "Not designed", the message, the frame and
+/// its section; the numeric cells stay empty.
+fn not_designed_row(
+    model: &SapModel,
+    frame: &str,
+    message: &str,
+    code: &str,
+) -> BTreeMap<&'static str, String> {
+    let mut r = BTreeMap::new();
+    r.insert("Frame", frame.to_string());
+    r.insert(
+        "DesignSect",
+        model
+            .frames
+            .get(frame)
+            .map(|f| f.section.clone())
+            .unwrap_or_default(),
+    );
+    r.insert("DesignCode", code.to_string());
+    r.insert("Status", "Not designed".to_string());
+    r.insert("ErrMsg", message.to_string());
+    r
 }
 
 /// Interactive Database Tables facade (`SAP2000v19.cDatabaseTables`).
@@ -1263,7 +1313,16 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("Ratio", format!("{}", res.total_ratio));
                     r.insert("RatioType", "PMM".to_string());
                     r.insert("Status", res.status.clone());
+                    r.insert("ErrMsg", String::new());
                     rows.push(r);
+                }
+                for (frame, message) in &model.steel_design_errors {
+                    rows.push(not_designed_row(
+                        model,
+                        frame,
+                        message,
+                        &model.steel_design_code,
+                    ));
                 }
             }
             "CONCRETE DESIGN 1 - COLUMN SUMMARY DATA" => {
@@ -1285,7 +1344,18 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("TotalAv", format!("{}", res.av_over_s));
                     r.insert("PMMRatio", format!("{}", res.pmm_ratio));
                     r.insert("Status", res.status.clone());
+                    r.insert("ErrMsg", String::new());
                     rows.push(r);
+                }
+                for (frame, message) in &model.concrete_design_errors {
+                    if refused_concrete_is_column(model, frame) {
+                        rows.push(not_designed_row(
+                            model,
+                            frame,
+                            message,
+                            &model.concrete_design_code,
+                        ));
+                    }
                 }
             }
             "CONCRETE DESIGN 2 - BEAM SUMMARY DATA" => {
@@ -1305,7 +1375,18 @@ impl<'a> cDatabaseTables<'a> {
                     r.insert("SideAs", format!("{}", res.as_side));
                     r.insert("TotalAv", format!("{}", res.av_over_s));
                     r.insert("Status", res.status.clone());
+                    r.insert("ErrMsg", String::new());
                     rows.push(r);
+                }
+                for (frame, message) in &model.concrete_design_errors {
+                    if !refused_concrete_is_column(model, frame) {
+                        rows.push(not_designed_row(
+                            model,
+                            frame,
+                            message,
+                            &model.concrete_design_code,
+                        ));
+                    }
                 }
             }
             _ => {}

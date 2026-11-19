@@ -13,19 +13,20 @@ pub use auto_select::{verify_all_members_passed, verify_analysis_vs_design};
 pub use default_combos::{
     add_default_design_combos, DefaultComboOptions, DefaultComboSummary, DesignMethod,
 };
-pub use error::DesignError;
+pub use error::{DesignError, DesignRunReport};
 
 pub use concrete::{
     compute_whitney_beta1, design_aci_beam_flexure, design_aci_beam_shear, design_ec2_beam,
     evaluate_column_biaxial_pmm_ratio, generate_column_pm_curve, interpolate_phi_mn_at_pu,
-    is_concrete_column, run_concrete_design, try_run_concrete_design, ConcreteCode, PmCurvePoint,
+    is_concrete_column, run_concrete_design, run_concrete_design_per_member, try_run_concrete_design, ConcreteCode, PmCurvePoint,
 };
 pub use steel::{
     check_compactness_aisc, classify_ec3_section, compute_aisc_360_capacities,
     compute_aisc_torsional_capacity,
     compute_cb_from_stations, compute_ec3_capacities, compute_k_braced, compute_k_sway,
     compute_member_k_factors, compute_slender_q_factor, evaluate_station_interaction,
-    frame_clear_length, run_steel_design, run_steel_design_with_overwrites, try_run_steel_design,
+    frame_clear_length, run_steel_design, run_steel_design_per_member,
+    run_steel_design_per_member_with_overwrites, run_steel_design_with_overwrites, try_run_steel_design,
     try_run_steel_design_with_overwrites, CompactnessClass, Ec3Class, SectionCompactness, SteelCode,
     SteelMemberOverwrite,
 };

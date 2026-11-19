@@ -1737,6 +1737,15 @@ pub struct SapModel {
     pub unavailable_results: IndexMap<String, String>,
     pub steel_design_results: IndexMap<String, SteelDesignResult>,
     pub concrete_design_results: IndexMap<String, ConcreteDesignResult>,
+    /// D127: frames the last steel design run did not design, with the reason (the text of the
+    /// design error). SAP2000 reports design error messages per frame (v19 API help,
+    /// cDesignSteel.GetSummaryResults, ErrorSummary). A frame is in this map or in
+    /// `steel_design_results`, never in both.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub steel_design_errors: IndexMap<String, String>,
+    /// D127: the same for concrete design.
+    #[serde(default, skip_serializing_if = "IndexMap::is_empty")]
+    pub concrete_design_errors: IndexMap<String, String>,
 
     /// Where the mass of the model comes from.
     #[serde(default, skip_serializing_if = "seismic::MassSource::is_default")]
@@ -1869,6 +1878,8 @@ impl SapModel {
             unavailable_results: IndexMap::new(),
             steel_design_results: IndexMap::new(),
             concrete_design_results: IndexMap::new(),
+            steel_design_errors: IndexMap::new(),
+            concrete_design_errors: IndexMap::new(),
             mass_source: seismic::MassSource::default(),
             auto_seismic: IndexMap::new(),
             auto_seismic_eccentricity: IndexMap::new(),
@@ -2202,7 +2213,9 @@ impl SapModel {
         self.case_results.clear();
         self.unavailable_results.clear();
         self.steel_design_results.clear();
+        self.steel_design_errors.clear();
         self.concrete_design_results.clear();
+        self.concrete_design_errors.clear();
         self.is_locked = false;
     }
 }
