@@ -1,0 +1,46 @@
+TABLE: "PROGRAM CONTROL"
+ CurrUnits="kN, m, C"
+TABLE: "MATERIAL PROPERTIES 02 - BASIC MECHANICAL PROPERTIES"
+ Material=A992Fy50 E1=200000000 G12=76923077 U12=0.3 UnitWeight=0 UnitMass=0
+TABLE: "JOINT COORDINATES"
+ Joint=K XorR=0 Y=3 Z=0
+ Joint=L XorR=3 Y=3 Z=0
+ Joint=I XorR=0 Y=0 Z=0
+ Joint=J XorR=3 Y=0 Z=0
+TABLE: "JOINT RESTRAINT ASSIGNMENTS"
+ Joint=K U1=Yes U2=Yes U3=Yes R1=Yes R2=Yes R3=Yes
+ Joint=L U2=Yes U3=Yes R1=Yes R2=Yes R3=Yes
+ Joint=I U1=Yes U2=Yes U3=Yes R1=Yes R2=Yes R3=Yes
+ Joint=J U3=Yes R1=Yes R2=Yes
+TABLE: "FRAME SECTION PROPERTIES 01 - GENERAL"
+ SectionName=BAR Material=A992Fy50 Shape=General Area=0.01 I33=0.0001 I22=0.0001 TorsConst=0.0001
+TABLE: "CONNECTIVITY - FRAME"
+ Frame=G JointI=K JointJ=L MeshSegments=1
+ Frame=F JointI=I JointJ=J MeshSegments=1
+TABLE: "FRAME SECTION ASSIGNMENTS"
+ Frame=G AnalSect=BAR
+ Frame=F AnalSect=BAR
+TABLE: "LOAD PATTERN DEFINITIONS"
+ LoadPat=P DesignType=Other SelfWtMult=0
+ LoadPat=AX DesignType=Other SelfWtMult=0
+TABLE: "JOINT LOADS - FORCE"
+ Joint=J LoadPat=P F2=1
+ Joint=L LoadPat=AX F1=30
+ Joint=J LoadPat=AX F1=-0.01
+TABLE: "RUST HINGE PROPERTIES"
+ Name=H DOF=P Symmetric=Yes BeyondE=Extrapolated
+TABLE: "RUST HINGE PROPERTIES - CURVE"
+ Name=H Point=B Force=1e6 Deform=0
+ Name=H Point=C Force=1e6 Deform=0.1
+ Name=H Point=D Force=1e6 Deform=0.2
+ Name=H Point=E Force=1e6 Deform=1
+TABLE: "RUST FRAME HINGE ASSIGNMENTS"
+ Frame=G HingeNum=1 Prop=H RelDist=1
+ Frame=F HingeNum=1 Prop=H RelDist=1
+TABLE: "LOAD CASE DEFINITIONS"
+ Case=PUSH Type=NonStatic RunCase=Yes GeomNonLin=PDelta
+ Case=FOLLOW Type=NonStatic GeomNonLin=PDelta InitialCond=PUSH RustDisplTarget=0.000008 RustDisplJoint=J RustDisplDOF=U2 RustDisplConjugate=No
+TABLE: "CASE - STATIC 1 - LOAD ASSIGNMENTS"
+ Case=FOLLOW LoadType="Load pattern" LoadName=AX LoadSF=1
+ Case=PUSH LoadType="Load pattern" LoadName=P LoadSF=1
+END TABLE DATA

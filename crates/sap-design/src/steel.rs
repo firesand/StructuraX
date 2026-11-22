@@ -91,7 +91,12 @@ pub fn check_compactness_aisc(sec: &FrameSection, e: f64, fy: f64) -> SectionCom
             };
             let tf = sec.tf.max(1e-9);
             let tw = sec.tw.max(1e-9);
-            let h = (sec.t3 - sec.tf - sec.tfb).max(0.0);
+            let bottom_tf = if sec.prop_type == FramePropType::I && sec.tfb == 0.0 {
+                sec.tf
+            } else {
+                sec.tfb
+            };
+            let h = (sec.t3 - sec.tf - bottom_tf).max(0.0);
 
             let lambda_f = if sec.prop_type == FramePropType::Channel
                 || sec.prop_type == FramePropType::DbChannel
@@ -823,6 +828,111 @@ fn flb_linear(mp: f64, fy: f64, s: f64, lambda: f64, lp: f64, lr: f64, slender: 
     }
 }
 
+/// Major-axis strength of a doubly symmetric I with a noncompact web. CSI AISC
+/// 360-10 manual §3.5.3.1.1.3, pp. 3-39–3-42. For equal flanges both bending
+/// signs have the same compression flange and yield moment.
+fn noncompact_web_mn33(
+    sec: &FrameSection,
+    e: f64,
+    fy: f64,
+    lb: f64,
+    cb: f64,
+) -> Result<f64, DesignError> {
+    let refuse = |what: &str| DesignError::AiscLimitStateNotBuilt {
+        frame: String::new(),
+        section: sec.name.clone(),
+        kind: "I".into(),
+        what: what.into(),
+    };
+    if !(sec.tf > 0.0
+        && sec.t2 > 0.0
+        && sec.tw > 0.0
+        && sec.t3 > 2.0 * sec.tf
+        && sec.i22 > 0.0
+        && sec.s33 > 0.0
+        && sec.z33 > 0.0
+        && sec.torsional_j >= 0.0)
+    {
+        return Err(refuse(
+            "F4 needs flange and web dimensions, Iy, S33, Z33 and a nonnegative J",
+        ));
+    }
+    if (sec.t2b > 0.0 && (sec.t2b - sec.t2).abs() > 1e-9 * sec.t2)
+        || (sec.tfb > 0.0 && (sec.tfb - sec.tf).abs() > 1e-9 * sec.tf)
+    {
+        return Err(refuse("F4 for unequal flanges is not implemented"));
+    }
+
+    let h = sec.t3 - 2.0 * sec.tf;
+    let plate_area = 2.0 * sec.t2 * sec.tf + h * sec.tw;
+    // F4 uses the clear web depth. The model has no fillet radius, so only
+    // geometry consistent with a sharp plate section supports this calculation.
+    if !(plate_area.is_finite() && (sec.area - plate_area).abs() <= 1e-4 * plate_area) {
+        return Err(refuse(
+            "F4 requires the clear web depth. The tabulated area differs from the plate geometry, and rolled fillet dimensions are unavailable",
+        ));
+    }
+    let h0 = sec.t3 - sec.tf;
+    let lambda = h / sec.tw;
+    let root = (e / fy).sqrt();
+    let my = fy * sec.s33;
+    let mp = (fy * sec.z33).min(1.6 * my);
+    let iyc = sec.tf * sec.t2.powi(3) / 12.0;
+    let (yield_moment, j) = if iyc > 0.23 * sec.i22 {
+        let web_fraction = ((lambda - 3.76 * root) / ((5.70 - 3.76) * root)).clamp(0.0, 1.0);
+        (mp - (mp - my) * web_fraction, sec.torsional_j)
+    } else {
+        (my, 0.0)
+    };
+
+    // F4-5, F4-7, F4-8 and F4-11. The rearranged Lr also has a finite value at J = 0.
+    let aw = (h * sec.tw / (sec.t2 * sec.tf)).min(10.0);
+    let rt = sec.t2 / (12.0 * (h0 / sec.t3 + aw * h.powi(2) / (6.0 * h0 * sec.t3))).sqrt();
+    let lp = 1.1 * rt * root;
+    let fl = 0.7 * fy;
+    let j_ratio = j / (sec.s33 * h0);
+    let lr = 1.95 * rt * e / fl * (j_ratio + j_ratio.hypot(2.6 * fl / e)).sqrt();
+    let ltb = if lb <= lp {
+        yield_moment
+    } else if lb <= lr {
+        cb * (yield_moment - (yield_moment - fl * sec.s33) * (lb - lp) / (lr - lp))
+    } else {
+        let slenderness_sq = (lb / rt).powi(2);
+        cb * PI.powi(2) * e / slenderness_sq
+            * (1.0 + 0.078 * j_ratio * slenderness_sq).sqrt()
+            * sec.s33
+    };
+    let cap = yield_moment.min(ltb);
+
+    let flange = sec.t2 / (2.0 * sec.tf);
+    let lp_flange = 0.38 * root;
+    if flange <= lp_flange {
+        return Ok(cap);
+    }
+    // The manual specifies 0.5 Fy here for flange local buckling. Table 3-1
+    // distinguishes rolled and built-up flanges. FrameSection has no fabrication
+    // field. A unique governing strength can still result (e.g. elastic LTB).
+    let kc = (4.0 / lambda.sqrt()).clamp(0.35, 0.76);
+    let fl_flange = 0.5 * fy;
+    let capacity = |lr_flange| {
+        let flb = if flange <= lr_flange {
+            yield_moment
+                - (yield_moment - fl_flange * sec.s33) * (flange - lp_flange)
+                    / (lr_flange - lp_flange)
+        } else {
+            0.90 * e * kc * sec.s33 / flange.powi(2)
+        };
+        cap.min(flb)
+    };
+    let rolled = capacity(root);
+    // Table B4.1b note b uses 0.7 Fy to classify a doubly symmetric I.
+    let built_up = capacity(0.95 * (kc * e / fl).sqrt());
+    if (rolled - built_up).abs() > 16.0 * f64::EPSILON * rolled.max(built_up) {
+        return Err(refuse("F4 flange local buckling depends on rolled or built-up fabrication, which the section does not record"));
+    }
+    Ok(rolled.min(built_up))
+}
+
 /// The factored strengths of [`compute_aisc_360_strengths`]. `phi_mn33_pos` is for M3 >= 0, which
 /// compresses the +2 face (Analysis Reference p. 143): the flange of a tee, whose stem is then in
 /// tension. `phi_mn33_neg` is for M3 < 0. `phi_mn33_pos_stem_compressed` is for a station with
@@ -891,6 +1001,24 @@ pub fn compute_aisc_360_strengths(
     cb: f64,
     is_asd: bool,
 ) -> Result<AiscStrengths, DesignError> {
+    aisc_strengths(sec_in, mat, l33, l22, l_ltb, k33, k22, cb, is_asd, false)
+        .map(|(strengths, _)| strengths)
+}
+
+/// Member design may leave F4 major-axis strength unavailable if the design entry has zero M3.
+/// The public section strength query requires a complete set of strengths.
+fn aisc_strengths(
+    sec_in: &FrameSection,
+    mat: &Material,
+    l33: f64,
+    l22: f64,
+    l_ltb: f64,
+    k33: f64,
+    k22: f64,
+    cb: f64,
+    is_asd: bool,
+    allow_missing_f4: bool,
+) -> Result<(AiscStrengths, Option<String>), DesignError> {
     let sec_leg = angle_leg_thickness(sec_in);
     let sec: &FrameSection = &sec_leg;
     let e = mat.e.max(1.0);
@@ -1143,7 +1271,21 @@ pub fn compute_aisc_360_strengths(
         mp22
     };
 
+    let mut missing_f4 = None;
     match sec.prop_type {
+        FramePropType::I if compactness.web_flexure == CompactnessClass::Noncompact => {
+            mn33_pos = match noncompact_web_mn33(sec, e, fy, l_ltb, cb) {
+                Ok(strength) => strength,
+                Err(DesignError::AiscLimitStateNotBuilt { what, .. }) if allow_missing_f4 => {
+                    missing_f4 = Some(format!(
+                        "Major-axis flexural strength unavailable at zero M3. {what}"
+                    ));
+                    0.0
+                }
+                Err(err) => return Err(err),
+            };
+            mn33_neg = mn33_pos;
+        }
         // D129: Pipe, F8 (p. 3-58), both axes with the modulus of that axis. The page prints
         // Table 3-1's lambda_p as 0.07 sqrt(E/Fy), a misprint: the same row's lambda_r and
         // lambda_s, AISC Table B4.1b case 20 and `check_compactness_aisc` use E/Fy.
@@ -1355,16 +1497,19 @@ pub fn compute_aisc_360_strengths(
         phi_v_lrfd * vn2
     };
 
-    Ok(AiscStrengths {
-        phi_pnc,
-        phi_pnt,
-        phi_mn33_pos,
-        phi_mn33_pos_stem_compressed,
-        phi_mn33_neg,
-        phi_mn22,
-        phi_vn2,
-        compactness,
-    })
+    Ok((
+        AiscStrengths {
+            phi_pnc,
+            phi_pnt,
+            phi_mn33_pos,
+            phi_mn33_pos_stem_compressed,
+            phi_mn33_neg,
+            phi_mn22,
+            phi_vn2,
+            compactness,
+        },
+        missing_f4,
+    ))
 }
 
 /// EC3 section class of a cross section by the vendor's Tables 4-1 (bending only) and 4-2
@@ -3067,25 +3212,22 @@ pub(crate) fn design_frame_with_section(
             // `phi_mn33_neg` is the strength for M3 < 0 (the stem of a tee in compression); it
             // equals `phi_mn33` (M3 >= 0) for every other shape and under EC3 (D129).
             let mut phi_mn33_neg = 0.0;
+            let mut missing_f4 = None;
             let (mut phi_pnc, mut phi_pnt, mut phi_mn33, mut phi_mn22, mut phi_vn2, compactness) = match code {
                 SteelCode::Aisc360Lrfd | SteelCode::Aisc360Asd => {
-                    let s = compute_aisc_360_strengths(
+                    let (s, unavailable) = aisc_strengths(
                         sec, mat, l33, l22, l_ltb, k33, k22, cb, is_asd,
+                        stations.iter().all(|st| st.m3 == 0.0),
                     )
-                    .map_err(|err| match err {
-                        DesignError::SlenderPipeNotDesigned {
-                            section,
-                            d_over_t,
-                            limit,
-                            ..
-                        } => DesignError::SlenderPipeNotDesigned {
-                            frame: frame_name.to_string(),
-                            section,
-                            d_over_t,
-                            limit,
-                        },
-                        other => other,
+                    .map_err(|mut err| {
+                        if let DesignError::SlenderPipeNotDesigned { frame, .. }
+                            | DesignError::AiscLimitStateNotBuilt { frame, .. } = &mut err
+                        {
+                            *frame = frame_name.to_string();
+                        }
+                        err
                     })?;
+                    missing_f4 = unavailable;
                     phi_mn33_neg = s.phi_mn33_neg;
                     // D129, tee and double angle: when the stem is compressed at any station of
                     // this state (M3 < 0 beyond roundoff), the stations with M3 >= 0 take the
@@ -3532,6 +3674,7 @@ pub(crate) fn design_frame_with_section(
 
                 if is_more_critical {
                     let mut result_notes = notes.clone();
+                    result_notes.extend(missing_f4.iter().cloned());
                     // only when the member check is what governs (not a shear check above it)
                     if gov_eq == eq_name && eq_name.starts_with("EC3-6.3.3(4)") {
                         result_notes.extend(member_note);

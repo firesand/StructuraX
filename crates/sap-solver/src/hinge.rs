@@ -1186,7 +1186,8 @@ impl Stepper<'_> {
                 progress: p_now,
             });
         };
-        if tau <= 1e-12 * target {
+        let progress_scale = if sol.dp != 0.0 { target / sol.dp.abs() } else { 0.0 };
+        if tau <= 1e-12 * progress_scale {
             counters.nulls += 1;
             if counters.nulls > spec.max_null_steps {
                 return Err(StepError::Budget {
@@ -1206,7 +1207,7 @@ impl Stepper<'_> {
         for h in 0..n {
             end.q[h] += tau * sol.dq[h];
         }
-        let limit = tau * (1.0 + EVENT_TIE) + 1e-13 * target;
+        let limit = tau * (1.0 + EVENT_TIE) + 1e-13 * progress_scale;
         let event = evs
             .iter()
             .find(|(t, _)| *t == tau)
@@ -1314,11 +1315,16 @@ fn loading_direction(
     stepper.control = Control::Load;
     let first = stepper.search(&probe, &cls, active, &cand, 1.0, false);
     stepper.control = saved_control;
-    let rate = match first {
-        Some((_, sol)) => problem.c * sol.dlam + (0..n).map(|j| problem.w[j] * sol.dq[j]).sum::<f64>(),
-        None => problem.c,
+    let (rate, scale) = match first {
+        Some((_, sol)) => {
+            let direct = problem.c * sol.dlam;
+            (0..n).fold((direct, direct.abs()), |(sum, magnitude), j| {
+                let contribution = problem.w[j] * sol.dq[j];
+                (sum + contribution, magnitude + contribution.abs())
+            })
+        }
+        None => (problem.c, problem.c.abs()),
     };
-    let scale = problem.c.abs() + problem.w.iter().fold(0.0f64, |m, w| m.max(w.abs()));
     if !rate.is_finite() || rate.abs() <= 1e-12 * scale || rate == 0.0 {
         return Err(StepError::NoMotion);
     }
@@ -2745,6 +2751,21 @@ impl PdCtx {
             }
         }
     }
+
+    /// Check a corrected target or grid row in the units it controls.
+    fn progress_row_holds(&self, event: Ev, progress: f64) -> bool {
+        let goal = match event {
+            Ev::Target => self.target,
+            Ev::Grid => self.grid.unwrap_or(self.target),
+            _ => return true,
+        };
+        let origin = match self.control {
+            Control::Load => self.lambda0,
+            Control::Monitored { .. } => self.u0,
+        };
+        let rounding = 16.0 * f64::EPSILON * (origin.abs() + goal.abs());
+        (progress - goal).abs() <= 1e-12 * goal.abs() + rounding
+    }
 }
 
 /// The axial forces of one recovered state together with what their
@@ -2756,8 +2777,8 @@ impl PdCtx {
 struct AxialState {
     /// P-Delta axial force per analysis element.
     n: IndexMap<String, f64>,
-    /// Largest axial or shear force of any frame station of the state.
-    force: f64,
+    /// Largest axial or shear force at each element's stations.
+    force: IndexMap<String, f64>,
     /// Per element: relative displacement of its ends over its length (the
     /// chord rotation, with the small axial strain), which turns an error of
     /// the axial force into an unbalanced transverse force `dN * tilt`.
@@ -2774,36 +2795,29 @@ struct AxialState {
 /// Two conditions, both in force units (v19 Analysis Reference p. 435: the
 /// convergence tolerance compares "the magnitude of force error with the
 /// magnitude of the force acting on the structure"):
-/// * the largest change of an axial force is within `tol` of the largest
-///   axial force;
-/// * the unbalanced force that the stale axial forces leave on any element,
-///   `dN * tilt`, is within `tol` of the largest force of the state: the
-///   accepted state is in equilibrium to the tolerance.
+/// * the axial change is relative to that element's axial force;
+/// * the unbalanced transverse force is relative to its station forces.
 ///
 /// A change below what rounding can produce in an element counts as none.
 fn axial_converged(new: &AxialState, old: &IndexMap<String, f64>, tol: f64) -> (bool, f64) {
     let mut gap = 0.0f64;
-    let mut gap_beyond_rounding = 0.0f64;
-    let mut unbalance = 0.0f64;
-    let mut scale = old.values().fold(0.0f64, |m, v| m.max(v.abs()));
+    let mut converged = true;
     for (name, value) in &new.n {
-        scale = scale.max(value.abs());
-        let change = (value - old.get(name).copied().unwrap_or(0.0)).abs();
+        let previous = old.get(name).copied().unwrap_or(0.0);
+        let change = (value - previous).abs();
         gap = gap.max(change);
         let real = (change - new.rounding.get(name).copied().unwrap_or(0.0)).max(0.0);
-        gap_beyond_rounding = gap_beyond_rounding.max(real);
-        unbalance = unbalance.max(real * new.tilt.get(name).copied().unwrap_or(0.0));
+        let tilt = new.tilt.get(name).copied().unwrap_or(0.0);
+        let force = new.force.get(name).copied().unwrap_or(0.0);
+        converged &= real <= tol * value.abs().max(previous.abs()) && real * tilt <= tol * force;
     }
     for (name, value) in old {
         if !new.n.contains_key(name) {
             gap = gap.max(value.abs());
-            gap_beyond_rounding = gap_beyond_rounding.max(value.abs());
+            converged &= *value == 0.0;
         }
     }
-    (
-        gap_beyond_rounding <= tol * scale && unbalance <= tol * new.force,
-        gap,
-    )
+    (converged, gap)
 }
 
 /// The rates, per unit load factor at fixed plastic jumps, of the hinge
@@ -2852,9 +2866,14 @@ impl CaseSetup<'_> {
         let n = frame_axial_forces(&results);
         let force = results
             .frame_forces
-            .values()
-            .flatten()
-            .fold(0.0f64, |m, f| m.max(f.p.abs()).max(f.v2.abs()).max(f.v3.abs()));
+            .iter()
+            .map(|(name, stations)| {
+                let peak = stations.iter().fold(0.0f64, |m, f| {
+                    m.max(f.p.abs()).max(f.v2.abs()).max(f.v3.abs())
+                });
+                (name.clone(), peak)
+            })
+            .collect();
         let mut tilt = IndexMap::new();
         let mut rounding = IndexMap::new();
         for name in n.keys() {
@@ -2954,48 +2973,109 @@ impl CaseSetup<'_> {
         // limit of its own, not the limit the case sets for a step, so that
         // the rates (and with them the path) do not depend on that limit.
         const TRIAL_ITERATIONS: usize = 50;
-        let delta = 1e-3 * st.lambda.abs().max(1.0);
-        let mut trial = st.clone();
-        trial.lambda += delta;
-        let mut n = built.axial.clone();
-        let mut settled = None;
-        for _ in 0..TRIAL_ITERATIONS {
-            let b = self.build(&n).ok()?;
-            let next = self.axial_state(&b, &trial).ok()?;
-            if axial_converged(&next, &n, tol.min(1e-9)).0 {
-                settled = Some(b);
+        // Choose the perturbation in physical response units. Rescaling a
+        // pattern then inversely rescales its trial load factor.
+        let mut response = 0.0f64;
+        // All frame elements can affect a monitored displacement, including
+        // elements without hinge sites. Compare translations in common axes.
+        let u = &built.u_own;
+        let translation = |joint: usize, axis: usize| -> f64 {
+            (0..3).map(|d| self.joint_rot[joint][axis][d] * u[6 * joint + d]).sum()
+        };
+        for frame in self.model.frames.values() {
+            let (i, j) = (self.pt_index[&frame.point_i], self.pt_index[&frame.point_j]);
+            let (pi, pj) = (&self.work_points[&frame.point_i], &self.work_points[&frame.point_j]);
+            let length = (pi.x - pj.x).hypot(pi.y - pj.y).hypot(pi.z - pj.z);
+            if length == 0.0 {
+                continue;
+            }
+            for d in 0..3 {
+                response = response
+                    .max((translation(j, d) - translation(i, d)).abs() / length)
+                    .max(u[6 * i + 3 + d].abs())
+                    .max(u[6 * j + 3 + d].abs());
+            }
+        }
+        // Both samples must satisfy the same fixed-point tolerance. Otherwise
+        // the correction of a previously accepted state enters the derivative
+        // divided by the (possibly tiny) probe interval.
+        let settle = |sample: &State, mut n: IndexMap<String, f64>| -> Option<Built> {
+            for _ in 0..TRIAL_ITERATIONS {
+                let b = self.build(&n).ok()?;
+                let next = self.axial_state(&b, sample).ok()?;
+                if axial_converged(&next, &n, tol.min(1e-10)).0 {
+                    return Some(b);
+                }
+                n = next.n;
+            }
+            None
+        };
+        let base = settle(st, built.axial.clone())?;
+        let observations = |b: &Built, state: &State| {
+            let mut values = b.problem.forces(state);
+            if monitored {
+                values.push(b.monitored_chain + b.problem.displacement(state));
+            }
+            values
+        };
+        let at_base = observations(&base, st);
+        let mut direct = built.problem.g.clone();
+        if monitored {
+            direct.push(built.problem.c);
+        }
+        let undeformed = st.lambda == 0.0 && st.q.iter().all(|&q| q == 0.0)
+            && base.u_chain.iter().all(|&u| u == 0.0);
+        let mut rates = direct.clone();
+        let mut resolved = vec![false; rates.len()];
+        let mut previous = vec![0.0; rates.len()];
+        // If a large response elsewhere makes this first interval too small
+        // to resolve a particular force or displacement, increase it only for
+        // that observable. Two successive secants must agree before replacing
+        // its direct rate. A coarse probe hitting instability is discarded.
+        let mut delta = if response > 0.0 {
+            (1e-8 / response).max(1e-8 * st.lambda.abs())
+        } else {
+            1e-3 * st.lambda.abs().max(1.0)
+        };
+        const GROWTH: f64 = 8.0;
+        for attempt in 0..12 {
+            let mut trial = st.clone();
+            trial.lambda += delta;
+            let Some(b) = settle(&trial, base.axial.clone()) else { break };
+            let at_trial = observations(&b, &trial);
+            for i in 0..rates.len() {
+                if resolved[i] {
+                    continue;
+                }
+                let diff = at_trial[i] - at_base[i];
+                let magnitude = at_base[i].abs() + at_trial[i].abs();
+                let total = diff / delta;
+                let significant = diff.abs() > 1e-9 * magnitude;
+                if significant {
+                    let agreement = 0.05 * total.abs()
+                        + 64.0 * f64::EPSILON * magnitude * GROWTH / delta;
+                    if attempt == 0 || (total - previous[i]).abs() <= agreement {
+                        if (total - direct[i]).abs() * delta > 64.0 * f64::EPSILON * magnitude {
+                            rates[i] = total;
+                        }
+                        resolved[i] = true;
+                    }
+                } else if magnitude == 0.0 && undeformed {
+                    // No preload or plastic jump can drive a geometric rate.
+                    resolved[i] = true;
+                }
+                previous[i] = total;
+            }
+            if resolved.iter().all(|&done| done) {
                 break;
             }
-            n = next.n;
+            delta *= GROWTH;
         }
-        let b = settled?;
-        let p = &built.problem;
-        let (f_k, f_d) = (p.forces(st), b.problem.forces(&trial));
-        let mut coupled = false;
-        // A difference from the direct rate below the rounding of the two
-        // states it is taken from is none.
-        let mut rate = |direct: f64, at_k: f64, at_d: f64| -> f64 {
-            let total = (at_d - at_k) / delta;
-            let noise = 1e-9 * (at_k.abs() + at_d.abs()) / delta;
-            if (total - direct).abs() <= noise {
-                return direct;
-            }
-            if (total - direct).abs() > 0.1 * total.abs().max(direct.abs()) {
-                coupled = true;
-            }
-            total
-        };
-        let g: Vec<f64> = (0..p.g.len()).map(|i| rate(p.g[i], f_k[i], f_d[i])).collect();
-        let c = if monitored {
-            rate(
-                p.c,
-                built.monitored_chain + p.displacement(st),
-                b.monitored_chain + b.problem.displacement(&trial),
-            )
-        } else {
-            p.c
-        };
-        coupled.then_some(Tangent { g, c })
+        let coupled = rates.iter().zip(&direct).any(|(total, direct)| {
+            (total - direct).abs() > 0.1 * total.abs().max(direct.abs())
+        });
+        let c = if monitored { rates.pop()? } else { built.problem.c };
+        coupled.then_some(Tangent { g: rates, c })
     }
 
     /// The end state of `step` for the problem `b`: the load factor and the
@@ -3152,6 +3232,7 @@ impl CaseSetup<'_> {
                 },
             };
         }
+        holds &= ctx.progress_row_holds(event, ctx.progress(&end, b));
         Ok(Some((end, holds)))
     }
 
@@ -3243,7 +3324,7 @@ impl CaseSetup<'_> {
         let p = &b.problem;
         let f = p.forces(end);
         let p_end = ctx.progress(end, b);
-        let limit = step.tau * EVENT_TIE + 1e-13 * ctx.target;
+        let limit = step.tau * EVENT_TIE;
         let remaining = |ev: Ev| -> f64 {
             match ev {
                 Ev::SegEnd(h) => {
@@ -3279,7 +3360,11 @@ impl CaseSetup<'_> {
             out.push(event);
         }
         for ev in &step.tied {
-            if *ev == event || remaining(*ev) <= limit {
+            let reached = match ev {
+                Ev::Target | Ev::Grid => ctx.progress_row_holds(*ev, p_end),
+                _ => remaining(*ev) <= limit,
+            };
+            if *ev == event || reached {
                 out.push(*ev);
             }
         }
