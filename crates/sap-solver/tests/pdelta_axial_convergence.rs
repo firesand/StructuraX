@@ -355,3 +355,74 @@ fn a_compression_of_a_straight_column_does_not_move_the_tip_and_is_refused() {
     assert!(e.contains("does not move the monitored displacement"), "{e}");
     assert!(m.case_results.is_empty(), "no results are kept");
 }
+
+#[test]
+fn an_unrelated_preload_does_not_change_the_column_equilibrium() {
+    let text = include_str!("fixtures/pdelta/disconnected-preload.s2k");
+    let mut model = parse_s2k(text).unwrap();
+    analyze_model(&mut model).unwrap();
+    let (factor, tip) = answer(&model, 1.0);
+    assert_eq!(model.case_results["FOLLOW"].status, CaseStatus::Finished);
+    close(factor, closed_form_factor(), 1e-6, "column factor");
+    close(tip, tip_at(factor), 1e-6, "equilibrium at the reported factor");
+}
+
+#[test]
+fn scaling_the_axial_pattern_preserves_the_coupled_displacement_solution() {
+    let further = 8e-6;
+    for compression in [1e7, 100.0, 0.01, 1e-10] {
+        let text = column_text(1.0, Ok(further)).replace("F1=-100", &format!("F1=-{compression:e}"));
+        let mut model = parse_s2k(&text).unwrap();
+        analyze_model(&mut model).unwrap();
+        let (factor, tip) = answer(&model, 1.0);
+        assert_eq!(model.case_results["FOLLOW"].status, CaseStatus::Finished);
+        close(factor * compression, 100.0 * column_factor(1.0, further), 1e-6, "compression");
+        close(tip - 1.0 / tip_stiffness2(0.0), further, 1e-9, "tip increment");
+    }
+}
+
+#[test]
+fn a_yield_event_halfway_to_the_conjugate_target_does_not_end_the_case() {
+    let fixture = include_str!("fixtures/pdelta/conjugate-axial.s2k");
+    for force in [1.0, 1e-14] {
+        let text = fixture.replace("F1=1e-14", &format!("F1={force:e}"));
+        let mut model = parse_s2k(&text).unwrap();
+        analyze_model(&mut model).unwrap();
+        let result = &model.case_results["FOLLOW"];
+        assert_eq!(result.status, CaseStatus::Finished);
+        close(result.joint_displacements["J"][0], 1.0, 1e-12, "final displacement");
+        // Elastic bar and hardening hinge in series: u = F/0.001 + (F-0.0005)/0.001.
+        close(result.displacement_control_factor.unwrap() * force, 0.00075, 1e-12, "final force");
+    }
+}
+
+#[test]
+fn an_independently_loaded_flexible_member_does_not_mask_the_monitored_rate() {
+    let further = 8e-6;
+    let fixture = include_str!("fixtures/pdelta/disconnected-follow.s2k");
+    let bar_only = fixture.replace(" Frame=F HingeNum=1 Prop=H RelDist=1\n", "");
+    for text in [fixture, &bar_only] {
+        let mut model = parse_s2k(text).unwrap();
+        analyze_model(&mut model).unwrap();
+        let (factor, tip) = answer(&model, 1.0);
+        assert_eq!(model.case_results["FOLLOW"].status, CaseStatus::Finished);
+        close(factor * 0.01, 100.0 * column_factor(1.0, further), 1e-6, "compression");
+        close(tip - 1.0 / tip_stiffness2(0.0), further, 1e-9, "tip increment");
+    }
+}
+
+#[test]
+fn a_stiff_or_fixed_shared_pier_does_not_mask_a_coupled_tip_rate() {
+    let fixture = include_str!("fixtures/pdelta/shared-pier.s2k");
+    let spring = fixture.replace("Joint=I U1=Yes U2=Yes U3=Yes R1=Yes R2=Yes R3=Yes", "Joint=I U3=Yes R1=Yes R2=Yes")
+        .replace("END TABLE DATA", "TABLE: \"JOINT SPRING ASSIGNMENTS 1 - UNCOUPLED\"\n Joint=I U1=1e12 U2=1e12 R3=1e12\nEND TABLE DATA");
+    for text in [fixture, &spring] {
+        let mut model = parse_s2k(text).unwrap();
+        analyze_model(&mut model).unwrap();
+        let (factor, tip) = answer(&model, 1.0);
+        assert_eq!(model.case_results["FOLLOW"].status, CaseStatus::Finished);
+        close(factor * 0.01, 100.0 * column_factor(1.0, 8e-6), 1e-6, "compression");
+        close(tip - model.case_results["PUSH"].joint_displacements["J"][1],
+            8e-6, 1e-9, "tip increment");
+    }
+}

@@ -2260,11 +2260,20 @@ fn apply_single_table(
                     return OAPI_ERR;
                 };
                 let case_name = get_cell(row, "CaseName").unwrap_or("");
-                let sf = get_cell(row, "ScaleFactor")
-                    .and_then(|s| s.trim().parse::<f64>().ok())
-                    .unwrap_or(1.0);
-                if !sf.is_finite() {
-                    return OAPI_ERR;
+                let sf = match get_cell(row, "ScaleFactor") {
+                    Some(s) => match s.trim().parse::<f64>() {
+                        Ok(value) if value.is_finite() => value,
+                        _ => {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: Invalid ScaleFactor '{}' for combination '{}'\n",
+                                    s, name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
+                    },
+                    None => 1.0,
                 };
 
                 let combo = model
@@ -2276,17 +2285,42 @@ fn apply_single_table(
                         cases: Vec::new(),
                     });
 
-                if seen_combos.insert(name.to_string()) {
+                let first_row = seen_combos.insert(name.to_string());
+                if first_row {
                     combo.cases.clear();
                 }
 
                 if let Some(ct) = get_cell(row, "ComboType") {
-                    combo.combo_type = match ct.to_ascii_uppercase().as_str() {
+                    let normalized: String = ct
+                        .chars()
+                        .filter(|c| !c.is_ascii_whitespace() && *c != '_' && *c != '-')
+                        .flat_map(char::to_uppercase)
+                        .collect();
+                    let kind = match normalized.as_str() {
+                        "LINEARADD" | "LINEARADDITION" => ComboType::LinearAdd,
                         "ENVELOPE" => ComboType::Envelope,
                         "ABSOLUTEADD" | "ABSADD" => ComboType::AbsAdd,
                         "SRSS" => ComboType::Srss,
-                        _ => ComboType::LinearAdd,
+                        "RANGEADD" => ComboType::RangeAdd,
+                        _ => {
+                            if fill_log {
+                                log.push_str(&format!(
+                                    "ERROR: Unknown combination type '{}' for combination '{}'\n",
+                                    ct, name
+                                ));
+                            }
+                            return OAPI_ERR;
+                        }
                     };
+                    if !first_row && combo.combo_type != kind {
+                        if fill_log {
+                            log.push_str(&format!(
+                                "ERROR: Conflicting combination types for '{}'\n", name
+                            ));
+                        }
+                        return OAPI_ERR;
+                    }
+                    combo.combo_type = kind;
                 }
 
                 if !case_name.is_empty() {

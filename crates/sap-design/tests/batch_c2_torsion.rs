@@ -282,53 +282,35 @@ fn aci_beam_that_is_too_small_for_the_stirrup_is_refused_naming_the_member() {
     assert!(m.concrete_design_results.is_empty());
 }
 
-// ------------------------------------------------------------------ step 2: other shapes
-
-fn tee_section(t3: f64, t2: f64, tf: f64, tw: f64, name: &str, material: &str) -> sap_model::FrameSection {
-    let mut s = make_rectangular(name, material, t3, t2);
-    s.prop_type = FramePropType::T;
-    s.tf = tf;
-    s.tw = tw;
-    s
-}
-
 #[test]
-fn aci_t_beam_torsion_below_the_printed_threshold_is_ignored_and_above_it_refused() {
-    // T section h 24, bf 36, ds 5, bw 12: Acp = 12 x 24 + 24 x 5 = 408, pcp = 2 x 36 + 2 x 24 = 120,
-    // Tth = 0.0632456 x 408^2/120 = 87.734231, phi Tth = 65.800674 kip-in (the bounding rectangle
-    // would give 295.08).
-    let run = |tu: f64| {
-        let mut m = aci_model(tee_section(24.0, 36.0, 5.0, 12.0, "T1", "C4"), false, vec![stn(0.5, 0.0, 30.0, tu)]);
-        try_run_concrete_design(&mut m).map(|_| m.concrete_design_results["B1"].clone())
-    };
-    same_bits(&run(60.0).unwrap(), &run(0.0).unwrap());
-    let e = run(70.0).unwrap_err();
-    let text = e.to_string();
-    assert!(matches!(e, DesignError::ConcreteTorsionNotDesigned { .. }));
-    assert!(text.contains("'T1'") && text.contains("section type T") && text.contains("G85"), "{text}");
-    assert!(text.contains("65.8006"), "{text}");
-}
-
-#[test]
-fn a_beam_of_another_shape_with_torsion_is_refused_and_without_it_designed() {
-    for kind in [FramePropType::General, FramePropType::I] {
-        let mut section = make_rectangular("G1", "C4", 24.0, 12.0);
-        section.prop_type = kind;
-        let run = |t: f64| {
-            let mut m = aci_model(section.clone(), false, vec![stn(0.5, 0.0, 30.0, t)]);
-            try_run_concrete_design(&mut m).map(|_| m.concrete_design_results["B1"].clone())
-        };
-        let e = run(1.0).unwrap_err();
-        let text = e.to_string();
-        assert!(matches!(e, DesignError::ConcreteTorsionNotDesigned { .. }));
-        assert!(text.contains(&format!("section type {kind:?}")) && text.contains("G85"), "{text}");
-        // without torsion: designed as before
-        let r = run(0.0).unwrap();
-        assert_eq!(r.at_over_s, 0.0);
-        assert!(r.av_over_s > 0.0);
-        // a roundoff torsion below 1e-6 phi Tth0 = 5.46e-5 kip-in does not refuse
-        assert!(run(1e-7).is_ok());
+fn nonrectangular_beams_are_refused_even_without_torsion() {
+    // The previous checks accepted a T beam using its 36 in flange as the shear width,
+    // although its web is only 12 in wide. The other unimplemented geometries also used
+    // their bounding rectangle (or essentially zero width when dimensions were absent).
+    for kind in [FramePropType::T, FramePropType::I, FramePropType::General, FramePropType::Variable] {
+        for t in [0.0, 70.0] {
+            let mut section = make_rectangular("B", "C4", 24.0, 36.0);
+            section.prop_type = kind;
+            section.tf = 5.0;
+            section.tw = 12.0;
+            let mut model = aci_model(section, false, vec![stn(0.5, 0.0, 130.0, t)]);
+            let err = try_run_concrete_design(&mut model).unwrap_err();
+            assert!(matches!(err, DesignError::UnsupportedConcreteBeamSection { .. }));
+            let text = err.to_string();
+            assert!(text.contains("'B1'") && text.contains("'B'") && text.contains(&format!("{kind:?}")), "{text}");
+            assert!(model.concrete_design_results.is_empty());
+        }
     }
+
+    let mut section = make_rectangular("B", "C30", 500.0, 900.0);
+    section.prop_type = FramePropType::T;
+    section.tf = 120.0;
+    section.tw = 300.0;
+    let mut model = ec2_model(section, false, vec![stn(0.5, 0.0, 20e3, 0.0)]);
+    assert!(matches!(
+        try_run_concrete_design(&mut model),
+        Err(DesignError::UnsupportedConcreteBeamSection { .. })
+    ));
 }
 
 // ------------------------------------------------------------------ step 3: columns
@@ -530,73 +512,104 @@ fn ec2_torsion_function_and_the_seismic_strut() {
     close(seis.av_over_s, 0.478725, 1e-6, "Asw/s 45 degrees");
 }
 
+// A model-level check of both synthesis and the stored maximum/minimum rows used after analysis.
 #[test]
-fn ec2_t_beam_torsion_is_ignored_by_eq_6_31_and_refused_above() {
-    // T: h 500, bf 900, ds 120, bw 300: A = 222 000, u = 2800, tef = 79.285714, Ak = 345 286.2245,
-    // TRd,c = 1.351685 x 79.285714 x 2 x 345 286.2245 = 74 008 180.9 N mm;
-    // VRd,c of the rectangle 900 x 436.5 the shear design uses: 163 536.6824 N.
-    let (bf, h, ds, bw, d) = (900.0_f64, 500.0_f64, 120.0_f64, 300.0_f64, 436.5_f64);
-    let tef = (bw * h + (bf - bw) * ds) / (2.0 * bf + 2.0 * h);
-    let ak = (bf - tef) * (h - tef);
-    let fctd = 1.0 * 0.7 * 0.30 * 30.0_f64.powf(2.0 / 3.0) / 1.5;
-    let trdc = fctd * tef * 2.0 * ak;
-    let k = (1.0 + (200.0_f64 / d).sqrt()).min(2.0);
-    let vrdc = 0.035 * k.powf(1.5) * 30.0_f64.sqrt() * bf * d;
-    close(trdc, 74008180.936, 1e-8, "TRd,c of the T beam");
-    close(vrdc, 163536.6824, 1e-8, "VRd,c");
-    let run = |t: f64| {
-        let mut m = ec2_model(
-            tee_section(500.0, 900.0, 120.0, 300.0, "T1", "C30"),
-            false,
-            vec![stn(0.5, 0.0, 0.5 * vrdc, t)],
-        );
-        try_run_concrete_design(&mut m).map(|_| m.concrete_design_results["B1"].clone())
-    };
-    // sum 0.5 + 0.4 = 0.9: ignored; 0.5 + 0.6 = 1.1: refused
-    same_bits(&run(0.4 * trdc).unwrap(), &run(0.0).unwrap());
-    let e = run(0.6 * trdc).unwrap_err();
-    let text = e.to_string();
-    assert!(matches!(e, DesignError::ConcreteTorsionNotDesigned { .. }));
-    assert!(text.contains("'T1'") && text.contains("section type T") && text.contains("G85"), "{text}");
+fn range_add_pairs_opposite_signed_shear_and_torsion_extrema() {
+    let e = ec2_hand();
+    let mut models = [
+        (aci_model(make_rectangular("B", "C4", 24.0, 12.0), false, vec![]), 70.0, 400.0),
+        (ec2_model(make_rectangular("B", "C30", 500.0, 300.0), false, vec![]), 4.0 * e.vrdc, 45e6),
+    ];
+    for (model, v, t) in &mut models {
+        for sign in [1.0, -1.0] {
+            for (name, station) in [
+                ("V", stn(0.5, 0.0, *v, 0.0)),
+                ("T", stn(0.5, 0.0, 0.0, sign * *t)),
+            ] {
+                let mut case = CaseResults { case_name: name.into(), ..Default::default() };
+                case.frame_forces.insert("B1".into(), vec![station]);
+                model.case_results.insert(name.into(), case);
+            }
+            model.case_results.shift_remove("COMBO1");
+            model.load_combos.insert("BOTH".into(), LoadCombo {
+                name: "BOTH".into(),
+                combo_type: ComboType::LinearAdd,
+                cases: vec![("V".into(), 1.0), ("T".into(), 1.0)],
+            });
+            try_run_concrete_design(model).unwrap();
+            let linear = model.concrete_design_results["B1"].clone();
+            assert_eq!(linear.status, "OVERSTRESSED");
+            model.load_combos.get_mut("BOTH").unwrap().combo_type = ComboType::RangeAdd;
+            try_run_concrete_design(model).unwrap();
+            same_bits(&linear, &model.concrete_design_results["B1"]);
+
+            let mut hi = CaseResults { case_name: "BOTH".into(), ..Default::default() };
+            let mut lo = CaseResults { case_name: "BOTH".into(), ..Default::default() };
+            hi.frame_forces.insert("B1".into(), vec![stn(0.5, 0.0, *v, (sign * *t).max(0.0))]);
+            lo.frame_forces.insert("B1".into(), vec![stn(0.5, 0.0, 0.0, (sign * *t).min(0.0))]);
+            hi.combo_min = Some(Box::new(lo));
+            model.case_results.insert("BOTH".into(), hi);
+            try_run_concrete_design(model).unwrap();
+            same_bits(&linear, &model.concrete_design_results["B1"]);
+            model.case_results.shift_remove("BOTH");
+        }
+    }
 }
 
 #[test]
-fn ec2_beam_of_another_shape_with_torsion_is_refused_and_without_it_designed() {
-    let mut section = make_rectangular("G1", "C30", 500.0, 300.0);
-    section.prop_type = FramePropType::General;
-    let run = |t: f64| {
-        let mut m = ec2_model(section.clone(), false, vec![stn(0.5, 0.0, 20e3, t)]);
-        try_run_concrete_design(&mut m).map(|_| m.concrete_design_results["B1"].clone())
-    };
-    let e = run(1e6).unwrap_err();
-    assert!(e.to_string().contains("section type General"), "{e}");
-    assert!(run(0.0).is_ok());
-    // below the floor 1e-6 TRd,c = 21.2 N mm: not refused
-    assert!(run(1.0).is_ok());
+fn ranged_torsion_keeps_the_axial_and_flexural_companions_that_activate_it() {
+    // ACI: 50 kip-in is ignored at zero axial load, but tension eliminates phi Tth.
+    let mut aci = aci_model(
+        make_rectangular("B", "C4", 24.0, 12.0),
+        false,
+        vec![stn(0.5, 100.0, 0.0, 0.0)],
+    );
+    // EC2: the positive moment increases rho_l enough to make Eq. 6.31 pass at
+    // 60 kN and 5 kN-m. The zero-M3 branch of the same range fails Eq. 6.31.
+    let mut hi_ec2 = stn(0.5, 0.0, 60e3, 5e6);
+    hi_ec2.m3 = 250e6;
+    let mut ec2 = ec2_model(
+        make_rectangular("B", "C30", 500.0, 300.0),
+        false,
+        vec![hi_ec2],
+    );
+    for (model, lo_station) in [
+        (&mut aci, stn(0.5, 0.0, 0.0, -50.0)),
+        (&mut ec2, stn(0.5, 0.0, 0.0, 0.0)),
+    ] {
+        try_run_concrete_design(model).unwrap();
+        assert_eq!(model.concrete_design_results["B1"].at_over_s, 0.0);
+        let mut lo = CaseResults::default();
+        lo.frame_forces.insert("B1".into(), vec![lo_station]);
+        model.case_results.get_mut("COMBO1").unwrap().combo_min = Some(Box::new(lo));
+        model.load_combos.insert("COMBO1".into(), LoadCombo {
+            name: "COMBO1".into(),
+            combo_type: ComboType::RangeAdd,
+            cases: Vec::new(),
+        });
+        try_run_concrete_design(model).unwrap();
+        assert!(model.concrete_design_results["B1"].at_over_s > 0.0);
+    }
 }
 
 #[test]
-fn the_noise_floor_of_a_t_beam_is_that_of_its_bounding_rectangle() {
-    // tf = tw = 0 would make the T section's own threshold 0; the floor is that of t2 x t3:
-    // ACI 36 x 24 in: Tth0 = 0.0632456 x 864^2/120 = 393.4 kip-in, floor 1e-6 x 0.75 x 393.4 = 2.95e-4;
-    // EC2 900 x 500 mm: TRd,c of the rectangle is about 1e8 N mm, floor about 100 N mm.
-    let mut m = aci_model(
-        tee_section(24.0, 36.0, 0.0, 0.0, "T0", "C4"),
+fn torsion_failure_governs_over_a_passing_flexure_combination() {
+    let mut flexure = stn(0.5, 0.0, 0.0, 0.0);
+    flexure.m3 = 4100.0;
+    let mut model = aci_model(
+        make_rectangular("B", "C4", 24.0, 12.0),
         false,
-        vec![stn(0.5, 0.0, 30.0, 1e-5)],
+        vec![flexure],
     );
-    try_run_concrete_design(&mut m).unwrap();
-    let mut m = ec2_model(
-        tee_section(500.0, 900.0, 0.0, 0.0, "T0", "C30"),
-        false,
-        vec![stn(0.5, 0.0, 20e3, 1.0)],
-    );
-    try_run_concrete_design(&mut m).unwrap();
-    // above the floor it is refused
-    let mut m = aci_model(
-        tee_section(24.0, 36.0, 0.0, 0.0, "T0", "C4"),
-        false,
-        vec![stn(0.5, 0.0, 30.0, 1.0)],
-    );
-    assert!(try_run_concrete_design(&mut m).is_err());
+    try_run_concrete_design(&mut model).unwrap();
+    assert_eq!(model.concrete_design_results["B1"].status, "OK");
+    let mut torsion = CaseResults { case_name: "TORSION".into(), ..Default::default() };
+    // The torsion-only case exceeds the section limit with an area metric of about
+    // 4.08 in², below the passing flexure case's 4.11 in².
+    torsion.frame_forces.insert("B1".into(), vec![stn(0.5, 0.0, 0.0, 425.0)]);
+    model.case_results.insert("TORSION".into(), torsion);
+    try_run_concrete_design(&mut model).unwrap();
+    let result = &model.concrete_design_results["B1"];
+    assert_eq!(result.status, "OVERSTRESSED");
+    assert_eq!(result.governing_combo, "TORSION");
 }

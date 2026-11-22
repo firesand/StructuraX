@@ -153,7 +153,7 @@ fn concrete_run_with_a_refused_beam_is_ok_and_has_an_error_summary() {
     assert!(api.design_concrete().get_summary_results("BM").is_some());
     assert!(api.design_concrete().get_summary_results("TB").is_none());
     let text = api.design_concrete().get_error_summary("TB").unwrap();
-    assert!(text.contains("'TB'") && text.contains("torsion"), "{text}");
+    assert!(text.contains("'TB'") && text.contains("'OB'") && text.contains("rectangular section"), "{text}");
 
     let (fields, rows) = table(&mut api, "Concrete Design 2 - Beam Summary Data");
     assert_eq!(rows.len(), 2);

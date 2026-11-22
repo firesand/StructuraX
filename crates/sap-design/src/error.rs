@@ -145,11 +145,14 @@ pub enum DesignError {
         kind: String,
         what: String,
     },
-    /// D130: concrete beam torsion that the design does not build (G85): a beam that is not
-    /// rectangular, with torsion above what the vendor manual lets the design ignore, or a
-    /// section too small for the closed stirrup the manual assumes. The run goes on with the
-    /// other members and the reason is recorded for the beam (D127); the strict entry point
-    /// still stops at the first refused member.
+    /// D144: beam flexure and shear require supported section geometry.
+    #[error("concrete design of beam '{frame}': section '{section}' ({kind}) is not designed: beam flexure and shear require a rectangular section (D144)")]
+    UnsupportedConcreteBeamSection {
+        frame: String,
+        section: String,
+        kind: String,
+    },
+    /// D130: the closed stirrup required by the rectangular beam torsion model does not fit.
     #[error("concrete design of beam '{frame}', combination '{combo}': torsion on section '{section}' is not designed: {reason}")]
     ConcreteTorsionNotDesigned {
         frame: String,
@@ -195,6 +198,7 @@ impl DesignError {
             | DesignError::MissingRebarYield { .. }
             | DesignError::AiscLimitStateNotBuilt { .. }
             | DesignError::ConcreteTorsionNotDesigned { .. }
+            | DesignError::UnsupportedConcreteBeamSection { .. }
             | DesignError::AutoSelectNoSection { .. } => true,
             DesignError::UnsupportedSteelCode(_)
             | DesignError::UnsupportedConcreteCode(_)

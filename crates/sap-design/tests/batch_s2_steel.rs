@@ -1036,3 +1036,99 @@ fn d129_ec3_results_and_refusals_are_bitwise_unchanged() {
     assert_eq!(r.total_ratio.to_bits(), 0x3faa173e54f791cd);
     assert!(try_design(b, 120.0, vec![station(0.0, 100.0, 0.0)]).is_err());
 }
+
+/// CSI AISC 360-10 §3.5.3.1.1.3. The plate dimensions give h/tw = 114,
+/// S33 = 125.9976 in³, Z33 = 138.312 in³, Rpc My = 6606.599854 kip·in.
+/// Independent F4 calculations give rt = 2.180661 in, Lp = 57.7690 in and
+/// Lr = 210.6974 in. These lengths exercise all three lateral-buckling branches.
+#[test]
+fn noncompact_i_web_uses_f4_strengths_and_detects_overstress() {
+    let sec = make_i_section("I24", "A992Fy50", 24.0, 8.0, 0.6, 0.2, 8.0, 0.6);
+    let mat = sap_model::Material::default_steel_kip_in();
+    for (length, lrfd, asd) in [
+        (12.0, 5945.93986882, 3956.04781691),
+        (100.0, 5399.98936290, 3592.80729401),
+        (360.0, 1630.46167870, 1084.80484278),
+    ] {
+        for (use_asd, expected) in [(false, lrfd), (true, asd)] {
+            let s = sap_design::steel::compute_aisc_360_strengths(
+                &sec, &mat, length, length, length, 1.0, 1.0, 1.0, use_asd,
+            )
+            .unwrap();
+            close(s.phi_mn33_pos, expected, 1e-8, "F4 major bending");
+            assert_eq!(s.phi_mn33_neg, s.phi_mn33_pos);
+        }
+    }
+    // Between the F4 design strength and the old 6224.04 kip·in plastic strength.
+    let r = design(&mut member(
+        sec.clone(),
+        12.0,
+        vec![station(0.0, 6100.0, 0.0)],
+    ));
+    assert_eq!(r.status, "OVERSTRESSED");
+    // Legacy omitted bottom dimensions denote the same symmetric section.
+    let implicit = FrameSection {
+        t2b: 0.0,
+        tfb: 0.0,
+        ..sec
+    };
+    let strengths = sap_design::steel::compute_aisc_360_strengths(
+        &implicit, &mat, 12.0, 12.0, 12.0, 1.0, 1.0, 1.0, false,
+    )
+    .unwrap();
+    close(
+        strengths.phi_mn33_neg,
+        r.phi_mn33,
+        1e-12,
+        "implicit bottom flange",
+    );
+}
+
+#[test]
+fn f4_reports_missing_fabrication_only_when_it_changes_the_governing_strength() {
+    let sec = make_i_section("I24", "A992Fy50", 24.0, 16.0, 0.6, 0.2, 16.0, 0.6);
+    let demand = vec![station(0.0, 100.0, 0.0)];
+    let err = try_design(sec.clone(), 12.0, demand.clone())
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("M1") && err.contains("I24") && err.contains("fabrication"),
+        "{err}"
+    );
+    // For a sufficiently long unbraced span the same elastic LTB limit
+    // governs for either fabrication. Its strength is available.
+    assert!(try_design(sec.clone(), 1200.0, demand).is_ok());
+    let axial_only = try_design(sec, 12.0, vec![station(-1.0, 0.0, 0.0)]).unwrap();
+    assert_eq!(axial_only.phi_mn33, 0.0);
+    assert!(axial_only.notes.iter().any(|note| note.contains("fabrication")));
+}
+
+
+#[test]
+fn f4_requires_clear_web_geometry_but_allows_checks_at_zero_major_moment() {
+    let mut sec = make_i_section("I24-TAB", "A992Fy50", 24.0, 8.0, 0.6, 0.2, 8.0, 0.6);
+    // A tabulated area that includes extra material absent from the sharp plate dimensions.
+    sec.area += 0.4;
+    let mat = sap_model::Material::default_steel_kip_in();
+    let err = sap_design::steel::compute_aisc_360_strengths(
+        &sec, &mat, 120.0, 120.0, 120.0, 1.0, 1.0, 1.0, false,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("clear web depth"), "{err}");
+
+    let shear = FrameStationResult { v2: 1.0, ..station(0.0, 0.0, 0.0) };
+    for load in [station(-1.0, 0.0, 0.0), station(0.0, 0.0, 1.0), shear] {
+        let result = try_design(sec.clone(), 120.0, vec![load.clone()]).unwrap();
+        assert_eq!(result.status, "OK");
+        assert_eq!(result.phi_mn33, 0.0);
+        assert_eq!(result.mr_major_ratio, 0.0);
+        assert!(result.total_ratio > 0.0);
+        assert!(result.notes.iter().any(|note| note.contains("clear web depth")));
+
+        let err = try_design(sec.clone(), 120.0, vec![load, station(0.0, 1.0, 0.0)])
+            .unwrap_err();
+        assert!(matches!(err, DesignError::AiscLimitStateNotBuilt { .. }));
+        let detail = err.to_string();
+        assert!(detail.contains("M1") && detail.contains("I24-TAB") && detail.contains("fillet"));
+    }
+}

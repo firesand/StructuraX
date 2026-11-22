@@ -27,7 +27,9 @@ These are scoped implementations. Unsupported combinations and known defects are
 
 Design results and several analysis results changed on 2026-11-19, after an outside audit of the whole program. [The audit note](docs/reconstruction/audit-2026-11-19.md) lists what moved, what is now refused by name, and what was not verified. Nothing was run in SAP2000: agreement rests on the vendor's manuals and published examples and on hand calculations.
 
-[The progress ledger](docs/reconstruction/tutorial-video-progress.md) tracks every known defect and missing feature with its status and a timeline of the work. It has open defects, two of them unconservative: an I section with a noncompact web takes the plastic moment, and a concrete beam that is not rectangular is designed as a rectangle.
+The November 22 repairs cover displacement-controlled P-Delta analysis and member design. Replaying a reported load factor checks equilibrium at the requested displacement. Rectangular concrete beam design now checks shear and torsion extrema together and identifies a failing combination when one exists. Reapplying the interactive load-combination table preserves its type and rejects invalid factors or conflicting definitions.
+
+[The progress ledger](docs/reconstruction/tutorial-video-progress.md) tracks every known defect and missing feature with its status and a timeline of the work. For doubly symmetric steel I-sections with noncompact webs and dimensions consistent with sharp-corner plates, major-axis bending uses the AISC F4 limits. A bending check that needs unrecorded fillet geometry or fabrication data gives a named refusal. With zero major-axis demand, other checks proceed and the result identifies the unavailable capacity (D142). ACI and EC2 beam design requires a rectangular section. Other beam shapes receive a per-member error and the design continues on supported members (D144).
 
 ## Build and run
 

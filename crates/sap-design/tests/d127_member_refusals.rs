@@ -429,8 +429,8 @@ fn concrete_material(model: &mut SapModel, name: &str, fc: f64, fy: f64) {
     model.materials.insert(name.into(), c);
 }
 
-/// A rectangular beam and a column (designed) and a beam of another shape with torsion (refused,
-/// G85). `kip_in` selects ACI in kip and in, else EC2 in N and mm.
+/// A rectangular beam and a column (designed) and a beam of another shape (refused, D144).
+/// `kip_in` selects ACI in kip and in, else EC2 in N and mm.
 fn concrete_model(kip_in: bool) -> SapModel {
     let (units, mat, code, len, b, h) = if kip_in {
         (Units::KipInF, "C4", "ACI 318-14", 120.0, 12.0, 24.0)
@@ -479,10 +479,10 @@ fn concrete_refused_beam_is_recorded_under_aci_and_ec2() {
         assert_eq!(report.not_designed.len(), 1);
         let (frame, error) = &report.not_designed[0];
         assert_eq!(frame, "TB");
-        assert!(matches!(error, DesignError::ConcreteTorsionNotDesigned { .. }), "{error:?}");
+        assert!(matches!(error, DesignError::UnsupportedConcreteBeamSection { .. }), "{error:?}");
         let text = &model.concrete_design_errors["TB"];
         assert_eq!(text, &error.to_string());
-        assert!(text.contains("'TB'") && text.contains("torsion"), "{text}");
+        assert!(text.contains("'TB'") && text.contains("D144"), "{text}");
         // the refused beam has no result at all
         assert!(!model.concrete_design_results.contains_key("TB"));
         assert_eq!(model.concrete_design_results.len(), 2);
@@ -495,15 +495,12 @@ fn concrete_refused_beam_is_recorded_under_aci_and_ec2() {
 
         let mut strict = concrete_model(kip_in);
         let err = try_run_concrete_design(&mut strict).unwrap_err();
-        assert!(matches!(err, DesignError::ConcreteTorsionNotDesigned { .. }), "{err:?}");
+        assert!(matches!(err, DesignError::UnsupportedConcreteBeamSection { .. }), "{err:?}");
         assert!(strict.concrete_design_results.is_empty() && strict.concrete_design_errors.is_empty());
 
         // rerun without the cause: no stale entry
         let mut again = model.clone();
-        again.case_results.get_mut("LC").unwrap().frame_forces.insert(
-            "TB".into(),
-            vec![st(0.0, if kip_in { 30.0 } else { 100_000.0 }, if kip_in { 1500.0 } else { 150.0e6 }, 0.0)],
-        );
+        again.frame_sections.get_mut("OB").unwrap().prop_type = FramePropType::Rectangular;
         let report = run_concrete_design_per_member(&mut again).unwrap();
         assert!(report.not_designed.is_empty());
         assert!(again.concrete_design_errors.is_empty());
